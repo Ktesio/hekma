@@ -952,6 +952,289 @@ fn the_drain_route_serves_both_outcomes_and_rejects_an_out_of_range_bound() {
     server.stop().unwrap();
 }
 
+// The drain body's own wire forms (the arms behind the out-of-range pin
+// above): a body that is not the JSON object shape is a rejected REQUEST
+// (400, naming the expected shape — the parse arm), while the two EMPTY
+// object forms — `{}` and `{"timeout_ms":null}` — are the manifest tier's
+// equals (the absent field's explicit-null spelling is the same tier, never
+// a zero-millisecond drain).
+#[test]
+fn the_drain_route_rejects_a_non_object_body_and_reads_the_empty_forms_as_the_manifest_tier() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    // Two COMPLETED-shape drainers (the anchored fixture above: the idle
+    // signal lands 800ms after the pause sentinel, the agent self-exits
+    // 2000ms after it) — each manifest-tier leg stops its own instance.
+    // The fixture TempDirs stay BOUND for the whole test: dropping one
+    // deletes its manifest before serve ever reads it.
+    let _obj_fixture = registered_drain_fake_agent(
+        &base,
+        "objdrain",
+        &[
+            "--linger-ms",
+            "600000",
+            "--idle-on-pause",
+            "800:pause.sentinel:idle.sentinel",
+            "--exit-on-pause",
+            "2000:pause.sentinel",
+        ],
+        "timeout_ms = 10000\nidle_file = \"idle.sentinel\"",
+    );
+    let _nul_fixture = registered_drain_fake_agent(
+        &base,
+        "nulldrain",
+        &[
+            "--linger-ms",
+            "600000",
+            "--idle-on-pause",
+            "800:pause.sentinel:idle.sentinel",
+            "--exit-on-pause",
+            "2000:pause.sentinel",
+        ],
+        "timeout_ms = 10000\nidle_file = \"idle.sentinel\"",
+    );
+    // A STALLED drainer with a SHORT manifest bound (the review round 3
+    // leg): the idle file never lands, so an empty-form drain on the
+    // MANIFEST tier burns the declared 800ms and reports the timed-out
+    // shape. This is the leg that distinguishes the tiers: the asserted
+    // band below (700..2500ms) is reachable ONLY by the 800ms manifest
+    // bound timing out. The fixture's self-exit is parked at 3000ms —
+    // PAST that ceiling — so if the empty forms regressed to the route's
+    // 30s default, the child's own exit ends the wait at ~3000ms and the
+    // leg fails the ceiling fast instead of hanging for the full window
+    // (the completed-shape legs above pass under any bound above ~500ms,
+    // so they cannot see the difference on their own). The same short
+    // exit keeps the Windows stop that follows this drain (~3s — the
+    // graceful step there only waits, no signal to lean on) far inside
+    // the suite client's 10s response timeout, the sibling pattern the
+    // 1200ms-exit fixture above (in
+    // `the_drain_route_serves_both_outcomes_and_rejects_an_out_of_range_bound`)
+    // uses for the same reason.
+    let _stalled_fixture = registered_drain_fake_agent(
+        &base,
+        "stalleddrain",
+        &[
+            "--linger-ms",
+            "600000",
+            "--exit-on-pause",
+            "3000:pause.sentinel",
+        ],
+        "timeout_ms = 800\nidle_file = \"never.sentinel\"",
+    );
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let obj = format!("http://{}/v0/instances/objdrain", server.addr);
+    let nul = format!("http://{}/v0/instances/nulldrain", server.addr);
+    let stalled = format!("http://{}/v0/instances/stalleddrain", server.addr);
+    for url in [&obj, &nul, &stalled] {
+        let mut response = client
+            .post(format!("{url}/start"))
+            .header("Authorization", &auth)
+            .send("")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{url}");
+        assert_eq!(json_body(&mut response)["instance"]["state"], "running");
+    }
+
+    // A body that is not the object shape is a rejected REQUEST — five
+    // forms: non-JSON bytes, three arrays (a bare `[1500]` and `[null]` are
+    // the sequence forms serde's derive would otherwise read as
+    // `timeout_ms`, draining with 200/defaults — the route refuses them AS
+    // SHAPE, before the typed read), and a mistyped field. None of them
+    // stop the instance (the route refuses before the engine gate, the
+    // out-of-range pin's own order).
+    for body in [
+        "not json at all",
+        "[1,2,3]",
+        "[1500]",
+        "[null]",
+        "{\"timeout_ms\":\"soon\"}",
+    ] {
+        let mut response = client
+            .post(format!("{obj}/drain"))
+            .header("Authorization", &auth)
+            .send(body)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "body={body}");
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["kind"], "invalid_body", "body={body}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("must be a JSON object"),
+            "body={body}: the refusal names the expected shape"
+        );
+    }
+
+    // A duplicate key is a rejected REQUEST too — the shape check reads the
+    // body as `Value`, which would collapse the pair (last one winning),
+    // but the typed read runs on the ORIGINAL bytes, where the derived
+    // visitor still refuses it. A `Value` re-read would silently drain on
+    // the manifest tier here.
+    for body in [
+        "{\"timeout_ms\":1,\"timeout_ms\":null}",
+        "{\"timeout_ms\":null,\"timeout_ms\":1500}",
+    ] {
+        let mut response = client
+            .post(format!("{obj}/drain"))
+            .header("Authorization", &auth)
+            .send(body)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "body={body}");
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["kind"], "invalid_body", "body={body}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate field"),
+            "body={body}: the refusal names the duplicate key"
+        );
+    }
+
+    // `{}` — an object with NO timeout — is the manifest tier's equal: the
+    // drain runs on the declared 10s bound, the idle signal lands mid-wait,
+    // and the outcome is the completed shape with an honestly counted wait.
+    let mut response = client
+        .post(format!("{obj}/drain"))
+        .header("Authorization", &auth)
+        .send("{}")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["completed"], true, "{json}");
+    assert_eq!(json["instance"]["state"], "stopped");
+    let waited = json["waited_ms"].as_u64().unwrap();
+    assert!(
+        waited >= 500,
+        "the empty object's drain waited for the anchored idle signal (waited {waited}ms)"
+    );
+    assert!(
+        waited < 9000,
+        "the empty object's drain finished inside its manifest bound (waited {waited}ms)"
+    );
+
+    // `{"timeout_ms":null}` is the SAME tier — an explicit null is the
+    // absent field's equal.
+    let mut response = client
+        .post(format!("{nul}/drain"))
+        .header("Authorization", &auth)
+        .send("{\"timeout_ms\":null}")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["completed"], true, "{json}");
+    assert_eq!(json["instance"]["state"], "stopped");
+    let waited = json["waited_ms"].as_u64().unwrap();
+    assert!(
+        waited >= 500,
+        "the explicit null's drain waited for the anchored idle signal (waited {waited}ms)"
+    );
+    assert!(
+        waited < 9000,
+        "the explicit null's drain finished inside its manifest bound (waited {waited}ms)"
+    );
+
+    // The empty form on the STALLED drainer is the tier's proof: the idle
+    // file never lands, so the `{}` drain burns the manifest's declared
+    // 800ms and reports the timed-out shape inside a band ONLY that bound
+    // can produce. If the empty forms resolved to the route's 30s default
+    // instead of the manifest tier, the child's own 3000ms self-exit
+    // would end the wait past the ceiling below and fail it — the
+    // completed-shape legs above cannot see that difference on their own.
+    let mut response = client
+        .post(format!("{stalled}/drain"))
+        .header("Authorization", &auth)
+        .send("{}")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(
+        json["completed"], false,
+        "the stalled empty-form drain must burn the manifest bound, not complete ({json})"
+    );
+    assert_eq!(json["instance"]["state"], "stopped");
+    let waited = json["waited_ms"].as_u64().unwrap();
+    assert!(
+        waited >= 700,
+        "the stalled empty-form drain genuinely burned toward its 800ms manifest bound (waited {waited}ms)"
+    );
+    assert!(
+        waited < 2500,
+        "the stalled empty-form drain ran on the MANIFEST tier, not the 30s default (waited {waited}ms)"
+    );
+
+    server.stop().unwrap();
+}
+
+// The non-object refusal is a ROUTE-FAMILY contract: the same typed-body
+// read backs `start`, `stop`, and `drain`, and serde's derive would accept
+// each DTO's bare sequence form — `[true]` would start detached, `[30]`
+// would stop on a 30s window, `[1500]` would drain on 1500ms — so every
+// one of them is refused AS SHAPE, before the engine gate (the instance
+// below is never started; the refusals never reach it), naming the object
+// each route wants.
+#[test]
+fn start_stop_and_drain_refuse_the_sequence_forms_as_shape() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let _manifest = registered_fake_agent(&base, "host");
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    for (verb, body) in [("start", "[true]"), ("stop", "[30]"), ("drain", "[1500]")] {
+        let mut response = client
+            .post(format!("http://{}/v0/instances/host/{verb}", server.addr))
+            .header("Authorization", &auth)
+            .send(body)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{verb}");
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["kind"], "invalid_body", "{verb}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("must be a JSON object"),
+            "{verb}: the refusal names the expected shape"
+        );
+    }
+
+    // The duplicate-key refusal is the SAME route-family contract, one step
+    // later: the body IS an object, so the shape check passes, but the
+    // typed read runs on the ORIGINAL bytes and the derived visitor refuses
+    // the repeated field — the sequence-form loop above cannot see this
+    // (a `Value` re-read would collapse the pair and act on the last
+    // value: a detached start, a day-long window, a manifest-tier drain).
+    for (verb, body) in [
+        ("start", "{\"detach\":false,\"detach\":true}"),
+        ("stop", "{\"window_secs\":5,\"window_secs\":86400}"),
+        ("drain", "{\"timeout_ms\":1,\"timeout_ms\":null}"),
+    ] {
+        let mut response = client
+            .post(format!("http://{}/v0/instances/host/{verb}", server.addr))
+            .header("Authorization", &auth)
+            .send(body)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{verb}");
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["kind"], "invalid_body", "{verb}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate field"),
+            "{verb}: the refusal names the repeated field"
+        );
+    }
+
+    server.stop().unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // The shutdown drain's paused-agent leg (the reported serve bug: a PAUSED
 // attached agent was handed to the engine Drop's raw kill-on-drop teardown —
@@ -3211,6 +3494,101 @@ fn the_run_routes_open_show_and_close_a_child_run_with_typed_refusals() {
     let mut response = get_ok(&client, &server.addr, "/v0/runs/run_ghost");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(json_body(&mut response)["error"]["code"], "run-not-found");
+
+    let _ = client
+        .post(format!("http://{}/v0/instances/host/stop", server.addr))
+        .header("Authorization", &auth)
+        .send("");
+}
+
+// The open's `parent_run_id` arm (the hop the matrix above leaves cold): a
+// child Run opened under ANOTHER RUN — the grandchild. The 201 + Location
+// are pinned together with the parent link from BOTH sides: the new Run's
+// document names its parent, and the parent's open-children count moves.
+#[test]
+fn the_run_routes_open_a_grandchild_run_from_a_parent_run_id() {
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        // The manifest fake agent is the POSIX shape (see the lifecycle test).
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let _manifest = registered_fake_agent(&base, "host");
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let runs = format!("http://{}/v0/runs", server.addr);
+    let post = |url: &str, body: serde_json::Value| {
+        client
+            .post(url)
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/json")
+            .send(body.to_string())
+            .unwrap()
+    };
+    let mut response = client
+        .post(format!("http://{}/v0/instances/host/start", server.addr))
+        .header("Authorization", &auth)
+        .send("")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(json_body(&mut response));
+
+    // The first child under the instance's open Run (the matrix's shape).
+    let mut response = post(&runs, serde_json::json!({"parent_instance": "host"}));
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let child = json_body(&mut response)["run"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The grandchild hop: `parent_run_id` names the CHILD Run, and the open
+    // answers 201 + Location with a new Run under it — a Host-opened child
+    // Run is at most Announced, so the depth and the carried limits pin too.
+    let mut response = post(
+        &runs,
+        serde_json::json!({
+            "parent_run_id": child,
+            "labels": {"task": "grandchild"},
+            "token_budget": 250
+        }),
+    );
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let location = response
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let json = json_body(&mut response);
+    let grandchild = json["run"]["run_id"].as_str().unwrap().to_string();
+    assert_eq!(location, format!("/v0/runs/{grandchild}"));
+    assert_ne!(grandchild, child);
+    assert_eq!(json["run"]["control_depth"], "announced");
+    assert_eq!(json["run"]["limits"]["token_per_run"], 250);
+
+    // The parent link, read from both sides: the grandchild's document
+    // names its parent Run, and the parent's open-children count moved to
+    // one — a DIRECT-children count, so the ROOT Run (the child's own
+    // parent, read back the same way) also counts exactly one open child;
+    // a subtree count would read two at the root.
+    let mut response = get_ok(&client, &server.addr, &format!("/v0/runs/{grandchild}"));
+    assert_eq!(
+        json_body(&mut response)["run"]["parent_run_id"],
+        child.as_str()
+    );
+    let mut response = get_ok(&client, &server.addr, &format!("/v0/runs/{child}"));
+    let json = json_body(&mut response);
+    assert_eq!(json["run"]["open_children"], 1);
+    let root = json["run"]["parent_run_id"].as_str().unwrap().to_string();
+    let mut response = get_ok(&client, &server.addr, &format!("/v0/runs/{root}"));
+    assert_eq!(
+        json_body(&mut response)["run"]["open_children"],
+        1,
+        "open_children counts DIRECT children only — the open grandchild is not counted at the root"
+    );
 
     let _ = client
         .post(format!("http://{}/v0/instances/host/stop", server.addr))

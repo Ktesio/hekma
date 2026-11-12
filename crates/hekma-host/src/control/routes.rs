@@ -284,12 +284,36 @@ pub(crate) async fn remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Control-route bodies are JSON OBJECTS (`{"detach":true}`,
+/// `{"window_secs":30}`, `{"timeout_ms":1500}`) — but serde's derive also
+/// accepts each DTO's bare SEQUENCE form (`[true]`, `[30]`, and `[1500]`
+/// all deserialize into the request structs), which would let an array
+/// silently act with position semantics. Parse to `Value` and refuse the
+/// non-object shapes BEFORE the typed read — the same shape the refusal
+/// message has always named.
+fn object_body<T: serde::de::DeserializeOwned>(body: &[u8], expected: &str) -> Result<T, ApiError> {
+    // Shape-check through `Value` (refuses the sequence forms serde's derive
+    // would otherwise accept), then deserialize the typed struct from the
+    // ORIGINAL bytes: the derived field visitor still rejects duplicate keys
+    // ("duplicate field `timeout_ms`"), which a `Value` re-read would
+    // silently collapse — last one wins. The body is tiny, so the second
+    // parse of the same bytes costs almost nothing.
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|err| ApiError::invalid_body(format!("{expected}: {err}")))?;
+    if !value.is_object() {
+        return Err(ApiError::invalid_body(expected.to_string()));
+    }
+    serde_json::from_slice(body).map_err(|err| ApiError::invalid_body(format!("{expected}: {err}")))
+}
+
 /// `POST /v0/instances/{name}/start` — the lifecycle verbs, each acknowledged
 /// with the post-transition Fleet-row read-back (the state the instance
 /// ACTUALLY reached, not the state the request hoped for). Story 21-4: the
 /// optional body `{"detach": true}` is the engine's detached start (the
 /// handle is disarmed at spawn, so the agent also survives this host's exit);
-/// an absent body is a supervised start. A PRESENT body must parse.
+/// an absent body is a supervised start. A PRESENT body must parse — and
+/// must be the OBJECT shape (a bare array is refused even where serde's
+/// derive could read it).
 pub(crate) async fn start(
     State(state): State<ApiState>,
     Path(name): Path<String>,
@@ -298,12 +322,11 @@ pub(crate) async fn start(
     let request = if body.is_empty() {
         dto::StartRequest::default()
     } else {
-        serde_json::from_slice::<dto::StartRequest>(&body).map_err(|err| {
-            ApiError::invalid_body(format!(
-                "the start body must be a JSON object like {{\"detach\":true}}, or no \
-                 body at all for a supervised start: {err}"
-            ))
-        })?
+        object_body(
+            &body,
+            "the start body must be a JSON object like {\"detach\":true}, or no \
+             body at all for a supervised start",
+        )?
     };
     if request.detach {
         state.engine.start_detached(&name).await?;
@@ -434,12 +457,11 @@ pub(crate) async fn stop(
         // Absent body → the engine default.
         None
     } else {
-        let request: dto::StopRequest = serde_json::from_slice(&body).map_err(|err| {
-            ApiError::invalid_body(format!(
-                "the stop body must be a JSON object like {{\"window_secs\":30}}, \
-                 or no body at all for the engine's default window: {err}"
-            ))
-        })?;
+        let request: dto::StopRequest = object_body(
+            &body,
+            "the stop body must be a JSON object like {\"window_secs\":30}, \
+             or no body at all for the engine's default window",
+        )?;
         match request.window_secs {
             // `{}` / `{"window_secs":null}` → the default too.
             None => None,
@@ -480,12 +502,11 @@ pub(crate) async fn drain(
         // Absent body → the manifest tier (then the engine default).
         None
     } else {
-        let request: dto::DrainRequest = serde_json::from_slice(&body).map_err(|err| {
-            ApiError::invalid_body(format!(
-                "the drain body must be a JSON object like {{\"timeout_ms\":1500}}, \
-                 or no body at all for the manifest tier: {err}"
-            ))
-        })?;
+        let request: dto::DrainRequest = object_body(
+            &body,
+            "the drain body must be a JSON object like {\"timeout_ms\":1500}, \
+             or no body at all for the manifest tier",
+        )?;
         match request.timeout_ms {
             // `{}` / `{"timeout_ms":null}` → the manifest tier too.
             None => None,
