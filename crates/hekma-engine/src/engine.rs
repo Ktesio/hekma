@@ -260,6 +260,12 @@ impl Drop for Engine {
 /// not a hot path and the engine is single-lifetime, so a coarse mutex is the
 /// correct, simplest altitude here.
 struct EngineInner {
+    /// Story 23-1: the shared Metering Proxy, when it runs. FIRST so it
+    /// drops (closing its store-writer handle) before the registry, whose
+    /// writer joins once every handle is gone.
+    metering_proxy: Mutex<Option<crate::metering::proxy::MeteringProxy>>,
+    /// Story 23-1: why the proxy is not running, when it is enabled.
+    metering_proxy_error: Option<String>,
     /// Story 21-4: this engine was opened read-only ([`Engine::open_read_only`])
     /// — no writer, no adoption, no reaper. Its Fleet reads take a live
     /// instance's current Run id from the persisted spawn record (the id the
@@ -298,13 +304,12 @@ struct EngineInner {
 /// first moment adoption and any start can run.
 #[derive(Clone, Default)]
 pub struct EngineOptions {
-    /// The fixed loopback PORT every `engine-observed` instance's metering
-    /// listener binds (`0` = the OS-ephemeral default). Non-zero pins the port
-    /// so engine restarts and orphan adoptions re-bind the SAME port and the
-    /// injected `base_url` stays live (the AI-46 strand closure). A pinned
-    /// port that is already taken surfaces the typed bind error at start —
-    /// never a silent hop.
-    pub metering_listen_port: u16,
+    /// The shared Metering Proxy (story 23-1): on by default on an
+    /// ephemeral, unrecorded port; the Service Host makes the port sticky
+    /// per state directory. A taken port never hops: the engine opens
+    /// without a proxy, says why ([`Engine::metering_proxy_error`]), and
+    /// refuses `engine-observed` starts until it is free.
+    pub metering_proxy: crate::metering::proxy::MeteringProxyOptions,
     /// When `true`, every child spawn CLEARS the inherited environment first
     /// and applies ONLY the manifest-declared mappings (the Host's
     /// `child_env_allowlist`: no ambient Host-shell variables leak into hosted
@@ -357,7 +362,7 @@ impl std::fmt::Debug for EngineOptions {
         // Manual impl: `DiagnosticSink` (a boxed writer) is not `Debug`, and a
         // sink must never be printed anyway (no-leak discipline).
         f.debug_struct("EngineOptions")
-            .field("metering_listen_port", &self.metering_listen_port)
+            .field("metering_proxy", &self.metering_proxy)
             .field("child_env_allowlist", &self.child_env_allowlist)
             .field("log_capture", &self.log_capture)
             .field("diagnostics", &self.diagnostics.as_ref().map(|_| "<sink>"))
@@ -502,7 +507,7 @@ impl Engine {
     /// `open_with_options` threads the Host's serve options through.
     fn open_inner(base: Option<PathBuf>, options: EngineOptions) -> Result<Self, RegistryError> {
         let EngineOptions {
-            metering_listen_port,
+            metering_proxy,
             child_env_allowlist,
             log_capture,
             diagnostics,
@@ -524,8 +529,22 @@ impl Engine {
         // adoption — an adopted observed instance re-binds the pinned port on
         // this very open.
         let mut supervisor = Supervisor::with_runtime(rt.handle().clone());
+        if let Some(sink) = diagnostics {
+            supervisor.install_diagnostics(sink);
+        }
+        // Story 23-1: the shared Metering Proxy starts BEFORE adoption and the
+        // reaper, so an adopted engine-observed agent's base URL is live on
+        // this very open and the first snapshot it reads already carries
+        // every durable `block` reason. A bind failure is surfaced, never a
+        // port hop.
+        let (proxy, proxy_error) =
+            Self::start_metering_proxy(&rt, &registry, &supervisor, &metering_proxy);
+        let proxy_url = proxy.as_ref().map(|proxy| proxy.info().url.clone());
+        if let Some(error) = &proxy_error {
+            supervisor.emit_open_note(error);
+        }
         supervisor
-            .set_serve_options(metering_listen_port, child_env_allowlist, log_capture)
+            .set_serve_options(proxy_url, child_env_allowlist, log_capture)
             .map_err(|err| RegistryError::ServeOptionsOpenTimeOnly {
                 detail: err.to_string(),
             })?;
@@ -540,9 +559,6 @@ impl Engine {
         if let Some(cap) = pause_command_cap_override {
             supervisor.override_pause_command_cap(cap);
         }
-        if let Some(sink) = diagnostics {
-            supervisor.install_diagnostics(sink);
-        }
         // Story 21-1: anything the one-time v12 import could not carry into
         // state.db (a torn or corrupt legacy log line) is surfaced once, on
         // the engine's diagnostic surface, before supervision starts.
@@ -553,6 +569,8 @@ impl Engine {
         let run_snapshot = Arc::clone(registry.run_publisher());
         let credential_reader = Mutex::new(registry.open_credential_reader(false)?);
         let inner = Arc::new(EngineInner {
+            metering_proxy: Mutex::new(proxy),
+            metering_proxy_error: proxy_error,
             read_only: false,
             registry: Mutex::new(registry),
             supervisor: Mutex::new(supervisor),
@@ -615,6 +633,8 @@ impl Engine {
         let run_snapshot = Arc::clone(registry.run_publisher());
         let credential_reader = Mutex::new(registry.open_credential_reader(true)?);
         let inner = Arc::new(EngineInner {
+            metering_proxy: Mutex::new(None),
+            metering_proxy_error: None,
             read_only: true,
             registry: Mutex::new(registry),
             supervisor: Mutex::new(supervisor),
@@ -660,6 +680,99 @@ impl Engine {
     /// DELAYED restart: sleep the backoff, then run [`Supervisor::restart`] via
     /// `spawn_blocking`. A restart whose instance was meanwhile stopped is a
     /// harmless no-op (the transition gate rejects a non-`failed` start — AC7).
+    /// Start the shared Metering Proxy (story 23-1) when enabled: the port
+    /// is the given one, else (sticky) the state directory's recorded one,
+    /// else an OS pick — recorded when sticky. Returns the proxy, or the
+    /// surfaced reason it is not running.
+    fn start_metering_proxy(
+        rt: &Runtime,
+        registry: &Registry,
+        supervisor: &Supervisor,
+        options: &crate::metering::proxy::MeteringProxyOptions,
+    ) -> (Option<crate::metering::proxy::MeteringProxy>, Option<String>) {
+        if !options.enabled {
+            return (None, None);
+        }
+        let Some(writer) = registry.writer().handle() else {
+            return (None, None);
+        };
+        let recorded = if options.sticky && options.port == 0 {
+            registry.reader().proxy_port().ok().flatten()
+        } else {
+            None
+        };
+        let mut chosen = options.clone();
+        if let Some(port) = recorded {
+            chosen.port = port;
+        }
+        let diagnostics = supervisor.diagnostic_fn();
+        let deps = crate::metering::proxy::ProxyDeps {
+            snapshot: Arc::clone(registry.run_publisher()),
+            writer,
+            inbox: supervisor.proxy_inbox(),
+            diagnostics,
+        };
+        match crate::metering::proxy::MeteringProxy::start(rt.handle(), &chosen, deps) {
+            Ok(proxy) => {
+                if options.sticky && recorded != Some(proxy.info().port) {
+                    let port = proxy.info().port;
+                    if let Err(err) = registry
+                        .writer()
+                        .call(move |ctx| ctx.store().set_proxy_port(port))
+                    {
+                        supervisor.emit_open_note(&format!(
+                            "the metering proxy port {port} could not be recorded for this \
+                             state directory ({err}); the next start may pick another port"
+                        ));
+                    }
+                }
+                (Some(proxy), None)
+            }
+            Err(err) => {
+                let port = chosen.port;
+                (
+                    None,
+                    Some(format!(
+                        "Port {port} is in use or not available ({err}), so the metering proxy \
+                         is not running. Agents that meter through it cannot start until the \
+                         port is free or you pass --metering-listen."
+                    )),
+                )
+            }
+        }
+    }
+
+    /// Where the shared Metering Proxy listens (story 23-1), when it runs.
+    pub fn metering_proxy(&self) -> Option<crate::metering::proxy::ProxyInfo> {
+        self.inner
+            .metering_proxy
+            .lock()
+            .expect("metering proxy mutex poisoned")
+            .as_ref()
+            .map(|proxy| proxy.info().clone())
+    }
+
+    /// Why the shared Metering Proxy is not running, when it was enabled
+    /// and could not start (story 23-1).
+    pub fn metering_proxy_error(&self) -> Option<String> {
+        self.inner.metering_proxy_error.clone()
+    }
+
+    /// Stop the shared Metering Proxy gracefully (story 23-1): stop
+    /// accepting, let in-flight calls finish within `grace`, abort the rest
+    /// (recorded `shutdown`), then close its record pump. Idempotent.
+    pub async fn stop_metering_proxy(&self, grace: Duration) {
+        let proxy = self
+            .inner
+            .metering_proxy
+            .lock()
+            .expect("metering proxy mutex poisoned")
+            .take();
+        if let Some(mut proxy) = proxy {
+            proxy.shutdown(grace).await;
+        }
+    }
+
     fn spawn_reaper(rt: &Runtime, inner: Arc<EngineInner>) -> tokio::task::AbortHandle {
         let handle = rt.spawn(async move {
             let mut ticker = tokio::time::interval(CRASH_POLL_INTERVAL);
@@ -1448,6 +1561,9 @@ impl Engine {
         window: Duration,
         notes: Option<&DiagnosticSink>,
     ) -> Vec<DrainOutcome> {
+        // Story 23-1: the proxy stops first (in-flight calls get the grace),
+        // so its records flush before the drain stops the agents.
+        self.stop_metering_proxy(window).await;
         let notes = crate::shutdown::Notes::over(notes);
         crate::shutdown::drain_and_stop(self, window, &notes).await
     }

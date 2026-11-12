@@ -284,6 +284,11 @@ pub(crate) struct RunSnapshot {
     /// Story 23-1: the one adopted pre-proxy observed Run that receives
     /// calls matching no binding and no Run route (the legacy root route).
     pub legacy_root: Option<RunId>,
+    /// Story 23-1: Run routes published before their Run's launch job
+    /// commits (the agent may call as soon as it is spawned): the upstream
+    /// and the Run-start `block` reasons, until the Run's own entry carries
+    /// them.
+    pub pending_routes: HashMap<RunId, (Arc<str>, u8)>,
 }
 
 // The data path's reads: the Metering Proxy consumes them once it reads the
@@ -338,11 +343,29 @@ impl RunSnapshot {
     /// latched reasons of any action (story 23-1).
     pub(crate) fn disposition_over(&self, run_id: &RunId) -> Disposition {
         let mut over = Disposition::default();
-        for entry in self.chain(run_id) {
+        let chain = self.chain(run_id);
+        for entry in &chain {
             over.breach_block |= entry.disposition.breach_block;
             over.breach_latched |= entry.disposition.breach_latched;
+            if let Some((_, bits)) = self.pending_routes.get(&entry.record.run_id) {
+                over.breach_block |= bits;
+            }
+        }
+        if chain.is_empty() {
+            if let Some((_, bits)) = self.pending_routes.get(run_id) {
+                over.breach_block |= bits;
+            }
         }
         over
+    }
+
+    /// The upstream a Run route forwards to: the first recorded upstream up
+    /// the Run's chain, else its pending route's (story 23-1).
+    pub(crate) fn route_upstream(&self, run_id: &RunId) -> Option<Arc<str>> {
+        self.chain(run_id)
+            .iter()
+            .find_map(|entry| entry.upstream.clone())
+            .or_else(|| self.pending_routes.get(run_id).map(|(up, _)| Arc::clone(up)))
     }
 
     /// The next snapshot with `changes` applied: an ended entry leaves the
@@ -500,6 +523,25 @@ impl SnapshotPublisher {
         let mut next = (**guard).clone();
         next.generation = next.generation.wrapping_add(1);
         next.bindings = Arc::new(table);
+        *guard = Arc::new(next);
+    }
+
+    /// Publish (or retire) a pending Run route (story 23-1).
+    pub(crate) fn publish_pending_route(&self, run: RunId, route: Option<(Arc<str>, u8)>) {
+        let mut guard = match self.current.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut next = (**guard).clone();
+        next.generation = next.generation.wrapping_add(1);
+        match route {
+            Some(route) => {
+                next.pending_routes.insert(run, route);
+            }
+            None => {
+                next.pending_routes.remove(&run);
+            }
+        }
         *guard = Arc::new(next);
     }
 
