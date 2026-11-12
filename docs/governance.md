@@ -28,7 +28,8 @@ against its implementation and assert byte-exact agreement.
   `chain` kind for ancestor ceilings after the unchanged 1.1.0 set; 1.3.0
   appended the `policy` kind for Policy resolution after the unchanged 1.2.0
   set; 1.4.0 appended the `rearm` kind for the within-Run re-arm after the
-  unchanged 1.3.0 set.
+  unchanged 1.3.0 set, then six `policy-caller-*` cases for the resolver's
+  Caller layer (a Run's own limits, applied only where tighter).
 
 ## Getting the artifact
 
@@ -52,7 +53,7 @@ without running the CLI.
 
 ## The document, schema version 1
 
-An excerpt (the full artifact carries 63 cases; the shape is identical
+An excerpt (the full artifact carries 69 cases; the shape is identical
 throughout):
 
 ```json
@@ -221,7 +222,7 @@ API — see [Embedding the engine](embedding.md).
   | 1.1.0 | 27-34 | the `decision-block-*` cases and the `fence-*` cases |
   | 1.2.0 | 35-39 | the `chain-*` cases |
   | 1.3.0 | 40-53 | the `policy-*` cases and two `decision-policy-*` cases |
-  | 1.4.0 | 54-63 | the `rearm-*` cases |
+  | 1.4.0 | 54-69 | the `rearm-*` cases, then the `policy-caller-*` cases |
 
   The provenance list grows with the generator functions the new cases come
   from (1.1.0 added `governance::fence_refusal`, 1.2.0
