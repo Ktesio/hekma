@@ -3464,7 +3464,10 @@ mod tests {
         );
         let view = facade.run_limits_view(owner.as_str()).unwrap();
         assert_eq!(view.limits.token_cumulative, Some(9_000));
-        assert_eq!(view.resolution.sources.tokens_cumulative, crate::domain::LimitSource::Run);
+        assert_eq!(
+            view.resolution.sources.tokens_cumulative,
+            crate::domain::LimitSource::Run
+        );
         // A config write runs the re-arm pass (nothing latched here) and
         // leaves the Run-level limit on top.
         facade
@@ -3494,7 +3497,12 @@ mod tests {
         let read_only = Engine::open_read_only(Some(tmp.path().to_path_buf())).unwrap();
         let ro = read_only.blocking();
         assert!(ro
-            .set_run_limits(vec![owner.to_string()], change.clone(), LimitActor::Operator, true)
+            .set_run_limits(
+                vec![owner.to_string()],
+                change.clone(),
+                LimitActor::Operator,
+                true
+            )
             .is_ok());
         assert!(ro
             .set_run_limits(vec![owner.to_string()], change, LimitActor::Operator, false)

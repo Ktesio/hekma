@@ -11,8 +11,8 @@ use super::registry_policy::InstanceContext;
 use super::*;
 use crate::domain::governance::LatchKey;
 use crate::domain::runs::{
-    Anomaly, LimitActor, LimitSource, LimitsDirection, ResolveInputs, RunEventKind,
-    RunLimitChange, RunLimitField, RunLimits, RunStatus,
+    Anomaly, LimitActor, LimitSource, LimitsDirection, ResolveInputs, RunEventKind, RunLimitChange,
+    RunLimitField, RunLimits, RunStatus,
 };
 use crate::domain::{BreachDimension, BudgetBreachEvent};
 use crate::metering::WireFence;
@@ -143,7 +143,13 @@ fn context(fence: Option<WireFence>, explicit: PolicyLimits) -> InstanceContext 
     }
 }
 
-fn set(registry: &Registry, run: &RunId, change: RunLimitChange, actor: LimitActor, context: InstanceContext) -> Result<crate::domain::RunLimitsOutcome, crate::domain::RunError> {
+fn set(
+    registry: &Registry,
+    run: &RunId,
+    change: RunLimitChange,
+    actor: LimitActor,
+    context: InstanceContext,
+) -> Result<crate::domain::RunLimitsOutcome, crate::domain::RunError> {
     registry
         .apply_run_limits(run, &change, actor, Some(context))
         .map(|applied| applied.outcome.expect("one Run's outcome"))
@@ -285,7 +291,11 @@ fn lowering_each_ceiling_to_at_or_below_the_usage_breaches_at_once_then_raising_
             context(None, PolicyLimits::default()),
         )
         .unwrap();
-        assert_eq!(outcome.fired.len(), 1, "{label}: the re-armed latch fires again");
+        assert_eq!(
+            outcome.fired.len(),
+            1,
+            "{label}: the re-armed latch fires again"
+        );
         assert_eq!(breaches(&seeded.registry, &seeded.run).len(), 2, "{label}");
     }
 }
@@ -303,7 +313,14 @@ fn a_raise_lifts_the_matching_fence_reason_per_reason_and_the_other_holds() {
         breach_action: Some(BreachAction::Block),
         ..RunLimits::default()
     };
-    let outcome = set(&seeded.registry, &seeded.run, limits(both), LimitActor::Operator, ctx()).unwrap();
+    let outcome = set(
+        &seeded.registry,
+        &seeded.run,
+        limits(both),
+        LimitActor::Operator,
+        ctx(),
+    )
+    .unwrap();
     assert_eq!(outcome.fired.len(), 2, "{:?}", outcome.fired);
     assert_eq!(fence.refusal().unwrap().code, "tokens_per_run");
 
@@ -322,7 +339,10 @@ fn a_raise_lifts_the_matching_fence_reason_per_reason_and_the_other_holds() {
     .unwrap();
     assert_eq!(outcome.direction, LimitsDirection::Raised);
     let tokens = LatchKey::new(BreachDimension::Tokens, crate::domain::BreachScope::PerRun);
-    let dollars = LatchKey::new(BreachDimension::Dollars, crate::domain::BreachScope::Cumulative);
+    let dollars = LatchKey::new(
+        BreachDimension::Dollars,
+        crate::domain::BreachScope::Cumulative,
+    );
     assert_eq!(outcome.re_armed, vec![tokens]);
     assert_eq!(outcome.fence_cleared, vec![tokens]);
     assert_eq!(
@@ -436,7 +456,11 @@ fn a_run_limit_outranks_a_policy_both_ways_and_a_clear_hands_back_to_it() {
         outcome.resolution.sources.tokens_per_run,
         LimitSource::Policy("cap".to_string())
     );
-    assert_eq!(outcome.fired.len(), 1, "a clear can lower the effective ceiling");
+    assert_eq!(
+        outcome.fired.len(),
+        1,
+        "a clear can lower the effective ceiling"
+    );
     assert_eq!(breaches(&seeded.registry, &seeded.run).len(), 2);
     // A TIGHTER Run-level limit than the Policy also wins.
     let outcome = set(
@@ -475,9 +499,22 @@ fn a_caller_may_only_tighten_and_an_operator_or_host_may_raise() {
         breach_action: Some(BreachAction::Pause),
         ..RunLimits::default()
     };
-    set(&seeded.registry, &seeded.run, limits(start), LimitActor::Operator, context(None, PolicyLimits::default())).unwrap();
+    set(
+        &seeded.registry,
+        &seeded.run,
+        limits(start),
+        LimitActor::Operator,
+        context(None, PolicyLimits::default()),
+    )
+    .unwrap();
     let caller = |change: RunLimitChange| {
-        set(&seeded.registry, &seeded.run, change, LimitActor::Caller, context(None, PolicyLimits::default()))
+        set(
+            &seeded.registry,
+            &seeded.run,
+            change,
+            LimitActor::Caller,
+            context(None, PolicyLimits::default()),
+        )
     };
     // Raising a ceiling, clearing one (unlimited), loosening the action: refused.
     for (change, limit) in [
@@ -508,7 +545,10 @@ fn a_caller_may_only_tighten_and_an_operator_or_host_may_raise() {
         assert!(err.to_string().contains(limit), "{err}");
     }
     // Nothing was written by the refusals.
-    assert_eq!(seeded.registry.reader().run_limits(&seeded.run).unwrap(), start);
+    assert_eq!(
+        seeded.registry.reader().run_limits(&seeded.run).unwrap(),
+        start
+    );
     // Tightening is allowed for a Caller.
     let outcome = caller(limits(RunLimits {
         token_per_run: Some(500),
@@ -533,13 +573,10 @@ fn a_caller_may_only_tighten_and_an_operator_or_host_may_raise() {
         assert_eq!(outcome.direction, LimitsDirection::Raised, "{actor:?}");
     }
     // The rows carry the actor as their source.
-    let source: String = seeded
-        .registry
-        .reader()
-        .query_string_for_test(&format!(
-            "SELECT source FROM run_limits WHERE run_id = '{}' AND dimension = 'tokens'",
-            seeded.run
-        ));
+    let source: String = seeded.registry.reader().query_string_for_test(&format!(
+        "SELECT source FROM run_limits WHERE run_id = '{}' AND dimension = 'tokens'",
+        seeded.run
+    ));
     assert_eq!(source, "host");
 }
 
@@ -558,7 +595,14 @@ fn scopes_actions_and_ended_runs_are_refused_per_run() {
             ..RunLimits::default()
         },
     ] {
-        let err = set(&seeded.registry, &child, limits(set_limit), LimitActor::Operator, context(None, PolicyLimits::default())).unwrap_err();
+        let err = set(
+            &seeded.registry,
+            &child,
+            limits(set_limit),
+            LimitActor::Operator,
+            context(None, PolicyLimits::default()),
+        )
+        .unwrap_err();
         assert_eq!(err.code(), "scope-unavailable", "{err}");
     }
     // `block` on a supervised Run with no wire path names the Metering
@@ -576,7 +620,10 @@ fn scopes_actions_and_ended_runs_are_refused_per_run() {
     .unwrap_err();
     assert_eq!(err.code(), "action-unavailable");
     let text = err.to_string();
-    assert!(text.contains("supervised (no wire)") && text.contains("self-reported"), "{text}");
+    assert!(
+        text.contains("supervised (no wire)") && text.contains("self-reported"),
+        "{text}"
+    );
     let err = set(
         &seeded.registry,
         &child,
@@ -604,7 +651,17 @@ fn scopes_actions_and_ended_runs_are_refused_per_run() {
     .unwrap();
     assert_eq!(outcome.resolution.sources.tokens_per_run, LimitSource::Run);
     // An unknown Run, and an ended one.
-    let err = set(&seeded.registry, &RunId::mint(), limits(RunLimits { token_per_run: Some(1), ..RunLimits::default() }), LimitActor::Operator, context(None, PolicyLimits::default())).unwrap_err();
+    let err = set(
+        &seeded.registry,
+        &RunId::mint(),
+        limits(RunLimits {
+            token_per_run: Some(1),
+            ..RunLimits::default()
+        }),
+        LimitActor::Operator,
+        context(None, PolicyLimits::default()),
+    )
+    .unwrap_err();
     assert_eq!(err.code(), "run-not-found");
     let ended = seeded.run.clone();
     seeded
@@ -617,10 +674,23 @@ fn scopes_actions_and_ended_runs_are_refused_per_run() {
             store.save_run(&row)
         })
         .unwrap();
-    let err = set(&seeded.registry, &seeded.run, limits(RunLimits { token_per_run: Some(1), ..RunLimits::default() }), LimitActor::Operator, context(None, PolicyLimits::default())).unwrap_err();
+    let err = set(
+        &seeded.registry,
+        &seeded.run,
+        limits(RunLimits {
+            token_per_run: Some(1),
+            ..RunLimits::default()
+        }),
+        LimitActor::Operator,
+        context(None, PolicyLimits::default()),
+    )
+    .unwrap_err();
     assert_eq!(err.code(), "run-ended");
     // A malformed change is refused before any Run is read.
-    assert_eq!(RunLimitChange::default().validate().unwrap_err().code(), "invalid-request");
+    assert_eq!(
+        RunLimitChange::default().validate().unwrap_err().code(),
+        "invalid-request"
+    );
     let both = RunLimitChange {
         set: RunLimits {
             token_per_run: Some(1),
@@ -628,7 +698,11 @@ fn scopes_actions_and_ended_runs_are_refused_per_run() {
         },
         clear: vec![RunLimitField::TokensPerRun],
     };
-    assert!(both.validate().unwrap_err().to_string().contains("both set and cleared"));
+    assert!(both
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("both set and cleared"));
     // An unreadable configuration refuses (fail closed, never "nothing set").
     let err = seeded
         .registry
@@ -656,7 +730,11 @@ fn a_config_write_re_arms_and_breaches_through_the_same_pass() {
     let write = |explicit: PolicyLimits| {
         seeded
             .registry
-            .rearm_after_config_write(&name, inputs(explicit.clone()), context(Some(fence.clone()), explicit))
+            .rearm_after_config_write(
+                &name,
+                inputs(explicit.clone()),
+                context(Some(fence.clone()), explicit),
+            )
             .unwrap()
     };
     // An explicit `block` ceiling written at or below the usage fires now.
@@ -716,7 +794,10 @@ fn an_unsupervised_instance_re_arms_here_but_its_lowering_waits() {
     )
     .unwrap();
     assert!(outcome.fired.is_empty(), "the supervising engine fires it");
-    assert!(outcome.notes.iter().any(|note| note.contains("does not supervise")));
+    assert!(outcome
+        .notes
+        .iter()
+        .any(|note| note.contains("does not supervise")));
 }
 
 #[test]
@@ -779,10 +860,20 @@ fn a_dry_run_plans_the_same_outcome_and_writes_nothing() {
     assert!(planned.dry_run && planned.run_scoped);
     assert_eq!(planned.direction, LimitsDirection::Lowered);
     assert_eq!(planned.fired.len(), 1, "the breach it would fire");
-    assert_eq!(seeded.registry.reader().run_limits(&seeded.run).unwrap(), RunLimits::default());
+    assert_eq!(
+        seeded.registry.reader().run_limits(&seeded.run).unwrap(),
+        RunLimits::default()
+    );
     assert!(breaches(&seeded.registry, &seeded.run).is_empty());
     // The write does exactly what was planned.
-    let outcome = set(&seeded.registry, &seeded.run, change.clone(), LimitActor::Operator, ctx.clone()).unwrap();
+    let outcome = set(
+        &seeded.registry,
+        &seeded.run,
+        change.clone(),
+        LimitActor::Operator,
+        ctx.clone(),
+    )
+    .unwrap();
     assert_eq!(outcome.fired, planned.fired);
     // A planned raise reports the latch it would re-arm; a planned no-op
     // reports nothing.
@@ -820,7 +911,10 @@ fn the_budget_read_names_sources_headroom_and_latches() {
     .unwrap();
     let view = seeded.registry.run_limits_view(&seeded.run).unwrap();
     assert_eq!(view.resolution.sources.tokens_per_run, LimitSource::Run);
-    assert_eq!(view.usage.input_tokens + view.usage.output_tokens, 1_000_000);
+    assert_eq!(
+        view.usage.input_tokens + view.usage.output_tokens,
+        1_000_000
+    );
     assert!(view.cumulative_usage.is_some());
     assert_eq!(view.latched.len(), 1, "the token breach latched");
     // No Rate resolves through the stored inputs of a fresh read here: the
@@ -842,20 +936,57 @@ fn the_action_row_decides_the_runs_action_and_legacy_rows_keep_theirs() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits {
-            breach_action: Some(BreachAction::Pause),
-            ..PolicyLimits::default()
-        }),
+        context(
+            None,
+            PolicyLimits {
+                breach_action: Some(BreachAction::Pause),
+                ..PolicyLimits::default()
+            },
+        ),
     )
     .unwrap();
     assert_eq!(outcome.limits.breach_action, None);
-    assert_eq!(outcome.resolution.sources.breach_action, LimitSource::Instance);
+    assert_eq!(
+        outcome.resolution.sources.breach_action,
+        LimitSource::Instance
+    );
     assert_eq!(outcome.resolution.action, BreachAction::Pause);
     // Setting then clearing the action round-trips through the store.
-    set(&seeded.registry, &seeded.run, limits(RunLimits { breach_action: Some(BreachAction::Stop), ..RunLimits::default() }), LimitActor::Operator, context(None, PolicyLimits::default())).unwrap();
-    assert_eq!(seeded.registry.reader().run_limits(&seeded.run).unwrap().breach_action, Some(BreachAction::Stop));
-    set(&seeded.registry, &seeded.run, RunLimitChange { set: RunLimits::default(), clear: vec![RunLimitField::BreachAction, RunLimitField::TokensPerRun] }, LimitActor::Operator, context(None, PolicyLimits::default())).unwrap();
-    assert_eq!(seeded.registry.reader().run_limits(&seeded.run).unwrap(), RunLimits::default());
+    set(
+        &seeded.registry,
+        &seeded.run,
+        limits(RunLimits {
+            breach_action: Some(BreachAction::Stop),
+            ..RunLimits::default()
+        }),
+        LimitActor::Operator,
+        context(None, PolicyLimits::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        seeded
+            .registry
+            .reader()
+            .run_limits(&seeded.run)
+            .unwrap()
+            .breach_action,
+        Some(BreachAction::Stop)
+    );
+    set(
+        &seeded.registry,
+        &seeded.run,
+        RunLimitChange {
+            set: RunLimits::default(),
+            clear: vec![RunLimitField::BreachAction, RunLimitField::TokensPerRun],
+        },
+        LimitActor::Operator,
+        context(None, PolicyLimits::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        seeded.registry.reader().run_limits(&seeded.run).unwrap(),
+        RunLimits::default()
+    );
     // A child opened with ceilings (the 21-2 rows, no action row) keeps the
     // action stored on its ceiling rows.
     let child = RunId::mint();
@@ -876,7 +1007,12 @@ fn the_action_row_decides_the_runs_action_and_legacy_rows_keep_theirs() {
         })
         .unwrap();
     assert_eq!(
-        seeded.registry.reader().run_limits(&child).unwrap().breach_action,
+        seeded
+            .registry
+            .reader()
+            .run_limits(&child)
+            .unwrap()
+            .breach_action,
         Some(BreachAction::Warn)
     );
 }
@@ -897,7 +1033,11 @@ fn a_corrupt_limit_row_is_a_typed_store_error() {
             Ok(())
         })
         .unwrap();
-    let err = seeded.registry.reader().run_limits(&seeded.run).unwrap_err();
+    let err = seeded
+        .registry
+        .reader()
+        .run_limits(&seeded.run)
+        .unwrap_err();
     assert!(err.to_string().contains("per-hour"), "{err}");
     let sql = format!(
         "UPDATE run_limits SET scope = 'per-run', action = 'explode' WHERE run_id = '{}'",
@@ -911,6 +1051,10 @@ fn a_corrupt_limit_row_is_a_typed_store_error() {
             Ok(())
         })
         .unwrap();
-    let err = seeded.registry.reader().run_limits(&seeded.run).unwrap_err();
+    let err = seeded
+        .registry
+        .reader()
+        .run_limits(&seeded.run)
+        .unwrap_err();
     assert!(err.to_string().contains("explode"), "{err}");
 }

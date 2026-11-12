@@ -453,7 +453,10 @@ mod tests {
             let err = run_verb_target(verb, &record(false, RunStatus::Active)).unwrap_err();
             assert_eq!(err.code(), "verb-unavailable");
             let text = err.to_string();
-            assert!(text.contains("announced") && text.contains("model calls"), "{text}");
+            assert!(
+                text.contains("announced") && text.contains("model calls"),
+                "{text}"
+            );
             assert!(text.contains("hekma run close run_X"), "{text}");
         }
         assert_eq!(RunLifecycleVerb::from_wire("start"), None);
@@ -462,7 +465,10 @@ mod tests {
         let err = run_verb_target(RunLifecycleVerb::Resume, &record(false, RunStatus::Held))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("parent Run `run_P`") && err.contains("parent-paused"), "{err}");
+        assert!(
+            err.contains("parent Run `run_P`") && err.contains("parent-paused"),
+            "{err}"
+        );
         assert!(err.contains("hekma agent resume agent"), "{err}");
         // A process-owning Run without an agent is a typed refusal.
         let mut orphan = record(true, RunStatus::Active);

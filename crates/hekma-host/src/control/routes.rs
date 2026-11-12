@@ -1238,11 +1238,21 @@ async fn set_act(
         _ => None,
     };
     let run_ids = consume_set(&state, credential, &request.set_token)?;
+    // Every Run's own refusal is decided FIRST, against the set as it
+    // stands when the act begins — so a child is answered from its own
+    // cell, never from what its parent's concurrent stop then did to it.
+    let mut planned = Vec::with_capacity(run_ids.len());
+    for run_id in &run_ids {
+        planned.push(state.engine.plan_run_verb(run_id, verb).await.err());
+    }
     let mut tasks = Vec::with_capacity(run_ids.len());
-    for run_id in run_ids.iter().cloned() {
+    for (run_id, refusal) in run_ids.iter().cloned().zip(planned) {
         let state = state.clone();
         tasks.push(tokio::spawn(async move {
-            let acted = act_one(&state, verb, &run_id, window, bound).await;
+            let acted = match refusal {
+                Some(refusal) => Err(ApiError::from(refusal)),
+                None => act_one(&state, verb, &run_id, window, bound).await,
+            };
             (run_id, acted)
         }));
     }

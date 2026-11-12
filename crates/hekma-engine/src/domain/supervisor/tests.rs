@@ -10712,7 +10712,10 @@ fn a_run_limit_lowered_below_usage_executes_its_breach_action_on_the_live_agent(
         )
         .unwrap();
     assert_eq!(planned[0].1.as_ref().unwrap().fired.len(), 1);
-    assert_eq!(registry.lookup(&name).unwrap().state, LifecycleState::Running);
+    assert_eq!(
+        registry.lookup(&name).unwrap().state,
+        LifecycleState::Running
+    );
     // The write fires AT ONCE and the Supervisor executes `stop` (D2).
     let results = sup
         .set_run_limits(
@@ -10726,7 +10729,10 @@ fn a_run_limit_lowered_below_usage_executes_its_breach_action_on_the_live_agent(
     let outcome = results[0].1.as_ref().unwrap();
     assert_eq!(outcome.direction, crate::domain::LimitsDirection::Lowered);
     assert_eq!(outcome.fired.len(), 1);
-    assert_eq!(registry.lookup(&name).unwrap().state, LifecycleState::Stopped);
+    assert_eq!(
+        registry.lookup(&name).unwrap().state,
+        LifecycleState::Stopped
+    );
     // A malformed change is refused whole; an unknown Run is that Run's
     // refusal, the rest answered.
     assert!(sup
