@@ -399,6 +399,15 @@ async fn authorize(
             Ok(PresentedState::Active(matched)) => matched,
             Ok(PresentedState::Revoked) => return Err(ApiError::credential_revoked()),
             Ok(PresentedState::Unknown) => {
+                // An operator secret that happens to have a token's shape
+                // still resolves as the operator bearer.
+                if let Some(class) = state.resolver.resolve(Some(presented)) {
+                    return if class.allows(family) {
+                        Ok(Authority::Operator)
+                    } else {
+                        Err(ApiError::forbidden())
+                    };
+                }
                 state.auth_diagnostics.unresolved(Some(presented));
                 return Err(ApiError::unauthorized());
             }

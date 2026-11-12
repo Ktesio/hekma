@@ -975,3 +975,48 @@ fn the_snapshot_subject_of_a_credential_event_is_its_run() {
         other => panic!("expected the Run in the snapshot, got {other:?}"),
     }
 }
+
+#[test]
+fn a_callers_open_time_ceilings_land_in_the_caller_layer_and_only_tighten() {
+    // A Caller's ceilings at open must never become the child's Operator/Host
+    // layer (which outranks every Policy, the default included).
+    let w = world();
+    let (child, credentials) = w.operator_child();
+    let caller = w.caller(credentials.run_key());
+    let mut request = ChildRunRequest::under(RunParent::Run(child.clone()));
+    request.limits = RunLimits {
+        token_per_run: Some(700),
+        ..RunLimits::default()
+    };
+    let opened = w
+        .supervisor
+        .open_child_run_as(&w.registry, caller, request)
+        .unwrap();
+    let id = opened.view.record.run_id;
+    let reader = w.registry.reader();
+    assert_eq!(reader.run_limits(&id).unwrap(), RunLimits::default());
+    assert_eq!(
+        reader.run_caller_limits(&id).unwrap().token_per_run,
+        Some(700)
+    );
+    let resolution = w.registry.run_view(&id).unwrap().policy.unwrap();
+    assert_eq!(resolution.tokens.per_run, Some(700));
+    assert_eq!(resolution.sources.tokens_per_run, LimitSource::Caller);
+    // The Operator's open keeps writing the Run layer.
+    let mut request = ChildRunRequest::under(RunParent::Run(child));
+    request.limits = RunLimits {
+        token_per_run: Some(700),
+        ..RunLimits::default()
+    };
+    let opened = w
+        .supervisor
+        .open_child_run_as(&w.registry, RunActor::Operator, request)
+        .unwrap();
+    assert_eq!(
+        reader
+            .run_limits(&opened.view.record.run_id)
+            .unwrap()
+            .token_per_run,
+        Some(700)
+    );
+}

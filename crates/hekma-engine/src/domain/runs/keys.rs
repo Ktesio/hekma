@@ -576,7 +576,34 @@ pub(crate) fn open_child_as<S: RunRecords + crate::ports::RunStore + ?Sized>(
         RunActor::Operator | RunActor::Host => None,
     };
     let minted = run_id.clone();
+    let caller_inputs = inputs.clone();
     let (opened, mut changes) = super::ops::open_child(store, request, run_id, inputs, at)?;
+    // A Caller's open-time ceilings are the Caller's OWN layer (FR-60: a
+    // Caller only tightens), never the Run's Operator/Host layer, which
+    // outranks every Policy: `open_child` validated and wrote them as the
+    // Run's rows, so they move to the Caller layer and the Run re-resolves.
+    if caller.is_some() && opened == minted && request.limits.is_set() {
+        store.replace_run_limits(
+            &opened,
+            crate::ports::LimitSlot::Run,
+            &super::RunLimits::default(),
+            "caller",
+            at,
+        )?;
+        store.replace_run_limits(
+            &opened,
+            crate::ports::LimitSlot::Caller,
+            &request.limits,
+            "caller",
+            at,
+        )?;
+        changes.extend(super::policy::resolve_run(
+            store,
+            &opened,
+            caller_inputs,
+            at,
+        )?);
+    }
     if opened != minted {
         // A retried external id: the existing Run, no new credentials.
         if let RunActor::Caller { run_id: root, .. } = actor {
