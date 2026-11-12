@@ -1067,14 +1067,33 @@ async fn act_one(
             (report.instance, Some(report.outcome))
         }
     };
-    let entry = state.engine.fleet_entry(instance.name.as_str()).await?;
-    Ok(dto::RunActDocument {
+    let read_back = state
+        .engine
+        .fleet_entry(instance.name.as_str())
+        .await
+        .map_err(ApiError::from);
+    Ok(acted(
+        run_id,
+        read_back,
+        drain.map(|outcome| (outcome.completed, outcome.waited_ms)),
+    ))
+}
+
+/// The answer for a verb that COMMITTED on `run_id`: its Fleet row read
+/// back, when the read succeeded. A failed read-back drops only the row —
+/// the Run acted, so it is never reported as refused.
+fn acted(
+    run_id: &str,
+    read_back: ApiResult<hekma_engine::FleetEntry>,
+    drain: Option<(bool, u64)>,
+) -> dto::RunActDocument {
+    dto::RunActDocument {
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
         run_id: run_id.to_string(),
-        instance: entry,
-        completed: drain.as_ref().map(|outcome| outcome.completed),
-        waited_ms: drain.as_ref().map(|outcome| outcome.waited_ms),
-    })
+        instance: read_back.ok(),
+        completed: drain.map(|(completed, _)| completed),
+        waited_ms: drain.map(|(_, waited_ms)| waited_ms),
+    }
 }
 
 /// `POST /v0/runs/{id}/stop` — stop the instance whose process the Run
@@ -1331,7 +1350,7 @@ async fn set_act(
             Ok((run_id, Ok(document))) => dto::ActResult {
                 run_id,
                 outcome: past_tense(verb).to_string(),
-                instance: Some(document.instance),
+                instance: document.instance,
                 completed: document.completed,
                 waited_ms: document.waited_ms,
                 ..dto::ActResult::default()
@@ -1348,6 +1367,7 @@ async fn set_act(
     }
     Ok(Json(dto::ActResultsDocument {
         schema_version: dto::ACT_RESULTS_SCHEMA_VERSION,
+        dry_run: false,
         verb: verb.as_str(),
         matched: results.len(),
         results,
@@ -1443,6 +1463,7 @@ pub(crate) async fn runs_close(
     }
     Ok(Json(dto::ActResultsDocument {
         schema_version: dto::ACT_RESULTS_SCHEMA_VERSION,
+        dry_run: false,
         verb: "close",
         matched: results.len(),
         results,
@@ -1485,6 +1506,7 @@ pub(crate) async fn runs_labels_patch(
     }
     Ok(Json(dto::ActResultsDocument {
         schema_version: dto::ACT_RESULTS_SCHEMA_VERSION,
+        dry_run: false,
         verb: "label",
         matched: results.len(),
         results,
@@ -1520,8 +1542,31 @@ pub(crate) async fn runs_limits(
         .collect();
     Ok(Json(dto::ActResultsDocument {
         schema_version: dto::ACT_RESULTS_SCHEMA_VERSION,
-        verb: "limits",
+        dry_run: false,
+        verb: "budget",
         matched: results.len(),
         results,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_committed_verb_whose_read_back_fails_is_still_an_act() {
+        let document = acted(
+            "run_A",
+            Err(ApiError::new(
+                super::super::error::ApiErrorKind::Internal,
+                "the Fleet read failed".to_string(),
+            )),
+            None,
+        );
+        assert_eq!(document.run_id, "run_A");
+        assert!(document.instance.is_none());
+        let wire = serde_json::to_value(&document).unwrap();
+        assert!(wire.get("instance").is_none(), "{wire}");
+        assert!(wire.get("error").is_none(), "{wire}");
+    }
 }

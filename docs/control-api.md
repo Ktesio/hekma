@@ -336,7 +336,7 @@ POST /v0/runs/select
 POST /v0/runs/stop
 {"set_token": "hkset_…", "window_secs": 30}
 
-→ {"schema_version": 1, "verb": "stop", "matched": 2,
+→ {"schema_version": 1, "verb": "stop", "dry_run": false, "matched": 2,
    "results": [{"run_id": "…", "outcome": "stopped", "instance": {…}},
                {"run_id": "…", "outcome": "refused", "error": {"kind", "code", "message"}}]}
 ```
@@ -354,13 +354,19 @@ may have changed), and expires after 10 minutes (`409 set-token-expired`).
 The host keeps at most 64 pending sets in memory, the oldest evicted; a host
 restart forgets them (`404 set-token-not-found` — select again).
 
+The results document is the CLI's `--json` shape: `verb` names the verb as
+the CLI does (`stop`, `pause`, `resume`, `drain`, `close`, `label`, and
+`budget` for `POST /v0/runs/limits`) and `dry_run` is always `false` (a set
+act acts; plan with a single Run's `dry_run` or the CLI's `--dry-run`).
 Each Run of the set answers on its own, in set order: the verb's past tense
 (`stopped`, `paused`, `resumed`, `drained`, `closed`, `labeled`, a limits
 direction), `unchanged`, or `refused` with the error object a single-Run
 route would have answered (including `engine_error` when the agent's own
 verb refused). A Run that ended since the selection is its own `run-ended`
-refusal; the rest act. Stops and drains run their windows one after another,
-so a set's worst case is the sum of its windows.
+refusal; the rest act. A Run whose verb committed is never reported as
+refused: if its Fleet row cannot be read back, its result carries no
+`instance`. Stops and drains run their windows one after another, so a set's
+worst case is the sum of its windows.
 
 ## Documents and versions
 

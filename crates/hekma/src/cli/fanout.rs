@@ -393,11 +393,7 @@ pub(crate) fn run_selector(
     let wait = set_wait(runs.len(), act.per_run);
     let answer = route_bounded(act.method, act.path, Some(body), wait)
         .map_err(RoutedError::into_diagnostic)?;
-    let rows = answer
-        .value
-        .as_ref()
-        .and_then(|document| document["results"].as_array().cloned())
-        .unwrap_or_default();
+    let rows = result_rows(answer.value.as_ref(), answer.host_pid)?;
     let mut results = Vec::with_capacity(rows.len());
     let mut first: Option<Refusal> = None;
     let mut failures = 0usize;
@@ -434,6 +430,27 @@ pub(crate) fn run_selector(
     let matched = results.len();
     let failure = first.map(|refusal| summary(refusal, failures, matched, words, false));
     finish(words, flags, matched, results, failure, act.render)
+}
+
+/// A set act's per-Run rows. A success answer without a `results` array
+/// is refused, never read as "nothing happened": the acts may have
+/// committed, so the command says so and exits non-zero.
+fn result_rows(
+    document: Option<&Value>,
+    host_pid: u32,
+) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+    document
+        .and_then(|document| document["results"].as_array().cloned())
+        .ok_or_else(|| {
+            crate::error::AgentIo {
+                message: format!(
+                    "the local Service Host (pid {host_pid}) answered the set act without its \
+                     per-Run results; the acts may still have committed — check the Runs with: \
+                     hekma ps --all"
+                ),
+            }
+            .into()
+        })
 }
 
 /// Mint a set on the local Service Host: the token and the exact Runs.
@@ -559,6 +576,25 @@ pub(crate) fn invalid(message: String) -> Box<dyn std::error::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_set_act_answer_without_results_is_an_error_not_an_empty_success() {
+        let rows = result_rows(Some(&json!({"results": [{"run_id": "run_A"}]})), 7).unwrap();
+        assert_eq!(rows.len(), 1);
+        for answer in [
+            None,
+            Some(json!({"schema_version": 1})),
+            Some(json!({"results": 3})),
+        ] {
+            let err = result_rows(answer.as_ref(), 7).unwrap_err();
+            assert_ne!(crate::exit_code::classify(&*err).code(), 0, "{err}");
+            assert!(
+                err.to_string().contains("without its per-Run results"),
+                "{err}"
+            );
+            assert!(err.to_string().contains("pid 7"), "{err}");
+        }
+    }
     use hekma_engine::{ControlDepth, RunId, RunStatus};
 
     fn record(id: &str, instance: Option<&str>) -> RunRecord {

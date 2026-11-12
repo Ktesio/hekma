@@ -68,6 +68,12 @@ pub struct ShowArgs {
     pub json: bool,
 }
 
+/// How long one Run's limits change may take inside a set act: the write
+/// itself, plus — when a lowering breaches at once under a `stop` action —
+/// the agent's stop ladder (the default 30 s window and the forced kill),
+/// which runs inside the same act.
+const BUDGET_PER_RUN: std::time::Duration = std::time::Duration::from_secs(10 + 30 + 5);
+
 const WORDS: VerbWords = VerbWords {
     verb: "budget",
     past: "changed",
@@ -202,7 +208,7 @@ pub fn set(args: SetArgs) -> Result<(), Box<dyn std::error::Error>> {
                 method: "POST",
                 path: "/v0/runs/limits",
                 body: change_body(&change),
-                per_run: std::time::Duration::from_secs(10),
+                per_run: BUDGET_PER_RUN,
                 render: &render_set,
                 decorate: &|row: &mut ActResult| {
                     row.fields.insert("run_scoped".to_string(), json!(true));
@@ -676,6 +682,17 @@ mod tests {
             assert_eq!(crate::exit_code::classify(&*err).code(), 2, "{err}");
         }
         assert_eq!(micros_text(Micros(1_500_000)), "1.500000");
+    }
+
+    #[test]
+    fn a_set_wait_covers_a_breach_that_runs_the_stop_ladder() {
+        // A lowering that breaches under `stop` runs the 30 s window and
+        // the forced kill inside the act: the per-Run bound covers it.
+        assert!(BUDGET_PER_RUN >= std::time::Duration::from_secs(30 + 5));
+        assert_eq!(
+            fanout::set_wait(2, BUDGET_PER_RUN),
+            std::time::Duration::from_secs(10 + 2 * 45)
+        );
     }
 
     #[test]

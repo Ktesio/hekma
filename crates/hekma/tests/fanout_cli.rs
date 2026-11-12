@@ -16,6 +16,56 @@ fn json(stdout: &str) -> serde_json::Value {
     serde_json::from_str(stdout).unwrap_or_else(|err| panic!("{err}: {stdout}"))
 }
 
+/// Stops the local Service Host a test's registration started.
+struct HostGuard<'a>(&'a std::path::Path);
+
+impl Drop for HostGuard<'_> {
+    fn drop(&mut self) {
+        stop_host(self.0);
+    }
+}
+
+#[test]
+fn an_agent_named_like_a_legacy_run_id_is_still_the_agent() {
+    // `run-<digits>-<digits>` is both a legacy run id's shape and a valid
+    // agent name: a registered agent of that name is resolved first, so its
+    // verbs keep the agent route (no process needed: the agent is only
+    // registered).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let hekma = |args: &[&str]| run_hekma_agent(args, &ctx.project_dir, state_dir);
+    let _host = HostGuard(state_dir);
+    let manifest = ctx.project_dir.join("manifest");
+    std::fs::create_dir_all(&manifest).unwrap();
+    ManifestFixture::new("run-1-2", &[])
+        .guaranteed_on_all_oses("interaction")
+        .write(&manifest);
+    let run = hekma(&[
+        "agent",
+        "register",
+        "run-1-2",
+        "--manifest",
+        manifest.to_str().unwrap(),
+    ]);
+    assert!(run.success, "{}", run.stderr);
+    for verb in ["stop", "pause", "resume", "drain"] {
+        // Resolved as the agent: its (missing) open Run, never a lookup of
+        // a Run with that id.
+        let run = hekma(&["agent", verb, "run-1-2", "--dry-run"]);
+        assert_eq!(run.code, Some(4), "{verb}: {}", run.stderr);
+        assert!(
+            run.stderr
+                .contains("Agent Instance `run-1-2` has no open Run"),
+            "{verb}: {}",
+            run.stderr
+        );
+    }
+    // A legacy-shaped id no agent owns is still read as a run id.
+    let run = hekma(&["agent", "stop", "run-3-4", "--dry-run"]);
+    assert_eq!(run.code, Some(3), "{}", run.stderr);
+}
+
 #[test]
 fn the_selector_verbs_refuse_and_exit_by_class_on_every_os() {
     let ctx = TestContext::new();
@@ -48,6 +98,15 @@ fn the_selector_verbs_refuse_and_exit_by_class_on_every_os() {
         let run = hekma(&["agent", verb, "ghost-agent", "--dry-run"]);
         assert_eq!(run.code, Some(3), "{verb}: {}", run.stderr);
     }
+    // A stop window outside the host's bounds is served at the nearest
+    // bound on a run id too — and said so, as on the agent route.
+    let run = hekma(&["agent", "stop", UNKNOWN_RUN, "--timeout", "0", "--dry-run"]);
+    assert_eq!(run.code, Some(3), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("--timeout 0 is served as a 1s window"),
+        "{}",
+        run.stderr
+    );
     // `run close` takes the same flags.
     let run = hekma(&[
         "run",

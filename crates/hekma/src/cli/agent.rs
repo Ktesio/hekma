@@ -1504,6 +1504,21 @@ pub fn start(name: &str, detach: bool) -> Result<(), Box<dyn std::error::Error>>
 const STOP_WINDOW_MIN_SECS: u64 = hekma_host::MIN_STOP_WINDOW_SECS;
 const STOP_WINDOW_MAX_SECS: u64 = hekma_host::MAX_STOP_WINDOW_SECS;
 
+/// `--timeout <secs>` as the Service Host serves it: within
+/// 1..=86400 s (a zero window would be an instant kill, a longer one a
+/// lifetime), a value outside served at the nearest bound — and said so
+/// (AI-18). Every stop path (an agent, a run id, a Selector) uses it.
+pub(crate) fn served_stop_window(secs: u64) -> u64 {
+    let served = secs.clamp(STOP_WINDOW_MIN_SECS, STOP_WINDOW_MAX_SECS);
+    if served != secs {
+        ui::note(format!(
+            "--timeout {secs} is served as a {served}s window (the stop window is bounded to \
+             {STOP_WINDOW_MIN_SECS}..={STOP_WINDOW_MAX_SECS} seconds)"
+        ));
+    }
+    served
+}
+
 /// `hekma agent stop <name> [--timeout <secs>]` — stop a running Agent Instance
 /// (AC3/AC4).
 ///
@@ -1513,19 +1528,7 @@ const STOP_WINDOW_MAX_SECS: u64 = hekma_host::MAX_STOP_WINDOW_SECS;
 /// stop on `stopped`, AC4) to stderr.
 pub fn stop(name: &str, timeout_secs: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
     validate_instance_name(name)?;
-    // The Service Host serves a stop window within 1..=86400 s (a zero
-    // window would be an instant kill, a longer one a lifetime): a value
-    // outside it is served at the nearest bound — and said so (AI-18).
-    let window = timeout_secs.map(|secs| {
-        let served = secs.clamp(STOP_WINDOW_MIN_SECS, STOP_WINDOW_MAX_SECS);
-        if served != secs {
-            ui::note(format!(
-                "--timeout {secs} is served as a {served}s window (the stop window is bounded \
-                 to {STOP_WINDOW_MIN_SECS}..={STOP_WINDOW_MAX_SECS} seconds)"
-            ));
-        }
-        served
-    });
+    let window = timeout_secs.map(served_stop_window);
     let body = window.map(|secs| json!({ "window_secs": secs }));
     let routed = route(
         "POST",

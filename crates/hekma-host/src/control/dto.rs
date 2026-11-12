@@ -970,8 +970,11 @@ pub(crate) struct RunActDocument {
     pub schema_version: u32,
     /// The Run.
     pub run_id: String,
-    /// The instance's Fleet row after the verb.
-    pub instance: hekma_engine::FleetEntry,
+    /// The instance's Fleet row after the verb — absent only when the verb
+    /// committed but the read-back failed (the act still happened: it is
+    /// never reported as refused).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<hekma_engine::FleetEntry>,
     /// `drain` only: whether the bounded wait completed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed: Option<bool>,
@@ -1040,9 +1043,13 @@ pub(crate) struct ActResult {
 pub(crate) struct ActResultsDocument {
     /// [`ACT_RESULTS_SCHEMA_VERSION`].
     pub schema_version: u32,
-    /// The verb (`stop`, `pause`, `resume`, `drain`, `close`, `label`,
-    /// `limits`).
+    /// The verb, named as the CLI's `--json` document names it (`stop`,
+    /// `pause`, `resume`, `drain`, `close`, `label`, `budget`).
     pub verb: &'static str,
+    /// Always `false`: a set act acts (plan with the CLI's `--dry-run`, or
+    /// a single Run's `dry_run`). Present so the document is the CLI's
+    /// shape field for field.
+    pub dry_run: bool,
     /// How many Runs the set held.
     pub matched: usize,
     /// One result per Run.

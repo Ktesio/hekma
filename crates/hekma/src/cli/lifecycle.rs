@@ -76,12 +76,7 @@ fn words(verb: RunLifecycleVerb) -> VerbWords {
 fn body_and_bound(verb: RunLifecycleVerb, args: &LifecycleArgs) -> (Value, Duration) {
     match verb {
         RunLifecycleVerb::Stop => {
-            let window = args.timeout_secs.map(|secs| {
-                secs.clamp(
-                    hekma_host::MIN_STOP_WINDOW_SECS,
-                    hekma_host::MAX_STOP_WINDOW_SECS,
-                )
-            });
+            let window = args.timeout_secs.map(super::agent::served_stop_window);
             let body = window.map_or_else(|| json!({}), |secs| json!({ "window_secs": secs }));
             // The graceful window, then the forced kill.
             (body, Duration::from_secs(window.unwrap_or(30) + 5))
@@ -98,24 +93,52 @@ fn body_and_bound(verb: RunLifecycleVerb, args: &LifecycleArgs) -> (Value, Durat
     }
 }
 
+/// A target in the LEGACY run-id shape (`run-<digits>-<digits>`) is also a
+/// valid agent name: when an agent of that name is registered, it is the
+/// agent, so its verb keeps its unchanged instance route. A ULID run id is
+/// never an agent name (names are lowercase), so it is never looked up.
+fn prefer_agent(target: Target) -> Target {
+    match target {
+        Target::Run(raw)
+            if !hekma_engine::RunId::from_wire(&raw).is_ulid() && is_registered_agent(&raw) =>
+        {
+            Target::Instance(raw)
+        }
+        other => other,
+    }
+}
+
+/// Whether an agent named `name` is registered (a read-only look; no
+/// state directory or no such agent is `false`).
+fn is_registered_agent(name: &str) -> bool {
+    open_read_only_engine().is_ok_and(|engine| engine.blocking().fleet_entry(name).is_ok())
+}
+
 /// `hekma agent stop|pause|resume|drain <TARGET|--selector SEL>`.
 pub fn run(verb: RunLifecycleVerb, args: LifecycleArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let target = Target::parse(args.target.as_deref(), args.selector.as_deref())?;
+    let target = prefer_agent(Target::parse(
+        args.target.as_deref(),
+        args.selector.as_deref(),
+    )?);
     let flags = FanoutFlags {
         dry_run: args.dry_run,
         yes: args.yes,
         json: args.json,
     };
     let words = words(verb);
+    // Today's instance route and output, byte for byte.
+    if let Target::Instance(name) = &target {
+        if !flags.dry_run && !flags.json {
+            return match verb {
+                RunLifecycleVerb::Stop => super::agent::stop(name, args.timeout_secs),
+                RunLifecycleVerb::Pause => super::agent::pause(name),
+                RunLifecycleVerb::Resume => super::agent::resume(name),
+                RunLifecycleVerb::Drain => super::agent::drain(name, args.timeout_ms),
+            };
+        }
+    }
     let (body, per_run) = body_and_bound(verb, &args);
     match target {
-        // Today's instance route and output, byte for byte.
-        Target::Instance(name) if !flags.dry_run && !flags.json => match verb {
-            RunLifecycleVerb::Stop => super::agent::stop(&name, args.timeout_secs),
-            RunLifecycleVerb::Pause => super::agent::pause(&name),
-            RunLifecycleVerb::Resume => super::agent::resume(&name),
-            RunLifecycleVerb::Drain => super::agent::drain(&name, args.timeout_ms),
-        },
         Target::Instance(name) => {
             let engine = open_read_only_engine()?;
             let run_id = engine

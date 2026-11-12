@@ -4069,6 +4069,7 @@ fn set_tokens_are_single_use_credential_bound_expiring_and_forgotten_by_a_restar
     );
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["verb"], "stop");
+    assert_eq!(body["dry_run"], false);
     assert_eq!(body["matched"], 0);
     // … and only once.
     let (status, body) = act(
@@ -4329,7 +4330,8 @@ fn a_selected_set_acts_per_run_with_the_child_refused_and_limits_scoped_to_the_r
         serde_json::json!({"set_token": token, "tokens_per_run": 5_000_000}),
     );
     assert_eq!(status, 200, "{results}");
-    assert_eq!(results["verb"], "limits");
+    assert_eq!(results["verb"], "budget", "the CLI's verb name");
+    assert_eq!(results["dry_run"], false);
     assert_eq!(results["matched"], 2);
     for row in results["results"].as_array().unwrap() {
         assert_eq!(row["limits"]["run_scoped"], true, "{row}");
