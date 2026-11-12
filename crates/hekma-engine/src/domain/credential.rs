@@ -36,6 +36,9 @@ pub const RUN_KEY_PREFIX: &str = "hk_run_";
 pub const REFRESH_PREFIX: &str = "hk_ref_";
 /// The announce credential prefix.
 pub const ANNOUNCE_PREFIX: &str = "hk_ann_";
+/// The proxy-access credential prefix (a per-binding credential for the
+/// Metering Proxy beyond loopback; issued, accepted by nothing yet).
+pub const PROXY_ACCESS_PREFIX: &str = "hk_pxy_";
 /// The number of Crockford base32 characters after the prefix.
 pub const TOKEN_BODY_LEN: usize = 52;
 /// The number of hex characters in a token id.
@@ -58,14 +61,19 @@ pub enum TokenClass {
     Refresh,
     /// An announce credential (`hk_ann_`): format and matrix row only.
     Announce,
+    /// A per-binding proxy-access credential (`hk_pxy_`, story 23-1,
+    /// the security review's P6-A): issued and stored, accepted by
+    /// nothing in this release.
+    ProxyAccess,
 }
 
 impl TokenClass {
     /// Every class.
-    pub const ALL: [TokenClass; 3] = [
+    pub const ALL: [TokenClass; 4] = [
         TokenClass::RunKey,
         TokenClass::Refresh,
         TokenClass::Announce,
+        TokenClass::ProxyAccess,
     ];
 
     /// The token prefix.
@@ -74,6 +82,7 @@ impl TokenClass {
             TokenClass::RunKey => RUN_KEY_PREFIX,
             TokenClass::Refresh => REFRESH_PREFIX,
             TokenClass::Announce => ANNOUNCE_PREFIX,
+            TokenClass::ProxyAccess => PROXY_ACCESS_PREFIX,
         }
     }
 
@@ -83,6 +92,7 @@ impl TokenClass {
             TokenClass::RunKey => "run-key",
             TokenClass::Refresh => "refresh",
             TokenClass::Announce => "announce",
+            TokenClass::ProxyAccess => "proxy-access",
         }
     }
 
@@ -92,6 +102,7 @@ impl TokenClass {
             TokenClass::RunKey => "run",
             TokenClass::Refresh => "refresh",
             TokenClass::Announce => "announce",
+            TokenClass::ProxyAccess => "proxy-access",
         }
     }
 
