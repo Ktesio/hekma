@@ -223,9 +223,40 @@ fn a_token_packed_url_keeps_at_most_the_cap_without_duplicates() {
             "token {index} is not the {index}th distinct"
         );
     }
-    // A URL with one token, repeated, still yields exactly that one.
+    // Review 3, L-new-1: what the cap dropped is counted (each of the 32
+    // distinct tokens past it, four times over; the decoded passes are the
+    // same text, so they add nothing), never silently lost.
+    assert_eq!(scan.overflow, URL_SCAN_MAX_TOKENS * 2 * 4);
+    // A URL with one token, repeated, still yields exactly that one, and
+    // repeats of a kept token past the cap are no overflow.
     let one = distinct[0].secret().expose_secret().repeat(50);
     let scan = scan_url(&format!("/v0/{one}"));
     assert!(scan.found);
     assert_eq!(scan.tokens.len(), 1);
+    assert_eq!(scan.overflow, 0);
+    let mut url = String::from("/v0/");
+    for token in &distinct[..URL_SCAN_MAX_TOKENS] {
+        url.push_str(token.secret().expose_secret());
+    }
+    url.push_str(&url.clone()[4..]);
+    let scan = scan_url(&url);
+    assert_eq!(scan.tokens.len(), URL_SCAN_MAX_TOKENS);
+    assert_eq!(scan.overflow, 0, "repeats of kept tokens are not dropped ones");
+    // The review's shape: the cap filled with raw junk, then a real token
+    // percent-encoded behind it. It is refused and reported, not lost.
+    let mut url = String::from("/v0/x?a=");
+    for token in &distinct[..URL_SCAN_MAX_TOKENS] {
+        url.push_str(token.secret().expose_secret());
+    }
+    url.push_str("&b=");
+    url.push_str(
+        &distinct[URL_SCAN_MAX_TOKENS]
+            .secret()
+            .expose_secret()
+            .replace('_', "%5F"),
+    );
+    let scan = scan_url(&url);
+    assert!(scan.found);
+    assert_eq!(scan.tokens.len(), URL_SCAN_MAX_TOKENS);
+    assert_eq!(scan.overflow, 1);
 }

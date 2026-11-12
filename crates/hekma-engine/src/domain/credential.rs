@@ -346,6 +346,11 @@ pub struct UrlScan {
     pub found: bool,
     /// Every complete token in the text, as a [`SecretString`].
     pub tokens: Vec<SecretString>,
+    /// Complete tokens [`scan_url`] saw past its cap of
+    /// [`URL_SCAN_MAX_TOKENS`] that are not among `tokens`: refused with the
+    /// request but not revoked. An upper bound on the distinct values so
+    /// dropped (repeats past the cap are not hashed, so each is counted).
+    pub overflow: usize,
 }
 
 impl fmt::Debug for UrlScan {
@@ -353,6 +358,7 @@ impl fmt::Debug for UrlScan {
         f.debug_struct("UrlScan")
             .field("found", &self.found)
             .field("tokens", &self.tokens.len())
+            .field("overflow", &self.overflow)
             .finish()
     }
 }
@@ -421,18 +427,34 @@ pub fn percent_decode(text: &str) -> String {
 /// It runs before authentication, so its work is bounded: each token is
 /// hashed once into a set (the server's own copies, so timing does not
 /// matter), and at most [`URL_SCAN_MAX_TOKENS`] distinct tokens are kept —
-/// the first ones, in order. `found` stays true whatever the count.
+/// the first ones, in order. `found` stays true whatever the count. A token
+/// past the cap is never hashed: it is compared with the kept ones (at most
+/// the cap's worth of plain comparisons) and, when it is not one of them,
+/// counted in `overflow`, so the caller can report what it could not revoke.
 pub fn scan_url(path_and_query: &str) -> UrlScan {
     let once = percent_decode(path_and_query);
     let twice = percent_decode(&once);
     let mut scan = UrlScan::default();
     let mut seen = std::collections::HashSet::new();
+    let mut previous: Option<&str> = None;
     for text in [path_and_query, once.as_str(), twice.as_str()] {
+        // A decoding that changed nothing holds nothing new.
+        if previous == Some(text) {
+            continue;
+        }
+        previous = Some(text);
         let part = scan_url_text(text);
         scan.found |= part.found;
         for token in part.tokens {
             if scan.tokens.len() >= URL_SCAN_MAX_TOKENS {
-                break;
+                let kept = scan
+                    .tokens
+                    .iter()
+                    .any(|kept| kept.expose_secret() == token.expose_secret());
+                if !kept {
+                    scan.overflow += 1;
+                }
+                continue;
             }
             if seen.insert(TokenHash::of(token.expose_secret())) {
                 scan.tokens.push(token);
