@@ -968,6 +968,131 @@ fn a_selector_matching_more_than_the_verb_cap_still_pages() {
     );
 }
 
+/// Page `view` under `selector` to exhaustion at `limit`, returning every
+/// page's run ids (and asserting the read ends — a bounded loop).
+fn page_to_the_end(
+    store: &SqliteStore,
+    view: ListingView,
+    selector: Option<&Selector>,
+    limit: usize,
+) -> Vec<Vec<String>> {
+    let mut pages = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..10_000 {
+        let (rows, next) = store
+            .list_runs(view, selector, after.as_deref(), limit, FIXTURE_CUTOFF)
+            .unwrap();
+        pages.push(
+            rows.iter()
+                .map(|r| r.run_id.as_str().to_string())
+                .collect::<Vec<_>>(),
+        );
+        match next {
+            Some(cursor) => after = Some(cursor),
+            None => return pages,
+        }
+    }
+    panic!("the listing never ended");
+}
+
+#[test]
+fn a_selector_pages_every_match_when_the_newest_runs_do_not_match() {
+    // Most of the newest Runs do NOT carry the label (only every third one
+    // does, and the 20 newest carry none): a Selector page must be the
+    // newest `limit` MATCHING rows, never the newest `limit` rows
+    // intersected with the Selector (short pages that end the read early).
+    let (_tmp, store) = store();
+    let mut expected: Vec<String> = Vec::new();
+    for index in 0..120u32 {
+        let id = format!("run_M{index:04}");
+        let matching = index < 100 && index % 3 == 0;
+        let labels = if matching {
+            vec![Label::bound("team", "core")]
+        } else {
+            vec![Label::bound("team", "edge")]
+        };
+        let anomalies: &[Anomaly] = if index % 2 == 0 {
+            &[Anomaly::Breach]
+        } else {
+            &[]
+        };
+        insert(
+            &store,
+            shaped_owner(&id, "a", false, RunStatus::Active, anomalies, None),
+            labels,
+            RunLimits::default(),
+        );
+        if matching {
+            expected.push(id);
+        }
+    }
+    expected.reverse();
+    let selector: Selector = "team=core".parse().unwrap();
+    for (view, want) in [
+        (ListingView::All, expected.clone()),
+        (
+            ListingView::Exceptions,
+            // Even indexes carry the breach: every sixth index matches both.
+            expected
+                .iter()
+                .filter(|id| id[5..].parse::<u32>().unwrap() % 2 == 0)
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let pages = page_to_the_end(&store, view, Some(&selector), 4);
+        let listed: Vec<String> = pages.iter().flatten().cloned().collect();
+        assert_eq!(
+            listed,
+            want,
+            "{}: every match exactly once, newest first",
+            view.as_str()
+        );
+        // Every page but the last is full; the last is non-empty (the
+        // cursor ends exactly at exhaustion).
+        let (last, full) = pages.split_last().unwrap();
+        assert!(full.iter().all(|page| page.len() == 4), "{pages:?}");
+        assert!(!last.is_empty() && last.len() <= 4, "{pages:?}");
+        let counts = store
+            .listing_counts(view, Some(&selector), FIXTURE_CUTOFF)
+            .unwrap();
+        assert_eq!(counts.listed, want.len() as u64);
+    }
+}
+
+#[test]
+fn an_exactly_full_final_page_carries_no_cursor() {
+    // Four Runs at `--limit 2`: page two is full AND the last — its
+    // `next_cursor` is null (no hint pointing at an empty third page).
+    let (_tmp, store) = store();
+    for id in ["run_Q1", "run_Q2", "run_Q3", "run_Q4"] {
+        insert(
+            &store,
+            shaped_owner(id, "a", false, RunStatus::Active, &[], None),
+            Vec::new(),
+            RunLimits::default(),
+        );
+    }
+    let pages = page_to_the_end(&store, ListingView::All, None, 2);
+    assert_eq!(
+        pages,
+        vec![
+            vec!["run_Q4".to_string(), "run_Q3".to_string()],
+            vec!["run_Q2".to_string(), "run_Q1".to_string()],
+        ],
+        "two full pages, and the second ends the read"
+    );
+    // One Run per page past the end: the same exact-multiple rule at 1.
+    let pages = page_to_the_end(&store, ListingView::All, None, 1);
+    assert_eq!(pages.len(), 4, "{pages:?}");
+    // A page larger than the set: one page, no cursor.
+    let (rows, next) = store
+        .list_runs(ListingView::All, None, None, 4, FIXTURE_CUTOFF)
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(next, None);
+}
+
 #[test]
 fn an_empty_store_lists_nothing() {
     let (_tmp, store) = store();
@@ -985,92 +1110,80 @@ fn an_empty_store_lists_nothing() {
 
 #[test]
 fn the_listing_queries_read_indexes_only_never_a_table_scan() {
+    // The plans of the statements the store ACTUALLY runs (the same
+    // constructors `list_runs`/`listing_counts` call), in every shape: both
+    // views, with and without a cursor, with and without a Selector.
     let (_tmp, store) = store();
     listing_fixture(&store);
-    let selector: Selector = "team=core".parse().unwrap();
-    let statements = [
-        (
-            "page exceptions",
-            format!(
-                "EXPLAIN QUERY PLAN SELECT {RUN_COLUMNS} {RUN_FROM} WHERE r.run_id IN ({}) \
-                 ORDER BY r.run_id DESC",
-                view_arms_sql(ListingView::Exceptions, true, Some(50))
-            ),
-            vec![FIXTURE_CUTOFF.to_string(), "run_z".to_string()],
-        ),
-        (
-            "page all",
-            format!(
-                "EXPLAIN QUERY PLAN SELECT {RUN_COLUMNS} {RUN_FROM} WHERE r.run_id IN ({}) \
-                 AND r.run_id IN ({}) ORDER BY r.run_id DESC",
-                view_arms_sql(ListingView::All, false, Some(50)),
-                selector_arms_sql(&selector).0,
-            ),
-            [FIXTURE_CUTOFF.to_string()]
-                .into_iter()
-                .chain(selector_arms_sql(&selector).1)
-                .collect(),
-        ),
-        (
-            "count exceptions",
-            format!(
-                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM runs WHERE run_id IN ({}) \
-                 AND run_id IN ({})",
-                view_arms_sql(ListingView::Exceptions, false, None),
-                selector_arms_sql(&selector).0,
-            ),
-            [FIXTURE_CUTOFF.to_string()]
-                .into_iter()
-                .chain(selector_arms_sql(&selector).1)
-                .collect(),
-        ),
-        (
-            "count all",
-            format!(
-                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM runs WHERE run_id IN ({})",
-                view_arms_sql(ListingView::All, false, None)
-            ),
-            vec![FIXTURE_CUTOFF.to_string()],
-        ),
-        (
-            "count healthy",
-            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM runs WHERE status <> 'ended' AND status = \
-             'active' AND anomalies = ''"
-                .to_string(),
-            Vec::<String>::new(),
-        ),
-    ];
-    for (name, sql, params) in statements {
-        let mut stmt = store.conn().prepare(&sql).unwrap();
+    let selector: Selector = "team=core,env=prod".parse().unwrap();
+    let mut statements: Vec<(String, ListingStatement, bool)> = Vec::new();
+    for view in [ListingView::Exceptions, ListingView::All] {
+        for after in [None, Some("run_z")] {
+            for chosen in [None, Some(&selector)] {
+                let name = format!(
+                    "page {} after={after:?} selector={}",
+                    view.as_str(),
+                    chosen.is_some()
+                );
+                let mut tail = listing_page_tail(view, chosen, after, FIXTURE_CUTOFF, 51);
+                tail.sql = format!("SELECT {RUN_COLUMNS} {RUN_FROM} {}", tail.sql);
+                statements.push((name, tail, true));
+            }
+        }
+        for chosen in [None, Some(&selector)] {
+            statements.push((
+                format!("count {} selector={}", view.as_str(), chosen.is_some()),
+                listing_listed_count(view, chosen, FIXTURE_CUTOFF),
+                true,
+            ));
+        }
+    }
+    for chosen in [None, Some(&selector)] {
+        statements.push((
+            format!("count healthy selector={}", chosen.is_some()),
+            listing_healthy_count(chosen),
+            false,
+        ));
+    }
+    for (name, statement, has_ended_arm) in statements {
+        let mut stmt = store
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", statement.sql))
+            .unwrap();
         let plan: Vec<String> = stmt
-            .query_map(rusqlite::params_from_iter(params), |row| {
+            .query_map(rusqlite::params_from_iter(statement.params), |row| {
                 row.get::<_, String>(3)
             })
             .unwrap()
             .map(Result::unwrap)
             .collect();
         assert!(!plan.is_empty(), "{name}: the plan rendered");
-        // The gate: no plan line is a bare table scan of `runs` — every line
-        // names an index read (`USING INDEX …`, a PK probe) or a merge/list
-        // helper. `SCAN runs USING INDEX idx_runs_open` and its kin READ THE
-        // INDEX, which is what the partial indexes exist for.
+        // The gate: no plan line walks the `runs` table (by its name or the
+        // outer read's `r` alias) except through one of the v16 listing
+        // indexes — a bare `SCAN runs` / `SCAN r`, or a walk of the primary
+        // key's autoindex, reads every Run.
         for line in &plan {
-            let bare_scan = line.starts_with("SCAN runs") && !line.contains("USING");
+            let scans_runs = line == "SCAN runs"
+                || line == "SCAN r"
+                || line.starts_with("SCAN runs ")
+                || line.starts_with("SCAN r ");
+            let through_a_listing_index =
+                ["idx_runs_open", "idx_runs_exception", "idx_runs_ended_at"]
+                    .iter()
+                    .any(|index| line.contains(index));
             assert!(
-                !bare_scan,
+                !scans_runs || through_a_listing_index,
                 "{name} table-scans runs: {line} (full plan: {plan:?})"
             );
         }
-        // And the ended arm rides the window index (the exception index
-        // alone would walk every historical anomalous row).
-        if name.contains("page") || name.contains("count") {
-            let joined = plan.join("\n");
-            if name != "count healthy" && name != "page exceptions" || true {
-                assert!(
-                    joined.contains("idx_runs_ended_at") || !joined.contains("'ended'"),
-                    "{name}: {joined}"
-                );
-            }
+        // And every statement with an ended arm reads it through the window
+        // index (the exception index alone would walk every historical
+        // anomalous row).
+        if has_ended_arm {
+            assert!(
+                plan.iter().any(|line| line.contains("idx_runs_ended_at")),
+                "{name}: the ended arm must ride idx_runs_ended_at: {plan:?}"
+            );
         }
     }
 }
