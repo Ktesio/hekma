@@ -1127,7 +1127,7 @@ async fn serve_resolved(
     let mut req_bytes = collected;
     inject_include_usage(
         &parts.method,
-        &target.rest_or_path(&path),
+        &target.rest_or_path(path),
         &parts.headers,
         &mut req_bytes,
     );

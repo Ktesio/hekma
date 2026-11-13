@@ -345,6 +345,29 @@ pub(crate) fn labels_header_value(labels: &[(String, String)]) -> Option<HeaderV
     HeaderValue::from_str(&items.join(",")).ok()
 }
 
+/// Set a first announce's credentials on the call's response (story
+/// 23-2): the Run Key and refresh credential as SENSITIVE headers (no
+/// `Debug` path prints them), and `cache-control: no-store` — a one-time
+/// credential must not sit in a cache. Their only cleartext crossing on
+/// this channel.
+pub(crate) fn set_announce_headers(
+    response: &mut hyper::Response<http_body_util::Full<bytes::Bytes>>,
+    issued: &crate::domain::credential::IssuedCredentials,
+) {
+    use hyper::header::{HeaderValue, CACHE_CONTROL};
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (RUN_KEY_RESPONSE_HEADER, issued.run_key()),
+        (REFRESH_RESPONSE_HEADER, issued.refresh_credential()),
+    ] {
+        if let Ok(mut value) = HeaderValue::from_str(value.expose_secret()) {
+            value.set_sensitive(true);
+            headers.insert(name, value);
+        }
+    }
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,27 +414,4 @@ mod tests {
         }
         assert_eq!(codes.len(), WireError::ALL.len());
     }
-}
-
-/// Set a first announce's credentials on the call's response (story
-/// 23-2): the Run Key and refresh credential as SENSITIVE headers (no
-/// `Debug` path prints them), and `cache-control: no-store` — a one-time
-/// credential must not sit in a cache. Their only cleartext crossing on
-/// this channel.
-pub(crate) fn set_announce_headers(
-    response: &mut hyper::Response<http_body_util::Full<bytes::Bytes>>,
-    issued: &crate::domain::credential::IssuedCredentials,
-) {
-    use hyper::header::{HeaderValue, CACHE_CONTROL};
-    let headers = response.headers_mut();
-    for (name, value) in [
-        (RUN_KEY_RESPONSE_HEADER, issued.run_key()),
-        (REFRESH_RESPONSE_HEADER, issued.refresh_credential()),
-    ] {
-        if let Ok(mut value) = HeaderValue::from_str(value.expose_secret()) {
-            value.set_sensitive(true);
-            headers.insert(name, value);
-        }
-    }
-    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
 }
