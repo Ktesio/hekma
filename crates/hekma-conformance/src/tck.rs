@@ -3585,10 +3585,11 @@ fn observe_readiness_hold(
             };
             let watch_start = std::time::Instant::now();
             // PHASE 1 — anchor: the subject's `starting` commitment is the
-            // agent's clock zero (the engine spawns, then commits the
-            // transition onto the bus). Any OTHER event is evidence at
-            // most: a start that dies before the anchor (a launch failure)
-            // is carried honestly by the joined starter's own verdict.
+            // agent's clock zero (the engine commits the transition onto
+            // the bus, THEN spawns). Any OTHER event is evidence at most:
+            // a launch failure either finishes the starter before the poll
+            // sees the commitment (early return) or anchors first and is
+            // then carried honestly by the joined starter's own verdict.
             let anchored = loop {
                 if starter.is_finished() {
                     let started = starter
@@ -5844,6 +5845,274 @@ mod tests {
             evidence.readiness.timeout_waited_ms.is_some(),
             "the never-ready twin's honest bracket"
         );
+    }
+
+    /// An unlaunchable subject (the exec path names no real binary): the
+    /// engine publishes the `starting` commitment BEFORE the spawn attempt
+    /// (an exec-path failure is not a registration failure), so the
+    /// observation takes whichever arm the 5ms poll lands on — the starter
+    /// finishing first (the early return) or that commitment anchoring
+    /// first — and the pinned contract is the one BOTH arms keep: the
+    /// exec failure returns within moments of the commitment (fork/exec
+    /// ENOENT, no timeout involved), so the hold is honestly unproven and
+    /// the joined starter's own verdict rides the surfaced reason through
+    /// the `; the start itself failed:` splice — a launch failure must
+    /// say so, never masquerade as a failed hold.
+    #[test]
+    fn readiness_healthy_leg_carries_a_launch_failure_verdict_instead_of_a_failed_hold() {
+        let (_engine_root, facade) = helper_engine();
+        let scratch = tempfile::Builder::new()
+            .prefix("ktesio-tck-hold-launch-")
+            .tempdir()
+            .expect("tempdir");
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind an ephemeral port")
+            .local_addr()
+            .expect("read the port")
+            .port();
+        crate::test_support::ManifestFixture::new(
+            "tck-hold-launch-failure",
+            &[
+                "--http-ready-after",
+                "250",
+                "--http-ready",
+                &format!("{port}:200"),
+                "--linger-ms",
+                "600000",
+            ],
+        )
+        .exec(scratch.path().join("no-such-agent-binary"))
+        .guaranteed_on_all_oses("pause")
+        .readiness(&format!(
+            "kind = \"http-get\"\ntimeout_ms = 3000\nurl = \
+             \"http://127.0.0.1:{port}/health\"\nexpected_status = 200"
+        ))
+        .write(scratch.path());
+        facade
+            .register_with_adapter(
+                "tck-hold-launch-failure",
+                &AdapterRef::Manifest(scratch.path().to_path_buf()),
+            )
+            .expect("register the unlaunchable subject");
+        let mut evidence = ReadinessEvidence::default();
+        let err = readiness_healthy_leg(
+            &facade,
+            "tck-hold-launch-failure",
+            Some(250),
+            Duration::from_secs(12),
+            &mut evidence,
+        )
+        .expect_err("the unlaunchable subject must fail the healthy leg");
+        assert!(
+            err.contains("the gate did not hold the transition"),
+            "the refused observation names the gate: {err}"
+        );
+        assert!(
+            err.contains("the start itself failed"),
+            "the launch-failure verdict rides the reason (never a bare failed hold): {err}"
+        );
+        assert!(
+            err.contains("could not launch"),
+            "the engine's own spawn diagnostic rides the reason — the starter's verdict is not dropped: {err}"
+        );
+        assert!(
+            err.contains("no-such-agent-binary"),
+            "the diagnostic names the unlaunchable binary it tried: {err}"
+        );
+        assert_eq!(
+            evidence.hold_proven,
+            Some(false),
+            "the observation honestly recorded the unproven hold"
+        );
+    }
+
+    /// A subject that dies at 150ms against a 250ms declared hold: the
+    /// child's death lands INSIDE the startup survival window (300ms), so
+    /// the engine's own death detection — not a readiness pass or timeout —
+    /// fails the launch. WHICH stage catches the death (the survival watch
+    /// on a fast launch, the readiness probe on a slow one) is runner
+    /// timing, not contract:
+    /// both surface the engine's own death text as the start's verdict,
+    /// and either way the threshold is crossed first (the child cannot die
+    /// before its own `--exit-with` bound, and the anchored elapsed only
+    /// grows), leaving `hold_proven` honestly `Some(true)`. The engine's
+    /// own death text then propagates AS ITSELF through the post-proof
+    /// `started?` — pinned by substring, so a generic error can never
+    /// stand in for the engine's verdict.
+    #[test]
+    fn readiness_healthy_leg_propagates_a_post_threshold_start_failure_as_itself() {
+        let (_engine_root, facade) = helper_engine();
+        let scratch = tempfile::Builder::new()
+            .prefix("ktesio-tck-hold-dies-")
+            .tempdir()
+            .expect("tempdir");
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind an ephemeral port")
+            .local_addr()
+            .expect("read the port")
+            .port();
+        crate::test_support::ManifestFixture::new(
+            "tck-hold-post-threshold-failure",
+            &[
+                "--http-ready-after",
+                "250",
+                "--http-ready",
+                &format!("{port}:200"),
+                "--exit-with",
+                "1:150",
+            ],
+        )
+        .guaranteed_on_all_oses("pause")
+        .readiness(&format!(
+            "kind = \"http-get\"\ntimeout_ms = 3000\nurl = \
+             \"http://127.0.0.1:{port}/health\"\nexpected_status = 200"
+        ))
+        .write(scratch.path());
+        facade
+            .register_with_adapter(
+                "tck-hold-post-threshold-failure",
+                &AdapterRef::Manifest(scratch.path().to_path_buf()),
+            )
+            .expect("register the dying subject");
+        let mut evidence = ReadinessEvidence::default();
+        let err = readiness_healthy_leg(
+            &facade,
+            "tck-hold-post-threshold-failure",
+            Some(250),
+            Duration::from_secs(12),
+            &mut evidence,
+        )
+        .expect_err("the dead subject must fail the healthy leg");
+        assert!(
+            !err.contains("the gate did not hold the transition"),
+            "a post-threshold failure is NOT a failed hold: {err}"
+        );
+        assert!(
+            err.contains("exited immediately during startup")
+                || err.contains("process exited during the readiness probe"),
+            "the engine's own death text rides the surfaced error, whichever \
+             stage catches the death (never a generic verdict): {err}"
+        );
+        assert_eq!(
+            evidence.hold_proven,
+            Some(true),
+            "the anchored threshold elapsed before the start's own failure returned"
+        );
+    }
+
+    /// A start queued behind a HELD one: the supervisor serializes facade
+    /// calls behind a running start (the A2 premise the bus observation is
+    /// built on), so the queued subject's `starting` commitment cannot land
+    /// within a budget far shorter than the blocker's remaining gate — the
+    /// observation refuses ANCHORLESS, naming the budget, instead of
+    /// measuring against nothing.
+    #[test]
+    fn readiness_healthy_leg_refuses_an_anchorless_budget_when_the_start_queues_behind_a_held_one()
+    {
+        let (_engine_root, facade) = helper_engine();
+        let blocker_dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-hold-blocker-")
+            .tempdir()
+            .expect("tempdir");
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind an ephemeral port")
+            .local_addr()
+            .expect("read the port")
+            .port();
+        crate::test_support::ManifestFixture::new(
+            "tck-hold-blocker",
+            &[
+                "--http-ready-after",
+                "2500",
+                "--http-ready",
+                &format!("{port}:200"),
+                "--linger-ms",
+                "600000",
+            ],
+        )
+        .guaranteed_on_all_oses("pause")
+        .readiness(&format!(
+            "kind = \"http-get\"\ntimeout_ms = 6000\nurl = \
+             \"http://127.0.0.1:{port}/health\"\nexpected_status = 200"
+        ))
+        .write(blocker_dir.path());
+        facade
+            .register_with_adapter(
+                "tck-hold-blocker",
+                &AdapterRef::Manifest(blocker_dir.path().to_path_buf()),
+            )
+            .expect("register the blocker");
+        let queued_dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-hold-queued-")
+            .tempdir()
+            .expect("tempdir");
+        crate::test_support::ManifestFixture::new("tck-hold-queued", &["--linger-ms", "600000"])
+            .guaranteed_on_all_oses("pause")
+            .write(queued_dir.path());
+        facade
+            .register_with_adapter(
+                "tck-hold-queued",
+                &AdapterRef::Manifest(queued_dir.path().to_path_buf()),
+            )
+            .expect("register the queued subject");
+        std::thread::scope(|scope| {
+            // Subscribe FIRST, then spawn the blocker, then wait — bounded —
+            // for the blocker's `starting` commitment ON THE BUS: the
+            // commitment is published inside the supervisor-serialized
+            // start, so seeing it proves the blocker HOLDS the
+            // serialization before the queued start is issued — no
+            // scheduling assumption between the two threads (the
+            // subscribe-first anchoring `observe_readiness_hold` uses).
+            let mut events = facade.subscribe();
+            let blocker =
+                scope.spawn(|| facade.start("tck-hold-blocker").map_err(|e| e.to_string()));
+            let ordering_deadline = std::time::Instant::now() + Duration::from_secs(8);
+            loop {
+                match events.try_recv() {
+                    Ok(EngineEvent::Transition(t))
+                        if t.instance == "tck-hold-blocker"
+                            && t.new_state == LifecycleState::Starting =>
+                    {
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(::hekma_engine::domain::broadcast::error::TryRecvError::Lagged(n)) => {
+                        panic!("the event bus dropped {n} events arming the queue-ordering proof");
+                    }
+                    Err(_) => {}
+                }
+                if std::time::Instant::now() > ordering_deadline {
+                    panic!(
+                        "the blocker never committed its `starting` transition — the \
+                         queue-ordering proof never armed"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let mut evidence = ReadinessEvidence::default();
+            let err = readiness_healthy_leg(
+                &facade,
+                "tck-hold-queued",
+                // Only `Some` matters here: the anchorless refusal in PHASE 1
+                // fires before the hold size is ever read (the queued subject
+                // declares no readiness endpoint), so the value is nominal —
+                // 200 stays under the section's clamp regardless.
+                Some(200),
+                Duration::from_millis(900),
+                &mut evidence,
+            )
+            .expect_err("the anchorless budget must be refused");
+            assert!(
+                err.contains(
+                    "never committed its `starting` transition within the \
+                     section budget"
+                ),
+                "the refusal names the anchorless budget: {err}"
+            );
+            let _ = blocker.join();
+        });
+        let _ = facade.stop("tck-hold-blocker", Some(Duration::from_secs(5)));
+        let _ = facade.stop("tck-hold-queued", Some(Duration::from_secs(5)));
     }
 
     #[test]
