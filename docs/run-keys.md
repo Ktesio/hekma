@@ -1,17 +1,17 @@
 ---
 title: "Run Keys and key custody"
-description: "Each Run's own credential: issued per launch, shown once, stored as a hash, revoked on exit, end or demand. Key custody, Scent-Check and bypass detection are planned."
+description: "Each Run's own credential: issued per launch, shown once, stored as a hash, revoked on exit, end or demand. Key custody is in preview; Scent-Check and bypass detection are planned."
 ---
 
 # Run Keys and key custody
 
-> **On main, not yet released.** Run Keys ship with the next release. Key custody, Scent-Check Modes, bypass detection and the authenticated proxy beyond loopback are still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **On main, not yet released.** Run Keys ship with the next release. Key custody is on main as a preview, not yet supported. Scent-Check Modes, bypass detection and the authenticated proxy beyond loopback are still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 > This page mirrors [hekma.ktesio.dev/docs/run-keys/](https://hekma.ktesio.dev/docs/run-keys/), where it is kept current.
 
 A **Run Key** is a [Run](runs.md)'s own credential. Whoever holds it can act on that Run and the child Runs beneath it as the Run's **Caller**: open a child Run, close a child, and tighten limits. It cannot read the fleet, change configuration, set Policies, raise a limit, or touch any other Run.
 
-A Run Key is not yet a replacement for your provider key: today the agent still holds the provider key you configured. Key custody, which puts the Run Key in the agent's API-key slot and keeps the real key inside Hekma, is planned (below).
+With [key custody](#key-custody-preview--not-yet-supported) (a preview), a Run Key replaces your provider key: Hekma puts the Run Key in the agent's API-key slot and keeps the real key inside Hekma. Without it, the agent holds the provider key you configured.
 
 ## What works on main
 
@@ -96,19 +96,114 @@ The [metering proxy](metering-proxy.md) reads a Run Key sent in `x-hekma-run-key
 - On a supervised agent's Run route, the key's Run must be that Run or beneath it, else the call gets `403 hekma_run_out_of_scope`. This is how a helper inside an agent charges its own child Run.
 - A key never chooses where a call goes: the upstream is the route's or the binding's.
 
-Until key custody ships, the provider key still travels with the call, so a Run Key in the API-key slot (`authorization` or `x-api-key`) is refused with `400 hekma_custody_unavailable` rather than forwarded to the provider. Send the provider key in `authorization` and the Run Key in `x-hekma-run-key`. Every `x-hekma-*` header is removed before the call is forwarded.
+A Run Key in the API-key slot (`authorization`, `x-api-key`, `x-goog-api-key` or `api-key`) asks for the custodied key. If its Run holds none, or the key was not issued to a supervised agent or a credentialed open, the call is refused with `400 hekma_custody_unavailable` rather than forwarded to the provider. Without custody, send the provider key in `authorization` and the Run Key in `x-hekma-run-key`. Every `x-hekma-*` header is removed before the call is forwarded.
 
 ### External ids
 
 A child open's `external_id` makes a retry safe: the same id returns the same Run. Ids are scoped by who opens. The Operator and Hosts share one namespace; each Run's keys have their own, so a Run Key can neither take over nor discover an id the Operator or a Host uses.
 
+## Key custody (preview — not yet supported)
+
+> **Preview.** Key custody is on Hekma's main branch, but it is not yet supported: it becomes supported when the pending security rulings are recorded and its test criteria pass in CI. Until then, treat it as a preview whose behaviour may change.
+
+With key custody, Hekma holds your provider key and the agent never sees it. The agent gets a Run Key in its API-key slot and the metering proxy's address as its base URL. When a call arrives, the proxy checks the Run Key, swaps in your real key, and sends the call to the provider.
+
+### Turning it on
+
+Set the agent's provider key as a secret reference:
+
+```sh
+hekma agent config set my-agent provider.api_key secret:OPENAI_KEY
+```
+
+Custody is then on by default. The adapter must map `provider.api_key` to an environment variable (an `env` target in its manifest); a `flag` or `file` target is refused, because it would put the key on the command line or in the Agent Home.
+
+| Key | Values | What it does |
+|---|---|---|
+| `provider.api_key` | `secret:NAME` only | The provider key Hekma holds. Any other value is refused. |
+| `provider.custody` | `on` (default), `off` | `off` delivers the real key to the agent as before, while Hekma still holds the reference. |
+| `provider.isolate_home` | `off` (default), `on` | Points the agent's home-directory variables at a directory inside its Agent Home (see the limits below). |
+
+At start, under custody, Hekma:
+
+- resolves the key and refuses the start if it does not resolve;
+- puts this launch's Run Key in the agent's API-key variable, and never the real key;
+- clears the inherited environment (only the agent's declared variables and the OS basics pass), so a provider key in the environment of `hekma serve` never reaches the agent;
+- refuses the start when the same key would also reach the agent another way: another config leaf naming the same secret, an `agent.<VAR>` pass-through naming a provider variable, or a provider variable in the manifest's launch environment. The error names the other delivery.
+
+The provider variables Hekma recognises (list version 1) are `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`, `AZURE_OPENAI_API_KEY`, `XAI_API_KEY` and `HF_TOKEN`.
+
+### Where the key may go
+
+The proxy sends a custodied key only over HTTPS, with certificate checks, to an origin pinned beside the key, and only to paths on the key's list. You can declare both in your secrets file, next to the key:
+
+```toml
+OPENAI_KEY = "sk-..."
+
+[custody.OPENAI_KEY]
+origins = ["https://api.openai.com"]
+paths = ["/v1/chat/completions", "/v1/responses"]
+```
+
+Without a `[custody.NAME]` table, Hekma uses its built-in table for well-known providers: OpenAI, Anthropic, Google's Gemini API, Mistral, Groq, DeepSeek, OpenRouter, xAI, Hugging Face's router and Azure OpenAI. Each comes with its inference paths and its own key header. An agent whose upstream matches neither is refused at start, and the error says to declare the origin beside the key.
+
+The origin is fixed on the Run when custody starts. A relaunch after the agent's configuration changes still sends the key to the same origin. A call to a path outside the list is refused with `400 hekma_path_not_allowed` and nothing is forwarded, so a Run Key cannot start batch or file jobs, or reach key-management endpoints.
+
+Give Hekma a key scoped to inference on the projects and models your agents use. A key that can manage other keys is more than any agent needs.
+
+### Which calls get the key
+
+Only a call that presents a Run Key issued to a supervised agent, or to a Run opened through the Control API with credentials, can use the custodied key — in the API-key slot (`authorization`, `x-api-key`, `x-goog-api-key` or `api-key`) or in `x-hekma-run-key`. A child Run of a custodied agent uses its parent's key. An endpoint binding's custodied key is used only by such a credential, never by a call that arrives with none.
+
+Any other call is forwarded with whatever key it carries, or none. A Run Key in the API-key slot whose Run holds no key is refused with `400 hekma_custody_unavailable`.
+
+Under the swap, the proxy removes every credential the client sent and inserts the custodied key once, in the provider's own header. If the provider echoes the key in a response, the proxy replaces it with `hekma_redacted_key` before the agent sees it. It asks the provider for an uncompressed response so the check can see the bytes.
+
+When you change a key in the secrets file, the proxy picks up the new value within 30 seconds. The value lives only in the memory of `hekma serve`.
+
+### Seeing it
+
+`hekma ps` (in the CONTROL column) and `hekma run show` (a CUSTODY line) show custody for each Run that owns a process: `on`, or `off` with the reason:
+
+| Reason | Meaning |
+|---|---|
+| `no-held-key` | The agent has no `provider.api_key`. |
+| `opted-out` | `provider.custody` is `off`. |
+| `pre-custody` | The Run started before this version; its next launch picks custody up. |
+
+`hekma agent config get my-agent provider.api_key --reveal` still prints the key, but for a custodied key it first records a `secret_revealed` event naming the secret (never the value). If the event cannot be recorded, nothing is printed.
+
+An agent whose provider key Hekma does not hold sends its own key. A self-reported one shows `supervised (no wire)`. An engine-observed one is refused at start: set `provider.api_key`, or switch the adapter to self-reported.
+
+### Threat model
+
+Key custody keeps your provider key away from the agent. It is not a sandbox.
+
+#### What custody protects
+
+- **Your key never reaches the agent.** The agent's environment, command line and Agent Home hold a Run Key and the proxy's address, never your provider key. So anything the agent prints, writes, uploads or commits — its logs, a transcript sent to its vendor, a crash report, a `.env` file pushed by mistake, an answer to a prompt that asks for its API key — can contain at most its Run Key.
+- **Your key goes only where you pinned it.** The proxy sends it only over HTTPS, with certificate checks, to the provider origins and paths listed beside the key in your secrets file (or the built-in default for well-known providers). Changing an agent's configuration cannot send it anywhere else.
+- **Your key is spent only with a credential Hekma issued.** A call reaches your key only with a Run Key Hekma issued. Any other call through the proxy is forwarded with whatever key it carries, or none.
+- **A Run Key is worth less than your key.** It works only through the proxy, only for its Run, under that Run's budgets and Policies, and you can revoke it at any time; it is refused from its next call. It changes every time a supervised agent is relaunched, and it stops working when the Run ends.
+- **Going around the proxy fails.** The Run Key is not a provider key, so an agent that calls the provider directly with it is refused by the provider.
+
+#### What custody does not protect against
+
+- **Anything running as your OS user.** The agent runs as you. A process running as you — the agent's own shell tool included — can read Hekma's secrets file, which sits in Hekma's state directory beside the agents' homes; run `hekma` with your authority, including `hekma agent config get --reveal`; and edit Hekma's configuration. A `--reveal` of a custodied key is recorded as an event, but a determined process does not need it. Running agents as a separate OS user is not supported yet.
+- **A compromised agent.** Custody limits what an agent can leak by accident or be talked into leaking. It does not contain an agent that sets out to misuse your machine.
+- **Other credentials.** An agent that finds another way to reach a provider — a login stored in your home directory, another environment, a different machine — is not using your custodied key. Hekma does not see those calls; bypass detection is planned.
+- **Hekma's own memory.** While `hekma serve` runs, it holds your key in memory. On Linux it marks itself non-dumpable, so other processes running as you cannot read its environment or memory and a crash writes no core file. On macOS and Windows, a process running as you, or a full crash dump, may expose it; leave full crash dumps off for `hekma`.
+- **Copies of the secrets file.** Backups and sync tools copy Hekma's state directory like any other. Exclude the secrets file, or keep your keys in the environment of `hekma serve` instead.
+
+#### Limits to know
+
+- **Agents that log in instead of using an API key** (a subscription or OAuth sign-in) cannot use custody. Hekma meters them from their own reports where it can, and says so in `hekma ps`.
+- **Your home directory stays visible by default.** Many agents need your Git and SSH settings, so the agent keeps your home directory. Turning on home isolation (`provider.isolate_home`) for an agent keeps it from finding your other stored logins by default, at the cost of those settings; it does not stop a shell command that reads them by full path.
+- **Custody inference keys, not admin keys.** Give Hekma a key scoped to the projects and models your agents use. A key that can manage other keys is more than any agent needs.
+- **On a shared machine,** another user can listen on the proxy's port while Hekma is not running and collect Run Keys and prompts. Run Hekma on a machine you do not share.
+- **Run Keys reach your agent's logs.** If an agent prints its environment, its Run Key lands in its output log. Revoke it if that log leaves your machine.
+
 ## What is coming
-
-### Key custody
-
-When you configure a supervised agent's provider key through Hekma, custody will be the default. Hekma will put the Run Key in the agent's API-key slot and the proxy's address in its base URL. The real key will never appear in the agent's environment, arguments or [Agent Home](https://hekma.ktesio.dev/docs/concepts/#agent-home), and the proxy will send it only to its configured upstream origin, over HTTPS.
-
-An agent that brings its own key cannot be identified on the wire. A self-reported one will show at **Control Depth** (how far Hekma controls a Run) `supervised (no wire)`, metered from its own reports and without wire controls; an engine-observed one will be refused at start.
 
 ### Scent-Check Modes
 

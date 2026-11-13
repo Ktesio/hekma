@@ -61,6 +61,10 @@ pub enum CredentialScheme {
     Bearer,
     /// `x-api-key: <key>` (Anthropic's scheme).
     XApiKey,
+    /// `x-goog-api-key: <key>` (Google's Gemini API key scheme).
+    XGoogApiKey,
+    /// `api-key: <key>` (Azure OpenAI's API key scheme).
+    AzureApiKey,
 }
 
 impl CredentialScheme {
@@ -69,6 +73,8 @@ impl CredentialScheme {
         match self {
             CredentialScheme::Bearer => "authorization",
             CredentialScheme::XApiKey => "x-api-key",
+            CredentialScheme::XGoogApiKey => "x-goog-api-key",
+            CredentialScheme::AzureApiKey => "api-key",
         }
     }
 
@@ -76,7 +82,9 @@ impl CredentialScheme {
     pub(crate) fn header_value(self, value: &SecretString) -> Option<(HeaderName, HeaderValue)> {
         let rendered = match self {
             CredentialScheme::Bearer => format!("Bearer {}", value.expose_secret()),
-            CredentialScheme::XApiKey => value.expose_secret().to_string(),
+            CredentialScheme::XApiKey
+            | CredentialScheme::XGoogApiKey
+            | CredentialScheme::AzureApiKey => value.expose_secret().to_string(),
         };
         let value = HeaderValue::from_str(&rendered).ok()?;
         let mut value = value;
@@ -120,7 +128,7 @@ const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
         host: "generativelanguage.googleapis.com",
         origin: "https://generativelanguage.googleapis.com",
         paths: &["/v1beta/models", "/v1/models"],
-        scheme: CredentialScheme::Bearer,
+        scheme: CredentialScheme::XGoogApiKey,
     },
     BuiltinProvider {
         host: "api.mistral.ai",
@@ -178,22 +186,24 @@ const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
         scheme: CredentialScheme::Bearer,
     },
     BuiltinProvider {
-        // Per-resource Azure OpenAI hosts: `<resource>.openenv.ai` and the
-        // classic `<resource>.openai.azure.com` (the leading dot = suffix
-        // match). The deployment path carries the model; the api-version
-        // rides the query, which is preserved verbatim.
+        // Per-resource Azure OpenAI hosts, `<resource>.openai.azure.com`
+        // (the leading dot = suffix match on a label boundary). The
+        // deployment path carries the model; the api-version rides the
+        // query, which is preserved verbatim.
         host: ".openai.azure.com",
         origin: "",
         paths: &["/openai/deployments"],
-        scheme: CredentialScheme::Bearer,
+        scheme: CredentialScheme::AzureApiKey,
     },
 ];
 
 fn builtin_by_host(host: &str) -> Option<&'static BuiltinProvider> {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     BUILTIN_PROVIDERS.iter().find(|provider| {
-        if let Some(suffix) = provider.host.strip_prefix('.') {
-            host.ends_with(suffix)
+        if provider.host.starts_with('.') {
+            // A label boundary: `x.openai.azure.com`, never
+            // `xopenai.azure.com`.
+            host.ends_with(provider.host)
         } else {
             host == provider.host
         }
@@ -430,6 +440,9 @@ pub(crate) struct CustodyEntry {
     pub declared: Option<CustodyPin>,
 }
 
+/// The cache's diagnostic sink.
+type DiagnosticFn = Arc<dyn Fn(String) + Send + Sync>;
+
 /// The in-memory custody cache (the AD-10 amendment): custodied values
 /// live ONLY here, beside — never inside — the published snapshot. A
 /// background refresh re-resolves every held reference through the same
@@ -438,7 +451,7 @@ pub(crate) struct CustodyEntry {
 pub(crate) struct CustodyCache {
     secrets_path: PathBuf,
     entries: RwLock<HashMap<String, Arc<CustodyEntry>>>,
-    diagnostics: RwLock<Option<Arc<dyn Fn(String) + Send + Sync>>>,
+    diagnostics: RwLock<Option<DiagnosticFn>>,
 }
 
 impl CustodyCache {
@@ -615,6 +628,20 @@ mod tests {
         assert!(builtin_by_host("API.OPENAI.COM.").is_some());
         assert!(builtin_by_host("my-resource.openai.azure.com").is_some());
         assert!(builtin_by_host("api.openai.example.com").is_none());
+        // A suffix entry matches on a label boundary only.
+        assert!(builtin_by_host("evilopenai.azure.com").is_none());
+        assert_eq!(
+            builtin_by_host("my-resource.openai.azure.com")
+                .unwrap()
+                .scheme,
+            CredentialScheme::AzureApiKey
+        );
+        assert_eq!(
+            builtin_by_host("generativelanguage.googleapis.com")
+                .unwrap()
+                .scheme,
+            CredentialScheme::XGoogApiKey
+        );
         assert_eq!(
             builtin_by_host("api.anthropic.com").unwrap().scheme,
             CredentialScheme::XApiKey
@@ -829,5 +856,16 @@ mod tests {
         assert_eq!(name.as_str(), "x-api-key");
         assert!(value.is_sensitive());
         assert_eq!(value.to_str().unwrap(), "sk-sentinel");
+        for (scheme, header) in [
+            (CredentialScheme::XGoogApiKey, "x-goog-api-key"),
+            (CredentialScheme::AzureApiKey, "api-key"),
+        ] {
+            let (name, value) = scheme
+                .header_value(&SecretString::new("sk-sentinel"))
+                .unwrap();
+            assert_eq!(name.as_str(), header);
+            assert!(value.is_sensitive());
+            assert_eq!(value.to_str().unwrap(), "sk-sentinel");
+        }
     }
 }

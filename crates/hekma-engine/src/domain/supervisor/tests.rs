@@ -10729,3 +10729,345 @@ fn a_failed_observed_start_retires_its_pending_run_route() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Story 22-2: key custody at start.
+// ---------------------------------------------------------------------------
+
+/// The custodied key's sentinel value (never seen by the agent).
+const CUSTODY_SENTINEL: &str = "sk-custody-sentinel-0123456789abcdef";
+
+/// A manifest whose adapter maps `provider.api_key` and `metering.base_url`
+/// to env targets, with the given metering source and launch env.
+fn write_custody_manifest(dir: &Path, kind: &str, args: &[&str], source: &str, launch_env: &str) {
+    let bin = hekma_conformance::fake_agent_bin();
+    let args_toml = args
+        .iter()
+        .map(|a| format!("{a:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = format!(
+        "contract_version = \"1.0.0\"\n\n\
+         [adapter]\nkind = \"{kind}\"\n\n\
+         [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]\n{launch_env}\n\n\
+         [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
+         [metering]\nsource = \"{source}\"\n\n\
+         [config.\"metering.base_url\"]\nenv = \"OPENAI_BASE_URL\"\n\n\
+         [config.\"provider.api_key\"]\nenv = \"OPENAI_API_KEY\"\n",
+        exec = bin.to_string_lossy(),
+    );
+    std::fs::write(dir.join("adapter.toml"), body).unwrap();
+}
+
+/// A registered custody subject: `(state, manifest, dump dir, registry,
+/// name)`, its key held through the environment as `secret:<var>`.
+fn custody_subject(
+    name: &str,
+    source: &str,
+    launch_env: &str,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Registry,
+    InstanceName,
+) {
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    let dump = tempfile::tempdir().unwrap();
+    let dump_path = dump.path().join("dump.txt");
+    let marker = dump.path().join("ready.marker");
+    write_custody_manifest(
+        manifest.path(),
+        name,
+        &[
+            "--linger-ms",
+            "600000",
+            "--dump",
+            dump_path.to_str().unwrap(),
+            "--marker",
+            marker.to_str().unwrap(),
+        ],
+        source,
+        launch_env,
+    );
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(name, &AdapterRef::Manifest(manifest.path().to_path_buf()))
+        .unwrap();
+    let parsed = InstanceName::new(name).unwrap();
+    std::env::set_var("HEKMA_TEST_CUSTODY_KEY", CUSTODY_SENTINEL);
+    registry
+        .set_config(&parsed, "provider.api_key", "secret:HEKMA_TEST_CUSTODY_KEY")
+        .unwrap();
+    registry
+        .set_config(
+            &parsed,
+            crate::domain::METERING_UPSTREAM_BASE_URL_KEY,
+            "https://api.openai.com/v1",
+        )
+        .unwrap();
+    (state, manifest, dump, registry, parsed)
+}
+
+fn custody_supervisor(rt: &tokio::runtime::Runtime) -> Supervisor {
+    let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    sup.set_serve_options(
+        Some("http://127.0.0.1:9".to_string()),
+        false,
+        LogCaptureMode::Full,
+    )
+    .unwrap();
+    sup
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+/// Every file under `dir`, recursively, as bytes.
+fn every_file(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                out.push((path, bytes));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_custodied_start_hands_the_agent_its_run_key_and_never_the_provider_key() {
+    // AC (R2.1–R2.3): the agent's API-key variable holds this launch's Run
+    // Key, its base URL the proxy route, HEKMA_RUN_KEY is present — and the
+    // custodied sentinel is in no environment variable, no argv entry and
+    // no file under the Agent Home. An inherited provider variable on the
+    // host is cleared (the allowlist is forced on for this spawn).
+    let (_state, _manifest, dump, registry, name) =
+        custody_subject("custody_on", "engine-observed", "");
+    std::env::set_var("OPENAI_API_KEY", "sk-inherited-host-sentinel");
+    let rt = runtime();
+    let mut sup = custody_supervisor(&rt);
+    sup.start(&registry, name.as_str()).unwrap();
+    wait_for_marker(&dump.path().join("ready.marker"));
+    let dumped = wait_for_dump(&dump.path().join("dump.txt"));
+    let run = registry.instance_run(name.as_str()).unwrap().record.run_id;
+
+    let env = |var: &str| {
+        dumped
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("env={var}=")))
+            .map(str::to_string)
+    };
+    let api_key = env("OPENAI_API_KEY").expect("the API-key variable is set");
+    assert!(
+        api_key.starts_with("hk_run_"),
+        "the agent holds its Run Key: {api_key}"
+    );
+    assert_eq!(env("HEKMA_RUN_KEY").as_deref(), Some(api_key.as_str()));
+    assert_eq!(
+        env("OPENAI_BASE_URL").as_deref(),
+        Some(format!("http://127.0.0.1:9/_hekma/runs/{}", run.as_str()).as_str())
+    );
+    assert!(
+        !dumped.contains(CUSTODY_SENTINEL),
+        "the custodied key reached the agent:\n{dumped}"
+    );
+    assert!(
+        !dumped.contains("sk-inherited-host-sentinel"),
+        "an inherited provider variable passed through:\n{dumped}"
+    );
+    for (path, bytes) in every_file(&registry.agent_home(&name)) {
+        assert!(
+            !bytes
+                .windows(CUSTODY_SENTINEL.len())
+                .any(|w| w == CUSTODY_SENTINEL.as_bytes()),
+            "the custodied key is in {path:?}"
+        );
+    }
+    // The Run records custody on, the held reference and the pinned origin.
+    let row = registry.run_custody(&run).unwrap().expect("a custody row");
+    assert_eq!(row.state, "on");
+    assert_eq!(row.reason, "held");
+    assert_eq!(row.origin.as_deref(), Some("https://api.openai.com"));
+    assert_eq!(
+        row.key_ref.as_deref(),
+        Some("secret:HEKMA_TEST_CUSTODY_KEY")
+    );
+    sup.stop(&registry, name.as_str(), Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn a_second_delivery_of_the_custodied_key_refuses_the_start_and_changes_nothing() {
+    // AC (R2.1): another leaf resolving the same secret, a pass-through
+    // naming a listed provider variable, or the launch env naming one —
+    // each refuses the start before any state change, naming the delivery.
+    let rt = runtime();
+    for (case, launch_env) in [
+        ("leaf", ""),
+        ("pass", ""),
+        (
+            "launch",
+            "env = { ANTHROPIC_API_KEY = \"sk-from-the-manifest\" }",
+        ),
+    ] {
+        let name = format!("second_{case}");
+        let (_state, _manifest, _dump, registry, parsed) =
+            custody_subject(&name, "engine-observed", launch_env);
+        match case {
+            "leaf" => registry
+                .set_config(
+                    &parsed,
+                    "agent.SOME_OTHER_VAR",
+                    "secret:HEKMA_TEST_CUSTODY_KEY",
+                )
+                .unwrap(),
+            "pass" => registry
+                .set_config(&parsed, "agent.OPENAI_API_KEY", "sk-live-pasted")
+                .unwrap(),
+            _ => Vec::new(),
+        };
+        let before = state_of(&registry, &name);
+        let mut sup = custody_supervisor(&rt);
+        let err = sup.start(&registry, &name).unwrap_err();
+        let EngineError::Custody { detail, .. } = &err else {
+            panic!("{case}: expected a custody refusal, got {err:?}");
+        };
+        match case {
+            "leaf" => assert!(detail.contains("agent.SOME_OTHER_VAR"), "{detail}"),
+            "pass" => assert!(detail.contains("agent.OPENAI_API_KEY"), "{detail}"),
+            _ => assert!(detail.contains("ANTHROPIC_API_KEY"), "{detail}"),
+        }
+        assert!(!detail.contains(CUSTODY_SENTINEL), "{detail}");
+        assert_eq!(
+            state_of(&registry, &name),
+            before,
+            "{case}: no state change"
+        );
+        assert!(registry.spawn_record(&parsed).unwrap().is_none(), "{case}");
+    }
+}
+
+#[test]
+fn an_engine_observed_agent_whose_key_hekma_does_not_hold_is_refused_and_a_self_reported_one_starts(
+) {
+    // AC (R2.14, FR-19): no held key — an engine-observed instance is
+    // refused before any state change with the remediation; a
+    // self-reported one starts, custody off with the honest reason.
+    let rt = runtime();
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_custody_manifest(
+        manifest.path(),
+        "keyless_obs",
+        &["--linger-ms", "600000"],
+        "engine-observed",
+        "",
+    );
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "keyless_obs",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let mut sup = custody_supervisor(&rt);
+    let err = sup.start(&registry, "keyless_obs").unwrap_err();
+    let EngineError::Custody { detail, .. } = &err else {
+        panic!("expected a custody refusal, got {err:?}");
+    };
+    assert!(
+        detail.contains("set 'provider.api_key' to a secret:NAME reference"),
+        "{detail}"
+    );
+    assert!(detail.contains("self-reported"), "{detail}");
+    assert_ne!(state_of(&registry, "keyless_obs"), LifecycleState::Running);
+
+    let manifest = tempfile::tempdir().unwrap();
+    write_custody_manifest(
+        manifest.path(),
+        "keyless_self",
+        &["--linger-ms", "600000"],
+        "self-reported",
+        "",
+    );
+    registry
+        .register_with_adapter(
+            "keyless_self",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    sup.start(&registry, "keyless_self").unwrap();
+    let run = registry.instance_run("keyless_self").unwrap().record.run_id;
+    let row = registry.run_custody(&run).unwrap().expect("a custody row");
+    assert_eq!(
+        (row.state.as_str(), row.reason.as_str()),
+        ("off", "no-held-key")
+    );
+    sup.stop(&registry, "keyless_self", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn an_opted_out_instance_receives_its_own_key_and_its_run_says_opted_out() {
+    let (_state, _manifest, dump, registry, name) =
+        custody_subject("opted_out", "self-reported", "");
+    registry
+        .set_config(&name, "provider.custody", "off")
+        .unwrap();
+    let rt = runtime();
+    let mut sup = custody_supervisor(&rt);
+    sup.start(&registry, name.as_str()).unwrap();
+    wait_for_marker(&dump.path().join("ready.marker"));
+    let dumped = wait_for_dump(&dump.path().join("dump.txt"));
+    assert!(
+        dumped
+            .lines()
+            .any(|line| line == format!("env=OPENAI_API_KEY={CUSTODY_SENTINEL}")),
+        "an opted-out agent gets the key it was configured with:\n{dumped}"
+    );
+    let run = registry.instance_run(name.as_str()).unwrap().record.run_id;
+    let row = registry.run_custody(&run).unwrap().expect("a custody row");
+    assert_eq!(
+        (row.state.as_str(), row.reason.as_str()),
+        ("off", "opted-out")
+    );
+    sup.stop(&registry, name.as_str(), Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn an_origin_the_key_cannot_be_pinned_to_refuses_the_start() {
+    // AC (R2.6): no declared origins and an upstream no built-in provider
+    // matches — the start is refused with the remediation; nothing changes.
+    let (_state, _manifest, _dump, registry, name) =
+        custody_subject("unpinned", "engine-observed", "");
+    registry
+        .set_config(
+            &name,
+            crate::domain::METERING_UPSTREAM_BASE_URL_KEY,
+            "https://gateway.internal.example/v1",
+        )
+        .unwrap();
+    let rt = runtime();
+    let mut sup = custody_supervisor(&rt);
+    let err = sup.start(&registry, name.as_str()).unwrap_err();
+    assert!(
+        matches!(err, EngineError::Custody { .. }),
+        "expected a custody refusal, got {err:?}"
+    );
+    assert!(registry.spawn_record(&name).unwrap().is_none());
+}

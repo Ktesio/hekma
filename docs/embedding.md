@@ -108,6 +108,8 @@ surface `hekma` uses. The capabilities you will reach for first:
 | `Engine::open_read_only(base)` | Open a READ-ONLY engine over the same facade: a `query_only` connection, a closed store writer (every write returns a typed error, never a panic), no orphan adoption and no crash-detection reaper — it never touches a process another engine supervises and never writes `state.db`. A missing `state.db` reads as an empty fleet and creates nothing; a `state.db` below the current schema answers `StoreError::NeedsMigration` (a writer must open it first). A live instance's current-Run totals come from its persisted Run id. This is how `hekma`'s read commands open the state while a Service Host owns the writes. |
 | `register` / `register_with_adapter` | Register an instance under a built-in adapter kind or a manifest (`adapter.toml`) directory. The built-in kinds include `hermes` and `acp` (any Agent Client Protocol v1 agent — set the `acp.command`/`acp.args` config keys; no contract negotiation). |
 | `set_config` / `effective_config` | Write and read the unified configuration (budgets, rates, model keys) with per-leaf provenance. |
+| `note_secret_revealed` / `Blocking::note_secret_revealed` | Before showing an instance's custodied provider key ([key custody](run-keys.md#key-custody-preview--not-yet-supported), a preview), record one `EngineEvent::SecretRevealed` naming the secret, never its value; returns the event, or `None` when the instance custodies nothing. A start that custody refuses returns `EngineError::Custody` with the remediation, before any state change. |
+| `harden_host_memory()` | A free function: on Linux, mark the process non-dumpable with a core-dump limit of 0 (it holds custodied keys in memory); elsewhere, nothing. `hekma serve` calls it at start; an embedding host may call it too. |
 | `start` / `stop` / `pause` / `resume` | Drive the lifecycle; `stop` takes a graceful-shutdown window and kills the whole process group. |
 | `shutdown` / `Blocking::shutdown` | Stop EVERY live agent through the same bounded ladder in one call — the graceful half of the embedder contract (below). |
 | `start_detached` / `Blocking::start_detached` | Spawn an instance that outlives your engine handle; refused with `EngineError::DetachRefused` for engine-observed instances. See the host duty below. |
@@ -165,7 +167,9 @@ Four rules cover the whole contract:
    measurement, or a Run event (`EngineEvent::Run`: a Run created, its depth,
    status, Anomalies or bound labels changed, or ended — published right after
    the event that caused it; a `labels-changed` event carries the bound labels
-   after and before (`prior_labels`) and its cause, `label-verb` or `config`)
+   after and before (`prior_labels`) and its cause, `label-verb` or `config`),
+   or a reveal (`EngineEvent::SecretRevealed`: a custodied provider key was
+   revealed, naming the instance and the secret, never the value)
    — the exact wire shapes `hekma --json` documents.
 3. **A slow subscriber never stalls supervision.** The bus is bounded; if you
    fall more than its capacity behind, your next receive observes `Lagged` and

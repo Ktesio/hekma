@@ -613,7 +613,12 @@ async fn serve_admitted(
                 query: query.as_deref(),
                 run_key: header(headers, wire::RUN_KEY_HEADER),
                 authorization: header(headers, hyper::header::AUTHORIZATION.as_str()),
-                api_key: header(headers, "x-api-key"),
+                // Story 22-2: every provider's API-key header is a slot
+                // (Anthropic's, Google's, Azure's), so a Run Key placed in
+                // any of them is read — never forwarded as if it were a key.
+                api_key: header(headers, "x-api-key")
+                    .or_else(|| header(headers, "x-goog-api-key"))
+                    .or_else(|| header(headers, "api-key")),
                 hint: header(headers, wire::RUN_HINT_HEADER),
                 hint_labels: header(headers, wire::LABELS_HEADER),
             },
@@ -900,6 +905,8 @@ async fn serve_admitted(
         hyper::header::AUTHORIZATION,
         hyper::header::PROXY_AUTHORIZATION,
         HeaderName::from_static("x-api-key"),
+        HeaderName::from_static("x-goog-api-key"),
+        HeaderName::from_static("api-key"),
     ] {
         if let Some(value) = parts.headers.get_mut(&name) {
             value.set_sensitive(true);
@@ -916,6 +923,8 @@ async fn serve_admitted(
             hyper::header::AUTHORIZATION,
             hyper::header::PROXY_AUTHORIZATION,
             HeaderName::from_static("x-api-key"),
+            HeaderName::from_static("x-goog-api-key"),
+            HeaderName::from_static("api-key"),
         ] {
             parts.headers.remove(&name);
         }
@@ -1165,5 +1174,155 @@ impl super::identify::Target {
         } else {
             self.rest.clone()
         }
+    }
+}
+
+/// Story 22-2: the pure pieces of the custody swap — response redaction and
+/// the Host/Origin guard.
+#[cfg(test)]
+mod custody_tests {
+    use super::*;
+
+    const KEY: &str = "sk-live-0123456789abcdef";
+
+    #[test]
+    fn redaction_masks_every_occurrence_byte_wise_and_fixes_the_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-echo",
+            HeaderValue::from_static("key=sk-live-0123456789abcdef!"),
+        );
+        headers.insert("content-length", HeaderValue::from_static("999"));
+        headers.insert("x-other", HeaderValue::from_static("untouched"));
+        // A non-UTF-8 body: the bytes around the key survive exactly.
+        let mut body = vec![0xff, 0xfe];
+        body.extend_from_slice(KEY.as_bytes());
+        body.extend_from_slice(b" and again ");
+        body.extend_from_slice(KEY.as_bytes());
+        body.push(0x80);
+        let out = redact_response(&mut headers, Bytes::from(body), KEY.as_bytes());
+        let mut expected = vec![0xff, 0xfe];
+        expected.extend_from_slice(wire::REDACTION_MASK.as_bytes());
+        expected.extend_from_slice(b" and again ");
+        expected.extend_from_slice(wire::REDACTION_MASK.as_bytes());
+        expected.push(0x80);
+        assert_eq!(out.as_ref(), expected.as_slice());
+        assert_eq!(
+            headers["content-length"],
+            HeaderValue::from(expected.len()),
+            "a changed body carries its new length"
+        );
+        assert_eq!(headers["x-echo"], "key=hekma_redacted_key!");
+        assert_eq!(headers["x-other"], "untouched");
+    }
+
+    #[test]
+    fn a_body_without_the_key_is_relayed_untouched() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", HeaderValue::from_static("5"));
+        let out = redact_response(&mut headers, Bytes::from_static(b"hello"), KEY.as_bytes());
+        assert_eq!(out.as_ref(), b"hello");
+        assert_eq!(headers["content-length"], "5");
+        assert_eq!(replace_bytes(b"", KEY.as_bytes(), b"x"), None);
+        assert_eq!(replace_bytes(b"abc", b"", b"x"), None);
+    }
+
+    #[test]
+    fn a_header_that_cannot_hold_the_mask_is_dropped_never_relayed_with_the_key() {
+        let mut headers = HeaderMap::new();
+        // An obs-text header value: valid on the wire, and the mask still
+        // fits; a value whose replacement would be invalid is dropped.
+        let raw = [b"\x80".as_slice(), KEY.as_bytes()].concat();
+        headers.insert("x-raw", HeaderValue::from_bytes(&raw).unwrap());
+        redact_response(&mut headers, Bytes::new(), KEY.as_bytes());
+        let kept = headers.get("x-raw").map(|v| v.as_bytes().to_vec());
+        assert!(
+            kept.as_deref()
+                .is_none_or(|v| !v.windows(KEY.len()).any(|w| w == KEY.as_bytes())),
+            "the key never survives in a header"
+        );
+    }
+
+    #[test]
+    fn the_host_name_part_strips_ports_and_brackets() {
+        assert_eq!(host_name_part("127.0.0.1:8478"), "127.0.0.1");
+        assert_eq!(host_name_part("[::1]:80"), "::1");
+        assert_eq!(host_name_part("[::1]"), "::1");
+        assert_eq!(host_name_part("localhost"), "localhost");
+        assert_eq!(host_name_part("proxy.internal:8478"), "proxy.internal");
+        // A bare IPv6 literal (no brackets) is not split on its colons.
+        assert_eq!(host_name_part("::1"), "::1");
+    }
+
+    fn guard(host: Option<&str>, origin: Option<&str>, hosts: &[&str], origins: &[&str]) -> bool {
+        let mut headers = HeaderMap::new();
+        if let Some(host) = host {
+            headers.insert(hyper::header::HOST, HeaderValue::from_str(host).unwrap());
+        }
+        if let Some(origin) = origin {
+            headers.insert("origin", HeaderValue::from_str(origin).unwrap());
+        }
+        let hosts: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
+        let origins: Vec<String> = origins.iter().map(|o| o.to_string()).collect();
+        host_origin_ok(&headers, &hosts, &origins)
+    }
+
+    #[test]
+    fn the_guard_admits_loopback_literals_and_listed_names_only() {
+        for host in [
+            "127.0.0.1",
+            "127.0.0.1:8478",
+            "127.9.9.9:1",
+            "[::1]:8478",
+            "localhost:1",
+        ] {
+            assert!(guard(Some(host), None, &[], &[]), "{host}");
+        }
+        // Rebinding-shaped names, a missing Host, a routable address.
+        for host in [
+            "evil.example",
+            "localhost.evil.example",
+            "127.0.0.1.nip.io",
+            "10.0.0.5:8478",
+        ] {
+            assert!(!guard(Some(host), None, &[], &[]), "{host}");
+        }
+        assert!(!guard(None, None, &[], &[]), "no Host");
+        // An Operator-listed name, with or without its port.
+        assert!(guard(
+            Some("proxy.internal"),
+            None,
+            &["proxy.internal"],
+            &[]
+        ));
+        assert!(guard(
+            Some("proxy.internal:8478"),
+            None,
+            &["proxy.internal"],
+            &[]
+        ));
+        assert!(guard(
+            Some("PROXY.internal:8478"),
+            None,
+            &["proxy.internal"],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn any_origin_is_refused_unless_listed() {
+        assert!(!guard(
+            Some("127.0.0.1"),
+            Some("https://evil.example"),
+            &[],
+            &[]
+        ));
+        assert!(!guard(Some("127.0.0.1"), Some("null"), &[], &[]));
+        assert!(guard(
+            Some("127.0.0.1"),
+            Some("https://app.example"),
+            &[],
+            &["https://app.example"]
+        ));
     }
 }

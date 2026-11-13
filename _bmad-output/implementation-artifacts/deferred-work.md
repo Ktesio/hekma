@@ -708,3 +708,25 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-19-4-per-call-records-for-hosts.md` (build)
   summary: `perf-budgets --calls-seed` runs standalone with absolute gates (like `--proxy`), not as a block of the default report with the baseline ratchet.
   evidence: `examples/perf-budgets.rs`; the canonical baseline carries no calls metric. Trigger: a regression the absolute gate misses, or the next baseline re-seed (fold the four p99 figures into the ratchet then).
+
+## From spec-22-2 (key custody, a preview) — build, 2026-11-13
+
+- source_spec: `spec-22-2-key-custody.md` (Ask First O1; the security review's §11 gate)
+  summary: Custody ships as "preview — not yet supported"; the docs may call it supported only when P1, P4 and P7 are ruled and carried in the spine (with P8's sentence) and both stories' criteria pass in CI.
+  evidence: `docs/run-keys.md` (Key custody section and banner), `docs/metering-proxy.md`, the CHANGELOG and RELEASE_NOTES banners. Trigger: Islam's rulings, recorded in the spine.
+
+- source_spec: `spec-22-2-key-custody.md` (Design Notes: the strip/insert set and response redaction)
+  summary: Response redaction scans the buffered response; it moves to a sliding window when incremental relay ships.
+  evidence: `metering/proxy/forward.rs` `redact_response` over the whole buffered body; the proxy asks for `accept-encoding: identity` under custody so the bytes are readable. Trigger: incremental streaming relay.
+
+- source_spec: `spec-22-2-key-custody.md` (Ask First O10)
+  summary: Host memory hardening is Linux-only (non-dumpable, `RLIMIT_CORE` 0); macOS and Windows are documented, not set.
+  evidence: `backends/unix` `harden_host_memory` under `target_os = "linux"`; the hosting docs' per-OS table. Trigger: a macOS or Windows host deployment that needs it (`PT_DENY_ATTACH` and the WER exclusion are the candidates).
+
+- source_spec: `spec-22-2-key-custody.md` (Ask First O10)
+  summary: The `secret_revealed` event is recorded by `hekma agent config get --reveal` (through `Engine::note_secret_revealed`); an embedding application that calls `reveal_secrets` directly records nothing unless it calls `note_secret_revealed` first.
+  evidence: `engine.rs` `reveal_secrets` is a read-only path (it runs on a read-only engine, which cannot write the event); the embedding docs name the call. Trigger: a Host that reveals keys through the facade.
+
+- source_spec: `spec-22-2-key-custody.md` (Design Notes: the engine-observed refusal)
+  summary: An `engine-observed` agent whose provider key Hekma does not hold is refused at start (AD-22, FR-19); one whose upstream is a local `http` gateway must opt out of custody (`provider.custody = "off"`), because a custodied key goes only over `https`.
+  evidence: `domain/supervisor/spawn.rs` `custody_start`; 40 existing tests now hold a key with custody off. Trigger: Islam's answer to ledger item 29 (keep, narrow, or a grace release).

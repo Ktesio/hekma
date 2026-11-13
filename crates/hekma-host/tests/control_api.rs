@@ -5071,11 +5071,25 @@ fn the_binding_routes_serve_crud_credentials_and_typed_codes() {
         json_body(&mut response)["error"]["code"],
         "binding-not-found"
     );
+    // Story 22-2: a custodied key must be pinnable to the binding's https
+    // upstream — `api.example.com` is neither declared nor built in.
     let mut response = call(
         &client,
         "PATCH",
         &format!("{base}/alpha"),
-        Some(serde_json::json!({"labels": [], "custodied_key": "secret:KEY"})),
+        Some(serde_json::json!({"custodied_key": "secret:KEY"})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&mut response)["error"]["code"], "binding-invalid");
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/alpha"),
+        Some(serde_json::json!({
+            "labels": [],
+            "upstream": "https://api.openai.com/v1",
+            "custodied_key": "secret:KEY"
+        })),
     );
     assert_eq!(response.status(), StatusCode::OK);
     let patched = json_body(&mut response);
