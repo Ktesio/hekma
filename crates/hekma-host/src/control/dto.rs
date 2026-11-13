@@ -540,6 +540,44 @@ pub(crate) struct RunOpenedDocument {
     pub credentials: Option<CredentialsDocument>,
 }
 
+/// `POST /v0/runs/announce` (story 23-2): the external id to claim beneath
+/// the credential's binding, and Caller labels. Unknown fields are
+/// tolerated (the 0.x additive posture).
+#[derive(Deserialize)]
+pub(crate) struct AnnounceRequest {
+    /// The identity (1 to 128 visible ASCII characters).
+    pub external_id: String,
+    /// Caller labels.
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+/// `POST /v0/runs/announce`'s answer (story 23-2): `201` with the Run and
+/// its credentials, shown this once, when the announce created it; `200`
+/// with the renewed Run and no credentials when the identity was open.
+#[derive(Serialize)]
+pub(crate) struct AnnouncedDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The Run.
+    pub run: hekma_engine::RunView,
+    /// Whether this announce created the Run.
+    pub created: bool,
+    /// Its Run Key and refresh credential (on create only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<CredentialsDocument>,
+    /// What to do with what came back.
+    pub note: &'static str,
+}
+
+/// The note on a created announce.
+pub(crate) const ANNOUNCE_CREATED_NOTE: &str =
+    "This Run Key is shown once and is not stored. Keep it somewhere safe.";
+
+/// The note on a renewed announce.
+pub(crate) const ANNOUNCE_RENEWED_NOTE: &str = "This identity already announced; the existing Run \
+     was renewed and no new Run Key was issued.";
+
 /// One issued Run Key + refresh credential pair, on the wire ONCE (the 201
 /// of a child open, the 200 of a refresh). The cleartext crosses into a
 /// serializable value here and nowhere else (story 22-1: one greppable
@@ -1207,7 +1245,7 @@ pub(crate) struct BindingDocument {
 
 /// `POST /v0/bindings/{name}/credentials` — issue (rotating any previous
 /// one). The token is in this answer ONCE and is never stored or shown
-/// again; nothing accepts it in this release.
+/// again; the note says what accepts it.
 #[derive(Serialize)]
 pub(crate) struct BindingCredentialDocument {
     /// [`CONTROL_API_SCHEMA_VERSION`].

@@ -920,13 +920,90 @@ pub(crate) async fn run_close(
 ) -> ApiResult<Json<dto::RunDocument>> {
     let view = state
         .engine
-        .close_run_as(authority.actor()?, &run_id)
+        .close_run_by(authority.lease_actor()?, &run_id)
         .await
         .map_err(|err| ApiError::for_authority(&authority, err))?;
     Ok(Json(dto::RunDocument {
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
         run: view,
     }))
+}
+
+/// `POST /v0/runs/announce` (story 23-2) — announce a Run beneath the
+/// presented announce credential's binding. `201` with the Run and its
+/// custody-eligible Run Key and refresh credential, shown once, when the
+/// identity was free (or its Run had ended); `200` with the renewed Run and
+/// no credentials when it was open. Only an announce credential reaches
+/// this handler (the matrix).
+pub(crate) async fn run_announce(
+    State(state): State<ApiState>,
+    Extension(authority): Extension<super::auth::Authority>,
+    ApiJson(request): ApiJson<dto::AnnounceRequest>,
+) -> ApiResult<Response> {
+    let super::auth::Authority::Announcer(credential) = &authority else {
+        return Err(ApiError::forbidden());
+    };
+    let announced = state
+        .engine
+        .announce(
+            credential.clone(),
+            &request.external_id,
+            request.labels.into_iter().collect(),
+        )
+        .await
+        .map_err(|err| ApiError::for_authority(&authority, err))?;
+    let location = format!("/v0/runs/{}", announced.view.record.run_id);
+    let credentials = announced
+        .credentials
+        .as_ref()
+        .map(dto::CredentialsDocument::from);
+    let (status, note) = if announced.created {
+        (StatusCode::CREATED, dto::ANNOUNCE_CREATED_NOTE)
+    } else {
+        (StatusCode::OK, dto::ANNOUNCE_RENEWED_NOTE)
+    };
+    let mut response = (
+        status,
+        [(header::LOCATION, location)],
+        Json(dto::AnnouncedDocument {
+            schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+            run: announced.view,
+            created: announced.created,
+            credentials,
+            note,
+        }),
+    )
+        .into_response();
+    // A one-time credential must not sit in a cache.
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+/// `POST /v0/runs/{id}/heartbeat` (story 23-2) — renew the Run's Lease and
+/// bring a `silent` Run back to `active`. A Run Key within its own subtree,
+/// or the announce credential that created the Run. `204`; an ended Run is
+/// `409 run-ended`.
+pub(crate) async fn run_heartbeat(
+    State(state): State<ApiState>,
+    Extension(authority): Extension<super::auth::Authority>,
+    Path(run_id): Path<String>,
+) -> ApiResult<StatusCode> {
+    match state
+        .engine
+        .heartbeat(authority.lease_actor()?, &run_id)
+        .await
+    {
+        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Err(err @ hekma_engine::RunError::RunEnded { .. }) => Err(ApiError::from(err)
+            .with_message(format!(
+                "Run `{run_id}` has ended, so it has no Lease to renew; announce again to start \
+                 a new Run"
+            ))),
+        Err(err) => Err(ApiError::for_authority(&authority, err)),
+    }
 }
 
 /// `POST /v0/runs/refresh` (story 22-1) — trade the presented refresh
@@ -1911,8 +1988,9 @@ pub(crate) async fn binding_route_delete(
 /// `POST /v0/bindings/{name}/credentials` (Operator bearer only, body
 /// `{"class":"announce"|"proxy-access"}`) — issue the binding's credential
 /// of that class, rotating any previous one in the same job. The token is
-/// in this answer ONCE (its hash and token id are all that is stored);
-/// nothing accepts it in this release, and the note says so.
+/// in this answer ONCE (its hash and token id are all that is stored). The
+/// note says what accepts it: an announce credential announces beneath its
+/// binding (story 23-2); nothing accepts a proxy-access one yet.
 pub(crate) async fn binding_credential_issue(
     State(state): State<ApiState>,
     Path(name): Path<String>,
@@ -1926,11 +2004,27 @@ pub(crate) async fn binding_credential_issue(
         token_id: issued.token_id.clone(),
         token: issued.token.expose_secret().to_string(),
         note: format!(
-            "This credential is shown once and is not stored. Nothing accepts it yet; the \
-             release that does will say so. (token id {})",
+            "{} (token id {})",
+            credential_note(class, &name),
             issued.token_id
         ),
     }))
+}
+
+/// What a freshly issued binding credential is for (story 23-2).
+pub(crate) fn credential_note(
+    class: hekma_engine::BindingCredentialClass,
+    binding: &str,
+) -> String {
+    match class {
+        hekma_engine::BindingCredentialClass::Announce => format!(
+            "This credential is shown once and is not stored. It announces Runs beneath binding \
+             `{binding}` on POST /v0/runs/announce, and heartbeats or closes the Runs it creates."
+        ),
+        hekma_engine::BindingCredentialClass::ProxyAccess => "This credential is shown once and \
+             is not stored. Nothing accepts it yet; the release that does will say so."
+            .to_string(),
+    }
 }
 
 /// `POST /v0/bindings/{name}/credentials/revoke` (Operator bearer only,

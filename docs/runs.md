@@ -5,7 +5,7 @@ description: "Every agent workload as a Run with an id, labels, a status and a C
 
 # Runs, Control Depth, ps and top
 
-> **Partly on main.** Runs for supervised agents, child Runs, labels from configuration, `hekma run`, `hekma label`, `hekma ps`, Selectors on the lifecycle verbs and `hekma budget` are on main and ship in the next release. `hekma top` and Runs Hekma did not start are still being built, and their names, commands and defaults may change before they ship. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **Partly on main.** Runs for supervised agents, child Runs, labels from configuration, `hekma run`, `hekma label`, `hekma ps`, Selectors on the lifecycle verbs and `hekma budget` are on main and ship in the next release. Runs Hekma did not start, at depth `wire` and through [announce](announce.md), are on main too. `hekma top` is still being built, and their names, commands and defaults may change before they ship. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 > This page mirrors [hekma.ktesio.dev/docs/runs/](https://hekma.ktesio.dev/docs/runs/), where it is kept current.
 
@@ -23,7 +23,9 @@ With a dozen agents on a laptop, you want one list of those that need you. With 
 - **`block` works for all of them.** Usage enforces through the same Policies and budgets, and `block` refuses a Run's calls while it or any Run above it holds a latched breach. `pause` and `stop` need a process, so for these Runs they act as `warn` with the `depth-fallback` Anomaly until wire hold and reject ship.
 - **Pricing.** A wire Run has no configured model, so each call is priced at the matching Policy's flat Rate, else at the default Policy's Rate table entry for the model the call reported. A call with neither is unpriced, and a Cost Cap then raises `unpriced-model`. Cumulative ceilings bind an agent, which a wire Run does not have, so only its per-run ceilings and those of the Runs above it apply.
 
-These Runs stay open in this release: Leases and announce, which end a Run that goes quiet, are planned.
+<a id="announce"></a>**Announced Runs and Leases.** A client can [announce](announce.md) an identity: `x-hekma-announce` on a proxied call, or `POST /v0/runs/announce` under a binding's announce credential. Its Run is created once, with a Run Key and refresh credential shown once, and later announces of the open identity renew it without issuing anything. A Run discovered on the wire and announced later under the same identity stays one Run, moving to depth `announced`. An announced Run holds a **Lease** (60 seconds), renewed by every call attributed to it and by `POST /v0/runs/{id}/heartbeat`.
+
+<a id="silent"></a>**Quiet Runs go `silent`, then end.** A Run whose Lease lapses, or a Run that holds none and has had no traffic for 15 minutes, is marked `silent`: one `status-changed` event, and `hekma ps` lists it. Silence never stops anything: its next call is served, and its next call or heartbeat brings it back to `active`. A Run silent for 60 minutes ends with cause `silent-window`, its keys revoked at once; its identity's next call or announce creates a new Run. This includes a binding's Run and the unattributed Run. A supervised agent's Run is never marked silent: its process is its heartbeat. `hekma run show` prints a Run's LEASE and LAST SEEN, and Run documents carry `lease_expires_at` and `last_activity_at`.
 
 **A crash relaunch keeps the Run.** When the Restart Policy relaunches a crashed agent, the run id stays the same, so per-run Token Budgets and Cost Caps keep counting from before the crash, a breach already recorded for the Run does not fire again, and a per-run `block` fence stays up. A `pause` or `stop` the Run had already fired on a breach is applied again to the relaunched agent, so an agent that crashes while paused by a breach comes back paused. Only `start` (by you or a Host) opens a new Run. Before this release a relaunch started a fresh Run with a fresh per-run budget.
 
@@ -117,7 +119,8 @@ A **Run** is one unit of agent work with a stable run id, a Control Depth, label
 | Hold, release, reroute and reject on a set | In development |
 | `hekma top` | Planned |
 | Runs Hekma did not start at depth `wire`: binding Runs, split and child Runs, the unattributed Run | On main |
-| Runs Hekma did not start at depths `announced` and `observed` | Planned |
+| Runs Hekma did not start at depths `announced` and `observed`: announce, Leases, `silent` | On main |
+| Announce over OpenTelemetry; CrewAI and LangGraph helpers | Planned |
 
 **Control Depth** says how far Hekma controls a Run, on a ladder where each rung includes the one below: `observed` (known from telemetry or an announcement only) < `wire` (its model calls pass through the **Metering Proxy**) < `announced` (wire, plus the Run declared itself and keeps a **Lease**, its claim to be alive) < `supervised` (Hekma owns the process). A Run keeps its id when its depth changes. A supervised agent whose calls skip the proxy shows as `supervised (no wire)`.
 
@@ -130,6 +133,7 @@ Which verbs work depends on the depth; “no” means the verb fails at once wit
 | Budgets with `warn` | from telemetry | yes | yes | yes |
 | `pause` / `resume` | no | holds its calls | holds its calls | pauses the process |
 | `stop` | no | rejects its calls | rejects its calls, ends the Lease | stops the process |
+| Heartbeat (`POST /v0/runs/{id}/heartbeat`) | renews the Lease | grants and renews a Lease | renews the Lease | its process is its heartbeat |
 | `send`, `attach` | no | no | no | as the adapter declares |
 | hold, release, reroute, reject | no | yes | yes | yes |
 
@@ -138,7 +142,7 @@ limits — each with its source (the Run, the agent's configuration, a Policy
 by name, or the default Policy) — plus the `depth-fallback` and
 `unpriced-model` Anomalies a Policy can raise.
 
-**Run Status** is `active`, `held`, `silent` (no recent heartbeat or traffic), `stale` (its machine is unreachable) or `ended`. An **Anomaly** is a condition Hekma makes loud, such as a budget breach or a Run gone `silent`. It never acts on a Run, and no Run is stopped for running long: only a verb you run or a [Policy](policies.md) you configure acts on one.
+**Run Status** is `active`, `held`, `silent` (no recent heartbeat or traffic), `stale` (its machine is unreachable) or `ended`. An **Anomaly** is a condition Hekma makes loud, such as a budget breach; `silent` is a status, listed the same way. Neither acts on a Run, and no Run is stopped for running long: only a verb you run or a [Policy](policies.md) you configure acts on one.
 
 ## How it will work
 

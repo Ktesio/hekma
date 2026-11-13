@@ -482,12 +482,15 @@ fn a_caller_may_open_at_most_the_cap_of_open_children_under_one_parent() {
     let w = world();
     let (child, credentials) = w.operator_child();
     let parent = child.clone();
-    // Seed MAX - 1 open children under the caller's own Run directly.
+    // Seed open children under the caller's own Run directly, up to one
+    // short of the cap. Story 23-2: the root's whole subtree is capped too
+    // (1,000 open descendants, this child Run itself included), so here the
+    // root cap binds one Run before the per-parent cap would.
     w.registry
         .writer
         .call(move |ctx| {
             let store = ctx.store();
-            for _ in 0..(MAX_CALLER_OPEN_CHILDREN - 1) {
+            for _ in 0..(MAX_CALLER_OPEN_CHILDREN - 2) {
                 store.insert_run(&crate::ports::NewRun {
                     record: record(&RunId::mint(), false, Some(&parent)),
                     labels: Vec::new(),
@@ -499,7 +502,7 @@ fn a_caller_may_open_at_most_the_cap_of_open_children_under_one_parent() {
         })
         .unwrap();
     let caller = w.caller(credentials.run_key());
-    // The 1,000th open child is allowed; the 1,001st is refused.
+    // The subtree's 1,000th open Run is allowed; the next is refused.
     w.open(caller.clone(), &child).unwrap();
     let err = w.open(caller, &child).unwrap_err();
     assert_eq!(err.code(), "too-many-children");

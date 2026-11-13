@@ -12,6 +12,7 @@
     "policies",
     "run-keys",
     "metering-proxy",
+    "announce",
     "attach",
     "---Reference---",
     "commands",

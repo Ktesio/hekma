@@ -19,6 +19,7 @@ With [key custody](#key-custody-preview--not-yet-supported) (a preview), a Run K
 |---|---|
 | A key per launch | Every supervised start, and every Restart Policy relaunch, issues a fresh Run Key and hands it to the agent in `HEKMA_RUN_KEY`. |
 | A pair per child Run | `POST /v0/runs` (and `hekma run open --print-key`) returns the child's Run Key and a refresh credential, once. |
+| A pair per announced Run | An [announce](announce.md) that creates its Run returns the Run's Run Key and refresh credential once: in the `201` of `POST /v0/runs/announce`, or in the `x-hekma-run-key` and `x-hekma-refresh` response headers of the announcing call. Announcing an open identity again issues nothing. |
 | Hash-only storage | Hekma stores the SHA-256 of each credential, never the value. A short **token id** (12 hex characters) labels it in records and reports. |
 | Revocation | A key is revoked when its process exits, when its Run ends, after a refresh, when it shows up in a URL, and on demand with `hekma run revoke-keys`. The next request presenting it is refused. |
 | Refresh with reuse detection | A refresh credential trades itself once for a new pair. Presenting a used one again — or seeing one in a URL — revokes the Run's current pair and raises the `credential-reuse` Anomaly. |
@@ -98,6 +99,10 @@ The [metering proxy](metering-proxy.md) reads a Run Key sent in `x-hekma-run-key
 
 A Run Key in the API-key slot (`authorization`, `x-api-key`, `x-goog-api-key` or `api-key`) asks for the custodied key. If its Run holds none, or the key was not issued to a supervised agent or a credentialed open, the call is refused with `400 hekma_custody_unavailable` rather than forwarded to the provider. Without custody, send the provider key in `authorization` and the Run Key in `x-hekma-run-key`. Every `x-hekma-*` header is removed before the call is forwarded.
 
+### Heartbeat and close
+
+A Run Key heartbeats its own Run or one beneath it with `POST /v0/runs/{id}/heartbeat`, renewing the Run's [Lease](announce.md#leases-and-the-windows), and closes a child as before. A binding's **announce credential** (`hk_ann_`) announces Runs beneath its binding, and heartbeats or closes only the Runs it created; on any other route, or for another Run, it is refused with `403`.
+
 ### External ids
 
 A child open's `external_id` makes a retry safe: the same id returns the same Run. Ids are scoped by who opens. The Operator and Hosts share one namespace; each Run's keys have their own, so a Run Key can neither take over nor discover an id the Operator or a Host uses.
@@ -151,9 +156,9 @@ Give Hekma a key scoped to inference on the projects and models your agents use.
 
 ### Which calls get the key
 
-Only a call that presents a Run Key issued to a supervised agent, or to a Run opened through the Control API with credentials, can use the custodied key — in the API-key slot (`authorization`, `x-api-key`, `x-goog-api-key` or `api-key`) or in `x-hekma-run-key`. A child Run of a custodied agent uses its parent's key. An endpoint binding's custodied key is used only by such a credential, never by a call that arrives with none.
+Only a call that presents a Run Key issued to a supervised agent, to a Run opened through the Control API with credentials, or to a Run announced on `POST /v0/runs/announce` (which presented an announce credential), can use the custodied key — in the API-key slot (`authorization`, `x-api-key`, `x-goog-api-key` or `api-key`) or in `x-hekma-run-key`. A child Run of a custodied agent uses its parent's key. An endpoint binding's custodied key is used only by such a credential, never by a call that arrives with none.
 
-Any other call is forwarded with whatever key it carries, or none. A Run Key in the API-key slot whose Run holds no key is refused with `400 hekma_custody_unavailable`.
+Any other call is forwarded with whatever key it carries, or none. A Run Key issued through the `x-hekma-announce` header never draws custody: whoever sent the header got it, with no credential. A Run Key in the API-key slot whose Run holds no key, or that is not eligible, is refused with `400 hekma_custody_unavailable`.
 
 Under the swap, the proxy removes every credential the client sent and inserts the custodied key once, in the provider's own header. If the provider echoes the key in a response, the proxy replaces it with `hekma_redacted_key` before the agent sees it. It asks the provider for an uncompressed response so the check can see the bytes.
 
@@ -222,7 +227,8 @@ A call is **scented** when a valid Run Key identifies it: sent in `x-hekma-run-k
 - **Only tighter.** A Run's own Caller (its Run Key) may raise its Run's mode with `scent_check` on `PATCH /v0/runs/{id}/limits`, never lower it. The Operator sets modes on Policies.
 - **An unknown or revoked Run Key is refused under every mode** (`401 hekma_unknown_credential`, `401 hekma_credential_revoked`): a key that fails is a failed authentication, not a missing identity.
 - **Breach Actions do not change.** A latched `block` still refuses first with its `402`, under every mode, and `warn`, `pause` and `stop` behave the same under every mode. Unlike `block`, `enforce` has no exemption for `GET`, `HEAD` or `OPTIONS`.
-- **Attribution, not access control.** On your machine any process can obtain an identity; Scent-Check is about knowing which Run a call belongs to. Custody's protection does not depend on the mode.
+- **Announcing is served under every mode.** A call that [announces](announce.md) is served under `enforce` too: announcing is how a client obtains the identity the mode asks for. Under `shadow` the announced Run gets the `unscented` Anomaly; its later calls that present its Run Key are scented.
+- **Attribution, not access control.** On your machine any process can obtain an identity, by announcing one; Scent-Check is about knowing which Run a call belongs to. Custody's protection does not depend on the mode.
 - `enforce` is never a default.
 
 ## What is coming

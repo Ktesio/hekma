@@ -14,13 +14,18 @@
 //! route's, else the binding's own Run when it has labels, else the single
 //! unattributed Run; an `x-hekma-run` hint names a child (beneath a key or
 //! a route) or a split Run (beneath a labelled binding) and is ignored
-//! beneath the unattributed Run. The upstream is always the route's or the
+//! beneath the unattributed Run. Story 23-2: an `x-hekma-announce` header
+//! claims the same namespaces — a child beneath a key or a route, else
+//! `binding:<name>` beneath ANY binding (labelled or not: it mints a
+//! credential, so it is never ignored) — and wins over a hint on the same
+//! call (the hint is then counted as ignored). The upstream is always the route's or the
 //! binding's — a Run Key never chooses where a call goes.
 
 use std::sync::Arc;
 
 use crate::domain::credential::{parse_presented, scan_url, TokenClass, TokenHash};
 use crate::domain::custody::CustodyInfo;
+use crate::domain::runs::announce::{AnnounceClaim, AnnounceScope};
 use crate::domain::runs::snapshot::RunSnapshot;
 use crate::domain::runs::wire::{parse_hint_labels, valid_external_id, WireIdentity};
 use crate::domain::RunId;
@@ -39,6 +44,8 @@ pub(crate) struct CallFacts<'a> {
     pub api_key: Option<&'a str>,
     pub hint: Option<&'a str>,
     pub hint_labels: Option<&'a str>,
+    /// Story 23-2: the `x-hekma-announce` header.
+    pub announce: Option<&'a str>,
 }
 
 /// Why a call was refused before any upstream dial.
@@ -93,6 +100,14 @@ pub(crate) enum Attribution {
         fallback: Option<RunId>,
         fallback_identity: Option<WireIdentity>,
     },
+    /// Story 23-2: an announce to claim through the writer (renewing an
+    /// open identity, or creating its Run and minting its pair); the
+    /// fallbacks as for [`Attribution::Ensure`], when a cap is reached.
+    Announce {
+        claim: AnnounceClaim,
+        fallback: Option<RunId>,
+        fallback_identity: Option<WireIdentity>,
+    },
 }
 
 /// The outcome of identification. Built once per proxied call, on the hot
@@ -109,6 +124,20 @@ pub(crate) enum Identified {
         hint_ignored: bool,
     },
     Refused(Refusal),
+}
+
+/// Where a call stays when its split or announce cannot claim its own Run:
+/// the base Run, or the identity the base would ensure.
+fn fallback_of(base: Attribution) -> (Option<RunId>, Option<WireIdentity>) {
+    match base {
+        Attribution::Run(run) => (Some(run), None),
+        Attribution::Ensure { identity, .. } => (None, Some(identity)),
+        Attribution::Announce {
+            fallback,
+            fallback_identity,
+            ..
+        } => (fallback, fallback_identity),
+    }
 }
 
 fn bearer(value: &str) -> Option<&str> {
@@ -306,8 +335,58 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
         }
     };
 
+    // Story 23-2: the announce, before the hint (it wins; a hint on the
+    // same call is counted as ignored). A malformed external id is ignored
+    // like a malformed hint. A key or a Run route always resolves to a Run,
+    // so every well-formed announce has a scope.
+    let announce = facts.announce.map(str::trim).filter(|a| !a.is_empty());
+    let announce_ignored = announce.is_some_and(|a| !valid_external_id(a));
+    let scope =
+        announce
+            .filter(|a| valid_external_id(a))
+            .and_then(|_| match (&key, &route, &base) {
+                (Some(_), _, Attribution::Run(parent))
+                | (None, Route::Run(_), Attribution::Run(parent)) => {
+                    Some(AnnounceScope::Parent(parent.clone()))
+                }
+                (None, Route::Binding { name, .. }, _) => {
+                    Some(AnnounceScope::Binding(name.clone()))
+                }
+                _ => None,
+            });
+    if let (Some(scope), Some(external)) = (scope, announce) {
+        let caller_labels = facts
+            .hint_labels
+            .and_then(parse_hint_labels)
+            .unwrap_or_default();
+        let (fallback, fallback_identity) = fallback_of(base);
+        return Identified::Call {
+            target: Target {
+                upstream,
+                rest,
+                via,
+                token_id,
+                custody,
+            },
+            attribution: Attribution::Announce {
+                claim: AnnounceClaim {
+                    scope,
+                    external: external.to_string(),
+                    caller_labels,
+                    credentialed: false,
+                    created_by: None,
+                    issuer: "announce".to_string(),
+                    wire: true,
+                },
+                fallback,
+                fallback_identity,
+            },
+            hint_ignored: facts.hint.is_some_and(|hint| !hint.trim().is_empty()),
+        };
+    }
+
     // The hint.
-    let mut hint_ignored = false;
+    let mut hint_ignored = announce_ignored;
     let attribution = match facts.hint.map(str::trim).filter(|h| !h.is_empty()) {
         None => base,
         Some(hint) if !valid_external_id(hint) => {
@@ -351,10 +430,7 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
                     external: hint.to_string(),
                     labels: labels.clone(),
                 };
-                let (fallback, fallback_identity) = match base {
-                    Attribution::Run(run) => (Some(run), None),
-                    Attribution::Ensure { identity, .. } => (None, Some(identity)),
-                };
+                let (fallback, fallback_identity) = fallback_of(base);
                 match snapshot.identities.get(&identity.key()) {
                     Some(split) => Attribution::Run(split.clone()),
                     None => Attribution::Ensure {

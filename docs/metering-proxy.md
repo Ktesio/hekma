@@ -5,7 +5,7 @@ description: "One loopback proxy per state directory meters every model call, at
 
 # The metering proxy
 
-> **On main, not yet released.** The shared metering proxy ships with the next release. It replaces the per-agent metering listener. Key custody is a preview, not yet supported. Scent-Check Modes are on main. Announce, wire hold and reroute, and serving beyond loopback are still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **On main, not yet released.** The shared metering proxy ships with the next release. It replaces the per-agent metering listener. Key custody is a preview, not yet supported. Scent-Check Modes and [announce](announce.md) are on main. Wire hold and reroute, and serving beyond loopback, are still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 Hekma meters model calls by sitting between a client and its model provider. The **metering proxy** is one HTTP listener on `127.0.0.1`, owned by the Service Host (`hekma serve`). Each call it forwards is attributed to a [Run](runs.md), counted once in the usage ledger, checked against that Run's budgets, and relayed back. Supervised agents reach it through the base URL Hekma injects. Any other client reaches it through an **endpoint binding** you create.
 
@@ -62,6 +62,17 @@ Two request headers refine the Run. Neither is ever an identity on its own.
 An id is at most 128 visible ASCII characters, and a hint carries at most 16 labels, each checked like any label. A hint's labels apply when it creates the Run; later different labels are ignored. Each parent or binding holds at most 1,000 open hint Runs. Past that, or past 8 levels of nesting, calls stay on the parent, still attributed, and a diagnostic says so at most once a minute.
 
 The first call for a new Run waits up to one second for the Run to be created. Past that it is refused with `503 hekma_run_unavailable` (retryable) and not forwarded.
+
+### Announce
+
+`x-hekma-announce: <id>` claims an identity in the same namespaces a hint uses: a child beneath a Run Key or a Run route, else `<id>` beneath the binding, labelled or not (it is never ignored, because it issues a Run Key). It wins over an `x-hekma-run` hint on the same call, and `x-hekma-labels` gives the Run its Caller labels. A call that announces is served under every Scent-Check Mode. The claim waits within the same one-second bound.
+
+When the claim **creates** the Run, the call's response carries the new Run's credentials once, whatever status it answers:
+
+- `x-hekma-run-key: hk_run_…` and `x-hekma-refresh: hk_ref_…`, with `cache-control: no-store`;
+- never again: a later announce of the open identity renews its Lease and issues nothing.
+
+This Run Key never draws key custody. Past a cap, the call stays on the parent or binding Run, nothing is issued, and a diagnostic says so at most once a minute. See [Announce and Leases](announce.md).
 
 ## What the proxy changes
 
@@ -159,7 +170,7 @@ There are at most 256 bindings. Changing a binding's prefix or upstream keeps it
 Each binding can also hold one active **announce** credential (`hk_ann_`) and one active **proxy-access** credential (`hk_pxy_`):
 - `hekma binding credential issue` prints the credential once and stores only its hash. Issuing again revokes the previous one.
 - `revoke` works per class, and `list` shows token ids and states.
-- **Nothing accepts either credential yet.** Announce and the proxy beyond loopback will.
+- **The announce credential** announces Runs beneath its binding on `POST /v0/runs/announce`, and heartbeats or closes the Runs it created (see [Announce and Leases](announce.md)). **Nothing accepts the proxy-access credential yet;** the proxy beyond loopback will.
 
 Bindings are managed by the Operator only: through `hekma binding` (see [Commands](commands.md)) or `/v0/bindings` (see [Control API](control-api.md)).
 
@@ -211,11 +222,14 @@ The `402` body and headers are unchanged from earlier releases; see [Governance]
 |---|---|---|
 | `x-hekma-run-key` | Request | The Run Key naming the call's Run |
 | `x-hekma-run` | Request | A hint: a child or split Run's id |
-| `x-hekma-labels` | Request | The hint's Caller labels |
+| `x-hekma-labels` | Request | The hint's or announce's Caller labels |
+| `x-hekma-announce` | Request | Claim this identity (see [Announce](#announce)) |
 | `x-hekma-*` | Request | Every one is removed before forwarding |
 | `x-hekma-run-id` | Outbound | The Run's id (unless `--no-identity-headers`) |
 | `x-hekma-labels` | Outbound | The Run's labels (unless `--no-identity-headers`) |
 | `x-hekma-breach` | Response | The latched breaches of the Run or a Run above it |
+| `x-hekma-run-key` | Response | A first announce's new Run Key, once |
+| `x-hekma-refresh` | Response | A first announce's new refresh credential, once |
 
 ## Moving from the per-agent listener
 
@@ -232,7 +246,7 @@ Earlier releases gave each `engine-observed` agent its own listener on its own p
 ## What is still planned
 
 - **Key custody, supported:** it is a preview today, until the pending security rulings are recorded and its test criteria pass in CI.
-- **Announce:** self-identifying clients and Leases.
+- **Announce over OpenTelemetry,** and helpers for CrewAI and LangGraph.
 - **Wire hold, release, reroute and reject.**
 - **Incremental streaming relay.**
 - **An authenticated proxy beyond loopback.**

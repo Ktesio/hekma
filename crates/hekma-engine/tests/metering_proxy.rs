@@ -1948,3 +1948,456 @@ fn recorded_calls_read_back_with_their_shapes_and_nothing_secret_anywhere() {
         }
     }
 }
+
+/// Story 23-2: the `x-hekma-announce` header channel end to end — a first
+/// announcing call is served and its response carries the Run Key and
+/// refresh credential ONCE; the Run is `binding:<name>`/id at `announced`;
+/// the minted key identifies the Run, is never custody-eligible, never
+/// reaches the upstream or the state directory, and a revoked key wins
+/// over an announce of the same identity, which never re-mints.
+#[test]
+fn a_header_announce_returns_its_pair_once_and_the_key_names_the_run() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let announce = [
+        ("x-hekma-announce", "job-7"),
+        ("x-hekma-labels", "step=plan"),
+    ];
+    let first = post(port, "/openai/chat", &announce);
+    assert_eq!(first.status, 200, "{}", first.body);
+    let key = first.header("x-hekma-run-key").unwrap().to_string();
+    let refresh = first.header("x-hekma-refresh").unwrap().to_string();
+    assert!(key.starts_with("hk_run_") && refresh.starts_with("hk_ref_"));
+    assert_eq!(first.header("cache-control"), Some("no-store"));
+    // A re-announce is served with no credentials.
+    let again = post(port, "/openai/chat", &announce);
+    assert_eq!(again.status, 200);
+    assert!(again.header("x-hekma-run-key").is_none());
+    assert!(again.header("x-hekma-refresh").is_none());
+    let run = wait_for_usage(&engine, ("binding:openai", "job-7"), 20);
+    assert_eq!(run.record.control_depth.as_str(), "announced");
+    assert!(run.record.wire_path);
+    assert!(run
+        .labels
+        .iter()
+        .any(|label| label.key == "team" && label.value == "core"));
+    assert!(run
+        .labels
+        .iter()
+        .any(|label| label.key == "step" && label.value == "plan"));
+    let shown = engine.blocking().run(run.record.run_id.as_str()).unwrap();
+    assert!(
+        shown.lease_expires_at.is_some(),
+        "an announced Run holds a Lease"
+    );
+    // The minted key names the Run.
+    let keyed = post(port, "/openai/chat", &[("x-hekma-run-key", &key)]);
+    assert_eq!(keyed.status, 200, "{}", keyed.body);
+    wait_for_usage(&engine, ("binding:openai", "job-7"), 30);
+    // A header-announced key never draws custody: in the API-key slot it
+    // is `custody_unavailable`, and nothing is forwarded.
+    let served = upstream.served().len();
+    let slot = post(
+        port,
+        "/openai/chat",
+        &[("authorization", &format!("Bearer {key}"))],
+    );
+    assert_eq!(slot.status, 400, "{}", slot.body);
+    assert_eq!(slot.error_type(), "hekma_custody_unavailable");
+    assert_eq!(upstream.served().len(), served);
+    // Neither the announce nor a credential reached the upstream.
+    for seen in upstream.served() {
+        assert!(seen.header("x-hekma-announce").is_none());
+        assert!(seen.header("x-hekma-run-key").is_none());
+        assert!(!format!("{seen:?}").contains(&refresh));
+    }
+    // A revoked key presented with an announce of the same identity: the
+    // 401 wins, and a later announce renews without a new key.
+    engine
+        .blocking()
+        .revoke_run_keys(run.record.run_id.as_str(), true)
+        .unwrap();
+    let revoked = post(
+        port,
+        "/openai/chat",
+        &[("x-hekma-run-key", &key), ("x-hekma-announce", "job-7")],
+    );
+    assert_eq!(revoked.status, 401, "{}", revoked.body);
+    assert_eq!(revoked.error_type(), "hekma_credential_revoked");
+    let renewed = post(port, "/openai/chat", &announce);
+    assert_eq!(renewed.status, 200);
+    assert!(
+        renewed.header("x-hekma-run-key").is_none(),
+        "announcing never re-mints a revoked key"
+    );
+    // Nothing in the state directory carries either credential.
+    drop(engine);
+    for secret in [&key, &refresh] {
+        assert!(files_carrying(state.path(), secret).is_empty());
+    }
+}
+
+/// Story 23-2: an announce beneath an unlabelled binding claims its own
+/// Run (it is never ignored like a hint there).
+#[test]
+fn an_announce_beneath_an_unlabelled_binding_claims_its_own_run() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    bind(&engine, "plain", "/plain", &upstream.base(), &[]);
+    let first = post(port, "/plain/chat", &[("x-hekma-announce", "solo")]);
+    assert_eq!(first.status, 200, "{}", first.body);
+    assert!(first.header("x-hekma-run-key").is_some());
+    let run = wait_for_usage(&engine, ("binding:plain", "solo"), 10);
+    assert_eq!(run.record.control_depth.as_str(), "announced");
+    assert!(
+        !runs(&engine)
+            .iter()
+            .any(|r| r.identity.as_ref().is_some_and(|(ns, _)| ns == "proxy")),
+        "the unattributed Run was not used"
+    );
+}
+
+/// Story 23-2: the fence wins over everything, and a fenced announcing
+/// call still carries its credentials on the 402 — the child Run beneath a
+/// blocked parent's key exists and is listed; its calls are refused by its
+/// ancestor's ceiling.
+#[test]
+fn a_fenced_announcing_call_answers_402_with_its_credentials() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    engine
+        .blocking()
+        .create_policy(
+            PolicyChange {
+                name: "core-cap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits {
+                    tokens_per_run: Some(10),
+                    breach_action: Some(BreachAction::Block),
+                    ..PolicyLimits::default()
+                },
+                ..PolicyChange::default()
+            },
+            false,
+        )
+        .unwrap();
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    // The parent: announced, its key spends past its 10-token ceiling.
+    let first = post(port, "/openai/chat", &[("x-hekma-announce", "parent")]);
+    assert_eq!(first.status, 200, "{}", first.body);
+    let parent_key = first.header("x-hekma-run-key").unwrap().to_string();
+    wait_for_usage(&engine, ("binding:openai", "parent"), 10);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let answer = post(port, "/openai/chat", &[("x-hekma-run-key", &parent_key)]);
+        if answer.status == 402 {
+            break;
+        }
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert!(Instant::now() < deadline, "block never fenced the parent");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let served = upstream.served().len();
+    // A child announced beneath the fenced parent's key: 402, nothing
+    // forwarded, and the child's pair rides the refusal.
+    let fenced = post(
+        port,
+        "/openai/chat",
+        &[
+            ("x-hekma-run-key", &parent_key),
+            ("x-hekma-announce", "kid"),
+        ],
+    );
+    assert_eq!(fenced.status, 402, "{}", fenced.body);
+    assert_eq!(fenced.error_type(), "hekma_budget_block");
+    assert!(fenced
+        .header("x-hekma-run-key")
+        .is_some_and(|key| key.starts_with("hk_run_") && key != parent_key));
+    assert!(fenced.header("x-hekma-refresh").is_some());
+    assert_eq!(upstream.served().len(), served);
+    assert!(runs(&engine).iter().any(|run| run
+        .identity
+        .as_ref()
+        .is_some_and(|(ns, id)| ns.starts_with("run:") && id == "kid")));
+}
+
+/// Poll until the Run `identity` has `status`, returning it.
+fn wait_for_status(engine: &Engine, identity: (&str, &str), status: &str) -> RunSummary {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let found = runs(engine).into_iter().find(|run| {
+            run.identity
+                .as_ref()
+                .is_some_and(|(ns, id)| ns == identity.0 && id == identity.1)
+                && run.record.status.as_str() == status
+        });
+        if let Some(run) = found {
+            return run;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no Run {identity:?} became {status}: {:?}",
+            runs(engine)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Story 23-2: the sweeper over a real proxy, with second-scale windows —
+/// an announced Run whose Lease lapses goes `silent` (served all the
+/// while), a call brings it back to `active`, and past the silent window
+/// it ends (`silent-window`) with its key revoked at once; the identity's
+/// next announce creates a new Run.
+#[test]
+fn the_sweeper_silences_renews_and_ends_an_announced_run() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let engine = Engine::open_with_options(
+        Some(state.path().to_path_buf()),
+        EngineOptions {
+            metering_proxy: MeteringProxyOptions {
+                leases: hekma_engine::LeaseOptions {
+                    lease_secs: 1,
+                    wire_inactivity_secs: 1,
+                    silent_window_secs: 3,
+                    sweep_interval_secs: 1,
+                },
+                ..MeteringProxyOptions::default()
+            },
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let port = engine.metering_proxy().unwrap().port;
+    bind(&engine, "openai", "/openai", &upstream.base(), &[]);
+    // The unattributed Run (an unlabelled binding's plain call) holds no
+    // Lease: it ends by inactivity too, and is recreated on the next call.
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    let first = post(port, "/openai/chat", &[("x-hekma-announce", "job")]);
+    assert_eq!(first.status, 200, "{}", first.body);
+    let key = first.header("x-hekma-run-key").unwrap().to_string();
+    let identity = ("binding:openai", "job");
+    let silent = wait_for_status(&engine, identity, "silent");
+    // Silence never stops anything: the next call is served and lifts it.
+    let call = post(port, "/openai/chat", &[("x-hekma-run-key", &key)]);
+    assert_eq!(call.status, 200, "{}", call.body);
+    let active = wait_for_status(&engine, identity, "active");
+    assert_eq!(active.record.run_id, silent.record.run_id);
+    // Left alone: silent again, then ended past the silent window.
+    let ended = wait_for_status(&engine, identity, "ended");
+    assert_eq!(ended.record.run_id, silent.record.run_id);
+    assert_eq!(ended.record.end_cause.as_deref(), Some("silent-window"));
+    let refused = post(port, "/openai/chat", &[("x-hekma-run-key", &key)]);
+    assert_eq!(refused.status, 401, "{}", refused.body);
+    assert_eq!(refused.error_type(), "hekma_credential_revoked");
+    // The identity's next announce is a new Run, with a new pair.
+    let again = post(port, "/openai/chat", &[("x-hekma-announce", "job")]);
+    assert_eq!(again.status, 200);
+    assert!(again
+        .header("x-hekma-run-key")
+        .is_some_and(|fresh| fresh != key));
+    let reborn = wait_for_status(&engine, identity, "active");
+    assert_ne!(reborn.record.run_id, ended.record.run_id);
+    let unattributed = ("proxy", "unattributed");
+    let gone = wait_for_status(&engine, unattributed, "ended");
+    assert_eq!(gone.record.end_cause.as_deref(), Some("silent-window"));
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    let fresh = wait_for_status(&engine, unattributed, "active");
+    assert_ne!(fresh.record.run_id, gone.record.run_id);
+}
+
+/// Story 23-2: concurrent first announces of one identity converge on ONE
+/// Run and exactly one minted pair (the writer serializes the claims).
+#[test]
+fn concurrent_first_announces_converge_on_one_run_and_one_pair() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    bind(&engine, "openai", "/openai", &upstream.base(), &[]);
+    let answers: Vec<Answer> = std::thread::scope(|scope| {
+        let calls: Vec<_> = (0..50)
+            .map(|_| {
+                scope.spawn(move || post(port, "/openai/chat", &[("x-hekma-announce", "same")]))
+            })
+            .collect();
+        calls.into_iter().map(|call| call.join().unwrap()).collect()
+    });
+    assert!(answers.iter().all(|answer| answer.status == 200));
+    let minted = answers
+        .iter()
+        .filter(|answer| answer.header("x-hekma-run-key").is_some())
+        .count();
+    assert_eq!(minted, 1, "exactly one pair is issued");
+    let matching = runs(&engine)
+        .into_iter()
+        .filter(|run| {
+            run.identity
+                .as_ref()
+                .is_some_and(|(ns, id)| ns == "binding:openai" && id == "same")
+        })
+        .count();
+    assert_eq!(matching, 1, "exactly one Run");
+}
+
+/// Story 23-2: the engine's announce facade (what the Control API's
+/// announce, heartbeat and close routes call): a credential resolves, an
+/// announce creates then renews, heartbeat and close act on the Run it
+/// created, and a revoked or unknown credential is refused.
+#[test]
+fn the_engine_announce_facade_resolves_creates_renews_and_closes() {
+    use hekma_engine::{AnnounceCredentialState, BindingCredentialClass, LeaseActor, RunError};
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, _port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let facade = engine.blocking();
+    let issued = facade
+        .issue_binding_credential("openai", BindingCredentialClass::Announce)
+        .unwrap();
+    let token = issued.token.expose_secret().to_string();
+    let AnnounceCredentialState::Active(credential) = facade.announce_credential(&token).unwrap()
+    else {
+        panic!("the issued credential resolves");
+    };
+    assert_eq!(credential.binding, "openai");
+    let shown = format!("{credential:?}");
+    assert!(shown.contains(&credential.token_id) && !shown.contains(&token));
+    // Other shapes, and a value never issued, are unknown.
+    for other in [
+        format!("hk_run_{}", "9".repeat(52)),
+        format!("hk_ann_{}", "9".repeat(52)),
+        "not-a-token".to_string(),
+    ] {
+        assert_eq!(
+            facade.announce_credential(&other).unwrap(),
+            AnnounceCredentialState::Unknown
+        );
+    }
+    let created = facade
+        .announce(
+            credential.clone(),
+            "job",
+            vec![("step".into(), "plan".into())],
+        )
+        .unwrap();
+    assert!(created.created && created.credentials.is_some());
+    assert!(created.view.lease_expires_at.is_some());
+    let run_id = created.view.record.run_id.as_str().to_string();
+    let renewed = facade
+        .announce(credential.clone(), "job", Vec::new())
+        .unwrap();
+    assert!(!renewed.created && renewed.credentials.is_none());
+    assert_eq!(renewed.view.record.run_id.as_str(), run_id);
+    assert!(matches!(
+        facade.announce(credential.clone(), "has space", Vec::new()),
+        Err(RunError::Invalid { .. })
+    ));
+    let by = LeaseActor::Announcer(credential.clone());
+    let beat = facade.heartbeat(by.clone(), &run_id).unwrap();
+    assert!(beat.last_activity_at.is_some());
+    let closed = facade.close_run_by(by, &run_id).unwrap();
+    assert_eq!(closed.record.status.as_str(), "ended");
+    // Revoked: resolved as revoked, and an announce in flight is refused
+    // inside its job.
+    facade
+        .revoke_binding_credential("openai", BindingCredentialClass::Announce)
+        .unwrap();
+    assert_eq!(
+        facade.announce_credential(&token).unwrap(),
+        AnnounceCredentialState::Revoked
+    );
+    assert!(matches!(
+        facade.announce(credential.clone(), "job-2", Vec::new()),
+        Err(RunError::CredentialRevoked)
+    ));
+    // The binding gone, its credentials with it.
+    facade.delete_binding("openai").unwrap();
+    assert!(matches!(
+        facade.announce(credential, "job-3", Vec::new()),
+        Err(RunError::CredentialUnknown)
+    ));
+}
+
+/// Story 23-2: an announce that cannot claim (here a Caller label on a key
+/// the binding sets) stays on the binding's Run, served, and issues
+/// nothing; under `enforce` an announcing call is served while a plain one
+/// is refused.
+#[test]
+fn a_refused_claim_stays_on_the_binding_and_enforce_serves_an_announce() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let bound = post(
+        port,
+        "/openai/chat",
+        &[("x-hekma-announce", "job"), ("x-hekma-labels", "team=edge")],
+    );
+    assert_eq!(bound.status, 200, "{}", bound.body);
+    assert!(bound.header("x-hekma-run-key").is_none());
+    wait_for_usage(&engine, ("binding", "openai"), 10);
+    assert!(!runs(&engine).iter().any(|run| run
+        .identity
+        .as_ref()
+        .is_some_and(|(ns, _)| ns == "binding:openai")));
+    engine
+        .blocking()
+        .create_policy(
+            PolicyChange {
+                name: "strict".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits {
+                    scent_check: Some(hekma_engine::ScentCheckMode::Enforce),
+                    ..PolicyLimits::default()
+                },
+                ..PolicyChange::default()
+            },
+            false,
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let plain = post(port, "/openai/chat", &[]);
+        if plain.status == 401 {
+            assert_eq!(plain.error_type(), "hekma_unscented_call");
+            break;
+        }
+        assert!(Instant::now() < deadline, "enforce never applied");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let announced = post(port, "/openai/chat", &[("x-hekma-announce", "strict-job")]);
+    assert_eq!(announced.status, 200, "{}", announced.body);
+    let key = announced.header("x-hekma-run-key").unwrap().to_string();
+    assert_eq!(
+        post(port, "/openai/chat", &[("x-hekma-run-key", &key)]).status,
+        200
+    );
+}

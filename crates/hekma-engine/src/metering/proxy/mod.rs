@@ -63,6 +63,9 @@ pub struct MeteringProxyOptions {
     /// SDKs send none, and a browser page's cross-site request is the
     /// threat).
     pub allowed_origins: Vec<String>,
+    /// Story 23-2: the Lease and window knobs (the sweeper runs beside the
+    /// proxy, in the engine that owns the data path).
+    pub leases: crate::domain::runs::lease::LeaseOptions,
     /// cfg(test) seam: one extra trusted root (DER) for the custody tests'
     /// TLS fake upstream.
     #[cfg(test)]
@@ -90,6 +93,7 @@ impl Default for MeteringProxyOptions {
             max_buffered_bytes: 512 * 1024 * 1024,
             allowed_hosts: Vec::new(),
             allowed_origins: Vec::new(),
+            leases: crate::domain::runs::lease::LeaseOptions::default(),
             #[cfg(test)]
             test_root_der: None,
         }
@@ -125,6 +129,9 @@ pub(crate) struct MeteringProxy {
     shared: Arc<forward::ProxyShared>,
     stop: Option<tokio::sync::watch::Sender<Option<Duration>>>,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// Story 23-2: the Lease sweeper (aborted before the record pump
+    /// closes, so the store writer can close).
+    sweeper: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// What the proxy needs from its engine.
@@ -176,11 +183,12 @@ impl MeteringProxy {
         };
         let pump = Arc::new(records::RecordPump {
             permits: Arc::new(Semaphore::new(records::RECORD_PERMITS)),
-            writer: std::sync::Mutex::new(Some(deps.writer)),
+            writer: std::sync::Mutex::new(Some(deps.writer.clone())),
             runs: Arc::clone(&deps.snapshot),
             inbox: deps.inbox,
             stats: Arc::default(),
             diagnostics: Arc::clone(&deps.diagnostics),
+            leases: options.leases,
             #[cfg(test)]
             fail_closes: Arc::default(),
             #[cfg(test)]
@@ -210,6 +218,14 @@ impl MeteringProxy {
         });
         let (stop, stop_rx) = tokio::sync::watch::channel(None);
         let task = handle.spawn(accept_loop(listener, Arc::clone(&shared), stop_rx));
+        let sweeper = spawn_sweeper(
+            handle,
+            deps.writer,
+            Arc::clone(&shared.pump.runs),
+            Arc::clone(&shared.pump.inbox),
+            options.leases,
+            Arc::clone(&shared.pump.diagnostics),
+        );
         Ok(Self {
             info: ProxyInfo {
                 url: format!("http://127.0.0.1:{}", addr.port()),
@@ -218,6 +234,7 @@ impl MeteringProxy {
             shared,
             stop: Some(stop),
             task: Some(task),
+            sweeper: Some(sweeper),
         })
     }
 
@@ -236,6 +253,10 @@ impl MeteringProxy {
     /// `grace`, abort the rest (recorded `shutdown`), then close the record
     /// pump so the store writer can close.
     pub(crate) async fn shutdown(&mut self, grace: Duration) {
+        if let Some(sweeper) = self.sweeper.take() {
+            sweeper.abort();
+            let _ = sweeper.await;
+        }
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(Some(grace));
         }
@@ -251,11 +272,61 @@ impl Drop for MeteringProxy {
         self.shared
             .stopping
             .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(sweeper) = self.sweeper.take() {
+            sweeper.abort();
+        }
         if let Some(task) = self.task.take() {
             task.abort();
         }
         self.shared.pump.close();
     }
+}
+
+/// The Lease sweeper (story 23-2): one writer job per tick marks expired
+/// or idle Runs `silent` and ends Runs silent past the window, publishing
+/// before return; the Run events reach the bus through the evaluation
+/// inbox (drained on the reaper tick).
+fn spawn_sweeper(
+    handle: &tokio::runtime::Handle,
+    writer: WriterHandle,
+    runs: Arc<SnapshotPublisher>,
+    inbox: Arc<EvaluationInbox>,
+    leases: crate::domain::runs::lease::LeaseOptions,
+    diagnostics: Arc<dyn Fn(String) + Send + Sync>,
+) -> tokio::task::JoinHandle<()> {
+    handle.spawn(async move {
+        let mut tick =
+            tokio::time::interval(Duration::from_secs(leases.sweep_interval_secs.max(1)));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_note: Option<std::time::Instant> = None;
+        loop {
+            tick.tick().await;
+            let runs = Arc::clone(&runs);
+            let inbox = Arc::clone(&inbox);
+            let swept = writer
+                .call_async(move |ctx| {
+                    let changes = crate::domain::runs::lease::sweep(
+                        ctx.store(),
+                        &leases,
+                        crate::time::now_unix_secs(),
+                    )?;
+                    if changes.events.is_empty() && changes.entries.is_empty() {
+                        return Ok(());
+                    }
+                    let events = crate::domain::runs::ops::commit(ctx, &runs, changes)?;
+                    ctx.after_commit(move || inbox.push_run_events(events));
+                    Ok(())
+                })
+                .await;
+            if let Err(err) = swept {
+                let quiet = last_note.is_some_and(|at| at.elapsed() < Duration::from_secs(60));
+                if !quiet && !matches!(err, crate::ports::StoreError::Busy { .. }) {
+                    last_note = Some(std::time::Instant::now());
+                    diagnostics(format!("the Lease sweeper could not run this pass ({err})"));
+                }
+            }
+        }
+    })
 }
 
 async fn accept_loop(

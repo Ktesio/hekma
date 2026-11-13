@@ -159,6 +159,13 @@ impl ApiError {
         Self::store_unreachable()
     }
 
+    /// Replace the message, keeping the kind and code (story 23-2: a
+    /// route that names its own remediation).
+    pub(crate) fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self
+    }
+
     /// Whether this is the credential-class refusal (`403 forbidden`).
     #[cfg(test)]
     pub(crate) fn is_forbidden(&self) -> bool {
@@ -463,7 +470,9 @@ impl From<RunError> for ApiError {
             RunError::CredentialRevoked | RunError::CredentialUnknown => {
                 ApiErrorKind::Unauthorized
             }
-            RunError::TooManyChildren { .. } => ApiErrorKind::Conflict,
+            RunError::TooManyChildren { .. } | RunError::TooManyCallerRuns { .. } => {
+                ApiErrorKind::Conflict
+            }
             RunError::CredentialUnavailable { .. } => ApiErrorKind::Unavailable,
             // The request itself cannot be honored.
             RunError::NestingTooDeep { .. }

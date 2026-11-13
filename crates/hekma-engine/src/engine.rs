@@ -299,6 +299,9 @@ struct EngineInner {
     /// supervisor lock and sending nothing to the writer — the read cannot
     /// slow supervision or the proxy's hot path.
     calls_dir: std::path::PathBuf,
+    /// Story 23-2: the Lease and window knobs (the proxy's sweeper and the
+    /// announce and heartbeat jobs read the same values).
+    leases: crate::domain::runs::lease::LeaseOptions,
 }
 
 /// Open-time options for the long-running Host (story 17-2) — the additive,
@@ -597,6 +600,7 @@ impl Engine {
         let run_snapshot = Arc::clone(registry.run_publisher());
         let credential_reader = Mutex::new(registry.open_credential_reader(false)?);
         let calls_dir = registry.calls_dir();
+        let leases = metering_proxy.leases;
         let inner = Arc::new(EngineInner {
             metering_proxy: Mutex::new(proxy),
             metering_proxy_error: proxy_error,
@@ -607,6 +611,7 @@ impl Engine {
             run_snapshot,
             credential_reader,
             calls_dir,
+            leases,
         });
 
         // (1) Orphan adoption on open (AC-B / AI-7 / AI-8). Reconcile BEFORE the
@@ -673,6 +678,7 @@ impl Engine {
             run_snapshot,
             credential_reader,
             calls_dir,
+            leases: crate::domain::runs::lease::LeaseOptions::default(),
         });
         Ok(Self {
             rt: Arc::new(rt),
@@ -2696,6 +2702,101 @@ impl Engine {
         .await
     }
 
+    /// What a presented announce credential (`hk_ann_`) is (story 23-2):
+    /// ONE read on the credential reader — no engine lock, no writer job, so
+    /// a flood of unrecognised presentations costs reads only. A value that
+    /// is not an announce credential's shape is unknown.
+    pub async fn announce_credential(
+        &self,
+        presented: &str,
+    ) -> Result<crate::domain::AnnounceCredentialState, RunError> {
+        use crate::domain::{AnnounceCredential, AnnounceCredentialState, TokenClass};
+        let Some((TokenClass::Announce, secret)) = crate::domain::parse_presented(presented) else {
+            return Ok(AnnounceCredentialState::Unknown);
+        };
+        let hash = crate::domain::credential::hash_presented(&secret);
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let reader = inner
+                .credential_reader
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Ok(match reader.announce_credential(&hash)? {
+                None => AnnounceCredentialState::Unknown,
+                Some((_, _, false)) => AnnounceCredentialState::Revoked,
+                Some((binding, token_id, true)) => {
+                    AnnounceCredentialState::Active(AnnounceCredential {
+                        binding,
+                        token_id,
+                        hash,
+                    })
+                }
+            })
+        })
+        .await
+    }
+
+    /// Announce a Run beneath `credential`'s binding (story 23-2, `POST
+    /// /v0/runs/announce`): the identity's open Run is renewed (Lease,
+    /// Caller labels; no new credentials), or a new Run is created at
+    /// `observed` with a Lease, and its Run Key and refresh credential —
+    /// custody-eligible — are returned ONCE in
+    /// [`crate::Announced::credentials`].
+    pub async fn announce(
+        &self,
+        credential: crate::domain::AnnounceCredential,
+        external_id: &str,
+        labels: Vec<(String, String)>,
+    ) -> Result<crate::domain::Announced, RunError> {
+        self.refuse_if_read_only().map_err(RunError::Store)?;
+        let inner = Arc::clone(&self.inner);
+        let external = external_id.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.announce(&registry, credential, external, labels, inner.leases)
+        })
+        .await
+    }
+
+    /// Heartbeat a Run (story 23-2, `POST /v0/runs/{id}/heartbeat`): extend
+    /// its Lease (granting one when it held none) and return a `silent` Run
+    /// to `active`. A Caller only within its own subtree; an announcer only
+    /// on Runs its credential created; an ended Run is refused.
+    pub async fn heartbeat(
+        &self,
+        actor: crate::domain::LeaseActor,
+        run_id: &str,
+    ) -> Result<RunView, RunError> {
+        self.refuse_if_read_only().map_err(RunError::Store)?;
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.heartbeat(&registry, actor, &run_id, inner.leases)
+        })
+        .await
+    }
+
+    /// Close a Run as a Lease actor (story 23-2): [`Engine::close_run_as`]
+    /// for a Caller, and for an announcer only a Run its credential created.
+    pub async fn close_run_by(
+        &self,
+        actor: crate::domain::LeaseActor,
+        run_id: &str,
+    ) -> Result<RunView, RunError> {
+        self.refuse_if_read_only().map_err(RunError::Store)?;
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.close_run_by(&registry, actor, &run_id)
+        })
+        .await
+    }
+
     /// Close a child Run as `actor` (story 22-1): a Caller only within its
     /// own Run's subtree.
     pub async fn close_run_as(
@@ -3992,6 +4093,50 @@ impl Blocking<'_> {
             self.engine
                 .set_run_limits_as(run_ids, change, actor, dry_run),
         )
+    }
+
+    /// Blocking twin of [`Engine::announce_credential`].
+    pub fn announce_credential(
+        &self,
+        presented: &str,
+    ) -> Result<crate::domain::AnnounceCredentialState, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.announce_credential(presented))
+    }
+
+    /// Blocking twin of [`Engine::announce`].
+    pub fn announce(
+        &self,
+        credential: crate::domain::AnnounceCredential,
+        external_id: &str,
+        labels: Vec<(String, String)>,
+    ) -> Result<crate::domain::Announced, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.announce(credential, external_id, labels))
+    }
+
+    /// Blocking twin of [`Engine::heartbeat`].
+    pub fn heartbeat(
+        &self,
+        actor: crate::domain::LeaseActor,
+        run_id: &str,
+    ) -> Result<RunView, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.heartbeat(actor, run_id))
+    }
+
+    /// Blocking twin of [`Engine::close_run_by`].
+    pub fn close_run_by(
+        &self,
+        actor: crate::domain::LeaseActor,
+        run_id: &str,
+    ) -> Result<RunView, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.close_run_by(actor, run_id))
     }
 
     /// Blocking twin of [`Engine::refresh_credentials`].
