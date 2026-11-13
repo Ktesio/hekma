@@ -3040,3 +3040,85 @@ fn a_parked_call_is_re_validated_at_release_and_a_stop_interrupts_it() {
     assert_eq!(interrupted.error_type(), "hekma_hold_interrupted");
     assert_eq!(interrupted.header("x-should-retry"), Some("true"));
 }
+
+#[test]
+fn a_parked_call_whose_client_leaves_records_a_hold_and_a_rerouted_release_goes_to_the_route() {
+    // Story 23-4: a call dropped while parked is recorded as a held call
+    // (`hold_end` disconnect, never forwarded); a held call released onto a
+    // reroute goes to the route's upstream and ends `rerouted`.
+    use hekma_engine::{DispositionVerb, RouteSpec};
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let backup = Upstream::start();
+    let (engine, port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let facade = engine.blocking();
+    facade
+        .put_binding_route(
+            "openai",
+            RouteSpec {
+                name: "backup".to_string(),
+                upstream: backup.base(),
+                custodied_key: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    let run = wait_for_usage(&engine, ("binding", "openai"), 10);
+    let run_id = run.record.run_id.as_str().to_string();
+    facade
+        .set_disposition(&run_id, DispositionVerb::Hold, "operator")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // A parked call whose client hangs up.
+    let body = r#"{"model":"m","messages":[]}"#;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        stream,
+        "POST /openai/chat/gone HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    drop(stream);
+    let dispositions = call_dispositions(&engine, &run_id, 2);
+    assert!(
+        dispositions.contains(&("hold".to_string(), Some("disconnect".to_string()))),
+        "{dispositions:?}"
+    );
+
+    // A parked call released onto a reroute.
+    let served = upstream.served().len();
+    let parked = std::thread::spawn(move || post(port, "/openai/chat/later", &[]));
+    std::thread::sleep(Duration::from_millis(400));
+    facade
+        .set_disposition(
+            &run_id,
+            DispositionVerb::Reroute(Some("openai/backup".to_string())),
+            "operator",
+        )
+        .unwrap();
+    facade
+        .set_disposition(&run_id, DispositionVerb::Release, "operator")
+        .unwrap();
+    assert_eq!(parked.join().unwrap().status, 200);
+    assert_eq!(
+        upstream.served().len(),
+        served,
+        "never the binding's upstream"
+    );
+    assert_eq!(backup.served().len(), 1);
+    let dispositions = call_dispositions(&engine, &run_id, 3);
+    assert!(
+        dispositions.contains(&("reroute".to_string(), Some("rerouted".to_string()))),
+        "{dispositions:?}"
+    );
+}
