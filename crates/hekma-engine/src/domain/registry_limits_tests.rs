@@ -1924,3 +1924,67 @@ fn l2_a_caller_may_not_trade_pause_or_stop_for_the_cooperative_block() {
     .unwrap();
     assert_eq!(outcome.resolution.effective_action, BreachAction::Block);
 }
+
+#[test]
+fn a_caller_may_tighten_its_runs_scent_check_mode_and_nobody_lowers_it_here() {
+    // Story 22-3: `scent_check` on the limits route is the Caller's field,
+    // applied only where tighter; a lower value is `raise-forbidden`; the
+    // Operator and a Host set modes on Policies (`invalid-request`).
+    use crate::domain::runs::policy::ScentCheckMode;
+    let seeded = seed_with(50, 50, true);
+    let scent = |mode: ScentCheckMode| {
+        limits(RunLimits {
+            scent_check: Some(mode),
+            ..RunLimits::default()
+        })
+    };
+    for actor in [LimitActor::Operator, LimitActor::Host] {
+        let err = set(
+            &seeded.registry,
+            &seeded.run,
+            scent(ScentCheckMode::Shadow),
+            actor,
+            context(false, PolicyLimits::default()),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "invalid-request", "{err}");
+        assert!(err.to_string().contains("hekma policy change"), "{err}");
+    }
+    let caller = |change: RunLimitChange| {
+        set(
+            &seeded.registry,
+            &seeded.run,
+            change,
+            LimitActor::Caller,
+            context(false, PolicyLimits::default()),
+        )
+    };
+    let outcome = caller(scent(ScentCheckMode::Enforce)).unwrap();
+    assert_eq!(outcome.resolution.scent_check, ScentCheckMode::Enforce);
+    assert_eq!(outcome.resolution.sources.scent_check, LimitSource::Caller);
+    // Stored in the Caller's layer and read back.
+    assert_eq!(
+        seeded
+            .registry
+            .reader()
+            .run_caller_limits(&seeded.run)
+            .unwrap()
+            .scent_check,
+        Some(ScentCheckMode::Enforce)
+    );
+    // Lowering it again is refused, and nothing changes.
+    for lower in [ScentCheckMode::Shadow, ScentCheckMode::Off] {
+        let err = caller(scent(lower)).unwrap_err();
+        assert_eq!(err.code(), "raise-forbidden", "{err}");
+        assert!(err.to_string().contains("scent_check"), "{err}");
+    }
+    assert_eq!(
+        seeded
+            .registry
+            .reader()
+            .run_caller_limits(&seeded.run)
+            .unwrap()
+            .scent_check,
+        Some(ScentCheckMode::Enforce)
+    );
+}

@@ -176,3 +176,16 @@ Each is a public-contract or product choice; the recommendation is the spec's cu
 
 - 2026-11-12 — drafted. Spec written from Story 22.3 and its Epic 22 seams (22.1 built; 22.2 ready-for-dev, not built; 22.4/22.5 out of scope), FR-53 with its Gates line, §13 Q9 and the Glossary, FR-60/FR-43/NFR-9, AD-25/AD-26/AD-20/AD-22/AD-21, the key-custody security review (§7.9 threats, §9 R3.1–R3.8 copied, P4's mode-independent custody rule), the 22-1/23-1/22-2 specs (house format; 23-1's O6 reconciliation and 22-2's "under every Scent-Check Mode" honoured via O4), the code as it stands on this branch's base (23-1 built; `scent-unavailable` the refusal this story lifts), and the deferred-work entry naming this story. Status ready-for-dev; awaiting the orchestrator's review and Islam's rulings on O1–O7 — Q9 (O1/O2) is the decision this story exists to make, and the PR stays unmerged until he rules.
 - 2026-11-12 — orchestrator review: approved for build. The orchestrator-level Ask First items 1–8 are accepted as recommended. O1–O7 are Islam's rulings and still pending, so the build proceeds on the recommended options and the PR stays unmerged until he rules. O1 (PRD Q9: `off` everywhere, "environment" retired) and O4 (unknown and revoked keys keep their 401 under every mode) are the two flagged to him first. Build after 22-2.
+- **2026-11-13, build** (the orchestrator; GLM out until Nov 19). Deviations, for review:
+  - **The Operator's `scent_check` on the limits route answers `400 invalid-request`, not `422`.** The Control API has no typed `422` kind; `422` comes only from axum's JSON extractor. A new error kind would widen the public error vocabulary for one refusal. The message names the Policy surface (`hekma policy change <name> --scent-check <mode>`). Confirm or ask for a `422` kind.
+  - **Governance vectors stay 1.4.0** (three cases appended, 76 in all), following 22-1's and 23-1's practice of appending to the unreleased 1.4.0 rather than stepping to a new minor.
+  - **A Caller's mode is stored as a `run_limits` row** (`caller:scent` / `mode`, value = tightness 0–2): data-only, no schema step. An older engine reading that row would report it as an unknown limit; acceptable within the unreleased 0.12.0, and noted here.
+  - **The `unscented` Anomaly** is raised in the proxied close job (set-if-absent, one `anomalies-changed` event, published through the evaluation inbox), whether or not the call carried usage. It is cleared by the Policy re-resolution (`resolution.scent_check != shadow`), as `depth-fallback` is.
+  - **Tests:**
+    - `scent_over` table (chain strictness);
+    - an end-to-end proxy test over a labelled binding: `shadow` serves and marks once (one event), `enforce` refuses POST and GET with nothing forwarded and records `enforce`, an unknown key keeps its 401, and `off` serves again; the Policy change clears the Anomaly;
+    - the Caller tighten, raise-forbidden and Operator refusal;
+    - the CLI flag;
+    - the host's Policy route now accepting every mode.
+  - **Not covered by a dedicated test:** the fence-first ordering under `enforce` (the code checks the fence first, before the scent verdict), and the 10,000-call junk-header bound (the counters are atomics; no client string reaches a label or log).
+  - **Not done:** the independent adversarial review (GLM out until Nov 19, Opus subagents off).

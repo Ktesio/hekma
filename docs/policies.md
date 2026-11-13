@@ -5,7 +5,7 @@ description: "Standing limits that apply to every Run a Selector matches, and wa
 
 # Policies and the warn default
 
-> **On main, unreleased.** Policies and the `warn` default are on main and ship in the next release. Scent-Check Modes other than `off` arrive with Run Keys (planned). See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **On main, unreleased.** Policies and the `warn` default are on main and ship in the next release. Scent-Check Modes are on main too. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 > This page mirrors [hekma.ktesio.dev/docs/policies/](https://hekma.ktesio.dev/docs/policies/), where it is kept current.
 
@@ -88,7 +88,7 @@ Each Run has a **Control Depth**, how far Hekma controls it. Where a Policy's Br
 
 ## Not yet
 
-- **Scent-Check Modes.** Every Policy carries a Scent-Check Mode, and only `off` is accepted until Run Keys land; `shadow` and `enforce` are refused rather than stored and ignored.
+- **Scent-Check Modes.** Every Policy may carry a [Scent-Check Mode](run-keys.md#scent-check-modes): `off`, `shadow` or `enforce` (`--scent-check` on `hekma policy create` and `change`; `--clear scent-check` removes it). A tie between matching Policies takes the strictest mode. A Run's own Caller may only tighten its Run's mode, never lower it, and the default stays `off` everywhere.
 - **Pinning a Policy for long Runs.** A Run follows the latest Policy. Versioned policy-as-data comes later.
 
 ## Read next

@@ -670,6 +670,7 @@ hekma policy delete nightly-research
 | `create <name> --selector <selector>` | A new Policy; the name is 1-63 characters of lowercase letters, digits, `-` and `_` |
 | `--tokens-per-run/-cumulative N`, `--dollars-per-run/-cumulative $X` | Token ceilings and Cost Caps (dollars parse like `25` or `0.0001`) |
 | `--breach-action <warn\|pause\|stop\|block>` | The Breach Action for these ceilings |
+| `--scent-check <off\|shadow\|enforce>` | The [Scent-Check Mode](run-keys.md#scent-check-modes) for these Runs: what the metering proxy does with a call that carries no credential Hekma issued |
 | `--rate-input $X --rate-output $X [--rate-cached $X]` | A flat Rate for the Policy's matched Runs |
 | `change <name> ...` | Set limits (a set field wins), `--clear <limit>[,<limit>]` removes one (`tokens-per-run`, `dollars-per-run`, `breach-action`, `rate`, …) |
 | `change default --rate-for <model> ...` | Price a model in the default Policy's Rate table; `--clear rate:<model>` removes the entry |
