@@ -1469,3 +1469,101 @@ fn no_provider_key_or_run_key_leaks_into_state_responses_events_or_upstream() {
         );
     }
 }
+
+#[test]
+fn a_lowered_ceiling_applies_on_the_next_proxied_call_and_wire_runs_price_by_model() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    let facade = engine.blocking();
+    // The default Policy prices the reported model: $1 in, $2 out per 1M.
+    let mut rates = std::collections::BTreeMap::new();
+    rates.insert(
+        "gpt-demo".to_string(),
+        Some(hekma_engine::Rate::new(1_000_000, 2_000_000)),
+    );
+    facade
+        .change_policy(
+            PolicyChange {
+                name: "default".to_string(),
+                rates,
+                ..PolicyChange::default()
+            },
+            false,
+        )
+        .unwrap();
+    facade
+        .create_policy(
+            PolicyChange {
+                name: "core-cap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits {
+                    tokens_per_run: Some(1_000_000),
+                    breach_action: Some(BreachAction::Block),
+                    ..PolicyLimits::default()
+                },
+                ..PolicyChange::default()
+            },
+            false,
+        )
+        .unwrap();
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    let run = wait_for_usage(&engine, ("binding", "openai"), 10);
+    // 10 in × $1/1M + 5 out × $2/1M = 20 micro-dollars, priced by model.
+    assert_eq!(
+        run.usage.cost_micros,
+        hekma_engine::Micros(20),
+        "{:?}",
+        run.usage
+    );
+    // A high ceiling: calls pass.
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    wait_for_usage(&engine, ("binding", "openai"), 20);
+
+    // Lower the ceiling below the Run's 30 tokens: the very next call's
+    // close breaches it, and the call after that is fenced.
+    facade
+        .change_policy(
+            PolicyChange {
+                name: "core-cap".to_string(),
+                set: PolicyLimits {
+                    tokens_per_run: Some(25),
+                    ..PolicyLimits::default()
+                },
+                ..PolicyChange::default()
+            },
+            false,
+        )
+        .unwrap();
+    // The first call after the change is evaluated against the lowered
+    // ceiling at its close, which latches `block`; calls made before that
+    // batch commits may pass (the documented overshoot, at most one batch
+    // window), then every call is fenced.
+    let lowered_at = Instant::now();
+    let deadline = lowered_at + Duration::from_secs(15);
+    loop {
+        let answer = post(port, "/openai/chat", &[]);
+        if answer.status == 402 {
+            break;
+        }
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert!(
+            Instant::now() < deadline,
+            "the lowered ceiling never fenced"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        lowered_at.elapsed() < Duration::from_secs(2),
+        "the fence took {:?}",
+        lowered_at.elapsed()
+    );
+    assert_eq!(post(port, "/openai/chat", &[]).status, 402);
+}
