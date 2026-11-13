@@ -152,6 +152,9 @@ fn assert_payload_validates(event: &EngineEvent) {
                 hekma_engine::CREDENTIAL_EVENT_SCHEMA_VERSION
             );
         }
+        EngineEvent::SecretRevealed(e) => {
+            assert_eq!(e.schema_version, hekma_engine::SECRET_REVEALED_SCHEMA_VERSION);
+        }
         EngineEvent::BreachDefaultUpgraded(e) => {
             assert_eq!(e.schema_version, hekma_engine::POLICY_EVENT_SCHEMA_VERSION);
         }
@@ -321,6 +324,10 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
             EngineEvent::Credential(_) => continue,
             // Story 23-1: this flow creates no binding.
             EngineEvent::Binding(_) => panic!("unexpected binding event in this flow: {event:?}"),
+            // Story 22-2: this flow reveals nothing.
+            EngineEvent::SecretRevealed(_) => {
+                panic!("unexpected reveal event in this flow: {event:?}")
+            }
         };
         assert_eq!(
             instance,

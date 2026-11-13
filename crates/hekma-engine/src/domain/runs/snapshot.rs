@@ -510,7 +510,8 @@ pub(crate) fn subject_labels(
         EngineEvent::Credential(event) => snapshot.run(&event.run_id),
         EngineEvent::Policy(_)
         | EngineEvent::BreachDefaultUpgraded(_)
-        | EngineEvent::Binding(_) => return SubjectLabels::NoSubject,
+        | EngineEvent::Binding(_)
+        | EngineEvent::SecretRevealed(_) => return SubjectLabels::NoSubject,
     };
     match entry {
         Some(entry) => SubjectLabels::Found(entry.labels.clone()),

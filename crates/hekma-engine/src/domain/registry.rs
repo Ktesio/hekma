@@ -498,6 +498,8 @@ impl Registry {
             EngineEvent::Credential(event) => Some(event.run_id.clone()),
             // Story 23-1: a binding event names no Run.
             EngineEvent::Binding(_) => None,
+            // Story 22-2: a reveal names an instance and secrets, no Run.
+            EngineEvent::SecretRevealed(_) => None,
         }
     }
 
@@ -839,6 +841,17 @@ impl Registry {
     }
 
     /// The store writer, for the supervisor's pipeline and transition jobs.
+    /// Commit one event with its outbox row in its own writer job (story
+    /// 22-2: an event no other change carries, such as a reveal). The
+    /// caller publishes it with the returned append.
+    pub(crate) fn commit_event(
+        &self,
+        event: crate::domain::bus::EngineEvent,
+    ) -> Result<crate::ports::OutboxAppend, StoreError> {
+        self.writer
+            .call(move |ctx| ctx.store().append_outbox(&event, crate::domain::OUTBOX_MAX_BYTES))
+    }
+
     pub(crate) fn writer(&self) -> &StoreWriter {
         &self.writer
     }

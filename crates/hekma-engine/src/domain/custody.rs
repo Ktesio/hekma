@@ -395,6 +395,25 @@ pub(crate) fn allowed_paths(declared: Option<&CustodyPin>, origin: &str) -> Vec<
         .unwrap_or_default()
 }
 
+/// The schema version of [`SecretRevealedEvent`].
+pub const SECRET_REVEALED_SCHEMA_VERSION: u32 = 1;
+
+/// A custodied secret was revealed (story 22-2, P10): `hekma agent config
+/// get --reveal` printed the cleartext of an instance's held provider key.
+/// Committed and published BEFORE the value prints. Names the secrets,
+/// never a value.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SecretRevealedEvent {
+    /// The event's schema version.
+    pub schema_version: u32,
+    /// The Agent Instance whose configuration was revealed.
+    pub instance: String,
+    /// The revealed custodied secrets' NAMES (the `NAME` of `secret:NAME`).
+    pub secrets: Vec<String>,
+    /// When (RFC 3339).
+    pub at: String,
+}
+
 /// What the published snapshot carries for a custodied Run: REFERENCES
 /// only, never a value. The proxy resolves `key_ref` through the custody
 /// cache at call time.

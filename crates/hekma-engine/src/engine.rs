@@ -2202,6 +2202,51 @@ impl Engine {
         .await
     }
 
+    /// Record that an instance's custodied provider key is about to be
+    /// revealed (story 22-2, P10): when the instance holds its provider key
+    /// under custody (`provider.api_key` set, `provider.custody` not `off`),
+    /// one `secret_revealed` event naming the secret — never a value — is
+    /// committed with its outbox row and published, and returned. `None`
+    /// when the instance custodies nothing (no event). A `config get
+    /// --reveal` that shows a custodied key calls this first and prints
+    /// nothing when it fails.
+    pub async fn note_secret_revealed(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::domain::custody::SecretRevealedEvent>, ConfigError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let iname = InstanceName::new(&name).map_err(|reason| ConfigError::InvalidName {
+                name: name.clone(),
+                reason: reason.to_string(),
+            })?;
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let effective = registry.effective_config(&iname, ConfigLayer::empty())?;
+            let Some(secret) = crate::domain::config::custodied_secret(&effective) else {
+                return Ok(None);
+            };
+            let event = crate::domain::custody::SecretRevealedEvent {
+                schema_version: crate::domain::custody::SECRET_REVEALED_SCHEMA_VERSION,
+                instance: name.clone(),
+                secrets: vec![secret],
+                at: crate::time::now_rfc3339(),
+            };
+            let committed = EngineEvent::SecretRevealed(event.clone());
+            let append = registry
+                .commit_event(committed)
+                .map_err(|err| ConfigError::Store {
+                    name: name.clone(),
+                    detail: format!("the reveal could not be recorded ({err})"),
+                })?;
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.note_outbox_append(&append);
+            supervisor.publish(append.seq, EngineEvent::SecretRevealed(event.clone()));
+            Ok(Some(event))
+        })
+        .await
+    }
+
     /// Set one unified-config key on an instance's INSTANCE layer (story 2-1,
     /// spine AD-9, AC-B / AC10). This is the write `hekma agent config set` uses.
     ///
@@ -4055,6 +4100,16 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.delete_policy(name, dry_run))
+    }
+
+    /// Blocking [`Engine::note_secret_revealed`] (story 22-2).
+    pub fn note_secret_revealed(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::domain::custody::SecretRevealedEvent>, ConfigError> {
+        self.engine
+            .rt
+            .block_on(self.engine.note_secret_revealed(name))
     }
 
     /// Blocking [`Engine::reveal_secrets`] (story 2-4, AC-C/AC11). The

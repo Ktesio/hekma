@@ -1442,7 +1442,7 @@ impl Supervisor {
     /// state.db outbox since story 21-1): an UN-ACKED eviction means a Host
     /// that has not acked lost replayable events, so it is a diagnostic,
     /// never silent (AI-18). An acked eviction is free and silent.
-    pub(super) fn note_outbox_append(&self, append: &crate::ports::OutboxAppend) {
+    pub(crate) fn note_outbox_append(&self, append: &crate::ports::OutboxAppend) {
         if append.dropped_unacked > 0 {
             self.emit_diagnostic(&format!(
                 "outbox compaction dropped {} un-acked event(s) to stay under the {}MB cap — \

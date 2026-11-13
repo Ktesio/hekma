@@ -451,6 +451,8 @@ fn event_instance(event: &EngineEvent) -> &str {
         EngineEvent::Credential(_) => "",
         // Story 23-1: binding events are fleet-wide.
         EngineEvent::Binding(_) => "",
+        // Story 22-2: a reveal names its instance.
+        EngineEvent::SecretRevealed(e) => &e.instance,
     }
 }
 

@@ -114,6 +114,7 @@ pub use adapter::{AdapterRef, ResolvedAdapter};
 /// Service Host (the engine owns process control; the OS parts live in
 /// `backends/`).
 pub use backends::spawn_detached_process;
+pub use domain::custody::{SecretRevealedEvent, SECRET_REVEALED_SCHEMA_VERSION};
 
 /// Story 22-2 (P10): harden the calling process's memory — on Linux it
 /// becomes non-dumpable (no core dump, no same-user `ptrace` or

@@ -239,6 +239,21 @@ pub const PROVIDER_ENV_VARS_V1: &[&str] = &[
 ];
 
 /// Whether `var` names a variable on the current provider-variable list.
+/// The secret NAME an instance's effective configuration holds under key
+/// custody (story 22-2): `provider.api_key`'s `secret:NAME`, unless
+/// `provider.custody` is `off`. `None` when nothing is custodied.
+pub(crate) fn custodied_secret(effective: &EffectiveConfig) -> Option<String> {
+    let name = effective
+        .value(PROVIDER_API_KEY_KEY)
+        .and_then(toml::Value::as_str)
+        .and_then(secret_name)?;
+    let opted_out = effective
+        .value(PROVIDER_CUSTODY_KEY)
+        .and_then(toml::Value::as_str)
+        == Some("off");
+    (!opted_out).then(|| name.to_string())
+}
+
 pub fn is_provider_env_var(var: &str) -> bool {
     PROVIDER_ENV_VARS_V1.contains(&var)
 }
