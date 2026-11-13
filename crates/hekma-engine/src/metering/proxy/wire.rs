@@ -27,6 +27,11 @@ pub(crate) const RUN_ID_HEADER: &str = "x-hekma-run-id";
 pub(crate) const BREACH_HEADER: &str = "x-hekma-breach";
 /// Every request header with this prefix is stripped before forwarding.
 pub(crate) const STRIP_PREFIX: &str = "x-hekma-";
+/// The fixed mask that replaces every exact occurrence of the custodied
+/// key in a relayed response (story 22-2): providers can echo a presented
+/// key in an error body, and the response the agent reads must not carry
+/// the real key back into everything the agent prints or writes.
+pub(crate) const REDACTION_MASK: &str = "hekma_redacted_key";
 
 /// One `proxy-wire v1` refusal row (the table in the module docs and in
 /// `docs/metering-proxy.md`).
@@ -35,6 +40,8 @@ pub(crate) enum WireError {
     CredentialInUrl,
     CustodyUnavailable,
     BadTarget,
+    BadHost,
+    PathNotAllowed,
     UnknownCredential,
     CredentialRevoked,
     RunOutOfScope,
@@ -49,10 +56,12 @@ pub(crate) enum WireError {
 impl WireError {
     /// Every row (the table tests walk it).
     #[cfg(test)]
-    pub(crate) const ALL: [WireError; 12] = [
+    pub(crate) const ALL: [WireError; 14] = [
         WireError::CredentialInUrl,
         WireError::CustodyUnavailable,
         WireError::BadTarget,
+        WireError::BadHost,
+        WireError::PathNotAllowed,
         WireError::UnknownCredential,
         WireError::CredentialRevoked,
         WireError::RunOutOfScope,
@@ -91,6 +100,21 @@ impl WireError {
                 "bad_target",
                 "This request target cannot be forwarded: send an origin-form path to the \
                  metering proxy.",
+                Some(false),
+            ),
+            WireError::BadHost => (
+                403,
+                "hekma_bad_host",
+                "bad_host",
+                "This address is not an allowed Host for the metering proxy.",
+                Some(false),
+            ),
+            WireError::PathNotAllowed => (
+                400,
+                "hekma_path_not_allowed",
+                "path_not_allowed",
+                "This path is outside the endpoints allowed for the held provider key. Ask the \
+                 operator to widen the key's path list if this endpoint is genuinely needed.",
                 Some(false),
             ),
             WireError::UnknownCredential => (

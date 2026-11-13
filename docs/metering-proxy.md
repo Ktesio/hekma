@@ -5,7 +5,7 @@ description: "One loopback proxy per state directory meters every model call, at
 
 # The metering proxy
 
-> **On main, not yet released.** The shared metering proxy ships with the next release. It replaces the per-agent metering listener. Key custody, Scent-Check Modes, announce, wire hold and reroute, and serving beyond loopback are still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **On main, not yet released.** The shared metering proxy ships with the next release. It replaces the per-agent metering listener. Key custody is a preview, not yet supported. Scent-Check Modes, announce, wire hold and reroute, and serving beyond loopback are still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 Hekma meters model calls by sitting between a client and its model provider. The **metering proxy** is one HTTP listener on `127.0.0.1`, owned by the Service Host (`hekma serve`). Each call it forwards is attributed to a [Run](runs.md), counted once in the usage ledger, checked against that Run's budgets, and relayed back. Supervised agents reach it through the base URL Hekma injects. Any other client reaches it through an **endpoint binding** you create.
 
@@ -21,6 +21,8 @@ This page is the complete contract: where the proxy listens, how a call finds it
 | A taken port | Hekma never moves to another port. The host keeps serving the Control API, says which port is taken and why, and refuses `engine-observed` starts until you free the port or pass another. |
 | Embedding | An embedding application gets the proxy on an ephemeral, unrecorded port. A read-only engine never runs one. |
 
+**The Host and Origin guard.** Before anything else, the proxy checks two request headers. `Host` must be a loopback address (`127.0.0.1` or anything in `127.0.0.0/8`, `::1`, or `localhost`), with any port, or a name you list with `hekma serve --proxy-allowed-hosts <name,...>`. An `Origin` header, which browser pages send and SDKs do not, must be on the list you give with `--proxy-allowed-origins <origin,...>`; by default any `Origin` is refused. A request that fails either check gets `403 hekma_bad_host` before any upstream is dialled. The proxy never adds `Access-Control-*` headers and never answers a browser's preflight permissively. This stops a web page from reaching the proxy through DNS rebinding.
+
 On loopback the proxy asks for no credential. A Run Key tells it *which* Run a call belongs to; it is not a gate. Another OS user on the same machine can reach a loopback port, and can bind it while no host holds it. Treat the proxy as reachable by every local user, and serve it only on machines you control.
 
 ## How a call finds its Run
@@ -32,7 +34,7 @@ The proxy decides everything about a call from one consistent view of the Runs, 
    - An unknown key is refused with `401 hekma_unknown_credential`.
    - A key revoked in the last 24 hours is refused with `401 hekma_credential_revoked`, so the client is told to stop rather than to fix its key. An older revoked key answers as unknown.
    - A refresh or announce credential is refused as unknown.
-   - A Run Key in the **API-key slot** (`authorization` or `x-api-key`) names the Run, but forwarding it would send it to the provider. Until key custody ships the call is refused with `400 hekma_custody_unavailable`: send your provider key in `authorization` and the Run Key in `x-hekma-run-key`.
+   - A Run Key in the **API-key slot** (`authorization`, `x-api-key`, `x-goog-api-key` or `api-key`) asks for [key custody](run-keys.md#key-custody-preview--not-yet-supported): the proxy swaps in the provider key Hekma holds for that Run. If the Run holds no key, or the Run Key was not issued to a supervised agent or a credentialed open, the call is refused with `400 hekma_custody_unavailable`. Without custody, send your provider key in `authorization` and the Run Key in `x-hekma-run-key`.
 3. **A Run route**, a path that starts with `/_hekma/runs/<run id>/`. This is the base URL Hekma injects into a supervised agent. It names the Run and that agent's upstream, and the proxy strips the prefix before forwarding. A Run route naming no open Run is `404 hekma_no_route`.
 4. **An endpoint binding:** the longest binding prefix that matches on a segment boundary. `/openai` matches `/openai/v1/chat/completions`, never `/openai2`. A `/` binding catches everything else.
 5. Nothing matched: `404 hekma_no_route`.
@@ -73,6 +75,13 @@ The first call for a new Run waits up to one second for the Run to be created. P
   - `x-hekma-labels`, the Run's labels as sorted, percent-encoded `key=value` items joined by commas.
 
   Neither ever carries a token, a token id or request content. **They are on by default, so your model provider receives each call's Run id and labels.** Turn them off if that is not what you want.
+
+**Under key custody** (a preview; see [Run Keys and key custody](run-keys.md#key-custody-preview--not-yet-supported)):
+- The call must be presented with a Run Key issued to a supervised agent or a credentialed open. Its Run, a Run above it, or its binding, must hold a provider key.
+- The outbound URL must be `https`, on the origin pinned for the key; anything else is `400 hekma_bad_target`. Its path must be on the key's path list, else `400 hekma_path_not_allowed`. In both cases nothing is forwarded.
+- Every credential the client sent (`authorization`, `x-api-key`, `x-goog-api-key`, `api-key`) is removed, and the held key is inserted once, in the provider's own header. The proxy asks for an uncompressed response.
+- Every exact occurrence of the held key in the response's headers and body is replaced with `hekma_redacted_key`.
+- The proxy reads keys from memory and picks up a changed secrets file within 30 seconds.
 
 **On the way back:** the response is relayed as the upstream sent it. If the Run, or any Run above it, holds a latched breach, the response also carries `x-hekma-breach: <code>[, <code>]`.
 
@@ -138,7 +147,7 @@ Point the client's base URL at the client base URL that `show` prints. A binding
 - **A prefix:** `/` plus segments of letters, digits and `._~-`, at most 128 characters, unique, and never under `/_hekma`.
 - **An upstream base URL:** `http` or `https`, with no user info, query or fragment.
 - **Labels.**
-- **An optional custodied-key reference** (`secret:NAME`). It's stored as the reference only, and is inert until key custody ships.
+- **An optional custodied-key reference** (`secret:NAME`). It's stored as the reference only. Under key custody, a call on the binding presented with a Run Key Hekma issued (to a Run beneath the binding's Run) uses it; a call with no credential never does. A binding with a custodied key needs an `https` upstream on the key's pinned origins, or creating or changing it is refused.
 - **Up to 16 reroute routes**, each a name and an upstream. They're stored and checked now, and used when reroute ships.
 
 There are at most 256 bindings. Changing a binding's prefix or upstream keeps its Runs. Changing its labels updates its open Runs. Deleting it ends its Run and its split Runs with cause `binding-removed`. Every change is one `binding` event.
@@ -174,8 +183,10 @@ No body ever carries a limit, a total, an agent name, a token, a token id, or an
 | Status | `error.type` | When | `x-should-retry` |
 |---|---|---|---|
 | 400 | `hekma_credential_in_url` | A credential appears in the URL | `false` |
-| 400 | `hekma_custody_unavailable` | A Run Key sits in the API-key slot | `false` |
-| 400 | `hekma_bad_target` | `CONNECT`, or a target naming another host | `false` |
+| 400 | `hekma_custody_unavailable` | A Run Key sits in the API-key slot, and its Run holds no key or the key is not one custody serves | `false` |
+| 400 | `hekma_bad_target` | `CONNECT`, a target naming another host, or a custodied call whose upstream is not its pinned `https` origin | `false` |
+| 400 | `hekma_path_not_allowed` | A custodied call to a path outside the key's list | `false` |
+| 403 | `hekma_bad_host` | The `Host` is not loopback or listed, or an `Origin` is not listed | `false` |
 | 401 | `hekma_unknown_credential` | The credential is not a Run Key Hekma honours | `false` |
 | 401 | `hekma_credential_revoked` | The Run Key was revoked in the last 24 hours | `false` |
 | 402 | `hekma_budget_block` | `block` holds for the Run or a Run above it | `false` |
@@ -215,7 +226,7 @@ Earlier releases gave each `engine-observed` agent its own listener on its own p
 
 ## What is still planned
 
-- **Key custody:** the Run Key in the API-key slot, the real provider key held by Hekma.
+- **Key custody, supported:** it is a preview today, until the pending security rulings are recorded and its test criteria pass in CI.
 - **Scent-Check Modes:** refusing unidentified traffic.
 - **Announce:** self-identifying clients and Leases.
 - **Wire hold, release, reroute and reject.**

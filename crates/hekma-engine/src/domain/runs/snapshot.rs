@@ -155,6 +155,9 @@ pub(crate) struct EntryExtras {
     pub upstream: Option<Arc<str>>,
     /// The Run's `(namespace, external id)` identity, when it has one.
     pub identity: Option<(String, String)>,
+    /// The Run's held-key custody (story 22-2): the reference and the
+    /// frozen origin, when custody is on.
+    pub custody: Option<crate::domain::custody::CustodyInfo>,
 }
 
 /// One Operator endpoint binding as the data path sees it (story 23-1).
@@ -166,6 +169,10 @@ pub(crate) struct BindingEntry {
     pub upstream: Arc<str>,
     /// The bound labels its Runs carry (sorted by key).
     pub labels: Vec<(String, String)>,
+    /// The binding's inert custodied-key reference (story 22-2: a
+    /// `secret:NAME` string, never a value; the swap never draws on it
+    /// without a custody-eligible credential).
+    pub custodied_key: Option<String>,
 }
 
 impl BindingEntry {
@@ -208,8 +215,7 @@ impl BindingTable {
             .find_map(|entry| entry.strip(path).map(|rest| (entry, rest)))
     }
 
-    /// The binding named `name` (the tests' lookup).
-    #[cfg(test)]
+    /// The binding named `name` (the custody lookup and the tests').
     pub(crate) fn by_name(&self, name: &str) -> Option<&Arc<BindingEntry>> {
         self.entries.iter().find(|entry| entry.name == name)
     }
@@ -235,6 +241,11 @@ pub(crate) struct RunEntry {
     pub upstream: Option<Arc<str>>,
     /// Its `(namespace, external id)` identity (story 23-1).
     pub identity: Option<(String, String)>,
+    /// Its held-key custody (story 22-2): the `secret:NAME` reference and
+    /// the frozen origin, when custody is on. A child Run reads up the
+    /// chain ([`RunSnapshot::custody_of`]) — a child of a custodied
+    /// supervised Run keeps custody.
+    pub custody: Option<crate::domain::custody::CustodyInfo>,
 }
 
 /// Build one snapshot entry: the record, its labels and limits, its stored
@@ -254,6 +265,7 @@ pub(crate) fn entry_of(
         disposition: extras.disposition,
         upstream: extras.upstream,
         identity: extras.identity,
+        custody: extras.custody,
     }
 }
 
@@ -367,6 +379,36 @@ impl RunSnapshot {
             })
     }
 
+    /// The custody a call attributed to `run_id` may draw on (story 22-2):
+    /// the FIRST held-key custody up the Run's chain — a supervised Run's
+    /// own, or the process-owning ancestor's for its in-process children
+    /// (a child of a custodied supervised Run keeps custody) — else, for a
+    /// binding's Run, a split beneath it or a Run beneath either, the
+    /// binding's custodied key, pinned to the binding's upstream. The
+    /// caller draws on it ONLY for a call authenticated by a
+    /// custody-eligible Run Key (P4): a binding's Run reached with no
+    /// credential never does.
+    pub(crate) fn custody_of(&self, run_id: &RunId) -> Option<crate::domain::custody::CustodyInfo> {
+        let chain = self.chain(run_id);
+        if let Some(found) = chain.iter().find_map(|entry| entry.custody.clone()) {
+            return Some(found);
+        }
+        chain.iter().find_map(|entry| {
+            let (namespace, external) = entry.identity.as_ref()?;
+            let binding = if namespace == super::bindings::BINDING_NAMESPACE {
+                external.as_str()
+            } else {
+                namespace.strip_prefix("binding:")?
+            };
+            let binding = self.bindings.by_name(binding)?;
+            let key_ref = binding.custodied_key.as_deref()?;
+            Some(crate::domain::custody::CustodyInfo {
+                key_ref: Arc::from(key_ref),
+                origin: Arc::clone(&binding.upstream),
+            })
+        })
+    }
+
     /// The next snapshot with `changes` applied: an ended entry leaves the
     /// index, any other replaces (or adds) its Run; then the key changes.
     fn with(&self, changes: Vec<RunEntry>, keys: Vec<KeyChange>) -> Self {
@@ -468,7 +510,8 @@ pub(crate) fn subject_labels(
         EngineEvent::Credential(event) => snapshot.run(&event.run_id),
         EngineEvent::Policy(_)
         | EngineEvent::BreachDefaultUpgraded(_)
-        | EngineEvent::Binding(_) => return SubjectLabels::NoSubject,
+        | EngineEvent::Binding(_)
+        | EngineEvent::SecretRevealed(_) => return SubjectLabels::NoSubject,
     };
     match entry {
         Some(entry) => SubjectLabels::Found(entry.labels.clone()),
@@ -642,6 +685,7 @@ mod tests {
             disposition: Disposition::default(),
             upstream: None,
             identity: None,
+            custody: None,
         }
     }
 

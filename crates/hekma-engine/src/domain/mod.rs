@@ -15,6 +15,7 @@ pub mod calls;
 pub(crate) mod config;
 mod cost;
 pub(crate) mod credential;
+pub(crate) mod custody;
 mod error;
 mod event;
 mod fleet;
@@ -111,9 +112,10 @@ pub use registry::{Registry, RemoveDisposition};
 pub use registry_policy::{PolicyChange, PolicyOutcome};
 pub use resync::{ResyncBatch, ResyncCursor};
 pub use runs::{
-    decode_cursor, encode_cursor, ended_run_cutoff, LatchedBreach, ListRunsQuery, ListingCounts,
-    ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument, RunSummary,
-    ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
+    decode_cursor, encode_cursor, ended_run_cutoff, CustodyView, LatchedBreach, ListRunsQuery,
+    ListingCounts, ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument,
+    RunSummary, ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT,
+    RUN_LISTING_SCHEMA_VERSION,
 };
 pub use runs::{
     validate_label_key, validate_label_value, verb_cell, Anomaly, CellBehavior, ChildRunRequest,

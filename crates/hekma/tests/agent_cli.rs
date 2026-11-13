@@ -9697,3 +9697,134 @@ fn logs_follow_primes_only_the_bounded_backlog_window_and_names_the_skipped_coun
         run.stderr
     );
 }
+
+#[test]
+fn an_engine_observed_start_without_a_held_provider_key_is_refused_with_the_remediation() {
+    // Story 22-2 (FR-19, AD-22): an `engine-observed` agent whose provider
+    // key Hekma does not hold is refused at start — exit 1, the remediation
+    // naming `provider.api_key` and the self-reported switch — and the
+    // instance is left `registered`.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = ctx.project_dir.join("obs-keyless-adapter");
+    std::fs::create_dir_all(&m).unwrap();
+    let bin = hekma_conformance::fake_agent_bin();
+    std::fs::write(
+        m.join("adapter.toml"),
+        format!(
+            r#"
+contract_version = "1.0.0"
+[adapter]
+kind = "obskeyless"
+[lifecycle.start]
+exec = {exec:?}
+args = ["--linger-ms", "600000"]
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+[metering]
+source = "engine-observed"
+[config."metering.base_url"]
+env = "OPENAI_BASE_URL"
+"#,
+            exec = bin.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "obskeyless",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_hekma_agent(
+        &["agent", "start", "obskeyless"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(1), "stderr={}", run.stderr);
+    assert!(
+        run.stderr.contains("key custody") && run.stderr.contains("provider.api_key"),
+        "the refusal names the key to set; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("self-reported"),
+        "stderr={}",
+        run.stderr
+    );
+    let show = run_hekma_agent(
+        &["agent", "show", "obskeyless"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(show.stdout.contains("registered"), "stdout={}", show.stdout);
+}
+
+#[test]
+fn revealing_a_custodied_key_notes_the_recorded_event_before_printing_it() {
+    // Story 22-2 (P10): `config get --reveal` of a custodied provider key
+    // asks the Service Host to record a `secret_revealed` event first and
+    // says so on stderr; the value still prints on stdout.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let env = [("HEKMA_CLI_REVEAL_KEY", "sk-cli-reveal-sentinel")];
+    let run = run_hekma_agent_with_env(
+        &["agent", "register", "revealer", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+        &env,
+    );
+    assert!(run.success, "stderr={}", run.stderr);
+    let run = run_hekma_agent_with_env(
+        &[
+            "agent",
+            "config",
+            "set",
+            "revealer",
+            "provider.api_key",
+            "secret:HEKMA_CLI_REVEAL_KEY",
+        ],
+        &ctx.project_dir,
+        state_dir,
+        &env,
+    );
+    assert!(run.success, "stderr={}", run.stderr);
+    let run = run_hekma_agent_with_env(
+        &[
+            "agent",
+            "config",
+            "get",
+            "revealer",
+            "provider.api_key",
+            "--reveal",
+        ],
+        &ctx.project_dir,
+        state_dir,
+        &env,
+    );
+    assert!(run.success, "stderr={}", run.stderr);
+    assert!(
+        run.stdout.contains("sk-cli-reveal-sentinel"),
+        "stdout={}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("secret_revealed") && run.stderr.contains("HEKMA_CLI_REVEAL_KEY"),
+        "the reveal is recorded first; stderr={}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("sk-cli-reveal-sentinel"),
+        "stderr={}",
+        run.stderr
+    );
+}

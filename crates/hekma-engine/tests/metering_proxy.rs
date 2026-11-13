@@ -755,12 +755,24 @@ fn the_binding_lifecycle_through_the_engine_with_its_refusals_and_the_proxy_in_s
         let err = facade.create_binding(bad.clone()).unwrap_err();
         assert_eq!(err.code(), code, "{bad:?}: {err}");
     }
-    // A custodied-key reference is stored as given.
+    // Story 22-2: a custodied key goes only over https to an origin it is
+    // pinned to — an http upstream, and an https one no table or
+    // declaration names, are refused.
+    for unpinned in [
+        upstream.base(),
+        "https://gateway.example.com/v1".to_string(),
+    ] {
+        let err = facade
+            .create_binding(spec("keyed", "/keyed", &unpinned, Some("secret:KEY")))
+            .unwrap_err();
+        assert_eq!(err.code(), "binding-invalid", "{unpinned}: {err}");
+    }
+    // A custodied-key reference on a pinnable upstream is stored as given.
     let keyed = facade
         .create_binding(spec(
             "keyed",
             "/keyed",
-            &upstream.base(),
+            "https://api.openai.com/v1",
             Some("secret:KEY"),
         ))
         .unwrap();
@@ -812,11 +824,26 @@ fn the_binding_lifecycle_through_the_engine_with_its_refusals_and_the_proxy_in_s
         "{:?}",
         relabelled.labels
     );
-    // Set and clear the custodied-key reference; refusals on update.
+    // Set and clear the custodied-key reference; refusals on update. A key
+    // on the binding's http stub upstream is refused (story 22-2: a
+    // custodied key goes only over https to a pinned origin); with a
+    // pinnable https upstream it is stored, and clearing it puts the stub
+    // back for the calls below.
+    let err = facade
+        .update_binding(
+            "openai",
+            BindingPatch {
+                custodied_key: Some(Some("secret:OPENAI".into())),
+                ..BindingPatch::default()
+            },
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "binding-invalid", "{err}");
     let set = facade
         .update_binding(
             "openai",
             BindingPatch {
+                upstream: Some("https://api.openai.com/v1".into()),
                 custodied_key: Some(Some("secret:OPENAI".into())),
                 ..BindingPatch::default()
             },
@@ -827,6 +854,7 @@ fn the_binding_lifecycle_through_the_engine_with_its_refusals_and_the_proxy_in_s
         .update_binding(
             "openai",
             BindingPatch {
+                upstream: Some(upstream.base()),
                 custodied_key: Some(None),
                 ..BindingPatch::default()
             },
@@ -1043,7 +1071,7 @@ fn an_oversized_or_over_budget_request_is_refused_before_any_dial() {
         .unwrap();
     stream
         .write_all(
-            b"POST /openai/chat HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\
+            b"POST /openai/chat HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\
               content-type: application/json\r\ncontent-length: 70000000\r\n\r\n{}",
         )
         .unwrap();
@@ -1078,7 +1106,7 @@ fn a_client_that_disconnects_cancels_the_call_and_is_not_metered() {
     {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let request = format!(
-            "POST /openai/chat HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+            "POST /openai/chat HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\n\
              content-length: {}\r\n\r\n{CHAT}",
             CHAT.len()
         );
@@ -1728,7 +1756,7 @@ fn a_streamed_request_body_over_the_budget_is_refused_before_it_is_buffered() {
     stream
         .write_all(
             format!(
-                "POST /openai/chat HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+                "POST /openai/chat HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\n\
                  transfer-encoding: chunked\r\n\r\n{:x}\r\n{chunk}\r\n",
                 chunk.len()
             )

@@ -271,6 +271,29 @@ const ENV_FLOOR: &[&str] = &[
     "HOME",
 ];
 
+/// Make `path` owner-only: on Windows a fresh file in the user's profile
+/// already is (the secrets file's documented portable posture), so this
+/// changes nothing.
+#[cfg(test)]
+pub fn restrict_to_owner(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Story 22-2: Windows — nothing is changed (crash-report behaviour is
+/// documented per OS in the hosting docs).
+pub fn harden_host_memory() -> Result<(), String> {
+    Ok(())
+}
+
+/// The home-pointing variables home isolation rewrites (story 22-2; see
+/// `backends::isolated_home_env_vars`). The profile variables, matched
+/// case-insensitively by the spawn (like the floor itself); tools that
+/// reach the known-folder APIs bypass them, which the docs name as the
+/// residual limit.
+pub fn isolated_home_env_vars() -> &'static [&'static str] {
+    &["USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOME"]
+}
+
 impl WindowsBackend {
     /// Construct the backend.
     pub fn new() -> Self {

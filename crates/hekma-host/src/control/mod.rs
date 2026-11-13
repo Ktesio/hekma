@@ -201,6 +201,11 @@ fn router(state: ApiState) -> Router {
             "/v0/instances/{name}/config",
             get(routes::config_get).put(routes::config_put),
         )
+        // Story 22-2: a custodied key's reveal is recorded before it prints.
+        .route(
+            "/v0/instances/{name}/config/revealed",
+            post(routes::config_revealed),
+        )
         .route("/v0/instances/{name}/events", get(routes::events_pull))
         .route("/v0/instances/{name}/start", post(routes::start))
         .route("/v0/instances/{name}/stop", post(routes::stop))

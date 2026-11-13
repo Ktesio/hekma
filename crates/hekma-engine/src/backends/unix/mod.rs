@@ -168,6 +168,67 @@ impl UnixBackend {
 /// everything else (see the spawn guard + docs/commands.md).
 const ENV_FLOOR: &[&str] = &["PATH", "HOME"];
 
+/// The home-pointing variables home isolation rewrites (story 22-2; see
+/// `backends::isolated_home_env_vars`). `HOME` heads the list because the
+/// clear-then-apply floor re-applies it — the mapped environment wins on
+/// top, which is exactly the override an isolated home needs.
+pub fn isolated_home_env_vars() -> &'static [&'static str] {
+    &[
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+    ]
+}
+
+/// Story 22-2 (P10): keep the Service Host's memory — which holds custodied
+/// provider keys in its custody cache — out of core dumps, and on Linux
+/// out of same-user `ptrace` and `/proc/<pid>/mem` reads, by clearing the
+/// process's dumpable flag and setting `RLIMIT_CORE` to 0. Linux only;
+/// elsewhere it changes nothing (the docs state each OS's behaviour).
+#[cfg(target_os = "linux")]
+pub fn harden_host_memory() -> Result<(), String> {
+    use nix::libc;
+    // SAFETY: two plain syscalls with constant arguments; `limit` is a
+    // stack value the kernel only reads.
+    let dumpable = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    if dumpable != 0 {
+        return Err(format!(
+            "could not mark the process non-dumpable ({})",
+            io::Error::last_os_error()
+        ));
+    }
+    let limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: as above.
+    let core = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
+    if core != 0 {
+        return Err(format!(
+            "could not set the core-dump limit to 0 ({})",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// Make `path` readable and writable by its owner only (`0600`): the
+/// secrets-file posture (story 22-2 — the custody tests write secrets
+/// files, and the file resolver refuses a looser one on Unix).
+#[cfg(test)]
+pub fn restrict_to_owner(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// Story 22-2: not Linux — nothing is changed (see the Linux variant).
+#[cfg(not(target_os = "linux"))]
+pub fn harden_host_memory() -> Result<(), String> {
+    Ok(())
+}
+
 impl ProcessBackend for UnixBackend {
     type Handle = UnixProcess;
 

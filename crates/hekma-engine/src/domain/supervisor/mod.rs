@@ -818,6 +818,12 @@ pub struct Supervisor {
     /// ONLY the manifest-declared mappings (via [`SpawnSpec::inherit_env`] —
     /// the supervisor owns the decision, the backends stay dumb executors).
     child_env_allowlist: bool,
+    /// Story 22-2 — the engine's custody cache (installed open-time by the
+    /// engine, before any start): custodied provider values live only in
+    /// memory, here, beside the published snapshot. `None` (a supervisor
+    /// built outside the engine) leaves the start path seeding nothing —
+    /// the cache's refresher still holds what it re-resolves.
+    custody_cache: Option<Arc<crate::domain::custody::CustodyCache>>,
     /// Story 17-4 — the engine's log-capture posture (the AD-12 amendment),
     /// set open-time via [`Supervisor::set_serve_options`] from
     /// `EngineOptions::log_capture`. Resolved into each spawn's
@@ -1075,6 +1081,7 @@ impl Supervisor {
             proxy_url: None,
             inbox: Arc::default(),
             child_env_allowlist: false,
+            custody_cache: None,
             serve_options_applied: false,
             log_capture_mode: LogCaptureMode::default(),
             #[cfg(test)]
@@ -1133,6 +1140,7 @@ impl Supervisor {
             proxy_url: None,
             inbox: Arc::default(),
             child_env_allowlist: false,
+            custody_cache: None,
             serve_options_applied: false,
             log_capture_mode: LogCaptureMode::default(),
             #[cfg(test)]
@@ -1190,6 +1198,7 @@ impl Supervisor {
             proxy_url: None,
             inbox: Arc::default(),
             child_env_allowlist: false,
+            custody_cache: None,
             serve_options_applied: false,
             log_capture_mode: LogCaptureMode::default(),
             #[cfg(test)]
@@ -1254,6 +1263,23 @@ impl Supervisor {
     /// swallowed by the bus.
     pub(crate) fn publish(&self, seq: u64, event: EngineEvent) {
         self.events.publish(seq, event);
+    }
+
+    /// Install the engine's custody cache (story 22-2, open-time only,
+    /// before any start): a custodied start seeds its resolved value here —
+    /// the one in-memory home for provider cleartext outside the spawn
+    /// environment's Run Key delivery.
+    /// The installed custody cache (cfg(test): the cache-miss tests).
+    #[cfg(test)]
+    pub(crate) fn custody_cache(&self) -> Option<Arc<crate::domain::custody::CustodyCache>> {
+        self.custody_cache.clone()
+    }
+
+    pub(crate) fn install_custody_cache(
+        &mut self,
+        cache: std::sync::Arc<crate::domain::custody::CustodyCache>,
+    ) {
+        self.custody_cache = Some(cache);
     }
 
     /// Install (or replace) the host-provided diagnostic sink (story 10-2).
@@ -1422,7 +1448,7 @@ impl Supervisor {
     /// state.db outbox since story 21-1): an UN-ACKED eviction means a Host
     /// that has not acked lost replayable events, so it is a diagnostic,
     /// never silent (AI-18). An acked eviction is free and silent.
-    pub(super) fn note_outbox_append(&self, append: &crate::ports::OutboxAppend) {
+    pub(crate) fn note_outbox_append(&self, append: &crate::ports::OutboxAppend) {
         if append.dropped_unacked > 0 {
             self.emit_diagnostic(&format!(
                 "outbox compaction dropped {} un-acked event(s) to stay under the {}MB cap — \

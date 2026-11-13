@@ -1450,6 +1450,15 @@ fn conformance_inner_evidence(
             // A provisioning failure is not fatal here: the affected sections
             // report the engine's own fail-fast reason (machine-readable).
             let _ = facade.set_config("tck-subject", "metering.upstream_base_url", &stub.base_url);
+            // Story 22-2: an engine-observed agent starts only when Hekma holds its
+            // provider key (FR-19); this metering test holds one with custody off.
+            std::env::set_var("HEKMA_TCK_PROVIDER_KEY", "sk-test-held-provider-key");
+            let _ = facade.set_config(
+                "tck-subject",
+                "provider.api_key",
+                "secret:HEKMA_TCK_PROVIDER_KEY",
+            );
+            let _ = facade.set_config("tck-subject", "provider.custody", "off");
             Some(stub)
         } else {
             None
@@ -5017,6 +5026,19 @@ fn engine_observed_metering_inner(
     // Operator config: the real upstream (the engine forwards there).
     facade
         .set_config(probe_kind, "metering.upstream_base_url", &stub.base_url)
+        .map_err(|e| format!("set upstream url failed: {e}"))?;
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TCK_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            probe_kind,
+            "provider.api_key",
+            "secret:HEKMA_TCK_PROVIDER_KEY",
+        )
+        .map_err(|e| format!("set upstream url failed: {e}"))?;
+    facade
+        .set_config(probe_kind, "provider.custody", "off")
         .map_err(|e| format!("set upstream url failed: {e}"))?;
     facade
         .start(probe_kind)

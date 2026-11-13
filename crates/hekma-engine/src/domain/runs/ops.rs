@@ -442,6 +442,11 @@ pub(crate) struct SupervisedRun {
     /// the Run (the shared proxy's Run route forwards there); `None` keeps
     /// what is recorded (an adoption) or records none (self-reported).
     pub upstream: Option<String>,
+    /// Story 22-2: the custody row this launch freezes on the Run. `None`
+    /// (an adoption) keeps what is recorded; the row's `origin` is frozen
+    /// for the Run's life — a relaunch after a configuration edit changes
+    /// nothing.
+    pub custody: Option<crate::ports::RunCustodyRow>,
 }
 
 /// A supervised launch's credentials (story 22-1), value-free: the Run Key
@@ -659,6 +664,14 @@ pub(crate) fn ensure_supervised<S: RunRecords + ?Sized>(
     // Run route forwards there); the freshest entry publishes last.
     if let Some(upstream) = &run.upstream {
         store.set_run_upstream(&run.run_id, Some(upstream))?;
+        if let Some(entry) = refreshed_entry(store, &run.run_id)? {
+            changes.entries.push(entry);
+        }
+    }
+    // Story 22-2: the custody row freezes on the Run with the same job
+    // (the origin for the Run's life; the reference, never a value).
+    if let Some(custody) = &run.custody {
+        store.set_run_custody(&run.run_id, Some(custody.clone()))?;
         if let Some(entry) = refreshed_entry(store, &run.run_id)? {
             changes.entries.push(entry);
         }
@@ -1235,6 +1248,11 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
         cost_micros: rollup.cost,
         estimate: EstimateLabel::Estimated,
     };
+    let custody = if record.process_owner {
+        Some(super::listing::CustodyView::of(store.run_custody(run_id)?))
+    } else {
+        None
+    };
     Ok(RunView {
         labels: store.run_labels(run_id)?,
         limits: store.run_limits(run_id)?,
@@ -1242,6 +1260,7 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
         open_children: store.open_children(run_id)?,
         usage,
         record,
+        custody,
     })
 }
 

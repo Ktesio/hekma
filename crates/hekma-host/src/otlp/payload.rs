@@ -312,6 +312,9 @@ impl MetricState {
             // Story 23-1: binding events carry no counter before
             // `otlp-metrics v2` (the AD-21 interim) — ignored.
             EngineEvent::Binding(_) => {}
+            // Story 22-2: a reveal names a secret, never a value, and has
+            // no metric — ignored.
+            EngineEvent::SecretRevealed(_) => {}
         }
     }
 

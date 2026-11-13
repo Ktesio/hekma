@@ -23,7 +23,7 @@ use crate::paths::EnginePaths;
 use crate::ports::RunStore;
 use crate::ports::{
     CompositeSecretResolver, GuaranteeLevel, MemoryBacking, MemoryBackingKind, MemoryBackingStatus,
-    PolicyRecords, SecretError, SpawnRecord, StateStore, StoreError,
+    PolicyRecords, SecretError, SecretResolver, SpawnRecord, StateStore, StoreError,
 };
 use crate::store::{LegacyLogs, LegacyOutbox, LegacySource, SqliteStore, StoreWriter};
 use crate::time::now_rfc3339;
@@ -498,6 +498,8 @@ impl Registry {
             EngineEvent::Credential(event) => Some(event.run_id.clone()),
             // Story 23-1: a binding event names no Run.
             EngineEvent::Binding(_) => None,
+            // Story 22-2: a reveal names an instance and secrets, no Run.
+            EngineEvent::SecretRevealed(_) => None,
         }
     }
 
@@ -839,6 +841,19 @@ impl Registry {
     }
 
     /// The store writer, for the supervisor's pipeline and transition jobs.
+    /// Commit one event with its outbox row in its own writer job (story
+    /// 22-2: an event no other change carries, such as a reveal). The
+    /// caller publishes it with the returned append.
+    pub(crate) fn commit_event(
+        &self,
+        event: crate::domain::bus::EngineEvent,
+    ) -> Result<crate::ports::OutboxAppend, StoreError> {
+        self.writer.call(move |ctx| {
+            ctx.store()
+                .append_outbox(&event, crate::domain::OUTBOX_MAX_BYTES)
+        })
+    }
+
     pub(crate) fn writer(&self) -> &StoreWriter {
         &self.writer
     }
@@ -1572,6 +1587,41 @@ impl Registry {
     /// [`RegistryError::Io`] as the other snapshot reads.
     pub(crate) fn metering_source(&self, name: &InstanceName) -> Result<String, RegistryError> {
         Ok(self.read_adapter_snapshot(name)?.metering_source)
+    }
+
+    /// Resolve ONE secret name fail-closed (story 22-2, the custody start
+    /// path): the same env-then-file resolver [`Self::resolve_secrets`]
+    /// composes, for the provider key alone — the value validates the start
+    /// and seeds the custody cache; it never reaches the adapter mapping.
+    pub(crate) fn require_secret(
+        &self,
+        name: &str,
+    ) -> Result<SecretString, crate::ports::SecretError> {
+        CompositeSecretResolver::env_then_file(self.paths.secrets_file()).require(name)
+    }
+
+    /// The pinning declared beside a secret in the secrets file
+    /// (`[custody.NAME]`, story 22-2): `None` when nothing is declared (the
+    /// built-in provider table supplies defaults).
+    pub(crate) fn custody_pin(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::domain::custody::CustodyPin>, crate::ports::SecretError> {
+        CompositeSecretResolver::env_then_file(self.paths.secrets_file()).custody_pin(name)
+    }
+
+    /// A Run's stored custody row (story 22-2): the relaunch freeze check.
+    pub(crate) fn run_custody(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<crate::ports::RunCustodyRow>, RegistryError> {
+        use crate::ports::RunRecords;
+        Ok(self.store.run_custody(run_id)?)
+    }
+
+    /// The engine's secrets-file path (the custody cache's resolver).
+    pub(crate) fn secrets_file(&self) -> std::path::PathBuf {
+        self.paths.secrets_file()
     }
 
     /// The effective (current-OS) [`SupportLevel`] for `capability` on an

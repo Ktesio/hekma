@@ -4,6 +4,20 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — key custody, a preview (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it. Key custody is a **preview, not yet supported**: it becomes supported when the pending security rulings are recorded and its test criteria pass in CI.
+>
+> - **Hekma holds the provider key; the agent gets a Run Key.** A new unified key, `provider.api_key`, takes a `secret:NAME` reference only. With it set, custody is on by default (`provider.custody = "off"` opts out). The agent's mapped API-key variable receives the launch's Run Key and its base URL the proxy route; the real key stays in the Service Host's memory and is never in the agent's environment, arguments or Agent Home. An adapter may map `provider.api_key` to an `env` target only.
+> - **Start refusals, before any state change** (`EngineError::Custody`, exit 1): the same key delivered a second way (another leaf naming the secret, an `agent.<VAR>` pass-through or a launch-environment entry naming a listed provider variable), a key that does not resolve, and an origin the key cannot be pinned to. **Breaking:** an `engine-observed` agent whose provider key Hekma does not hold is now refused at start; set `provider.api_key` (with `provider.custody = "off"` for an `http` gateway), or switch the adapter to self-reported.
+> - **The swap.** Only a Run Key issued to a supervised agent or a credentialed open draws the custodied key, presented in the API-key slot (`authorization`, `x-api-key`, `x-goog-api-key`, `api-key`) or in `x-hekma-run-key`. The proxy removes the client's credentials, inserts the held key once in the provider's header, sends it only over `https` to the origin pinned for the key (frozen on the Run for its life) and only to paths on the key's list (`400 hekma_path_not_allowed`), and replaces the key in responses with `hekma_redacted_key`. Pins and paths come from a `[custody.NAME]` table in the secrets file, else a built-in table of well-known providers. A changed secrets file is picked up within 30 seconds. An endpoint binding's custodied key is used the same way, and a binding whose key cannot be pinned to its `https` upstream is refused.
+> - **The Host/Origin guard.** The metering proxy refuses, with `403 hekma_bad_host` and before any dial, a `Host` that is not loopback or listed with `hekma serve --proxy-allowed-hosts`, and any `Origin` not listed with `--proxy-allowed-origins`.
+> - **The process environment is cleared for a custodied agent** (its declared variables and the OS basics only), and `provider.isolate_home = "on"` points its home-directory variables inside its Agent Home.
+> - **Reveals are recorded.** `hekma agent config get --reveal` of a custodied key first records a `secret_revealed` event (the secret's name, never its value) through the Service Host, via `POST /v0/instances/{name}/config/revealed`, and prints nothing if that fails.
+> - **On Linux, `hekma serve` marks itself non-dumpable** with a core-dump limit of 0.
+> - **Custody is visible:** `hekma ps` shows it in the CONTROL column, `hekma run show` on a CUSTODY line, and Run documents a `custody` field (`on`, or `off` with `no-held-key`, `opted-out` or `pre-custody`).
+> - **One-way upgrade.** The first open migrates `state.db` to schema 19 (the Run custody columns); a Run live at the upgrade shows `pre-custody` until its next launch.
+> - **Engine surface within the unreleased `hekma-engine` 0.12.0** (no version bump): `EngineError::Custody`, `EngineEvent::SecretRevealed` with `SecretRevealedEvent`, `Engine::note_secret_revealed` and its `Blocking` twin, `harden_host_memory`, `CustodyView` with `RunSummary.custody` and `RunView.custody`, and `MeteringProxyOptions.allowed_hosts`/`allowed_origins`.
+
 > **Unreleased — per-call records for Hosts: `hekma calls` and `/v0/calls` (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >

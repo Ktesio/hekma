@@ -114,6 +114,16 @@ pub use adapter::{AdapterRef, ResolvedAdapter};
 /// Service Host (the engine owns process control; the OS parts live in
 /// `backends/`).
 pub use backends::spawn_detached_process;
+pub use domain::custody::{SecretRevealedEvent, SECRET_REVEALED_SCHEMA_VERSION};
+
+/// Story 22-2 (P10): harden the calling process's memory — on Linux it
+/// becomes non-dumpable (no core dump, no same-user `ptrace` or
+/// `/proc/<pid>/mem` read) with `RLIMIT_CORE` 0; on other systems nothing
+/// changes. The Service Host calls it once at start, because its custody
+/// cache holds provider keys in memory. An embedding host may call it too.
+pub fn harden_host_memory() -> Result<(), String> {
+    backends::harden_host_memory()
+}
 pub use domain::{
     broadcast, is_pass_through, render_dollars, render_dollars_bare, resolve, AcpContextCostView,
     AcpContextUsageView, AgentInstance, BreachAction, BreachDimension, BreachScope,
@@ -148,9 +158,10 @@ pub use domain::{
 };
 // Story 21-5: the Run listing — `hekma ps` and `GET /v0/runs`'s read model.
 pub use domain::{
-    decode_cursor, encode_cursor, ended_run_cutoff, LatchedBreach, ListRunsQuery, ListingCounts,
-    ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument, RunSummary,
-    ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
+    decode_cursor, encode_cursor, ended_run_cutoff, CustodyView, LatchedBreach, ListRunsQuery,
+    ListingCounts, ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument,
+    RunSummary, ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT,
+    RUN_LISTING_SCHEMA_VERSION,
 };
 // The per-call read surface over the calls store: the query, the record,
 // the listing and its document, the forward-compatible enums, the cursor

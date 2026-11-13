@@ -289,6 +289,19 @@ fn serve_helper_subprocess() {
             "http://127.0.0.1:9/",
         )
         .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            "observed",
+            "provider.api_key",
+            "secret:HEKMA_TEST_PROVIDER_KEY",
+        )
+        .unwrap();
+    facade
+        .set_config("observed", "provider.custody", "off")
+        .unwrap();
     facade.start("observed").unwrap();
     // Crash: exit without dropping the engine. The child survives (its own
     // session), its injected base_url points at the now-dead port.
@@ -336,6 +349,19 @@ fn a_fixed_metering_port_binds_and_injects_that_port() {
             "metering.upstream_base_url",
             "http://127.0.0.1:9/",
         )
+        .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            "observed",
+            "provider.api_key",
+            "secret:HEKMA_TEST_PROVIDER_KEY",
+        )
+        .unwrap();
+    facade
+        .set_config("observed", "provider.custody", "off")
         .unwrap();
     facade.start("observed").unwrap();
     // The proxy answers on the FIXED port, and the engine reports it.
@@ -406,6 +432,19 @@ fn a_host_restart_rebinds_the_same_fixed_port() {
                 "metering.upstream_base_url",
                 "http://127.0.0.1:9/",
             )
+            .unwrap();
+        // Story 22-2: an engine-observed agent starts only when Hekma holds its
+        // provider key (FR-19); this metering test holds one with custody off.
+        std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+        facade
+            .set_config(
+                "observed",
+                "provider.api_key",
+                "secret:HEKMA_TEST_PROVIDER_KEY",
+            )
+            .unwrap();
+        facade
+            .set_config("observed", "provider.custody", "off")
             .unwrap();
         facade.start("observed").unwrap();
         poll_dump_for(
@@ -649,6 +688,19 @@ fn serve_mode_children_inherit_only_their_declared_environment() {
             "http://127.0.0.1:9/",
         )
         .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            "allowlist",
+            "provider.api_key",
+            "secret:HEKMA_TEST_PROVIDER_KEY",
+        )
+        .unwrap();
+    facade
+        .set_config("allowlist", "provider.custody", "off")
+        .unwrap();
     facade.start("allowlist").unwrap();
     // The DECLARED mapping arrived (the engine's injection survived the
     // clear — the value's PORT is the ephemeral pick here, so needle on the
@@ -733,6 +785,19 @@ fn plain_open_children_inherit_the_environment_unchanged() {
             "http://127.0.0.1:9/",
         )
         .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            "inherit",
+            "provider.api_key",
+            "secret:HEKMA_TEST_PROVIDER_KEY",
+        )
+        .unwrap();
+    facade
+        .set_config("inherit", "provider.custody", "off")
+        .unwrap();
     facade.start("inherit").unwrap();
     let text = poll_dump_for(&dump, "env=OPENAI_BASE_URL=http://127.0.0.1:");
     assert!(
@@ -796,6 +861,19 @@ fn a_pinned_port_already_held_refuses_the_start_naming_the_port() {
             "metering.upstream_base_url",
             "http://127.0.0.1:9/",
         )
+        .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            "collision",
+            "provider.api_key",
+            "secret:HEKMA_TEST_PROVIDER_KEY",
+        )
+        .unwrap();
+    facade
+        .set_config("collision", "provider.custody", "off")
         .unwrap();
     let err = facade.start("collision").unwrap_err();
     match &err {

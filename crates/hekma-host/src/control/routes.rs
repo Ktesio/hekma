@@ -123,6 +123,23 @@ pub(crate) async fn config_get(
     }))
 }
 
+/// `POST /v0/instances/{name}/config/revealed` (story 22-2) — record that
+/// the instance's custodied provider key is about to be revealed: one
+/// `secret_revealed` event naming the secret, committed and published
+/// before the answer. `hekma agent config get --reveal` calls it before it
+/// prints a custodied key, and prints nothing when it fails. Operator
+/// bearer only (the Operator route family).
+pub(crate) async fn config_revealed(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<dto::RevealedDocument>> {
+    let event = state.engine.note_secret_revealed(&name).await?;
+    Ok(Json(dto::RevealedDocument {
+        schema_version: hekma_engine::SECRET_REVEALED_SCHEMA_VERSION,
+        secrets: event.map(|event| event.secrets).unwrap_or_default(),
+    }))
+}
+
 /// `PUT /v0/instances/{name}/config` — one key write, acknowledged with the
 /// post-write read-back PLUS the engine's zero-or-more WARN-ONLY steering
 /// warnings (AI-18: they ride the body — the host's stderr is not the

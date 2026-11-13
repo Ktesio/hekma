@@ -512,6 +512,19 @@ fn adoption_helper_subprocess() {
             facade
                 .set_config("obssurv", "metering.upstream_base_url", &dead_upstream)
                 .unwrap();
+            // Story 22-2: an engine-observed agent starts only when Hekma holds its
+            // provider key (FR-19); this metering test holds one with custody off.
+            std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+            facade
+                .set_config(
+                    "obssurv",
+                    "provider.api_key",
+                    "secret:HEKMA_TEST_PROVIDER_KEY",
+                )
+                .unwrap();
+            facade
+                .set_config("obssurv", "provider.custody", "off")
+                .unwrap();
             facade.start("obssurv").unwrap();
             hekma_conformance::exit_helper_subprocess(0);
         }

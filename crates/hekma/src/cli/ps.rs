@@ -137,8 +137,8 @@ fn render(
     }
     let columns = [
         ui::TableColumn::new("RUN", 10, 32),
-        // 20: `supervised (no wire)` renders whole.
-        ui::TableColumn::new("CONTROL", 8, 20),
+        // 38: `supervised · custody off (no-held-key)` renders whole.
+        ui::TableColumn::new("CONTROL", 8, 38),
         ui::TableColumn::new("STATUS", 6, 6),
         ui::TableColumn::new("ANOMALIES", 9, 24),
         ui::TableColumn::new("LABELS", 6, 24),
@@ -153,11 +153,13 @@ fn render(
         .map(|item| {
             vec![
                 ui::TableCell::plain(run_cell(item)),
-                ui::TableCell::plain(
-                    item.record
+                ui::TableCell::plain(control_cell(
+                    &item
+                        .record
                         .control_depth
                         .display_with_wire(item.record.wire_path),
-                ),
+                    item.custody.as_ref(),
+                )),
                 ui::TableCell::status(item.record.status.as_str()),
                 ui::TableCell::plain(anomalies_cell(item)),
                 ui::TableCell::plain(labels_cell(item)),
@@ -169,6 +171,26 @@ fn render(
     ui::print_table("Runs", &columns, &rows);
     footer(listing, all, next_page);
     Ok(())
+}
+
+/// The CONTROL cell (story 22-2): the depth, then the custody of a Run that
+/// owns a process (`supervised · custody on`, `supervised · custody off
+/// (opted-out)`).
+fn control_cell(depth: &str, custody: Option<&hekma_engine::CustodyView>) -> String {
+    match custody {
+        Some(view) => format!("{depth} · custody {}", custody_cell(Some(view))),
+        None => depth.to_string(),
+    }
+}
+
+/// A Run's custody (story 22-2): `on`, `off (<reason>)`, or `-` for a Run
+/// that owns no process.
+pub(crate) fn custody_cell(custody: Option<&hekma_engine::CustodyView>) -> String {
+    match custody {
+        Some(view) if view.state == "on" => "on".to_string(),
+        Some(view) => format!("{} ({})", view.state, view.reason),
+        None => "-".to_string(),
+    }
 }
 
 /// The empty page's note, worded for what was asked: a later page, a
@@ -403,6 +425,7 @@ mod tests {
             kept_on_pause: false,
             identity: None,
             before_shared_proxy: false,
+            custody: None,
         }
     }
 

@@ -14,6 +14,9 @@
 //! Graceful stop: stop accepting → in-flight calls finish within the grace
 //! → the rest are aborted (`shutdown`) → the record pump closes.
 
+#[cfg(test)]
+#[path = "custody/tests.rs"]
+mod custody_tests;
 pub(crate) mod forward;
 pub(crate) mod identify;
 pub(crate) mod records;
@@ -51,6 +54,29 @@ pub struct MeteringProxyOptions {
     pub max_concurrent_calls: usize,
     /// The most request and response bytes buffered at once.
     pub max_buffered_bytes: u64,
+    /// Host header values beyond the loopback literals the Host/Origin
+    /// guard accepts (story 22-2, `--proxy-allowed-hosts`; empty = the
+    /// loopback literals alone).
+    pub allowed_hosts: Vec<String>,
+    /// `Origin` header values the Host/Origin guard accepts (story 22-2,
+    /// `--proxy-allowed-origins`; empty = every `Origin` is refused —
+    /// SDKs send none, and a browser page's cross-site request is the
+    /// threat).
+    pub allowed_origins: Vec<String>,
+    /// cfg(test) seam: one extra trusted root (DER) for the custody tests'
+    /// TLS fake upstream.
+    #[cfg(test)]
+    pub(crate) test_root_der: Option<Vec<u8>>,
+}
+
+/// The upstream client's TLS config (the cfg(test) seam adds one root).
+fn tls_config(options: &MeteringProxyOptions) -> std::sync::Arc<rustls::ClientConfig> {
+    #[cfg(test)]
+    if let Some(der) = &options.test_root_der {
+        return crate::metering::relay::tls_config_with_root(der);
+    }
+    let _ = options;
+    crate::metering::relay::default_tls_config()
 }
 
 impl Default for MeteringProxyOptions {
@@ -62,6 +88,10 @@ impl Default for MeteringProxyOptions {
             identity_headers: true,
             max_concurrent_calls: 512,
             max_buffered_bytes: 512 * 1024 * 1024,
+            allowed_hosts: Vec::new(),
+            allowed_origins: Vec::new(),
+            #[cfg(test)]
+            test_root_der: None,
         }
     }
 }
@@ -103,6 +133,9 @@ pub(crate) struct ProxyDeps {
     pub writer: WriterHandle,
     pub inbox: Arc<EvaluationInbox>,
     pub diagnostics: Arc<dyn Fn(String) + Send + Sync>,
+    /// Story 22-2: the custody cache — the swap's value source (in-memory
+    /// only, refreshed off the hot path).
+    pub custody: Arc<crate::domain::custody::CustodyCache>,
 }
 
 impl MeteringProxy {
@@ -157,9 +190,7 @@ impl MeteringProxy {
         let shared = Arc::new(forward::ProxyShared {
             snapshot: deps.snapshot,
             pump,
-            client: crate::metering::relay::proxy_client(
-                crate::metering::relay::default_tls_config(),
-            ),
+            client: crate::metering::relay::proxy_client(tls_config(options)),
             identity_headers: options.identity_headers,
             inflight: Arc::new(Semaphore::new(options.max_concurrent_calls.max(1))),
             max_calls: options.max_concurrent_calls.max(1),
@@ -171,6 +202,9 @@ impl MeteringProxy {
             pending: std::sync::Mutex::default(),
             diagnostics: deps.diagnostics,
             last_note_minute: std::sync::atomic::AtomicU64::new(0),
+            custody: deps.custody,
+            allowed_hosts: options.allowed_hosts.clone().into(),
+            allowed_origins: options.allowed_origins.clone().into(),
             #[cfg(test)]
             ensure_delay: std::sync::Mutex::new(None),
         });

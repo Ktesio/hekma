@@ -477,6 +477,21 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// Record a process-owning Run's upstream base URL (story 23-1).
     fn set_run_upstream(&self, run_id: &RunId, upstream: Option<&str>) -> Result<(), StoreError>;
 
+    /// Record a Run's custody row (story 22-2, its launch job): the state
+    /// (`on`/`off`), the reason (`held`/`no-held-key`/`opted-out`), the
+    /// origin frozen for the Run's life and the `secret:NAME` reference —
+    /// references only, never a value.
+    fn set_run_custody(
+        &self,
+        run_id: &RunId,
+        custody: Option<RunCustodyRow>,
+    ) -> Result<(), StoreError>;
+
+    /// A Run's stored custody row (story 22-2): the relaunch freeze check
+    /// and the listing's custody field. `None` when the Run predates
+    /// custody (`pre-custody`) or stores none.
+    fn run_custody(&self, run_id: &RunId) -> Result<Option<RunCustodyRow>, StoreError>;
+
     /// The Run Keys revoked at or after `since` (RFC 3339), newest first,
     /// at most `limit` (story 23-1: the recently-revoked set at open).
     fn recently_revoked_keys(
@@ -510,4 +525,20 @@ pub(crate) struct TokenRow {
     pub issued_at: String,
     pub revoked_at: Option<String>,
     pub revoke_cause: Option<String>,
+}
+
+/// One stored Run custody row (story 22-2, schema v19): what a launch froze
+/// on its Run. References only — `key_ref` is a `secret:NAME` string, never
+/// a value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RunCustodyRow {
+    /// `on` or `off`.
+    pub state: String,
+    /// `held`, `no-held-key` or `opted-out` (`pre-custody` is the honest
+    /// derivation for a row that stores none).
+    pub reason: String,
+    /// The canonical origin frozen at start, when custody is on.
+    pub origin: Option<String>,
+    /// The `secret:NAME` reference, when a key is held.
+    pub key_ref: Option<String>,
 }

@@ -64,6 +64,9 @@ impl Supervisor {
             // `pause` in the resolution (never resolved as if unset).
             inputs: Some(registry.resolve_inputs_fail_closed(name)),
             upstream: None,
+            // Story 22-2: an adoption keeps the Run's frozen custody row
+            // (nothing here re-resolves it; only a launch does).
+            custody: None,
         };
         match registry.ensure_supervised_run(run) {
             Ok(events) => self.publish_run_events(events),

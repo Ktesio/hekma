@@ -135,6 +135,7 @@ masked, exactly as the CLI displays it).
 | `GET` | `/v0/instances/{name}/capabilities` | The effective Capability Declaration projected onto this OS | 200 |
 | `GET` | `/v0/instances/{name}/config` | The effective config (the `config get --json` document; values masked) | 200 |
 | `PUT` | `/v0/instances/{name}/config` | Set one key: `{"key","value"}` — acknowledged with the post-write read-back plus the engine's warn-only steering warnings | 200 |
+| `POST` | `/v0/instances/{name}/config/revealed` | Record that the instance's custodied provider key is about to be revealed ([key custody](run-keys.md#key-custody-preview--not-yet-supported), a preview): one `secret_revealed` event naming the secret, committed before the answer. `hekma agent config get --reveal` calls it first and prints nothing if it fails. Answers `{"schema_version","secrets"}` with the secret names (empty, and no event, when the instance custodies nothing) | 200 |
 | `GET` | `/v0/instances/{name}/events` | Cursor pull: the engine's resync batch for one instance (lossless + idempotent) | 200 |
 | `POST` | `/v0/instances/{name}/start` | Start the agent. Optional body `{"detach": true}`: the handle is disarmed at spawn, so the agent also survives this host's exit (an `engine-observed` instance is refused). A PRESENT body must parse | 200 + read-back |
 | `POST` | `/v0/instances/{name}/stop` | Stop through the bounded ladder; optional body `{"window_secs": N}` (1..=86400, out-of-bounds is a 400). A PRESENT body must parse — only a truly ABSENT body means the engine's default window | 200 + read-back |
@@ -262,7 +263,11 @@ neither take over nor discover an id the Operator or a Host uses. The response (
 `wire_path`, `status`, `anomalies`, `parent_run_id`, `instance`,
 `process_owner`, `end_cause`, timestamps, `labels` (each with its `source`),
 `limits`, `usage` (input, output and cached tokens plus `cost_micros`, over the
-Run's subtree, labelled `estimated`) and `open_children`.
+Run's subtree, labelled `estimated`), `open_children`, and, on a Run that
+owns a supervised process, `custody`: `{"state": "on" | "off", "reason"}`
+with `held` when on, or `no-held-key`, `opted-out` or `pre-custody` when off
+([key custody](run-keys.md#key-custody-preview--not-yet-supported), a
+preview). The listing's rows (`GET /v0/runs`) carry the same `custody` field.
 
 Run refusals carry a stable `error.code` beside the `kind`:
 
@@ -648,7 +653,9 @@ first** (the SSE stream), then act, then pull the durable record.
 connected client; each event rides one `data:` frame whose payload is the
 engine's own kind-tagged JSON (`{"kind":"transition",…}`,
 `{"kind":"budget_breach",…}`, `{"kind":"usage_update",…}`, and
-`{"kind":"run",…}` for a Run created, ended or changed) — never re-shaped.
+`{"kind":"run",…}` for a Run created, ended or changed, and
+`{"kind":"secret_revealed",…}` when a custodied provider key is revealed,
+naming the instance and the secret, never its value) — never re-shaped.
 Every event frame also carries `id: <seq>` — the event's position in the
 global outbox, the same `seq` `GET /v0/export` serves. A client that falls
 behind the bus gets an in-stream `{"kind":"lagged","skipped":N}` frame
