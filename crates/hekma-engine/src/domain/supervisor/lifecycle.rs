@@ -1296,7 +1296,13 @@ impl Supervisor {
             // read is not crash evidence — that is poll_once's corroboration
             // discipline, AI-12 — and teardown must not invent a crash).
             if let Ok(ProcessStatus::Exited { code }) = self.backend.poll(&mut supervised.handle) {
-                self.reconcile_released_exit(registry, &name, code);
+                // AI-13: read the adopted flag BEFORE the reconcile — a
+                // code-less `None` has the same TWO shapes the reaper draws
+                // (an adopted handle's code is unrecoverable by structure;
+                // this engine's own child's code-less exit is a signal), and
+                // the cause must name the honest one (issue #387).
+                let adopted = supervised.adopted;
+                self.reconcile_released_exit(registry, &name, code, adopted);
                 continue;
             }
             if classify_pause_kind(registry, &name) == PauseKind::Breach {
@@ -1434,16 +1440,36 @@ impl Supervisor {
     /// settle). No restart plan: the engine is tearing down; the Restart
     /// Policy is the NEXT open's decision (its adoption already reconciles a
     /// dead pid identically).
-    fn reconcile_released_exit(&self, registry: &Registry, name: &InstanceName, code: Option<i32>) {
+    ///
+    /// AI-13 (issue #387): a code-less exit splits the same way the reaper's
+    /// crash path splits it, on the caller-read `Supervised.adopted` flag —
+    /// an ADOPTED handle's code is unrecoverable by structure (this engine is
+    /// not the parent), so the cause says the code is unavailable and why;
+    /// this engine's OWN child's code-less exit is a signal termination
+    /// (on Unix `ExitStatus::code() == None` ⟺ `WIFSIGNALED`) and says so.
+    /// The wording rides the shared cause fragments so the two surfaces
+    /// cannot drift. On WINDOWS the adopted poll reads the real code via
+    /// `GetExitCodeProcess`, so a code-less exit there is
+    /// genuinely-unreadable, not signal-shaped.
+    fn reconcile_released_exit(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        code: Option<i32>,
+        adopted: bool,
+    ) {
         let detail = match code {
             Some(code) => {
                 format!(
                     "paused detached child exited before engine release (exited with code {code})"
                 )
             }
-            None => "paused detached child exited before engine release (exit code unavailable \
-                     — adopted process is not this engine's child)"
-                .to_string(),
+            None if adopted => format!(
+                "paused detached child exited before engine release ({CODE_LESS_ADOPTED_FRAGMENT})"
+            ),
+            None => format!(
+                "paused detached child exited before engine release ({CODE_LESS_SIGNAL_FRAGMENT})"
+            ),
         };
         if self
             .transition(

@@ -207,6 +207,25 @@ const USAGE_PARK_MAX_ATTEMPTS: u32 = 3;
 /// SKIP bound above is the per-event counterpart of this whole-buffer bound.
 const OBSERVED_PARK_MAX_EVENTS: usize = 1024;
 
+/// AI-13's cause vocabulary for a CODE-LESS exit (`code: None`), shared by the
+/// reaper's crash path and the release pass's released-exit reconcile so the
+/// two surfaces cannot drift (issue #387). An ADOPTED handle's code is
+/// unrecoverable BY STRUCTURE — this engine is not the parent, so it reads
+/// liveness via `kill(pid, 0)` + the start-time fingerprint and can never hold
+/// an `ExitStatus` — while the engine's OWN child's code-less exit IS a signal
+/// termination (`try_wait` held the authoritative status; on Unix
+/// `ExitStatus::code() == None` ⟺ `WIFSIGNALED`). On WINDOWS the adopted
+/// handle's poll reads the real code via `GetExitCodeProcess`
+/// (backends/windows reap_if_exited), so a code-less exit there is
+/// genuinely-unreadable, not signal-shaped — both fragments are worded for
+/// that honesty.
+const CODE_LESS_ADOPTED_FRAGMENT: &str =
+    "exit code unavailable — adopted process is not this engine's child";
+
+/// The own-child counterpart of [`CODE_LESS_ADOPTED_FRAGMENT`] (see its doc
+/// for the platform shape and why one const guards both surfaces).
+const CODE_LESS_SIGNAL_FRAGMENT: &str = "terminated by signal";
+
 /// A scheduled restart of a crashed instance (story 1-6, AC4). Returned by
 /// [`Supervisor::poll_once`] for each crashed `on-failure` instance that has not
 /// hit the crash-loop threshold; the engine cadence sleeps [`RestartPlan::delay`]
