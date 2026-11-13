@@ -547,3 +547,93 @@ fn block_refuses_a_wire_runs_next_call_and_lets_safe_methods_pass() {
     );
     assert_eq!(upstream.served().len(), served_at_block + 1);
 }
+
+#[test]
+fn a_child_runs_key_charges_its_own_run_and_is_refused_once_revoked() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    // The binding's Run exists after its first call.
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    let parent = wait_for_usage(&engine, ("binding", "openai"), 10);
+
+    // A child Run beneath it, with its Run Key.
+    let mut request = hekma_engine::ChildRunRequest::under(hekma_engine::RunParent::Run(
+        parent.record.run_id.clone(),
+    ));
+    request.issue_credentials = true;
+    let opened = engine
+        .blocking()
+        .open_child_run_as(hekma_engine::RunActor::Operator, request)
+        .unwrap();
+    let credentials = opened.credentials.expect("the pair is issued");
+    let key = credentials.run_key().expose_secret().to_string();
+    let child = opened.view.record.run_id.clone();
+
+    // The key in x-hekma-run-key charges the child, on the binding's route.
+    let answer = post(port, "/openai/chat", &[("x-hekma-run-key", &key)]);
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    let served = upstream.served();
+    let seen = served.last().unwrap();
+    assert!(
+        seen.header("x-hekma-run-key").is_none(),
+        "the key went upstream"
+    );
+    assert_eq!(seen.header("x-hekma-run-id"), Some(child.as_str()));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let usage = runs(&engine)
+            .into_iter()
+            .find(|run| run.record.run_id == child)
+            .map(|run| run.usage.input_tokens)
+            .unwrap_or_default();
+        if usage >= 10 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the child was never charged");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // The same key in the API-key slot would reach the provider: refused.
+    let bearer = format!("Bearer {key}");
+    let answer = post(port, "/openai/chat", &[("authorization", &bearer)]);
+    assert_eq!(answer.status, 400, "{}", answer.body);
+    assert_eq!(answer.error_type(), "hekma_custody_unavailable");
+
+    // Revoked: the next call is told so, and is not forwarded.
+    let served_before = upstream.served().len();
+    engine
+        .blocking()
+        .revoke_run_keys(child.as_str(), true)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let answer = loop {
+        let answer = post(port, "/openai/chat", &[("x-hekma-run-key", &key)]);
+        if answer.status != 200 {
+            break answer;
+        }
+        assert!(Instant::now() < deadline, "the revoked key still served");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(answer.status, 401, "{}", answer.body);
+    assert_eq!(answer.error_type(), "hekma_credential_revoked");
+    assert!(!answer.body.contains(&key));
+    let served_after = upstream.served().len();
+    assert!(
+        served_after <= served_before + 1,
+        "revoked calls reached the upstream"
+    );
+    // Once refused, it stays refused.
+    assert_eq!(
+        post(port, "/openai/chat", &[("x-hekma-run-key", &key)]).status,
+        401
+    );
+    assert_eq!(upstream.served().len(), served_after);
+}
