@@ -33,6 +33,7 @@ use crate::ports::StoreError;
 pub mod bindings;
 pub(crate) mod keys;
 pub(crate) mod labels;
+pub(crate) mod lease;
 pub(crate) mod limits;
 pub(crate) mod listing;
 pub(crate) mod ops;

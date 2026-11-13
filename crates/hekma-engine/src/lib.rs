@@ -205,6 +205,9 @@ pub use domain::{
 };
 // Story 23-1: the shared Metering Proxy's options and address (the type of
 // `EngineOptions::metering_proxy` and `Engine::metering_proxy`).
+pub use domain::runs::lease::{
+    LeaseOptions, LEASE_SECS, SILENT_WINDOW_SECS, SWEEP_INTERVAL_SECS, WIRE_INACTIVITY_SECS,
+};
 /// Story 22-1: the reserved credential config keys and the variable every
 /// supervised agent receives its Run Key in.
 pub use domain::{RUN_KEY_ENV, RUN_KEY_KEY, RUN_KEY_MARKER_PREFIX, RUN_REFRESH_KEY_KEY};

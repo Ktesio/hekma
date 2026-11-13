@@ -723,10 +723,31 @@ pub(crate) fn commit_proxied_call(
     close: ProxiedClose,
     runs: &Arc<SnapshotPublisher>,
     inbox: &Arc<EvaluationInbox>,
+    leases: &runs::lease::LeaseOptions,
 ) -> Result<(), StoreError> {
     use crate::ports::PolicyRecords as _;
     let store = ctx.store();
     store.insert_call_record(&close.record)?;
+    // Story 23-2: every identified call is activity on its Run — a refused
+    // one too (a client still trying is alive): `last_activity_at` moves,
+    // a held Lease extends, a `silent` Run returns to `active`.
+    {
+        let mut changes = RunChanges::default();
+        runs::lease::note_activity(
+            store,
+            &mut changes,
+            &close.record.run_id,
+            leases,
+            crate::time::now_unix_secs(),
+            false,
+        )?;
+        if !changes.events.is_empty() || !changes.entries.is_empty() {
+            let events = runs::ops::commit(ctx, runs, changes)?;
+            let inbox = Arc::clone(inbox);
+            ctx.after_commit(move || inbox.push_run_events(events));
+        }
+    }
+    let store = ctx.store();
     // Story 22-3: the first unscented call under `shadow` raises the
     // `unscented` Anomaly on the attributed Run, in this transaction (one
     // `anomalies-changed` event; further calls are no-ops).

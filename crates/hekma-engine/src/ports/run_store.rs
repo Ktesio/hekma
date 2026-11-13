@@ -417,6 +417,47 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// The Run an external id maps to under a binding.
     fn identity_run(&self, binding: &str, external_id: &str) -> Result<Option<RunId>, StoreError>;
 
+    /// A Run's Lease and last activity (story 23-2): `(lease_expires_at,
+    /// last_activity_at)`, RFC 3339; `None` for a Run that holds no Lease
+    /// or has had no activity recorded.
+    fn run_lease(&self, run_id: &RunId) -> Result<(Option<String>, Option<String>), StoreError>;
+
+    /// Set a Run's Lease expiry (`Some` renews; `None` drops it) and, when
+    /// given, its last activity (story 23-2).
+    fn set_run_lease(
+        &self,
+        run_id: &RunId,
+        lease_expires_at: Option<&str>,
+        last_activity_at: Option<&str>,
+    ) -> Result<(), StoreError>;
+
+    /// Record a Run's last activity without touching its Lease (story
+    /// 23-2): every identified proxied call.
+    fn touch_run_activity(&self, run_id: &RunId, at: &str) -> Result<(), StoreError>;
+
+    /// The sweep's first pass (story 23-2): open, ACTIVE, non-process-
+    /// owning Runs whose Lease expired before `now`, or that hold no Lease
+    /// and saw no activity since `inactive_before` — at most `limit`, read
+    /// off the two partial indexes.
+    fn runs_going_silent(
+        &self,
+        now: &str,
+        inactive_before: &str,
+        limit: usize,
+    ) -> Result<Vec<RunId>, StoreError>;
+
+    /// The sweep's second pass (story 23-2): non-process-owning Runs
+    /// `silent` since before `silent_before` — at most `limit`.
+    fn silent_runs_past(&self, silent_before: &str, limit: usize)
+        -> Result<Vec<RunId>, StoreError>;
+
+    /// Record which announce credential created a Run (story 23-2), by its
+    /// token hash.
+    fn set_run_created_by(&self, run_id: &RunId, hash: &[u8]) -> Result<(), StoreError>;
+
+    /// The announce credential's hash that created a Run, if one did.
+    fn run_created_by(&self, run_id: &RunId) -> Result<Option<Vec<u8>>, StoreError>;
+
     /// How many of a Run's children have not ended.
     fn open_children(&self, run_id: &RunId) -> Result<u64, StoreError>;
 

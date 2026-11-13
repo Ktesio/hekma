@@ -1201,6 +1201,10 @@ fn a_v15_state_dir_migrates_to_v16_and_the_listing_reads_it() {
         let store = SqliteStore::open(&db).unwrap();
         store
             .conn()
+            .execute_batch(crate::store::runs_sqlite::UNDO_V20_FOR_TEST)
+            .unwrap();
+        store
+            .conn()
             .execute_batch(crate::store::runs_sqlite::UNDO_V19_FOR_TEST)
             .unwrap();
         store
@@ -1383,6 +1387,10 @@ fn a_v16_state_dir_migrates_to_v17_and_a_live_run_keeps_running_without_a_key() 
         let store = SqliteStore::open(&db).unwrap();
         store
             .conn()
+            .execute_batch(crate::store::runs_sqlite::UNDO_V20_FOR_TEST)
+            .unwrap();
+        store
+            .conn()
             .execute_batch(crate::store::runs_sqlite::UNDO_V19_FOR_TEST)
             .unwrap();
         store
@@ -1420,4 +1428,147 @@ fn a_v16_state_dir_migrates_to_v17_and_a_live_run_keeps_running_without_a_key() 
     drop(reopened);
     let again = SqliteStore::open(&db).unwrap();
     assert!(again.run_tokens(&run).unwrap().is_empty());
+}
+
+#[test]
+fn the_sweep_statements_read_only_their_partial_indexes() {
+    // Story 23-2: the sweeper must stay cheap at 100,000 open Runs — each
+    // of its reads walks a partial index, never the `runs` table.
+    let (_tmp, store) = store();
+    for (name, sql, index) in [
+        (
+            "lease",
+            crate::store::runs_sqlite::SWEEP_LEASE_SQL,
+            "idx_runs_lease",
+        ),
+        (
+            "inactive",
+            crate::store::runs_sqlite::SWEEP_INACTIVE_SQL,
+            "idx_runs_activity",
+        ),
+        (
+            "silent",
+            crate::store::runs_sqlite::SWEEP_SILENT_SQL,
+            "idx_runs_activity",
+        ),
+    ] {
+        let mut stmt = store
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(rusqlite::params!["2026-11-13T00:00:00Z", 10], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter().any(|line| line.contains(index)),
+            "{name}: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|line| line == "SCAN runs" || line.starts_with("SCAN runs ")),
+            "{name}: a bare scan: {plan:?}"
+        );
+    }
+}
+
+#[test]
+fn the_sweep_silences_expired_and_idle_runs_ends_long_silent_ones_and_never_touches_a_process() {
+    use crate::domain::runs::lease::{note_activity, sweep, LeaseOptions};
+    use crate::domain::runs::ops::RunChanges;
+    let (_tmp, store) = store();
+    let now = crate::time::parse_rfc3339("2026-11-13T12:00:00Z")
+        .unwrap()
+        .0;
+    let old = "2026-11-13T09:00:00Z";
+    let recent = "2026-11-13T11:59:30Z";
+    let mut owner = record("owner", None, "a", true);
+    owner.updated_at = old.to_string();
+    insert(&store, owner, Vec::new(), RunLimits::default());
+    for id in ["idle", "expired", "fresh", "leased"] {
+        insert(
+            &store,
+            record(id, None, "b", false),
+            Vec::new(),
+            RunLimits::default(),
+        );
+    }
+    let mut long_silent = record("long_silent", None, "b", false);
+    long_silent.status = RunStatus::Silent;
+    long_silent.updated_at = old.to_string();
+    insert(&store, long_silent, Vec::new(), RunLimits::default());
+    let id = |raw: &str| RunId::from_wire(raw);
+    // The owner, idle for hours, holds nothing the sweeper reads.
+    store.touch_run_activity(&id("owner"), old).unwrap();
+    store.touch_run_activity(&id("idle"), old).unwrap();
+    store
+        .set_run_lease(&id("expired"), Some("2026-11-13T11:59:00Z"), Some(recent))
+        .unwrap();
+    store.touch_run_activity(&id("fresh"), recent).unwrap();
+    store
+        .set_run_lease(&id("leased"), Some("2026-11-13T12:00:30Z"), Some(old))
+        .unwrap();
+    store.touch_run_activity(&id("long_silent"), old).unwrap();
+
+    let changes = sweep(&store, &LeaseOptions::default(), now).unwrap();
+    let status = |raw: &str| store.run_record(&id(raw)).unwrap().unwrap().status;
+    assert_eq!(
+        status("owner"),
+        RunStatus::Active,
+        "a process is its heartbeat"
+    );
+    assert_eq!(
+        status("idle"),
+        RunStatus::Silent,
+        "no Lease, idle past the window"
+    );
+    assert_eq!(status("expired"), RunStatus::Silent, "the Lease expired");
+    assert_eq!(status("fresh"), RunStatus::Active, "recent traffic");
+    assert_eq!(
+        status("leased"),
+        RunStatus::Active,
+        "a live Lease wins over old activity"
+    );
+    let ended = store.run_record(&id("long_silent")).unwrap().unwrap();
+    assert_eq!(ended.status, RunStatus::Ended);
+    assert_eq!(ended.end_cause.as_deref(), Some("silent-window"));
+    // Two silent markings and one end: three events, no more.
+    assert_eq!(changes.events.len(), 3, "{:?}", changes.events);
+
+    // Activity lifts a silent Run back to active (one event) and extends
+    // its Lease; it never revives an ended one.
+    let mut lifted = RunChanges::default();
+    note_activity(
+        &store,
+        &mut lifted,
+        &id("expired"),
+        &LeaseOptions::default(),
+        now,
+        false,
+    )
+    .unwrap();
+    assert_eq!(status("expired"), RunStatus::Active);
+    assert_eq!(lifted.events.len(), 1);
+    let (lease, activity) = store.run_lease(&id("expired")).unwrap();
+    assert_eq!(lease.as_deref(), Some("2026-11-13T12:01:00Z"));
+    assert_eq!(activity.as_deref(), Some("2026-11-13T12:00:00Z"));
+    let mut nothing = RunChanges::default();
+    note_activity(
+        &store,
+        &mut nothing,
+        &id("long_silent"),
+        &LeaseOptions::default(),
+        now,
+        true,
+    )
+    .unwrap();
+    assert_eq!(status("long_silent"), RunStatus::Ended);
+    assert!(nothing.events.is_empty());
+    // A second sweep at the same instant changes nothing more.
+    let again = sweep(&store, &LeaseOptions::default(), now).unwrap();
+    assert!(again.events.is_empty(), "{:?}", again.events);
 }
