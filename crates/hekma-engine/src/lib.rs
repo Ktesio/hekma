@@ -144,11 +144,11 @@ pub use domain::{
 // Story 21-9: bound labels — the label verb's request and outcome, label
 // origins, and Selectors.
 pub use domain::{
-    parse_dollars_to_micros, validate_label_key, validate_label_value, verb_cell, Anomaly,
-    CellBehavior, ChildRunRequest, ControlDepth, Label, LabelChange, LabelOrigin, LabelOutcome,
-    LabelSource, RunError, RunEvent, RunEventKind, RunLimits, RunParent, RunRecord, RunStatus,
-    RunUsage, RunVerb, RunView, Selector, SelectorScope, VerbCell, HOST_IDENTITY_BINDING,
-    MAX_RUN_NESTING, MAX_SELECTED_RUNS, RUN_EVENT_SCHEMA_VERSION, RUN_VERBS,
+    disposition_for, parse_dollars_to_micros, validate_label_key, validate_label_value, verb_cell,
+    Anomaly, CellBehavior, ChildRunRequest, ControlDepth, Label, LabelChange, LabelOrigin,
+    LabelOutcome, LabelSource, RunError, RunEvent, RunEventKind, RunLimits, RunParent, RunRecord,
+    RunStatus, RunUsage, RunVerb, RunView, Selector, SelectorScope, VerbCell,
+    HOST_IDENTITY_BINDING, MAX_RUN_NESTING, MAX_SELECTED_RUNS, RUN_EVENT_SCHEMA_VERSION, RUN_VERBS,
 };
 // Story 21-6: Selectors on every verb and `hekma budget` — the Run-grain
 // lifecycle verbs, Run-level limits as one actor, and the budget read.

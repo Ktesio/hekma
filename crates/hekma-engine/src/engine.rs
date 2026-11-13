@@ -2489,7 +2489,10 @@ impl Engine {
                 .ok_or_else(|| RunError::NotFound {
                     run_id: run_id.as_str().to_string(),
                 })?;
-            crate::domain::runs::verbs::run_verb_target(verb, &record)?;
+            // Story 23-4: on a wire Run the verb maps to a disposition.
+            if crate::domain::runs::verbs::disposition_for(verb, &record).is_none() {
+                crate::domain::runs::verbs::run_verb_target(verb, &record)?;
+            }
             Ok(record)
         })
         .await

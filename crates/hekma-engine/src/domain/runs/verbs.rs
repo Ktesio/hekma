@@ -36,7 +36,9 @@ pub(crate) fn action_executable(
 ) -> bool {
     match action {
         BreachAction::Warn => true,
-        BreachAction::Pause | BreachAction::Stop => depth == ControlDepth::Supervised,
+        // Story 23-4: at a depth with a wire path a `pause` holds the
+        // Run's calls and a `stop` refuses them (latched until re-arm).
+        BreachAction::Pause | BreachAction::Stop => depth == ControlDepth::Supervised || wire_path,
         // Story 23-1: the shared proxy fences every Run with a wire path,
         // at any depth (the snapshot's disposition over the ancestor
         // chain) — `block` needs no process.
@@ -173,7 +175,7 @@ pub fn verb_cell(verb: RunVerb, depth: ControlDepth, wire_path: bool) -> VerbCel
         (RunVerb::PauseResume, ControlDepth::Observed) => cell(FailsFast, false, "fails fast"),
         (RunVerb::PauseResume, ControlDepth::Wire | ControlDepth::Announced) => cell(
             Qualified,
-            false,
+            true,
             "qualified: holds / releases the Run's calls",
         ),
         (RunVerb::PauseResume, ControlDepth::Supervised) => cell(
@@ -185,12 +187,12 @@ pub fn verb_cell(verb: RunVerb, depth: ControlDepth, wire_path: bool) -> VerbCel
         (RunVerb::Stop, ControlDepth::Observed) => cell(FailsFast, false, "fails fast"),
         (RunVerb::Stop, ControlDepth::Wire) => cell(
             Qualified,
-            false,
+            true,
             "qualified: rejects further calls, the process keeps running",
         ),
         (RunVerb::Stop, ControlDepth::Announced) => cell(
             Qualified,
-            false,
+            true,
             "qualified: rejects further calls and ends the Lease",
         ),
         (RunVerb::Stop, ControlDepth::Supervised) => cell(Honored, true, "process stop"),
@@ -208,7 +210,7 @@ pub fn verb_cell(verb: RunVerb, depth: ControlDepth, wire_path: bool) -> VerbCel
         (RunVerb::HoldReleaseRerouteReject, _) if no_wire => {
             cell(FailsFast, false, "fails fast, naming the Metering Source")
         }
-        (RunVerb::HoldReleaseRerouteReject, _) => cell(Honored, false, "honored"),
+        (RunVerb::HoldReleaseRerouteReject, _) => cell(Honored, true, "honored"),
 
         (RunVerb::BreachActionPauseStopBlock, ControlDepth::Observed) => cell(
             Refused,
@@ -231,7 +233,7 @@ pub fn verb_cell(verb: RunVerb, depth: ControlDepth, wire_path: bool) -> VerbCel
         ),
         (RunVerb::BreachActionPauseStopBlock, _) => cell(
             Honored,
-            false,
+            true,
             "as the verbs above (block as reject), latched until the ceiling is raised or reset",
         ),
     }
@@ -294,6 +296,33 @@ impl RunLifecycleVerb {
 /// its parent (`resume`), or the cell's own refusal naming the depth (or
 /// the Metering Source). No cell is flipped here: a child Run's lifecycle
 /// verbs act on its calls, which arrive with wire hold.
+/// The disposition verb a lifecycle verb maps to on a Run that owns no
+/// process and has a wire path (story 23-4): `pause` holds its calls,
+/// `resume` releases them, `stop` and `drain` reject them (and end the
+/// Run). `None` on any other Run (a process-owning Run keeps its
+/// instance's own verb).
+pub fn disposition_for(
+    verb: RunLifecycleVerb,
+    record: &super::RunRecord,
+) -> Option<super::dispositions::DispositionVerb> {
+    use super::dispositions::DispositionVerb;
+    if record.process_owner
+        || record.is_ended()
+        || !record.wire_path
+        || !matches!(
+            record.control_depth,
+            ControlDepth::Wire | ControlDepth::Announced
+        )
+    {
+        return None;
+    }
+    Some(match verb {
+        RunLifecycleVerb::Pause => DispositionVerb::Hold,
+        RunLifecycleVerb::Resume => DispositionVerb::Release,
+        RunLifecycleVerb::Stop | RunLifecycleVerb::Drain => DispositionVerb::Reject,
+    })
+}
+
 pub(crate) fn run_verb_target(
     verb: RunLifecycleVerb,
     record: &super::RunRecord,
@@ -404,7 +433,7 @@ mod tests {
             CellBehavior::Refused
         );
         assert!(
-            !verb_cell(
+            verb_cell(
                 RunVerb::BreachActionPauseStopBlock,
                 ControlDepth::Announced,
                 true

@@ -122,11 +122,11 @@ pub use runs::{
     RUN_LISTING_SCHEMA_VERSION,
 };
 pub use runs::{
-    validate_label_key, validate_label_value, verb_cell, Anomaly, CellBehavior, ChildRunRequest,
-    ControlDepth, Label, LabelChange, LabelOrigin, LabelOutcome, LabelSource, RunError, RunEvent,
-    RunEventKind, RunLimits, RunParent, RunRecord, RunStatus, RunUsage, RunVerb, RunView, Selector,
-    SelectorScope, VerbCell, HOST_IDENTITY_BINDING, MAX_RUN_NESTING, MAX_SELECTED_RUNS,
-    RUN_EVENT_SCHEMA_VERSION, RUN_VERBS,
+    disposition_for, validate_label_key, validate_label_value, verb_cell, Anomaly, CellBehavior,
+    ChildRunRequest, ControlDepth, Label, LabelChange, LabelOrigin, LabelOutcome, LabelSource,
+    RunError, RunEvent, RunEventKind, RunLimits, RunParent, RunRecord, RunStatus, RunUsage,
+    RunVerb, RunView, Selector, SelectorScope, VerbCell, HOST_IDENTITY_BINDING, MAX_RUN_NESTING,
+    MAX_SELECTED_RUNS, RUN_EVENT_SCHEMA_VERSION, RUN_VERBS,
 };
 pub use runs::{
     BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyEvent, PolicyEventKind,

@@ -63,7 +63,9 @@ pub use policy::{
     UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
 };
 pub use selector::{Selector, SelectorScope, MAX_SELECTED_RUNS};
-pub use verbs::{verb_cell, CellBehavior, RunLifecycleVerb, RunVerb, VerbCell, RUN_VERBS};
+pub use verbs::{
+    disposition_for, verb_cell, CellBehavior, RunLifecycleVerb, RunVerb, VerbCell, RUN_VERBS,
+};
 
 /// The schema version stamped on every [`RunEvent`] (AD-14). Independent of
 /// the transition, breach and usage event schemas; bumped only on an

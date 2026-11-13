@@ -1006,6 +1006,177 @@ pub(crate) async fn run_heartbeat(
     }
 }
 
+/// One hold-family verb on one Run (story 23-4).
+async fn disposition_one(
+    state: &ApiState,
+    run_id: &str,
+    verb: hekma_engine::DispositionVerb,
+) -> ApiResult<dto::DispositionDocument> {
+    let outcome = state
+        .engine
+        .set_disposition(run_id, verb, "operator")
+        .await?;
+    Ok(dto::DispositionDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        run_id: run_id.to_string(),
+        changed: outcome.changed,
+        reasons: outcome.reasons,
+        note: dto::DISPOSITION_NOTE,
+    })
+}
+
+/// `POST /v0/runs/{id}/hold` (story 23-4, Operator only) — hold the Run's
+/// model calls at the metering proxy.
+pub(crate) async fn run_hold(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<dto::DispositionDocument>> {
+    Ok(Json(
+        disposition_one(&state, &run_id, hekma_engine::DispositionVerb::Hold).await?,
+    ))
+}
+
+/// `POST /v0/runs/{id}/release` (story 23-4) — release the hold.
+pub(crate) async fn run_release(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<dto::DispositionDocument>> {
+    Ok(Json(
+        disposition_one(&state, &run_id, hekma_engine::DispositionVerb::Release).await?,
+    ))
+}
+
+/// `POST /v0/runs/{id}/reject` (story 23-4) — refuse the Run's calls.
+pub(crate) async fn run_reject(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<dto::DispositionDocument>> {
+    Ok(Json(
+        disposition_one(&state, &run_id, hekma_engine::DispositionVerb::Reject).await?,
+    ))
+}
+
+/// `POST /v0/runs/{id}/reroute` (story 23-4) — `{"route": "<binding>/<route>"}`
+/// sends the Run's calls to the route; `{"route": null}` sends them back.
+pub(crate) async fn run_reroute(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    ApiJson(request): ApiJson<dto::RerouteRequest>,
+) -> ApiResult<Json<dto::DispositionDocument>> {
+    Ok(Json(
+        disposition_one(
+            &state,
+            &run_id,
+            hekma_engine::DispositionVerb::Reroute(request.route),
+        )
+        .await?,
+    ))
+}
+
+/// The hold-family set forms (story 23-4): one result per Run.
+async fn set_disposition(
+    state: ApiState,
+    credential: super::auth::Credential,
+    name: &'static str,
+    verb: impl Fn(Option<String>) -> hekma_engine::DispositionVerb,
+    request: dto::SetDispositionRequest,
+) -> ApiResult<Json<dto::ActResultsDocument>> {
+    if name != "reroute" && request.route.is_some() {
+        return Err(ApiError::invalid_body(format!(
+            "route applies to reroute only, not {name}"
+        )));
+    }
+    let run_ids = consume_set(&state, credential, &request.set_token)?;
+    let mut results = Vec::with_capacity(run_ids.len());
+    for run_id in run_ids {
+        results.push(
+            match state
+                .engine
+                .set_disposition(&run_id, verb(request.route.clone()), "operator")
+                .await
+            {
+                Ok(outcome) => dto::ActResult {
+                    run_id,
+                    outcome: if outcome.changed { name } else { "unchanged" }.to_string(),
+                    ..dto::ActResult::default()
+                },
+                Err(error) => refused(run_id, error.into()),
+            },
+        );
+    }
+    Ok(Json(dto::ActResultsDocument {
+        schema_version: dto::ACT_RESULTS_SCHEMA_VERSION,
+        dry_run: false,
+        verb: name,
+        matched: results.len(),
+        results,
+    }))
+}
+
+/// `POST /v0/runs/hold` — hold every Run of a selected set.
+pub(crate) async fn runs_hold(
+    State(state): State<ApiState>,
+    axum::Extension(credential): axum::Extension<super::auth::Credential>,
+    ApiJson(request): ApiJson<dto::SetDispositionRequest>,
+) -> ApiResult<Json<dto::ActResultsDocument>> {
+    set_disposition(
+        state,
+        credential,
+        "hold",
+        |_| hekma_engine::DispositionVerb::Hold,
+        request,
+    )
+    .await
+}
+
+/// `POST /v0/runs/release` — release every Run of a selected set.
+pub(crate) async fn runs_release(
+    State(state): State<ApiState>,
+    axum::Extension(credential): axum::Extension<super::auth::Credential>,
+    ApiJson(request): ApiJson<dto::SetDispositionRequest>,
+) -> ApiResult<Json<dto::ActResultsDocument>> {
+    set_disposition(
+        state,
+        credential,
+        "release",
+        |_| hekma_engine::DispositionVerb::Release,
+        request,
+    )
+    .await
+}
+
+/// `POST /v0/runs/reject` — reject every Run of a selected set.
+pub(crate) async fn runs_reject(
+    State(state): State<ApiState>,
+    axum::Extension(credential): axum::Extension<super::auth::Credential>,
+    ApiJson(request): ApiJson<dto::SetDispositionRequest>,
+) -> ApiResult<Json<dto::ActResultsDocument>> {
+    set_disposition(
+        state,
+        credential,
+        "reject",
+        |_| hekma_engine::DispositionVerb::Reject,
+        request,
+    )
+    .await
+}
+
+/// `POST /v0/runs/reroute` — reroute every Run of a selected set.
+pub(crate) async fn runs_reroute(
+    State(state): State<ApiState>,
+    axum::Extension(credential): axum::Extension<super::auth::Credential>,
+    ApiJson(request): ApiJson<dto::SetDispositionRequest>,
+) -> ApiResult<Json<dto::ActResultsDocument>> {
+    set_disposition(
+        state,
+        credential,
+        "reroute",
+        hekma_engine::DispositionVerb::Reroute,
+        request,
+    )
+    .await
+}
+
 /// `POST /v0/runs/refresh` (story 22-1) — trade the presented refresh
 /// credential for a new Run Key and refresh credential, once. Only a
 /// refresh credential reaches this handler (the matrix).
@@ -1344,6 +1515,26 @@ async fn act_one(
     bound: Option<Duration>,
 ) -> ApiResult<dto::RunActDocument> {
     use hekma_engine::RunLifecycleVerb as Verb;
+    // Story 23-4: on a wire Run the verb acts on its model calls at the
+    // metering proxy — pause holds them, resume releases them, stop and
+    // drain reject them and end the Run.
+    let record = state.engine.plan_run_verb(run_id, verb).await?;
+    if let Some(disposition) = hekma_engine::disposition_for(verb, &record) {
+        state
+            .engine
+            .set_disposition(run_id, disposition, "operator")
+            .await?;
+        if matches!(verb, Verb::Stop | Verb::Drain) {
+            state.engine.close_run(run_id).await?;
+        }
+        return Ok(dto::RunActDocument {
+            schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+            run_id: run_id.to_string(),
+            instance: None,
+            completed: None,
+            waited_ms: None,
+        });
+    }
     let (instance, drain) = match verb {
         Verb::Stop => (state.engine.stop_run(run_id, window).await?, None),
         Verb::Pause => (state.engine.pause_run(run_id).await?, None),
