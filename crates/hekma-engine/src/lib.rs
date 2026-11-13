@@ -178,7 +178,7 @@ pub use engine::{Blocking, DrainReport, Engine, EngineOptions, EventSubscription
 // credential event, and the actor a Caller acts as.
 /// Story 22-1: the URL scan the Control API and the metering listener use
 /// to refuse a credential in a path or query.
-pub use domain::credential::{percent_decode, scan_url, UrlScan};
+pub use domain::credential::{percent_decode, scan_url, UrlScan, URL_SCAN_MAX_TOKENS};
 pub use domain::{
     parse_presented, CredentialChange, CredentialError, CredentialEvent, CredentialMatch,
     CredentialSummary, IssuedCredentials, MintedToken, OpenedRun, PresentedState, RevokeOutcome,

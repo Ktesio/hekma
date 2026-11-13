@@ -631,6 +631,10 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: `hekma rm --force` now drops the removed instance's Runs' keys from the published key index in the same commit (fixed in the review's fix round), but the `tokens` rows themselves still go with the instance through `ON DELETE CASCADE`, so `hekma run keys` can no longer list them; the credential events in the outbox keep the history. Decide whether a removed instance's credential rows should be kept as an audit trail (and the foreign key relaxed).
   evidence: `store/tokens_sqlite.rs` (`tokens.run_id … ON DELETE CASCADE`), `domain/registry.rs` (`remove`). Trigger: story 23.1 (the proxy and its audit surface) or the first audit-export story, whichever lands first.
 
+- source_spec: `spec-22-1-run-keys.md` (security review pass 2, L5 remainder)
+  summary: The metering listener's exposed-credential queue holds 64 distinct values between two reaper drains; past that a credential seen in a URL is refused but not revoked. Fix round 3 made the drop visible (counted, and the next drain writes a diagnostic naming `hekma run revoke-keys`), but it does not revoke synchronously: the listener task holds no engine or store handle, so a revocation from it needs a new seam (a channel to the supervisor, or a resolver over the published key index that prefers values that resolve). Impact is small: the listener refuses before dialling upstream and keeps no log, so the dropped value never reached a third-party log.
+  evidence: `metering/listener.rs` (`ExposedTokens`, `note_exposed`, `EXPOSED_QUEUE_MAX`), `domain/supervisor/usage.rs` (`drain_exposed_for`). Trigger: story 23.1 (the shared proxy reworks the forwarding path and owns its revocation).
+
 - source_spec: `spec-22-1-run-keys.md` (Design Notes: Display once; secret scanning)
   summary: The `hk_run_`/`hk_ref_`/`hk_ann_` prefixes are distinctive enough for secret scanners, but they are not registered with GitHub secret scanning (a follow-up outside the code).
   evidence: `docs/run-keys.md` (The format). Trigger: the first public release carrying Run Keys.

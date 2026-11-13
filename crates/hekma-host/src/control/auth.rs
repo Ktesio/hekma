@@ -189,6 +189,14 @@ pub(crate) struct AuthDiagnostics {
 struct DiagnosticsInner {
     counts: BTreeMap<&'static str, u64>,
     last: Option<Instant>,
+    /// Presentations the engine could not check (a store failure), and when
+    /// that was last reported.
+    check_failures: u64,
+    last_check_failure: Option<Instant>,
+    /// Tokens the URL scan left past its cap (refused with the request, not
+    /// revoked), and when that was last reported.
+    url_overflow: u64,
+    last_url_overflow: Option<Instant>,
 }
 
 impl AuthDiagnostics {
@@ -201,6 +209,10 @@ impl AuthDiagnostics {
             inner: Arc::new(Mutex::new(DiagnosticsInner {
                 counts: BTreeMap::new(),
                 last: None,
+                check_failures: 0,
+                last_check_failure: None,
+                url_overflow: 0,
+                last_url_overflow: None,
             })),
             notifier: notifier.map(Arc::new),
             interval,
@@ -242,6 +254,64 @@ impl AuthDiagnostics {
         );
         inner.counts.clear();
         inner.last = Some(Instant::now());
+        drop(inner);
+        if let Some(notifier) = &self.notifier {
+            notifier.note(&line);
+        }
+        Some(line)
+    }
+
+    /// Count one presentation the engine could not check (`detail` is the
+    /// store's error text, for the Operator's diagnostic only — never a
+    /// client's body); emit the line when the interval has passed. Returns
+    /// the line emitted, if any (for tests).
+    pub(crate) fn check_failed(&self, detail: &str) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.check_failures += 1;
+        let due = inner
+            .last_check_failure
+            .is_none_or(|last| last.elapsed() >= self.interval);
+        if !due {
+            return None;
+        }
+        let line = format!(
+            "the Control API could not check {} credential presentation(s) since the last \
+             report and answered 500: {detail}",
+            inner.check_failures
+        );
+        inner.check_failures = 0;
+        inner.last_check_failure = Some(Instant::now());
+        drop(inner);
+        if let Some(notifier) = &self.notifier {
+            notifier.note(&line);
+        }
+        Some(line)
+    }
+
+    /// Count the tokens refused URLs carried past the URL scan's cap (an
+    /// upper bound on the distinct values: repeats past the cap are not
+    /// hashed, so each is counted). The request is refused whatever the
+    /// count, but those values are NOT revoked — the Operator learns how
+    /// many, at most one line per interval, with the remedy; never a value.
+    /// Returns the line emitted, if any (for tests).
+    pub(crate) fn url_scan_overflow(&self, overflow: usize) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.url_overflow += overflow as u64;
+        let due = inner
+            .last_url_overflow
+            .is_none_or(|last| last.elapsed() >= self.interval);
+        if !due {
+            return None;
+        }
+        let count = inner.url_overflow;
+        let line = format!(
+            "the Control API refused {count} credential(s) in URLs past the scan cap of {} and \
+             could not revoke them; if one may be the Run's, revoke its keys with `hekma run \
+             revoke-keys`",
+            hekma_engine::URL_SCAN_MAX_TOKENS,
+        );
+        inner.url_overflow = 0;
+        inner.last_url_overflow = Some(Instant::now());
         drop(inner);
         if let Some(notifier) = &self.notifier {
             notifier.note(&line);
@@ -428,7 +498,13 @@ async fn authorize(
             state.auth_diagnostics.unresolved(Some(presented));
             return Err(ApiError::unauthorized());
         }
-        Err(err) => return Err(err.into()),
+        // The engine could not check it (a store failure). The client is
+        // unauthenticated: it gets a static 500, and the store's text goes
+        // to the Operator's diagnostic only.
+        Err(err) => {
+            state.auth_diagnostics.check_failed(&err.to_string());
+            return Err(ApiError::credential_check_failed());
+        }
     };
     let gated = gate(matched, state.loopback, family).map(|authority| match authority {
         // A refresh credential rides to the refresh job as its value (the
@@ -480,6 +556,12 @@ pub(crate) async fn refuse_credential_in_url(
     let scan = hekma_engine::scan_url(&target);
     if !scan.found {
         return next.run(request).await;
+    }
+    // Past the scan's cap the tokens are refused with the request but not
+    // revoked: that is the Operator's to know (rate-limited), never the
+    // client's — the refusal body stays static.
+    if scan.overflow > 0 {
+        state.auth_diagnostics.url_scan_overflow(scan.overflow);
     }
     drop(request);
     if !scan.tokens.is_empty() {
@@ -719,6 +801,25 @@ mod tests {
         );
         let line = quick.unresolved(None).unwrap();
         assert!(line.contains("none 1"), "{line}");
+    }
+
+    #[test]
+    fn url_scan_overflow_is_counted_and_reported_at_most_once_per_interval() {
+        let diagnostics = AuthDiagnostics::new(None, Duration::from_secs(3600));
+        let first = diagnostics.url_scan_overflow(1).expect("the first reports");
+        assert!(
+            first.contains("refused 1 credential(s) in URLs past the scan cap of")
+                && first.contains("hekma run revoke-keys"),
+            "{first}"
+        );
+        // Within the interval nothing more is written, but the count grows.
+        for _ in 0..100 {
+            assert!(diagnostics.url_scan_overflow(2).is_none());
+        }
+        // A zero interval reports again, carrying the count since.
+        let quick = AuthDiagnostics::new(None, Duration::ZERO);
+        let line = quick.url_scan_overflow(3).unwrap();
+        assert!(line.contains("refused 3 credential(s)"), "{line}");
     }
 
     #[test]

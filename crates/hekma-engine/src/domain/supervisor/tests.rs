@@ -10404,6 +10404,115 @@ fn make_pre_proxy(registry: &Registry, name: &InstanceName) -> crate::domain::Ru
     run
 }
 
+/// Story 22-1 (security review 2, L3): the in-process children an exit's
+/// cascade ends lose their credentials in the transition's OWN transaction,
+/// as the process-owning Run's do — never only inside the projection's
+/// savepoint, which absorbs a failure. The projection is sabotaged with a
+/// SQL trigger on the `runs` row; the exit still commits, and the child's
+/// key (handed to the exited process) is revoked with it.
+#[test]
+fn an_exit_revokes_its_in_process_childrens_keys_even_when_the_projection_fails() {
+    use crate::domain::credential::{hash_presented, mint, TokenClass, TokenState};
+    use crate::domain::runs::ops::{self, LaunchCredentials, RunFate, SupervisedRun};
+    use crate::ports::{RunRecords as _, RunStore as _};
+    let state = tempfile::tempdir().unwrap();
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let name = InstanceName::new("exits").unwrap();
+    let run = crate::domain::RunId::mint();
+    let stub = mint(TokenClass::RunKey).unwrap().stub();
+    let publisher = std::sync::Arc::clone(registry.run_publisher());
+    let (n, r) = (name.clone(), run.clone());
+    registry
+        .writer()
+        .call(move |ctx| {
+            ctx.store().execute_batch_for_test(
+                "INSERT INTO agent_instances (id, name, kind, state, agent_home, created_at, \
+                 updated_at) VALUES (1, 'exits', 'mock', 'running', '/h', 't', 't')",
+            );
+            let supervised = SupervisedRun {
+                instance: n.clone(),
+                run_id: r.clone(),
+                wire_path: false,
+                labels: Vec::new(),
+                fresh: true,
+                inputs: None,
+                upstream: None,
+            };
+            let generation = ctx.store().bump_launch_generation(&n)?;
+            let mut changes = ops::ensure_supervised(ctx.store(), &supervised, "t")?;
+            changes.extend(ops::issue_launch(
+                ctx.store(),
+                &r,
+                generation,
+                LaunchCredentials {
+                    key: stub,
+                    refresh: None,
+                },
+                "t",
+            )?);
+            ops::commit(ctx, &publisher, changes)
+        })
+        .unwrap();
+    // An in-process child of the process-owning Run, with credentials.
+    let sup = Supervisor::new();
+    let mut request =
+        crate::domain::ChildRunRequest::under(crate::domain::RunParent::Run(run.clone()));
+    request.issue_credentials = true;
+    let opened = sup
+        .open_child_run_as(&registry, crate::domain::RunActor::Operator, request)
+        .unwrap();
+    let child = opened.view.record.run_id.clone();
+    let issued = opened.credentials.unwrap();
+    let row = |secret: &crate::domain::SecretString| {
+        let hash = hash_presented(secret);
+        registry
+            .store
+            .snapshot(|store| store.token(&hash))
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(row(issued.run_key()).state, TokenState::Active);
+    // The sabotage: every write to a Run row aborts, so the projection (and
+    // its cascade) rolls back.
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER block_run_projection BEFORE UPDATE ON runs \
+             BEGIN SELECT RAISE(ABORT, 'injected projection fault'); END;",
+        )
+        .unwrap();
+    }
+    let crash = TransitionEvent::new(
+        "exits",
+        LifecycleState::Running,
+        LifecycleState::Failed,
+        TransitionCause::crashed("exit code 3"),
+        crate::time::now_rfc3339(),
+    );
+    let committed = super::commit::commit_transition(
+        &registry,
+        &name,
+        super::commit::StateWrite::Plain,
+        &crash,
+        RunFate::Terminal,
+    )
+    .unwrap();
+    assert!(committed.projection_failed.is_some());
+    assert_eq!(state_of(&registry, "exits"), LifecycleState::Failed);
+    // The child's Run did not end (its projection rolled back) …
+    assert!(!registry.run_record(&child).unwrap().unwrap().is_ended());
+    // … but its credentials left service with the exit.
+    for secret in [issued.run_key(), issued.refresh_credential()] {
+        let row = row(secret);
+        assert_eq!(row.state, TokenState::Revoked);
+        assert_eq!(row.revoke_cause.as_deref(), Some("run-ended"));
+    }
+    assert!(!registry
+        .run_snapshot()
+        .keys
+        .contains_key(&hash_presented(issued.run_key())));
+}
+
 #[test]
 fn one_pre_proxy_adopted_agent_gets_the_legacy_root_route_until_its_run_ends() {
     // Story 23-1 (Design Notes: Migration): exactly one adopted pre-proxy

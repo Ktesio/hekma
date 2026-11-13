@@ -387,7 +387,8 @@ pub(crate) fn project_transition<S: RunRecords + ?Sized>(
 /// open process-owning Run loses every launch-issued credential
 /// (`process-exited`) — before any relaunch spawns its next generation —
 /// and, when the edge ends the Run (`stopped`, or a terminal `failed`),
-/// every remaining one (`run-ended`). The caller commits these in the
+/// every remaining one (`run-ended`), with those of the in-process
+/// children the edge's cascade ends. The caller commits these in the
 /// transition's OWN transaction, outside any failure-absorbing savepoint:
 /// a revocation that cannot be written fails the transition, so an exit is
 /// never recorded with its key still honoured.
@@ -409,6 +410,13 @@ pub(crate) fn revoke_on_exit<S: RunRecords + ?Sized>(
     let ends = new_state == LifecycleState::Stopped || fate == RunFate::Terminal;
     if ends {
         super::keys::on_run_ended(store, &mut changes, &run.run_id, at)?;
+        // The in-process children the projection's cascade ends with the
+        // Run lose their credentials here too: they were handed to the
+        // process that just exited, so they never outlive a projection that
+        // could not be written.
+        for child in store.open_in_process_descendants(&run.run_id)? {
+            super::keys::on_run_ended(store, &mut changes, &child.run_id, at)?;
+        }
     }
     Ok(changes)
 }
@@ -460,10 +468,22 @@ pub(crate) fn issue_launch<S: RunRecords + ?Sized>(
         return Ok(changes);
     };
     // One live generation at a time, by construction: whatever an earlier
-    // launch of this Run still holds is revoked before the new generation
+    // launch of this Run still holds — used refresh credentials included —
+    // is revoked before the new generation
     // is issued (its exit should already have revoked it — this holds even
     // when that exit was never recorded).
     super::keys::revoke_run_tokens(
+        store,
+        &mut changes,
+        run_id,
+        |row| {
+            row.launch_generation
+                .is_some_and(|older| older < generation)
+        },
+        super::keys::cause::PROCESS_EXITED,
+        at,
+    )?;
+    super::keys::revoke_used_where(
         store,
         &mut changes,
         run_id,
