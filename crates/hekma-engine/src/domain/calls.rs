@@ -577,10 +577,9 @@ pub fn decode_call_cursor(raw: &str) -> Result<String, CallError> {
     })?;
     if !is_call_id(&id) {
         return Err(CallError::InvalidCursor {
-            detail: format!(
-                "the cursor names an id of another kind — it is not one this listing printed \
-                 (start again from the first page)"
-            ),
+            detail: "the cursor names an id of another kind — it is not one this listing \
+                     printed (start again from the first page)"
+                .to_string(),
         });
     }
     Ok(id)

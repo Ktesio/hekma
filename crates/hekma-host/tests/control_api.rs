@@ -5216,7 +5216,10 @@ fn the_binding_routes_serve_crud_credentials_and_typed_codes() {
 /// write). Each row is (run, outcome, status, status class, model); the
 /// ids are ULIDs at a controlled time so ordering and windows are
 /// deterministic.
-fn seed_call_records(base: &Path, rows: &[(&str, &str, Option<i64>, &str, Option<&str>)]) {
+/// A seeded call row: (call id, run id, input tokens, outcome, token id).
+type SeedCall<'a> = (&'a str, &'a str, Option<i64>, &'a str, Option<&'a str>);
+
+fn seed_call_records(base: &Path, rows: &[SeedCall<'_>]) {
     let calls_dir = base.join("calls");
     std::fs::create_dir_all(&calls_dir).unwrap();
     // A fresh segment beside whatever the host's engine owns: the reader

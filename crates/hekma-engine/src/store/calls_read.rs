@@ -498,7 +498,7 @@ pub(crate) fn read_page(dir: &Path, query: &CallsQuery) -> Result<CallListing, C
             else {
                 break;
             };
-            let record = row_to_record(&row).map_err(|err| CallError::Unavailable {
+            let record = row_to_record(row).map_err(|err| CallError::Unavailable {
                 detail: format!(
                     "the calls file {} holds a record that could not be read ({err})",
                     segment.display()
@@ -664,8 +664,11 @@ mod tests {
         format!("call_{}", chars.into_iter().collect::<String>())
     }
 
-    /// A row's full column values, defaulted to a clean pass.
-    #[derive(Clone)]
+    /// A filter setter (the refusal table's rows).
+    type Setter = Box<dyn Fn(&mut CallsQuery)>;
+
+    /// A row's full column values (each test fills what it asserts).
+    #[derive(Clone, Default)]
     struct Row {
         call_id: String,
         run_id: &'static str,
@@ -684,30 +687,6 @@ mod tests {
         ended_at: String,
         latency_us: i64,
         upstream_us: Option<i64>,
-    }
-
-    impl Default for Row {
-        fn default() -> Self {
-            Row {
-                call_id: String::new(),
-                run_id: "",
-                token_id: None,
-                depth: "",
-                binding: None,
-                disposition: "",
-                outcome: "",
-                status: None,
-                status_class: "",
-                model: None,
-                input: None,
-                output: None,
-                cached: None,
-                started_at: String::new(),
-                ended_at: String::new(),
-                latency_us: 0,
-                upstream_us: None,
-            }
-        }
     }
 
     impl Row {
@@ -987,7 +966,7 @@ mod tests {
         assert_eq!(combined.items[0].run_id.as_str(), PARENT);
         // A closed-list value this build does not know refuses, naming the
         // parameter.
-        let setters: Vec<(Box<dyn Fn(&mut CallsQuery)>, &str)> = vec![
+        let setters: Vec<(Setter, &str)> = vec![
             (
                 Box::new(|q: &mut CallsQuery| q.outcome = Some("superceded".into())),
                 "outcome",
