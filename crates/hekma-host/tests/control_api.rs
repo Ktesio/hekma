@@ -6094,6 +6094,22 @@ fn the_otlp_intake_accepts_announce_credentials_only_and_meters_forward_differen
     let shown = json_body(&mut shown);
     assert_eq!(shown["run"]["usage"]["input_tokens"], 1500, "{shown}");
     assert_eq!(shown["run"]["usage"]["output_tokens"], 40);
+    // The same batch again records nothing (a plain 200 with the unread
+    // point reported), and the totals stand.
+    let mut response = as_bearer(
+        &client,
+        "POST",
+        &url,
+        &announce,
+        Some(otlp_batch("job-7", 1500, 40)),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(&mut response)["partialSuccess"]["rejectedDataPoints"],
+        "1"
+    );
+    let mut again = get_ok(&client, &server.addr, &format!("/v0/runs/{run_id}"));
+    assert_eq!(json_body(&mut again)["run"]["usage"]["input_tokens"], 1500);
     let mut keys = get_ok(&client, &server.addr, &format!("/v0/runs/{run_id}/keys"));
     let keys = json_body(&mut keys);
     assert_eq!(
@@ -6137,6 +6153,40 @@ fn the_otlp_intake_accepts_announce_credentials_only_and_meters_forward_differen
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let response = raw("application/json", vec![b' '; 4 * 1024 * 1024 + 1]);
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // The binding's cap: 1,000 open identities, then `409 too-many-children`
+    // and no Run for the next one.
+    let batch_of = |ids: Vec<String>| {
+        let resources: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| otlp_batch(id, 1, 0)["resourceMetrics"][0].clone())
+            .collect();
+        serde_json::json!({ "resourceMetrics": resources })
+    };
+    // job-7 is open already: 999 more fill the binding.
+    let ids: Vec<String> = (0..999).map(|n| format!("cap-{n}")).collect();
+    for chunk in ids.chunks(8) {
+        let response = as_bearer(
+            &client,
+            "POST",
+            &url,
+            &announce,
+            Some(batch_of(chunk.to_vec())),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let mut response = as_bearer(
+        &client,
+        "POST",
+        &url,
+        &announce,
+        Some(batch_of(vec!["one-too-many".to_string()])),
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "too-many-children"
+    );
 
     // Revoked: 401.
     let response = call(
