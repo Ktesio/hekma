@@ -143,6 +143,9 @@ fn assert_payload_validates(event: &EngineEvent) {
         EngineEvent::Policy(e) => {
             assert_eq!(e.schema_version, hekma_engine::POLICY_EVENT_SCHEMA_VERSION);
         }
+        EngineEvent::Binding(e) => {
+            assert_eq!(e.schema_version, hekma_engine::BINDING_EVENT_SCHEMA_VERSION);
+        }
         EngineEvent::Credential(e) => {
             assert_eq!(
                 e.schema_version,
@@ -305,8 +308,8 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
     for event in &events {
         let instance = match event {
             EngineEvent::Transition(e) => e.instance.as_str(),
-            EngineEvent::BudgetBreach(e) => e.instance.as_str(),
-            EngineEvent::UsageUpdate(e) => e.event.instance.as_str(),
+            EngineEvent::BudgetBreach(e) => e.instance.as_deref().unwrap_or_default(),
+            EngineEvent::UsageUpdate(e) => e.event.instance.as_deref().unwrap_or_default(),
             EngineEvent::Run(e) => e.instance.as_deref().unwrap_or_default(),
             // This flow changes no Policy and its fresh state dir has nothing
             // to upgrade, so neither family can appear.
@@ -316,6 +319,8 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
             // Story 22-1: a launch's Run Key events name its Run, not the
             // instance.
             EngineEvent::Credential(_) => continue,
+            // Story 23-1: this flow creates no binding.
+            EngineEvent::Binding(_) => panic!("unexpected binding event in this flow: {event:?}"),
         };
         assert_eq!(
             instance,
@@ -894,7 +899,9 @@ fn interleaved_instances_keep_per_instance_fifo() {
         let mine: Vec<EngineEvent> = events
             .iter()
             .filter_map(|e| match e {
-                EngineEvent::UsageUpdate(u) if u.event.instance.as_str() == name => Some(e.clone()),
+                EngineEvent::UsageUpdate(u) if u.event.instance.as_deref() == Some(name) => {
+                    Some(e.clone())
+                }
                 _ => None,
             })
             .collect();

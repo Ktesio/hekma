@@ -86,9 +86,8 @@ hekma agent config set review-bot budget.breach_action stop
 dollar caps exist too — see the [unified config keys](commands.md#unified-config-keys)).
 `budget.breach_action` is what happens at the ceiling: `warn` (the default —
 record only, nothing is stopped), `pause`, `stop` (set it explicitly in CI: a
-spend cap must end the job, not just record), or `block` (engine-observed
-instances: the
-metering listener refuses further model calls; see
+spend cap must end the job, not just record), or `block` (Runs whose calls go
+through the metering proxy: the proxy refuses further model calls; see
 [the wire fence](hosting.md#the-wire-fence-block-refuses-further-model-calls)). The budget is re-read on every usage event,
 so a cap set before `start` is enforced from the first event.
 

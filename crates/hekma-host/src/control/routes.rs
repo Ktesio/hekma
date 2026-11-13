@@ -16,8 +16,8 @@
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Extension, Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{Extension, Path, Query, RawQuery, State};
+use axum::http::{header, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use hekma_engine::{
@@ -1638,6 +1638,229 @@ pub(crate) async fn runs_limits(
         verb: "budget",
         matched: results.len(),
         results,
+    }))
+}
+
+// ---- Story 23-1: the endpoint bindings and the metering proxy ----
+
+/// `GET /v0/bindings?after=&limit=` (Operator bearer only) — the keyset
+/// listing by name.
+pub(crate) async fn bindings_list(
+    State(state): State<ApiState>,
+    RawQuery(query): RawQuery,
+) -> ApiResult<Json<dto::BindingsDocument>> {
+    let (after, limit) = binding_page(query.as_deref());
+    let bindings = state.engine.bindings(after.as_deref(), limit).await?;
+    let next_after = bindings.last().map(|binding| binding.name.clone());
+    Ok(Json(dto::BindingsDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        bindings,
+        next_after,
+    }))
+}
+
+/// Parse the listing query: `after` (the keyset cursor, a binding name) and
+/// `limit` (1..=256, default 100). An unreadable query is the caller's
+/// `400 invalid_body`.
+fn binding_page(query: Option<&str>) -> (Option<String>, usize) {
+    let mut after = None;
+    let mut limit = 100usize;
+    for pair in query.unwrap_or_default().split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        match key {
+            "after" => after = Some(value.to_string()),
+            "limit" => {
+                if let Ok(parsed) = value.parse::<usize>() {
+                    limit = parsed.clamp(1, hekma_engine::MAX_BINDINGS);
+                }
+            }
+            _ => {}
+        }
+    }
+    (after, limit)
+}
+
+/// `POST /v0/bindings` (Operator bearer only) — create one binding: the
+/// prefix its calls arrive on, the upstream they forward to, the labels its
+/// Runs carry, an optional custodied-key reference (inert until key
+/// custody ships). `201` + `Location` + the binding; the change is one
+/// event, committed before this answers.
+pub(crate) async fn binding_create(
+    State(state): State<ApiState>,
+    ApiJson(spec): ApiJson<hekma_engine::BindingSpec>,
+) -> ApiResult<(
+    StatusCode,
+    [(HeaderName, String); 1],
+    Json<dto::BindingDocument>,
+)> {
+    let binding = state.engine.create_binding(spec).await?;
+    let location = format!("/v0/bindings/{}", binding.name);
+    Ok((
+        StatusCode::CREATED,
+        [(header::LOCATION, location)],
+        Json(dto::BindingDocument {
+            schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+            binding,
+        }),
+    ))
+}
+
+/// `GET /v0/bindings/{name}` (Operator bearer only) — one binding.
+pub(crate) async fn binding_show(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<dto::BindingDocument>> {
+    let binding = state
+        .engine
+        .binding(&name)
+        .await?
+        .ok_or_else(|| hekma_engine::BindingError::NotFound { name: name.clone() })?;
+    Ok(Json(dto::BindingDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        binding,
+    }))
+}
+
+/// `PATCH /v0/bindings/{name}` (Operator bearer only) — change the prefix,
+/// the upstream, the whole label set or the custodied-key reference; a
+/// label change re-resolves the binding's open Runs in the same job. One
+/// event.
+pub(crate) async fn binding_patch(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    ApiJson(patch): ApiJson<hekma_engine::BindingPatch>,
+) -> ApiResult<Json<dto::BindingDocument>> {
+    let binding = state.engine.update_binding(&name, patch).await?;
+    Ok(Json(dto::BindingDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        binding,
+    }))
+}
+
+/// `DELETE /v0/bindings/{name}` (Operator bearer only) — delete the
+/// binding: its Run and its split Runs end with cause `binding-removed`,
+/// and further calls on its prefix answer no route. One event.
+pub(crate) async fn binding_delete(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    state.engine.delete_binding(&name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PUT /v0/bindings/{name}/routes/{route}` (Operator bearer only) — add or
+/// replace one reroute route (stored and validated now; reroute uses it
+/// when it ships). One event, answered with the binding.
+pub(crate) async fn binding_route_put(
+    State(state): State<ApiState>,
+    Path((name, route)): Path<(String, String)>,
+    ApiJson(mut spec): ApiJson<hekma_engine::RouteSpec>,
+) -> ApiResult<Json<dto::BindingDocument>> {
+    spec.name = route;
+    let binding = state.engine.put_binding_route(&name, spec).await?;
+    Ok(Json(dto::BindingDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        binding,
+    }))
+}
+
+/// `DELETE /v0/bindings/{name}/routes/{route}` (Operator bearer only) —
+/// remove one route. One event, answered with the binding.
+pub(crate) async fn binding_route_delete(
+    State(state): State<ApiState>,
+    Path((name, route)): Path<(String, String)>,
+) -> ApiResult<Json<dto::BindingDocument>> {
+    let binding = state.engine.remove_binding_route(&name, &route).await?;
+    Ok(Json(dto::BindingDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        binding,
+    }))
+}
+
+/// `POST /v0/bindings/{name}/credentials` (Operator bearer only, body
+/// `{"class":"announce"|"proxy-access"}`) — issue the binding's credential
+/// of that class, rotating any previous one in the same job. The token is
+/// in this answer ONCE (its hash and token id are all that is stored);
+/// nothing accepts it in this release, and the note says so.
+pub(crate) async fn binding_credential_issue(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<dto::BindingCredentialDocument>> {
+    let class = credential_class(&body)?;
+    let issued = state.engine.issue_binding_credential(&name, class).await?;
+    Ok(Json(dto::BindingCredentialDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        class,
+        token_id: issued.token_id.clone(),
+        token: issued.token.expose_secret().to_string(),
+        note: format!(
+            "This credential is shown once and is not stored. Nothing accepts it yet; the \
+             release that does will say so. (token id {})",
+            issued.token_id
+        ),
+    }))
+}
+
+/// `POST /v0/bindings/{name}/credentials/revoke` (Operator bearer only,
+/// body `{"class":…}`) — revoke the binding's active credential of that
+/// class. One event.
+pub(crate) async fn binding_credential_revoke(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> ApiResult<StatusCode> {
+    let class = credential_class(&body)?;
+    state.engine.revoke_binding_credential(&name, class).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Parse a credential route's body, `{"class":"announce"|"proxy-access"}`,
+/// into its class. A blank body names no class, so it is refused the same
+/// way as an unknown one.
+fn credential_class(body: &[u8]) -> ApiResult<hekma_engine::BindingCredentialClass> {
+    let request: dto::BindingCredentialRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        dto::BindingCredentialRequest::default()
+    } else {
+        serde_json::from_slice(body)
+            .map_err(|err| ApiError::invalid_body(format!("invalid credential body: {err}")))?
+    };
+    hekma_engine::BindingCredentialClass::from_wire(&request.class).ok_or_else(|| {
+        ApiError::invalid_body(format!(
+            "unknown credential class `{}` (announce or proxy-access)",
+            request.class
+        ))
+    })
+}
+
+/// `GET /v0/bindings/{name}/credentials` (Operator bearer only) — the
+/// metadata listing: token ids, classes and states, never a value.
+pub(crate) async fn binding_credentials(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<dto::BindingCredentialsDocument>> {
+    let credentials = state.engine.binding_credentials(&name).await?;
+    Ok(Json(dto::BindingCredentialsDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        credentials,
+    }))
+}
+
+/// `GET /v0/proxy` (Operator bearer only) — where the shared Metering
+/// Proxy listens (`url`, `port`), or why it is not running (`error`).
+pub(crate) async fn proxy_show(
+    State(state): State<ApiState>,
+) -> ApiResult<Json<dto::ProxyDocument>> {
+    let info = state.engine.metering_proxy();
+    let error = state.engine.metering_proxy_error();
+    Ok(Json(dto::ProxyDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        running: info.is_some(),
+        url: info.as_ref().map(|info| info.url.clone()),
+        port: info.as_ref().map(|info| info.port),
+        error,
     }))
 }
 

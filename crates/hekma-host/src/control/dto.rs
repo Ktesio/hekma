@@ -1148,3 +1148,83 @@ pub(crate) struct ActResultsDocument {
     /// One result per Run.
     pub results: Vec<ActResult>,
 }
+
+// ---- Story 23-1: the endpoint bindings and the metering proxy ----
+
+/// `GET /v0/bindings?after=&limit=` — the keyset listing by name.
+#[derive(Serialize)]
+pub(crate) struct BindingsDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The bindings, by name order, at most `limit`.
+    pub bindings: Vec<hekma_engine::Binding>,
+    /// The last name of this page (the next request's `after`), present
+    /// when the page is non-empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<String>,
+}
+
+/// `POST /v0/bindings` — create one binding; `201` + `Location` + the
+/// binding. A refusal is `400 invalid_body` (a field) or `409 conflict`
+/// (a taken name, a taken or legacy-held prefix, a limit).
+#[derive(Serialize)]
+pub(crate) struct BindingDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The binding after the change.
+    pub binding: hekma_engine::Binding,
+}
+
+/// `POST /v0/bindings/{name}/credentials` — issue (rotating any previous
+/// one). The token is in this answer ONCE and is never stored or shown
+/// again; nothing accepts it in this release.
+#[derive(Serialize)]
+pub(crate) struct BindingCredentialDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The class as the request named it.
+    pub class: hekma_engine::BindingCredentialClass,
+    /// The token id (the metadata listing shows this).
+    pub token_id: String,
+    /// The token itself — this response is its only delivery.
+    pub token: String,
+    /// The one-time note (never the token).
+    pub note: String,
+}
+
+/// `GET /v0/bindings/{name}/credentials` — the metadata listing: token ids,
+/// classes and states, never a value.
+#[derive(Serialize)]
+pub(crate) struct BindingCredentialsDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The binding's credentials, oldest first.
+    pub credentials: Vec<hekma_engine::BindingCredential>,
+}
+
+/// `GET /v0/proxy` — where the shared Metering Proxy listens, or why it is
+/// not running.
+#[derive(Serialize)]
+pub(crate) struct ProxyDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// `true` when the proxy is running.
+    pub running: bool,
+    /// Its URL (`http://127.0.0.1:<port>`), present when running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The bound port, present when running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Why it is not running, present when it is not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The `POST /v0/bindings/{name}/credentials` body: the class to issue
+/// (`announce` or `proxy-access`).
+#[derive(Deserialize, Default)]
+pub(crate) struct BindingCredentialRequest {
+    /// The credential class as its wire string.
+    pub class: String,
+}

@@ -313,7 +313,8 @@ fn usage_folds_into_every_ancestor_and_the_instance_once() {
         RunLimits::default(),
     );
     let usage = |run: &str, sequence: u64, tokens: u64| crate::domain::UsageEvent {
-        instance: "a".to_string(),
+        instance: Some("a".to_string()),
+        call_id: None,
         run_id: RunId::from_wire(run),
         input_tokens: tokens,
         output_tokens: 0,
@@ -1200,6 +1201,10 @@ fn a_v15_state_dir_migrates_to_v16_and_the_listing_reads_it() {
         let store = SqliteStore::open(&db).unwrap();
         store
             .conn()
+            .execute_batch(crate::store::proxy_sqlite::UNDO_V18_FOR_TEST)
+            .unwrap();
+        store
+            .conn()
             .execute_batch(
                 "DROP INDEX idx_runs_open; \
                  DROP INDEX idx_runs_exception; \
@@ -1324,7 +1329,7 @@ fn the_view_sql_matches_the_specification_predicates_row_by_row() {
 fn the_v17_step_adds_the_tokens_table_and_its_three_indexes() {
     // Story 22-1: `tokens` with its CHECKs and the three indexes.
     let (_tmp, store) = store();
-    assert_eq!(SCHEMA_VERSION, 17, "tokens is the v17 step");
+    const { assert!(SCHEMA_VERSION >= 17, "tokens is the v17 step") };
     for (kind, name) in [
         ("table", "tokens"),
         ("index", "idx_tokens_run"),
@@ -1374,6 +1379,10 @@ fn a_v16_state_dir_migrates_to_v17_and_a_live_run_keeps_running_without_a_key() 
         let store = SqliteStore::open(&db).unwrap();
         store
             .conn()
+            .execute_batch(crate::store::proxy_sqlite::UNDO_V18_FOR_TEST)
+            .unwrap();
+        store
+            .conn()
             .execute_batch(
                 "INSERT INTO agent_instances (id, name, kind, state, agent_home, created_at, \
                  updated_at) VALUES (1, 'a', 'mock', 'running', '/h', 't', 't'); \
@@ -1391,7 +1400,7 @@ fn a_v16_state_dir_migrates_to_v17_and_a_live_run_keeps_running_without_a_key() 
         .conn()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, SCHEMA_VERSION);
     let run = RunId::from_wire("run_LIVE");
     assert_eq!(
         reopened.run_record(&run).unwrap().unwrap().status,

@@ -56,6 +56,12 @@
 //!                            #   written atomically (`write_atomically`) by
 //!                            #   the export-ack route; one cursor because the
 //!                            #   host lock guarantees exactly one Host owner
+//!   calls/                   # the per-call records store (story 23-1, AD-26):
+//!     <UTC date>.db          #   SQLite segment files named by their UTC
+//!                            #   creation date (`calls` + `open_calls`, own
+//!                            #   user_version 1), attached to the store
+//!                            #   writer's connection; one segment until
+//!                            #   rotation and retention arrive
 //!   agents/
 //!     <instance_name>/       # one Agent Home per instance
 //!       config.toml          # instance-level config (AD-9)
@@ -252,6 +258,10 @@ pub const SECRETS_FILE: &str = "secrets.toml";
 /// Directory (under the state base) that holds all Agent Homes. `[ASSUMPTION]`
 pub const AGENTS_DIR: &str = "agents";
 
+/// Directory (under the state base) of the per-call records store's
+/// segment files (story 23-1).
+pub const CALLS_DIR: &str = "calls";
+
 /// File name of the engine-GLOBAL outbox journal inside the state base (story
 /// 17-4, the AD-14 amendment): an append-only JSON-Lines file carrying the
 /// transition, breach, and usage event families under ONE monotonically
@@ -425,6 +435,12 @@ impl EnginePaths {
     /// only its PRESENCE triggers the permission check + lookup.
     pub fn secrets_file(&self) -> PathBuf {
         self.state_base.join(SECRETS_FILE)
+    }
+
+    /// Directory holding the per-call records store's segment files
+    /// (story 23-1).
+    pub fn calls_dir(&self) -> PathBuf {
+        self.state_base.join(CALLS_DIR)
     }
 
     /// Directory holding all Agent Homes.

@@ -120,6 +120,14 @@ pub(crate) trait RunStore {
     /// The rollup for one Run of an instance (zero when it has no rows).
     fn run_rollup(&self, name: &InstanceName, run_id: &RunId) -> Result<Rollup, StoreError>;
 
+    /// The rollup for one Run by id alone (story 23-1, schema v18: an
+    /// instance-less wire Run has a rollup too).
+    fn run_rollup_by_id(&self, run_id: &RunId) -> Result<Rollup, StoreError>;
+
+    /// A Run's `(namespace, external id)` identity, when it has one (story
+    /// 23-1: the wire Runs).
+    fn run_identity(&self, run_id: &RunId) -> Result<Option<(String, String)>, StoreError>;
+
     /// Bump the instance's launch generation and return the new value.
     fn bump_launch_generation(&self, name: &InstanceName) -> Result<u64, StoreError>;
 
@@ -465,6 +473,25 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// Every active Run Key and announce credential of a non-ended Run (the
     /// snapshot's key index at open).
     fn active_key_rows(&self) -> Result<Vec<TokenRow>, StoreError>;
+
+    /// Record a process-owning Run's upstream base URL (story 23-1).
+    fn set_run_upstream(&self, run_id: &RunId, upstream: Option<&str>) -> Result<(), StoreError>;
+
+    /// The Run Keys revoked at or after `since` (RFC 3339), newest first,
+    /// at most `limit` (story 23-1: the recently-revoked set at open).
+    fn recently_revoked_keys(
+        &self,
+        since: &str,
+        limit: usize,
+    ) -> Result<Vec<TokenHash>, StoreError>;
+
+    /// What a Run's snapshot entry carries beyond its row (story 23-1):
+    /// the disposition from its latch rows, its recorded upstream and its
+    /// identity.
+    fn entry_extras(
+        &self,
+        run_id: &RunId,
+    ) -> Result<crate::domain::runs::snapshot::EntryExtras, StoreError>;
 }
 
 /// One stored credential (story 22-1, `tokens`): its hash and metadata,

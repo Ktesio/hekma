@@ -57,6 +57,27 @@ pub(crate) const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// so a degraded mint is still unique within the process (see [`RunId::mint`]).
 static RUN_NONCE: AtomicU64 = AtomicU64::new(0);
 
+/// A fresh ULID (26 Crockford characters): 48 bits of wall-clock
+/// milliseconds (a clock before the epoch clamps to 0), then 80 bits from the
+/// OS CSPRNG. If the OS source fails (it does not on supported platforms),
+/// the random half falls back to the clock's nanoseconds plus the
+/// process-global [`RUN_NONCE`], so the id is still unique per process,
+/// never a panic: this is an id, not a secret. Shared by [`RunId::mint`] and
+/// the metering proxy's call ids, so the engine keeps one counter.
+pub(crate) fn mint_ulid() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let millis = (now.as_millis() as u64) & ((1 << 48) - 1);
+    let mut random = [0u8; 10];
+    if getrandom::getrandom(&mut random).is_err() {
+        let nonce = RUN_NONCE.fetch_add(1, Ordering::Relaxed);
+        random[..4].copy_from_slice(&now.subsec_nanos().to_be_bytes());
+        random[4..].copy_from_slice(&nonce.to_be_bytes()[2..]);
+    }
+    encode_ulid(millis, &random)
+}
+
 impl RunId {
     /// Mint a fresh Run id: `run_` + ULID (story 21-2, AD-25).
     ///
@@ -67,17 +88,7 @@ impl RunId {
     /// counter — still unique per process, never a panic: this is an id, not
     /// a secret.
     pub fn mint() -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        let millis = (now.as_millis() as u64) & ((1 << 48) - 1);
-        let mut random = [0u8; 10];
-        if getrandom::getrandom(&mut random).is_err() {
-            let nonce = RUN_NONCE.fetch_add(1, Ordering::Relaxed);
-            random[..4].copy_from_slice(&now.subsec_nanos().to_be_bytes());
-            random[4..].copy_from_slice(&nonce.to_be_bytes()[2..]);
-        }
-        Self(format!("run_{}", encode_ulid(millis, &random)))
+        Self(format!("run_{}", mint_ulid()))
     }
 
     /// Reconstruct a [`RunId`] from its stored wire string (a DB read / a
@@ -146,9 +157,17 @@ impl std::fmt::Display for RunId {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageEvent {
     /// The Agent Instance this measurement belongs to (its unique name).
-    pub instance: String,
+    /// `None` for usage on a Run with no Agent Instance (a wire Run of the
+    /// shared Metering Proxy, story 23-1) — omitted on the wire then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
     /// The Run (spine AD-7) this measurement was reported during.
     pub run_id: RunId,
+    /// The proxied call this measurement was metered from (`call_` + ULID,
+    /// story 23-1): the ledger's dedup key for proxied rows. `None` for a
+    /// self-reported row — omitted on the wire then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     /// Input (prompt) tokens the agent reported for this event — INCLUSIVE of
     /// the cached subset (`0 <= cached_tokens <= input_tokens`, the 14-6
     /// invariant).
@@ -289,7 +308,8 @@ mod tests {
 
     fn sample_event(seq: u64) -> UsageEvent {
         UsageEvent {
-            instance: "demo".to_string(),
+            instance: Some("demo".to_string()),
+            call_id: None,
             run_id: RunId::from_wire("run-1"),
             input_tokens: 10,
             output_tokens: 20,

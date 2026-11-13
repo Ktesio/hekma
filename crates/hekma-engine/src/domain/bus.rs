@@ -140,6 +140,12 @@ pub enum EngineEvent {
     /// the change. Carries a token id, never a token or a hash. Boxed for the
     /// same ring-size reason as `Policy`.
     Credential(Box<super::credential::CredentialEvent>),
+    /// An endpoint-binding change (story 23-1): created, changed, deleted,
+    /// a route added or removed, a per-binding credential issued or revoked
+    /// — committed with its outbox row in the job that made the change.
+    /// Carries a token id on a credential change, never a token or a hash.
+    /// Boxed for the same ring-size reason as `Policy`.
+    Binding(Box<super::runs::bindings::BindingEvent>),
 }
 
 /// The in-supervisor handle to the event bus: a cloneable pair of
@@ -421,7 +427,8 @@ mod tests {
             "2026-09-09T00:00:00Z",
         );
         let usage = UsageUpdateEvent::new(super::super::UsageEvent {
-            instance: "probe".to_string(),
+            instance: Some("probe".to_string()),
+            call_id: None,
             run_id: super::super::RunId::from_wire("run-1"),
             input_tokens: 10,
             output_tokens: 20,

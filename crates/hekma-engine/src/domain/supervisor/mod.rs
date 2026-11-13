@@ -54,12 +54,10 @@ use hekma_adapter_api::{
 
 use crate::adapter::{self, ConfigApplyError, LaunchResolveError};
 use crate::backends;
-use crate::metering::{ListenerError, ObservedListener};
 use crate::ports::{
-    assemble_usage_event, BackendError, LogCapture, LogCaptureMode, MemoryBackingKind,
-    ObservedUsageSource, ParsedUsage, ProcessBackend, ProcessStatus, RunStore,
-    SelfReportedUsageSource, SpawnRecord, SpawnSpec, UsageSource, KILL_CONFIRM_TIMEOUT,
-    LOG_ROTATE_GENERATIONS,
+    assemble_usage_event, BackendError, LogCapture, LogCaptureMode, MemoryBackingKind, ParsedUsage,
+    ProcessBackend, ProcessStatus, RunStore, SelfReportedUsageSource, SpawnRecord, SpawnSpec,
+    UsageSource, KILL_CONFIRM_TIMEOUT, LOG_ROTATE_GENERATIONS,
 };
 use crate::time::now_rfc3339;
 
@@ -193,19 +191,6 @@ const MAX_CONSECUTIVE_ENVIRONMENTAL_TICKS: u32 = 40;
 /// the cursor forever) and the diagnostic noise (≤ one diagnostic per attempt
 /// per offset, then the skip note).
 const USAGE_PARK_MAX_ATTEMPTS: u32 = 3;
-
-/// Story 12-4 AMENDMENT (review loop 1): how many minted events the observed
-/// drain's pending park buffer may hold at once. During a store outage EVERY
-/// reaper tick (~250ms cadence) mints MORE events than it can commit, so
-/// without a cap the parked buffer would grow for as long as the outage lasts
-/// — unbounded engine memory for an unbounded outage. When a park would exceed
-/// this cap, the OLDEST parked events are DROPPED (billing honesty: the ledger
-/// keeps its order-faithful sequence) and the loss is announced LOUDLY with the
-/// count — surfaced-not-silent, never a quiet truncation. The value is generous
-/// (each parked event is two token counts + a sequence ordinal — a few dozen
-/// bytes), so the cap only bites in a genuine, sustained outage; the 3-attempt
-/// SKIP bound above is the per-event counterpart of this whole-buffer bound.
-const OBSERVED_PARK_MAX_EVENTS: usize = 1024;
 
 /// A scheduled restart of a crashed instance (story 1-6, AC4). Returned by
 /// [`Supervisor::poll_once`] for each crashed `on-failure` instance that has not
@@ -551,27 +536,6 @@ fn plan_follow(bytes: &[u8], cursor: u64) -> FollowPlan {
     }
 }
 
-/// The parked OBSERVED events pending a ledger commit (story 12-4) — the
-/// observed channel's analog of the self-reported drain's byte cursor. The
-/// queue has no byte offset, so the parked identity is the minted events
-/// THEMSELVES: the buffer carries the exact [`ParsedUsage`] values that failed
-/// to commit (NEVER re-minted on retry — re-minting would hand out fresh
-/// `sequence` ordinals and break the dedup key stability the retry depends
-/// on), with the FRONT event's minted `sequence` as the attempt-counting
-/// identity (the analog of the self-reported "same offset" check: a different
-/// front resets the streak).
-#[derive(Debug, Clone)]
-struct ObservedPending {
-    /// The minted `sequence` of the FRONT parked event — the attempt-counting
-    /// identity (a different front resets the bounded-retry streak).
-    front_sequence: u64,
-    /// The exact minted events awaiting commit, in original (queue) order.
-    /// Capped at [`OBSERVED_PARK_MAX_EVENTS`]: a longer tail drops its OLDEST
-    /// events with a loud overflow diagnostic (the 12-4 AMENDMENT bound —
-    /// never unbounded memory during a store outage, never a silent loss).
-    events: Vec<ParsedUsage>,
-}
-
 /// The in-memory supervision state for ONE running Agent Instance (story 3-1).
 ///
 /// Beyond the process [`Handle`](backends::Handle) the supervisor has always held,
@@ -634,17 +598,6 @@ struct Supervised {
     /// host's mode must not destroy another engine's files — and refusal
     /// messages qualify the unknown provenance honestly).
     capture_mode: Option<LogCaptureMode>,
-    /// Story 12-4: the OBSERVED channel's park — `Some((pending, attempts))`
-    /// while a store error keeps minted-but-uncommitted observed events parked
-    /// (the analog of `usage_park_attempts`, which is the SELF-REPORTED
-    /// channel's park). `pending.events` are the exact [`ParsedUsage`] values
-    /// awaiting commit (retried as-is — never re-minted, so the dedup keys are
-    /// stable); `attempts` counts consecutive failed passes at the SAME front
-    /// event (a different front resets the streak); past
-    /// [`USAGE_PARK_MAX_ATTEMPTS`] the poisoned front event is SKIPPED with a
-    /// loud diagnostic and the rest keep counting. Dropped with the instance
-    /// at the terminal transition (a terminal failure announces the loss).
-    observed_park: Option<(ObservedPending, u32)>,
     /// The launch generation this handle meters under (story 21-1): bumped
     /// in state.db at every spawn, Restart Policy relaunch and adoption, and
     /// stamped on every usage row, so an engine-minted sequence that restarts
@@ -652,19 +605,10 @@ struct Supervised {
     /// a relaunch never collides with an earlier attach's rows. (The per-Run
     /// breach latch that lived here moved into state.db's `run_latches`.)
     launch_generation: u64,
-    /// The per-instance loopback forward listener for an `engine-observed` instance
-    /// (story 3-4), or `None` for a `self-reported` instance (whose start path is
-    /// UNCHANGED). Held for the Run; DROPPED at the terminal transition (which
-    /// aborts its accept-loop task — teardown bounded to the Run, no orphan
-    /// listeners, NFR-1). A restart opens a NEW listener under the new Run.
-    observed_listener: Option<ObservedListener>,
-    /// The `engine-observed` source (story 3-4): the per-Run monotonic `sequence`
-    /// minter for observed completions (the agent supplies no ordinal). Fresh per
-    /// Run (built here with the freshly-minted `run_id`), so the ordinal resets per
-    /// Run — preserving the `UNIQUE(instance_id, run_id, sequence)` dedup invariant.
-    /// Present only for an `engine-observed` instance (a `self-reported` instance
-    /// leaves it `None` and drives the log-tail `drain_usage_for` instead).
-    observed_source: Option<ObservedUsageSource>,
+    /// Story 23-1: whether this Run's model calls meter through the shared
+    /// Metering Proxy (an `engine-observed` instance, whose agent received
+    /// the proxy's Run route as its base URL). `false` for `self-reported`.
+    observed_route: bool,
     /// Set when a PRIOR [`Supervisor::stop`] call on this handle's `stop_inner`
     /// pass got [`BackendError::StopUnconfirmed`] back from the backend (fix
     /// pass, review of #80 follow-up — the CRITICAL finding): SIGKILL was sent
@@ -835,42 +779,6 @@ pub(crate) enum ServeOptionsRefused {
     AlreadyApplied,
 }
 
-/// The fixed-port adoption re-bind DECISION (story 17-2's AI-46 closure,
-/// extracted by review finding 14): whether an adopted instance gets a live
-/// observed-metering listener re-bound on the supervisor's fixed port.
-///
-/// PURE and unit-tested on every OS: the process-level re-bind e2e legs skip
-/// on the x86-64 Linux CI runner (#109) and tarpaulin — the coverage gate —
-/// runs ONLY on linux, so the DECISION LOGIC itself must be reachable by
-/// tests that always run. The e2e tests keep proving the PROCESS behavior;
-/// this seam proves the rule.
-pub(crate) enum AdoptionRebind {
-    /// The instance is `engine-observed` AND the supervisor opened with a
-    /// fixed port: attempt the live re-bind (`start_observed_listener`).
-    Attempt,
-    /// The instance is NOT `engine-observed`: there is no listener to
-    /// re-bind (the pre-17-2 behavior for self-reported instances).
-    SkipNotObserved,
-    /// The supervisor opened with port 0 (every pre-17-2 open): a re-bind
-    /// cannot guess the previous engine's ephemeral port — the story-11-3
-    /// strand diagnostic stays.
-    SkipNoFixedPort,
-}
-
-pub(crate) fn adoption_rebind_decision(
-    metering_source: &str,
-    metering_listen_port: u16,
-) -> AdoptionRebind {
-    match (
-        metering_source == "engine-observed",
-        metering_listen_port != 0,
-    ) {
-        (true, true) => AdoptionRebind::Attempt,
-        (true, false) => AdoptionRebind::SkipNoFixedPort,
-        (false, _) => AdoptionRebind::SkipNotObserved,
-    }
-}
-
 /// The lifecycle supervisor: owns running process handles + drives transitions.
 ///
 /// Constructed empty by [`Engine::open`](crate::Engine::open). Holds ONE
@@ -890,16 +798,6 @@ pub struct Supervisor {
     /// engine holds its own clone ([`Supervisor::event_bus`]) so
     /// `subscribe()` never takes the supervisor lock.
     events: EventBus,
-    /// The engine's tokio runtime handle (story 3-4), used to SPAWN the loopback
-    /// forward listener's accept loop for an `engine-observed` instance. The
-    /// supervisor's sync start path runs on the blocking pool, so it cannot use
-    /// `Handle::current`; the engine threads its handle in via
-    /// [`Supervisor::with_runtime`]. `None` (the [`Supervisor::new`]/
-    /// [`Supervisor::with_backoff`] default) means "no runtime to spawn a
-    /// listener" — an `engine-observed` start then fails fast with a clear error
-    /// (only the sync unit tests, which never start an observed instance, use the
-    /// handle-less constructors).
-    runtime: Option<tokio::runtime::Handle>,
     /// The host-provided diagnostic sink (story 10-2), when one is installed.
     /// `None` (every constructor's default) keeps the historical behavior: the
     /// two AD-12 diagnostics go to stderr. Both emission sites run while the
@@ -907,14 +805,14 @@ pub struct Supervisor {
     /// own `Mutex` is contended only by the rare diagnostics — never a hot
     /// path — and installs/rotations serialize with emissions correctly.
     diagnostics: Option<DiagnosticSink>,
-    /// Story 17-2 — the Host's `metering.listen` port (0 = the OS-ephemeral
-    /// default every pre-17-2 caller takes). When non-zero, an `engine-observed`
-    /// start pins the loopback listener to THIS port (via
-    /// `ObservedListener::start_on_port`) so engine restarts and orphan
-    /// adoptions re-bind the SAME port and the injected `base_url` stays live.
-    /// Defaults to `0`; the engine sets it from
-    /// [`EngineOptions`](crate::EngineOptions) before any start/adoption runs.
-    metering_listen_port: u16,
+    /// Story 23-1 — the shared Metering Proxy's URL (`http://127.0.0.1:<port>`),
+    /// when this engine runs one. An `engine-observed` start injects
+    /// `<proxy url>/_hekma/runs/<run id>` as its base URL; with no proxy the
+    /// start is refused naming the remediation.
+    proxy_url: Option<String>,
+    /// Story 23-1 — the proxy's evaluation inbox: committed proxied closes
+    /// wait here for the reaper tick to publish them and act.
+    inbox: Arc<crate::domain::pipeline::EvaluationInbox>,
     /// Story 17-2 — the Host's `child_env_allowlist` (default `false`): when
     /// `true`, every spawn clears the inherited environment first and applies
     /// ONLY the manifest-declared mappings (via [`SpawnSpec::inherit_env`] —
@@ -1163,11 +1061,9 @@ pub(crate) enum StopFault {
 impl Supervisor {
     /// Construct an empty supervisor with the current OS's process backend and
     /// the PRODUCTION backoff schedule (1s base, ×2, 60s cap — spine AD-15).
-    ///
-    /// NO runtime handle (story 3-4) — so this cannot start an `engine-observed`
-    /// listener. Production uses [`Supervisor::with_runtime`] (the engine threads
-    /// its runtime handle in); this handle-less form remains for the sync unit
-    /// tests that only exercise self-reported / lifecycle paths.
+    /// The engine's production constructor is [`Supervisor::with_runtime`];
+    /// this handle-less form remains for the sync unit tests that only
+    /// exercise self-reported / lifecycle paths.
     pub fn new() -> Self {
         Self {
             backend: backends::current(),
@@ -1175,9 +1071,9 @@ impl Supervisor {
             usage_source: SelfReportedUsageSource::new(),
             backoff: BackoffSchedule::production(),
             events: EventBus::new(),
-            runtime: None,
             diagnostics: None,
-            metering_listen_port: 0,
+            proxy_url: None,
+            inbox: Arc::default(),
             child_env_allowlist: false,
             serve_options_applied: false,
             log_capture_mode: LogCaptureMode::default(),
@@ -1220,22 +1116,22 @@ impl Supervisor {
         }
     }
 
-    /// Construct an empty supervisor with the PRODUCTION backoff schedule AND the
-    /// engine's tokio runtime handle (story 3-4) — the production constructor the
-    /// engine uses. The handle lets an `engine-observed` start SPAWN its loopback
-    /// forward listener's accept loop on the engine runtime (the supervisor's sync
-    /// start path runs on the blocking pool, so `Handle::current` is unavailable;
-    /// a `Handle` spawns onto its runtime from any thread).
-    pub fn with_runtime(runtime: tokio::runtime::Handle) -> Self {
+    /// Construct an empty supervisor with the PRODUCTION backoff schedule (the
+    /// production constructor the engine uses). Since story 23-1 the shared
+    /// Metering Proxy — not the supervisor — owns the runtime spawning, so the
+    /// historical runtime-handle parameter is accepted and ignored; the
+    /// signature stays so embedders and the engine's open path compile
+    /// unchanged.
+    pub fn with_runtime(_runtime: tokio::runtime::Handle) -> Self {
         Self {
             backend: backends::current(),
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff: BackoffSchedule::production(),
             events: EventBus::new(),
-            runtime: Some(runtime),
             diagnostics: None,
-            metering_listen_port: 0,
+            proxy_url: None,
+            inbox: Arc::default(),
             child_env_allowlist: false,
             serve_options_applied: false,
             log_capture_mode: LogCaptureMode::default(),
@@ -1281,8 +1177,7 @@ impl Supervisor {
     /// Construct an empty supervisor with a custom backoff schedule (TEST
     /// injection, so the crash-loop / backoff legs run in milliseconds without
     /// weakening the production constants). Production always uses
-    /// [`Supervisor::with_runtime`]. NO runtime handle — the lib tests using this
-    /// never start an `engine-observed` instance.
+    /// [`Supervisor::with_runtime`].
     #[cfg(test)]
     pub(crate) fn with_backoff(backoff: BackoffSchedule) -> Self {
         Self {
@@ -1291,9 +1186,9 @@ impl Supervisor {
             usage_source: SelfReportedUsageSource::new(),
             backoff,
             events: EventBus::new(),
-            runtime: None,
             diagnostics: None,
-            metering_listen_port: 0,
+            proxy_url: None,
+            inbox: Arc::default(),
             child_env_allowlist: false,
             serve_options_applied: false,
             log_capture_mode: LogCaptureMode::default(),
@@ -1400,9 +1295,22 @@ impl Supervisor {
     /// [`EngineOptions`](crate::EngineOptions) inside `open_with_options`;
     /// there is no post-open mutation seam (a port change mid-flight would
     /// strand already-started listeners, so serve options are open-time only).
+    /// The proxy's evaluation inbox (story 23-1).
+    pub(crate) fn proxy_inbox(&self) -> Arc<crate::domain::pipeline::EvaluationInbox> {
+        Arc::clone(&self.inbox)
+    }
+
+    /// A thread-safe diagnostic emitter for the proxy (story 23-1): the
+    /// installed sink, else stderr — the same surface as
+    /// [`Self::emit_diagnostic`], callable without the supervisor lock.
+    pub(crate) fn diagnostic_fn(&self) -> Arc<dyn Fn(String) + Send + Sync> {
+        let sink = self.diagnostics.clone();
+        Arc::new(move |line: String| write_diagnostic(sink.as_ref(), &line))
+    }
+
     pub(crate) fn set_serve_options(
         &mut self,
-        port: u16,
+        proxy_url: Option<String>,
         child_env_allowlist: bool,
         log_capture_mode: LogCaptureMode,
     ) -> Result<(), ServeOptionsRefused> {
@@ -1423,7 +1331,7 @@ impl Supervisor {
             return Err(ServeOptionsRefused::AlreadyApplied);
         }
         self.serve_options_applied = true;
-        self.metering_listen_port = port;
+        self.proxy_url = proxy_url;
         self.child_env_allowlist = child_env_allowlist;
         self.log_capture_mode = log_capture_mode;
         Ok(())
@@ -1570,28 +1478,7 @@ impl Supervisor {
     /// The sink's `Write` impl must not re-enter the engine — a call that
     /// took the supervisor lock would deadlock.
     fn emit_diagnostic(&self, message: &str) {
-        let mut line = String::with_capacity(message.len() + 10);
-        line.push_str("[hekma] ");
-        line.push_str(message);
-        line.push('\n');
-        match &self.diagnostics {
-            Some(sink) => {
-                let mut writer = sink
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let bytes = line.as_bytes();
-                // Swallow BOTH failure modes (io error, panic) and FLUSH:
-                // a buffering host writer must not silently lose the line
-                // inside its own buffer after a successful `write_all`.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _ = writer.write_all(bytes);
-                    let _ = writer.flush();
-                }));
-            }
-            None => {
-                let _ = std::io::stderr().write_all(line.as_bytes());
-            }
-        }
+        write_diagnostic(self.diagnostics.as_ref(), message);
     }
 
     // ---- ACP transport support (story 14-1, spine AD-19) ----
@@ -1799,7 +1686,7 @@ impl Supervisor {
 
     /// Publish committed Run events on the bus, in commit order (after the
     /// job's own events), noting any outbox eviction they caused.
-    pub(super) fn publish_run_events(
+    pub(crate) fn publish_run_events(
         &self,
         events: Vec<crate::domain::runs::ops::CommittedRunEvent>,
     ) {
@@ -2520,3 +2407,32 @@ mod reaper;
 mod runs;
 mod spawn;
 mod usage;
+
+/// Write one diagnostic line to the installed sink, else stderr: the body of
+/// [`Supervisor::emit_diagnostic`], shared with the proxy's lock-free
+/// [`Supervisor::diagnostic_fn`] so the engine still reaches stdio in exactly
+/// one place. The `[hekma] ` prefix and the terminating newline live here.
+fn write_diagnostic(sink: Option<&DiagnosticSink>, message: &str) {
+    let mut line = String::with_capacity(message.len() + 10);
+    line.push_str("[hekma] ");
+    line.push_str(message);
+    line.push('\n');
+    match sink {
+        Some(sink) => {
+            let mut writer = sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let bytes = line.as_bytes();
+            // Swallow BOTH failure modes (io error, panic) and FLUSH:
+            // a buffering host writer must not silently lose the line
+            // inside its own buffer after a successful `write_all`.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = writer.write_all(bytes);
+                let _ = writer.flush();
+            }));
+        }
+        None => {
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+    }
+}

@@ -32,6 +32,7 @@ fn supervised(run_id: &RunId, wire_path: bool, fresh: bool) -> SupervisedRun {
         labels: vec![Label::bound("team", "payments")],
         fresh,
         inputs: None,
+        upstream: None,
     }
 }
 
@@ -306,12 +307,14 @@ fn opening_a_child_is_refused_with_a_typed_cause() {
 }
 
 #[test]
-fn a_wire_child_refuses_hold_actions_until_they_exist_and_warn_is_accepted() {
+fn a_wire_child_accepts_block_and_refuses_hold_actions_until_they_exist() {
     let (_tmp, store) = store();
     let owner = RunId::mint();
     ops::ensure_supervised(&store, &supervised(&owner, true, true), AT).unwrap();
     let mut request = ChildRunRequest::under(RunParent::Run(owner.clone()));
-    request.limits.breach_action = Some(BreachAction::Block);
+    // `pause`/`stop` below `supervised` keep the depth fallback until wire
+    // hold and reject exist (23-4).
+    request.limits.breach_action = Some(BreachAction::Pause);
     match ops::open_child(&store, &request, RunId::mint(), None, AT) {
         Err(err @ RunError::ActionUnavailable { .. }) => {
             assert!(err.to_string().contains("not available yet"), "{err}");
@@ -319,6 +322,13 @@ fn a_wire_child_refuses_hold_actions_until_they_exist_and_warn_is_accepted() {
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
+    // `block` at wire depth is executable since the shared proxy fences the
+    // Run's own calls (the snapshot disposition over the ancestor chain).
+    let mut blocked = ChildRunRequest::under(RunParent::Run(owner.clone()));
+    blocked.limits.breach_action = Some(BreachAction::Block);
+    let (_id, changes) = ops::open_child(&store, &blocked, RunId::mint(), None, AT).unwrap();
+    assert_eq!(changes.events[0].change, RunEventKind::Created);
+    let mut request = ChildRunRequest::under(RunParent::Run(owner.clone()));
     request.limits.breach_action = Some(BreachAction::Warn);
     request.limits.token_per_run = Some(10);
     request.labels = vec![("task".into(), "review".into())];
@@ -546,7 +556,11 @@ fn the_wire_vocabulary_is_stable() {
     assert_eq!(LabelSource::from_wire("caller"), Some(LabelSource::Caller));
     assert_eq!(LabelSource::from_wire("x"), None);
     assert_eq!(LabelSource::Caller.as_str(), "caller");
-    for origin in [LabelOrigin::Config, LabelOrigin::LabelVerb] {
+    for origin in [
+        LabelOrigin::Config,
+        LabelOrigin::LabelVerb,
+        LabelOrigin::Binding,
+    ] {
         assert_eq!(LabelOrigin::from_wire(origin.as_str()), Some(origin));
         assert_eq!(
             serde_json::to_string(&origin).unwrap(),
@@ -1202,7 +1216,8 @@ fn the_listing_assembles_each_row_from_its_stored_facts() {
     // Usage on the owner's Run folds into its subtree rollup AND the
     // instance's cumulative rollup (10k in / 20k out at $1/$2 per 1M).
     let event = UsageEvent {
-        instance: "a".to_string(),
+        instance: Some("a".to_string()),
+        call_id: None,
         run_id: owner.clone(),
         input_tokens: 10_000,
         output_tokens: 20_000,
@@ -1236,7 +1251,7 @@ fn the_listing_assembles_each_row_from_its_stored_facts() {
             "2026-11-02T00:00:00Z",
         )
         .unwrap();
-    let items = listing::assemble(&store, rows).unwrap();
+    let items = listing::assemble(&store, rows, None).unwrap();
     assert_eq!(
         items.len(),
         1,
@@ -1277,7 +1292,7 @@ fn the_listing_assembles_each_row_from_its_stored_facts() {
     let (rows, _) = store
         .list_runs(ListingView::All, None, None, 50, "2026-11-02T00:00:00Z")
         .unwrap();
-    let items = listing::assemble(&store, rows).unwrap();
+    let items = listing::assemble(&store, rows, None).unwrap();
     let child_row = items
         .iter()
         .find(|row| row.record.run_id == child_id)

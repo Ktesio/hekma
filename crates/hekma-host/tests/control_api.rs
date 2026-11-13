@@ -1949,42 +1949,47 @@ fn the_api_is_off_by_default_and_the_flag_pair_is_validated() {
         "no operator listener exists by default:\n{text}"
     );
     // The notice SEQUENCE, pinned exactly (review item 27's discipline):
-    // started, the local endpoint, signal, the API stop, the drain's
-    // zero-agent outcome, complete — in order, and NOTHING else.
+    // started, the shared metering proxy's address, the local endpoint,
+    // signal, the API stop, the drain's zero-agent outcome, complete — in
+    // order, and NOTHING else.
     let notices: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(
         notices.len(),
-        6,
-        "a listener-less serve emits exactly six notices:\n{text}"
+        7,
+        "a listener-less serve emits exactly seven notices:\n{text}"
     );
     assert!(
         notices[0].starts_with("[hekma] host started; state root "),
         "the first notice is the started notice:\n{text}"
     );
     assert!(
-        notices[1].starts_with(&format!(
+        notices[1].starts_with("[hekma] the metering proxy is listening on http://127.0.0.1:"),
+        "the second notice names the shared metering proxy on loopback:\n{text}"
+    );
+    assert!(
+        notices[2].starts_with(&format!(
             "[hekma] local control endpoint on {} (loopback, for the hekma CLI;",
             discovery.addr
         )),
-        "the second notice names the local endpoint:\n{text}"
-    );
-    assert_eq!(
-        notices[2],
-        "[hekma] SIGTEST received; stopping running and paused agents (graceful window 1s) ...",
-        "the third notice is the signal notice, verbatim:\n{text}"
+        "the third notice names the local endpoint:\n{text}"
     );
     assert_eq!(
         notices[3],
+        "[hekma] SIGTEST received; stopping running and paused agents (graceful window 1s) ...",
+        "the fourth notice is the signal notice, verbatim:\n{text}"
+    );
+    assert_eq!(
+        notices[4],
         "[hekma] control api stopped; no requests are accepted for the rest of the shutdown",
-        "the fourth notice is the API stop:\n{text}"
+        "the fifth notice is the API stop:\n{text}"
     );
     assert_eq!(
-        notices[4], "[hekma] no running or paused agents; nothing to stop",
-        "the fifth notice is the drain's zero-agent outcome:\n{text}"
+        notices[5], "[hekma] no running or paused agents; nothing to stop",
+        "the sixth notice is the drain's zero-agent outcome:\n{text}"
     );
     assert_eq!(
-        notices[5], "[hekma] shutdown complete (SIGTEST)",
-        "the sixth notice is the completion notice, verbatim:\n{text}"
+        notices[6], "[hekma] shutdown complete (SIGTEST)",
+        "the seventh notice is the completion notice, verbatim:\n{text}"
     );
 
     // --listen without --bearer-secret: a typed InvalidOptions (usage class).
@@ -4964,6 +4969,233 @@ fn read_sse_frame<R: std::io::BufRead>(reader: &mut R) -> (u64, serde_json::Valu
             // A keep-alive comment.
         } else if line.is_empty() {
             // A frame terminator.
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Story 23-1: the /v0/bindings routes and /v0/proxy — CRUD, routes, the
+// one-time credentials, the listing's keyset page, and the typed codes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_binding_routes_serve_crud_credentials_and_typed_codes() {
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
+    let client = client();
+    let base = format!("http://{}/v0/bindings", server.addr);
+
+    // The proxy runs and says where.
+    let mut response = get_ok(&client, &server.addr, "/v0/proxy");
+    let proxy = json_body(&mut response);
+    assert_eq!(proxy["running"], true);
+    let port = proxy["port"].as_u64().unwrap();
+    assert_eq!(proxy["url"], format!("http://127.0.0.1:{port}"));
+    assert!(proxy.get("error").is_none());
+
+    // Create: 201 + Location + the binding.
+    for (name, prefix) in [("alpha", "/alpha"), ("beta", "/beta"), ("gamma", "/gamma")] {
+        let mut response = call(
+            &client,
+            "POST",
+            &base,
+            Some(serde_json::json!({
+                "name": name,
+                "prefix": prefix,
+                "upstream": "https://api.example.com/v1",
+                "labels": [["team", "core"]],
+            })),
+        );
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers()["location"].to_str().unwrap(),
+            format!("/v0/bindings/{name}")
+        );
+        assert_eq!(json_body(&mut response)["binding"]["prefix"], prefix);
+    }
+    // Typed refusals carry their codes.
+    for (body, status, code) in [
+        (
+            serde_json::json!({"name": "alpha", "prefix": "/x", "upstream": "https://e.com"}),
+            StatusCode::CONFLICT,
+            "binding-exists",
+        ),
+        (
+            serde_json::json!({"name": "dup", "prefix": "/alpha", "upstream": "https://e.com"}),
+            StatusCode::CONFLICT,
+            "binding-prefix-taken",
+        ),
+        (
+            serde_json::json!({"name": "bad", "prefix": "/_hekma", "upstream": "https://e.com"}),
+            StatusCode::BAD_REQUEST,
+            "binding-invalid",
+        ),
+    ] {
+        let mut response = call(&client, "POST", &base, Some(body));
+        assert_eq!(response.status(), status, "{code}");
+        assert_eq!(json_body(&mut response)["error"]["code"], code);
+    }
+    let mut response = call(&client, "POST", &base, Some(serde_json::json!({"oops": 1})));
+    assert!(response.status().is_client_error());
+    let _ = json_body(&mut response);
+
+    // The keyset listing: a page of two, then the rest after its cursor.
+    let mut response = get_ok(&client, &server.addr, "/v0/bindings?limit=2");
+    let page = json_body(&mut response);
+    assert_eq!(page["bindings"].as_array().unwrap().len(), 2);
+    assert_eq!(page["next_after"], "beta");
+    let mut response = get_ok(&client, &server.addr, "/v0/bindings?after=beta&limit=x");
+    let rest = json_body(&mut response);
+    assert_eq!(rest["bindings"][0]["name"], "gamma");
+
+    // Show, patch (labels replaced; custodied key set then cleared), 404s.
+    let mut response = get_ok(&client, &server.addr, "/v0/bindings/alpha");
+    assert_eq!(json_body(&mut response)["binding"]["name"], "alpha");
+    let mut response = client
+        .get(format!("{base}/ghost"))
+        .header("Authorization", format!("Bearer {BEARER_VALUE}"))
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "binding-not-found"
+    );
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/alpha"),
+        Some(serde_json::json!({"labels": [], "custodied_key": "secret:KEY"})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let patched = json_body(&mut response);
+    assert_eq!(patched["binding"]["custodied_key"], "secret:KEY");
+    assert_eq!(patched["binding"]["labels"].as_array().unwrap().len(), 0);
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/alpha"),
+        Some(serde_json::json!({"custodied_key": null})),
+    );
+    assert!(json_body(&mut response)["binding"]
+        .get("custodied_key")
+        .is_none());
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/ghost"),
+        Some(serde_json::json!({"prefix": "/g"})),
+    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let _ = json_body(&mut response);
+
+    // Routes: put, remove, and a missing route.
+    let mut response = call(
+        &client,
+        "PUT",
+        &format!("{base}/alpha/routes/backup"),
+        Some(serde_json::json!({"name": "backup", "upstream": "https://b.example.com"})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(&mut response)["binding"]["routes"][0]["name"],
+        "backup"
+    );
+    let mut response = call(
+        &client,
+        "DELETE",
+        &format!("{base}/alpha/routes/backup"),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(&mut response)["binding"]["routes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    let mut response = call(
+        &client,
+        "DELETE",
+        &format!("{base}/alpha/routes/backup"),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "binding-route-not-found"
+    );
+
+    // Credentials: issued once, listed without values, revoked per class.
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{base}/alpha/credentials"),
+        Some(serde_json::json!({"class": "proxy-access"})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let issued = json_body(&mut response);
+    let token = issued["token"].as_str().unwrap().to_string();
+    assert!(token.starts_with("hk_pxy_"));
+    assert_eq!(issued["class"], "proxy-access");
+    assert!(!issued["note"].as_str().unwrap().contains(&token));
+    let mut response = get_ok(&client, &server.addr, "/v0/bindings/alpha/credentials");
+    let listing = json_body(&mut response);
+    assert!(
+        !listing.to_string().contains(&token),
+        "a listing carries the token"
+    );
+    assert_eq!(listing["credentials"][0]["state"], "active");
+    for (body, code) in [
+        (Some(serde_json::json!({"class": "admin"})), "invalid"),
+        (None, "invalid"),
+    ] {
+        let response = call(&client, "POST", &format!("{base}/alpha/credentials"), body);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{code}");
+    }
+    let response = call(
+        &client,
+        "POST",
+        &format!("{base}/alpha/credentials/revoke"),
+        Some(serde_json::json!({"class": "proxy-access"})),
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let mut response = get_ok(&client, &server.addr, "/v0/bindings/alpha/credentials");
+    assert_eq!(
+        json_body(&mut response)["credentials"][0]["state"],
+        "revoked"
+    );
+    let response = call(
+        &client,
+        "POST",
+        &format!("{base}/alpha/credentials/revoke"),
+        Some(serde_json::json!({"class": "nope"})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Delete: 204, then 404.
+    let response = call(&client, "DELETE", &format!("{base}/gamma"), None);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let mut response = call(&client, "DELETE", &format!("{base}/gamma"), None);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let _ = json_body(&mut response);
+
+    // The token never reached the state directory's files.
+    let mut stack = vec![state.path().to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                assert!(
+                    !bytes.windows(token.len()).any(|w| w == token.as_bytes()),
+                    "{} carries the token",
+                    path.display()
+                );
+            }
         }
     }
 }

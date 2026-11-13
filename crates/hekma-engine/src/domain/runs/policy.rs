@@ -1115,6 +1115,7 @@ fn store_changes<S: RunRecords + ?Sized>(
         &labels,
         run_limits,
         Some(resolution),
+        store.entry_extras(&record.run_id)?,
     ));
     let raised = resolution.raised_anomalies();
     let owned = [Anomaly::DepthFallback, Anomaly::UnpricedModel];

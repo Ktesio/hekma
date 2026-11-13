@@ -15,7 +15,6 @@ use crate::domain::runs::{
     RunLimitField, RunLimits, RunStatus,
 };
 use crate::domain::{BreachDimension, BudgetBreachEvent};
-use crate::metering::WireFence;
 use crate::ports::{RunRecords as _, RunStore as _};
 
 const INSTANCE: &str = "money";
@@ -72,7 +71,8 @@ fn seed_with(input: u64, output: u64, wire_path: bool) -> Seeded {
             })?;
             store.insert_usage(
                 &crate::domain::usage::UsageEvent {
-                    instance: INSTANCE.to_string(),
+                    instance: Some(INSTANCE.to_string()),
+                    call_id: None,
                     run_id: usage_run,
                     input_tokens: input,
                     output_tokens: output,
@@ -130,17 +130,31 @@ fn inputs(explicit: PolicyLimits) -> ResolveInputs {
     }
 }
 
-fn context(fence: Option<WireFence>, explicit: PolicyLimits) -> InstanceContext {
+fn context(observed: bool, explicit: PolicyLimits) -> InstanceContext {
     InstanceContext {
-        metering_source: if fence.is_some() {
+        metering_source: if observed {
             "engine-observed".to_string()
         } else {
             "self-reported".to_string()
         },
-        fence,
         supervised: true,
         inputs: Some(Ok(inputs(explicit))),
     }
+}
+
+/// The `block` reason codes the published snapshot holds for `run` (over its
+/// ancestor chain — the shared proxy refuses on exactly this).
+fn block_codes(seeded: &Seeded, run: &RunId) -> Vec<&'static str> {
+    let bits = seeded
+        .registry
+        .run_publisher()
+        .current()
+        .disposition_over(run)
+        .breach_block;
+    crate::domain::runs::snapshot::Disposition::reasons(bits)
+        .into_iter()
+        .map(crate::domain::governance::fence_code)
+        .collect()
 }
 
 fn set(
@@ -240,7 +254,7 @@ fn lowering_each_ceiling_to_at_or_below_the_usage_breaches_at_once_then_raising_
             &seeded.run,
             limits(limit(below)),
             LimitActor::Operator,
-            context(None, PolicyLimits::default()),
+            context(false, PolicyLimits::default()),
         )
         .unwrap();
         assert_eq!(outcome.direction, LimitsDirection::Lowered, "{label}");
@@ -277,7 +291,7 @@ fn lowering_each_ceiling_to_at_or_below_the_usage_breaches_at_once_then_raising_
             &seeded.run,
             limits(limit(above)),
             LimitActor::Operator,
-            context(None, PolicyLimits::default()),
+            context(false, PolicyLimits::default()),
         )
         .unwrap();
         assert_eq!(outcome.direction, LimitsDirection::Raised, "{label}");
@@ -292,7 +306,7 @@ fn lowering_each_ceiling_to_at_or_below_the_usage_breaches_at_once_then_raising_
             &seeded.run,
             limits(limit(below)),
             LimitActor::Operator,
-            context(None, PolicyLimits::default()),
+            context(false, PolicyLimits::default()),
         )
         .unwrap();
         assert_eq!(
@@ -307,8 +321,7 @@ fn lowering_each_ceiling_to_at_or_below_the_usage_breaches_at_once_then_raising_
 #[test]
 fn a_raise_lifts_the_matching_fence_reason_per_reason_and_the_other_holds() {
     let seeded = seed();
-    let fence = WireFence::default();
-    let ctx = || context(Some(fence.clone()), PolicyLimits::default());
+    let ctx = || context(true, PolicyLimits::default());
     // Two `block` reasons: tokens per-run and dollars cumulative, both at
     // or below the usage.
     let both = RunLimits {
@@ -326,7 +339,7 @@ fn a_raise_lifts_the_matching_fence_reason_per_reason_and_the_other_holds() {
     )
     .unwrap();
     assert_eq!(outcome.fired.len(), 2, "{:?}", outcome.fired);
-    assert_eq!(fence.refusal().unwrap().code, "tokens_per_run");
+    assert!(block_codes(&seeded, &seeded.run).contains(&"tokens_per_run"));
 
     // Raise ONLY the token ceiling: its reason lifts, the dollar reason
     // holds the fence, the `breach` Anomaly stays.
@@ -349,9 +362,8 @@ fn a_raise_lifts_the_matching_fence_reason_per_reason_and_the_other_holds() {
     );
     assert_eq!(outcome.re_armed, vec![tokens]);
     assert_eq!(outcome.fence_cleared, vec![tokens]);
-    assert_eq!(
-        fence.refusal().unwrap().code,
-        "dollars_cumulative",
+    assert!(
+        block_codes(&seeded, &seeded.run).contains(&"dollars_cumulative"),
         "the other reason keeps the fence up"
     );
     assert_eq!(
@@ -373,7 +385,7 @@ fn a_raise_lifts_the_matching_fence_reason_per_reason_and_the_other_holds() {
     )
     .unwrap();
     assert_eq!(outcome.fence_cleared, vec![dollars]);
-    assert!(fence.refusal().is_none());
+    assert!(block_codes(&seeded, &seeded.run).is_empty());
     assert!(!anomalies(&seeded.registry, &seeded.run).contains(&Anomaly::Breach));
 
     // One `limits-changed` event per committed change, carrying the Run's
@@ -441,7 +453,7 @@ fn a_run_limit_outranks_a_policy_both_ways_and_a_clear_hands_back_to_it() {
             },
             std::collections::HashMap::from([(
                 INSTANCE.to_string(),
-                context(None, PolicyLimits::default()),
+                context(false, PolicyLimits::default()),
             )]),
         )
         .unwrap();
@@ -455,7 +467,7 @@ fn a_run_limit_outranks_a_policy_both_ways_and_a_clear_hands_back_to_it() {
             ..RunLimits::default()
         }),
         LimitActor::Host,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     assert_eq!(outcome.resolution.tokens.per_run, Some(3_000_000));
@@ -472,7 +484,7 @@ fn a_run_limit_outranks_a_policy_both_ways_and_a_clear_hands_back_to_it() {
             clear: vec![RunLimitField::TokensPerRun],
         },
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     assert_eq!(outcome.direction, LimitsDirection::Cleared);
@@ -495,7 +507,7 @@ fn a_run_limit_outranks_a_policy_both_ways_and_a_clear_hands_back_to_it() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     assert_eq!(outcome.resolution.tokens.per_run, Some(100));
@@ -509,7 +521,7 @@ fn a_run_limit_outranks_a_policy_both_ways_and_a_clear_hands_back_to_it() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     assert_eq!(outcome.direction, LimitsDirection::Unchanged);
@@ -528,7 +540,7 @@ fn a_caller_may_only_tighten_and_an_operator_or_host_may_raise() {
         &seeded.run,
         limits(start),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     let caller = |change: RunLimitChange| {
@@ -537,7 +549,7 @@ fn a_caller_may_only_tighten_and_an_operator_or_host_may_raise() {
             &seeded.run,
             change,
             LimitActor::Caller,
-            context(None, PolicyLimits::default()),
+            context(false, PolicyLimits::default()),
         )
     };
     // Raising a ceiling, loosening the action: refused. (Story 22-1, the
@@ -615,7 +627,7 @@ fn a_caller_may_only_tighten_and_an_operator_or_host_may_raise() {
                 ..RunLimits::default()
             }),
             actor,
-            context(None, PolicyLimits::default()),
+            context(false, PolicyLimits::default()),
         )
         .unwrap();
         assert_eq!(outcome.limits.token_per_run, Some(ceiling), "{actor:?}");
@@ -637,7 +649,7 @@ fn a_caller_may_only_tighten_and_an_operator_or_host_may_raise() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     assert_eq!(outcome.resolution.tokens.per_run, Some(400));
@@ -674,7 +686,7 @@ fn a_caller_limit_applies_only_while_tighter_than_a_later_operator_or_policy_lim
                 },
                 std::collections::HashMap::from([(
                     INSTANCE.to_string(),
-                    context(None, PolicyLimits::default()),
+                    context(false, PolicyLimits::default()),
                 )]),
             )
             .unwrap();
@@ -705,7 +717,7 @@ fn a_caller_limit_applies_only_while_tighter_than_a_later_operator_or_policy_lim
             ..RunLimits::default()
         }),
         LimitActor::Caller,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     assert_eq!(outcome.direction, LimitsDirection::Lowered);
@@ -742,7 +754,8 @@ fn a_caller_limit_on_a_child_run_arms_the_childs_own_level() {
         .call(move |ctx| {
             ctx.store().insert_usage(
                 &crate::domain::usage::UsageEvent {
-                    instance: INSTANCE.to_string(),
+                    instance: Some(INSTANCE.to_string()),
+                    call_id: None,
                     run_id: usage_child,
                     input_tokens: 30,
                     output_tokens: 30,
@@ -767,7 +780,7 @@ fn a_caller_limit_on_a_child_run_arms_the_childs_own_level() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     // A Caller tightens the child to 10 tokens per run — below its 60: the
@@ -780,7 +793,7 @@ fn a_caller_limit_on_a_child_run_arms_the_childs_own_level() {
             ..RunLimits::default()
         }),
         LimitActor::Caller,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     assert_eq!(
@@ -802,7 +815,7 @@ fn a_write_keeps_the_source_of_every_row_it_does_not_change() {
             &seeded.run,
             limits(set_limits),
             actor,
-            context(None, PolicyLimits::default()),
+            context(false, PolicyLimits::default()),
         )
         .unwrap()
     };
@@ -873,7 +886,7 @@ fn scopes_actions_and_ended_runs_are_refused_per_run() {
             &child,
             limits(set_limit),
             LimitActor::Operator,
-            context(None, PolicyLimits::default()),
+            context(false, PolicyLimits::default()),
         )
         .unwrap_err();
         assert_eq!(err.code(), "scope-unavailable", "{err}");
@@ -888,7 +901,7 @@ fn scopes_actions_and_ended_runs_are_refused_per_run() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap_err();
     assert_eq!(err.code(), "action-unavailable");
@@ -906,7 +919,7 @@ fn scopes_actions_and_ended_runs_are_refused_per_run() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap_err();
     assert_eq!(err.code(), "action-unavailable");
@@ -919,7 +932,7 @@ fn scopes_actions_and_ended_runs_are_refused_per_run() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     assert_eq!(outcome.resolution.sources.tokens_per_run, LimitSource::Run);
@@ -932,7 +945,7 @@ fn scopes_actions_and_ended_runs_are_refused_per_run() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap_err();
     assert_eq!(err.code(), "run-not-found");
@@ -955,7 +968,7 @@ fn scopes_actions_and_ended_runs_are_refused_per_run() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap_err();
     assert_eq!(err.code(), "run-ended");
@@ -1020,16 +1033,11 @@ fn scopes_actions_and_ended_runs_are_refused_per_run() {
 #[test]
 fn a_config_write_re_arms_and_breaches_through_the_same_pass() {
     let seeded = seed();
-    let fence = WireFence::default();
     let name = InstanceName::new(INSTANCE).unwrap();
     let write = |explicit: PolicyLimits| {
         seeded
             .registry
-            .rearm_after_config_write(
-                &name,
-                inputs(explicit.clone()),
-                context(Some(fence.clone()), explicit),
-            )
+            .rearm_after_config_write(&name, inputs(explicit.clone()), context(true, explicit))
             .unwrap()
     };
     // An explicit `block` ceiling written at or below the usage fires now.
@@ -1040,7 +1048,7 @@ fn a_config_write_re_arms_and_breaches_through_the_same_pass() {
         ..PolicyLimits::default()
     });
     assert_eq!(applied.breaches.len(), 2, "{:?}", applied.breaches.len());
-    assert_eq!(fence.refusal().unwrap().code, "tokens_per_run");
+    assert!(block_codes(&seeded, &seeded.run).contains(&"tokens_per_run"));
     // Raising the token ceiling above the totals lifts that reason only.
     write(PolicyLimits {
         tokens_per_run: Some(5_000_000),
@@ -1048,7 +1056,7 @@ fn a_config_write_re_arms_and_breaches_through_the_same_pass() {
         breach_action: Some(BreachAction::Block),
         ..PolicyLimits::default()
     });
-    assert_eq!(fence.refusal().unwrap().code, "dollars_per_run");
+    assert!(block_codes(&seeded, &seeded.run).contains(&"dollars_per_run"));
     assert!(anomalies(&seeded.registry, &seeded.run).contains(&Anomaly::Breach));
     // Raising both unfences (the live un-fence from a config write).
     let applied = write(PolicyLimits {
@@ -1058,7 +1066,7 @@ fn a_config_write_re_arms_and_breaches_through_the_same_pass() {
         ..PolicyLimits::default()
     });
     assert!(applied.breaches.is_empty());
-    assert!(fence.refusal().is_none());
+    assert!(block_codes(&seeded, &seeded.run).is_empty());
     assert!(latched(&seeded.registry, &seeded.run).is_empty());
     assert!(!anomalies(&seeded.registry, &seeded.run).contains(&Anomaly::Breach));
     // An instance with no open Run has nothing to re-arm.
@@ -1075,7 +1083,7 @@ fn an_unsupervised_instance_re_arms_here_but_its_lowering_waits() {
     let seeded = seed();
     let unsupervised = || InstanceContext {
         supervised: false,
-        ..context(None, PolicyLimits::default())
+        ..context(false, PolicyLimits::default())
     };
     let outcome = set(
         &seeded.registry,
@@ -1106,7 +1114,7 @@ fn a_run_limit_belongs_to_its_run_and_a_fresh_run_carries_none() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     // The Run ends; a fresh start mints a new Run for the same agent.
@@ -1147,7 +1155,7 @@ fn a_dry_run_plans_the_same_outcome_and_writes_nothing() {
         token_per_run: Some(10),
         ..RunLimits::default()
     });
-    let ctx = context(None, PolicyLimits::default());
+    let ctx = context(false, PolicyLimits::default());
     let planned = seeded
         .registry
         .plan_run_limits(&seeded.run, &change, LimitActor::Operator, Some(&ctx))
@@ -1201,7 +1209,7 @@ fn the_budget_read_names_sources_headroom_and_latches() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     let view = seeded.registry.run_limits_view(&seeded.run).unwrap();
@@ -1232,7 +1240,7 @@ fn the_action_row_decides_the_runs_action_and_legacy_rows_keep_theirs() {
         }),
         LimitActor::Operator,
         context(
-            None,
+            false,
             PolicyLimits {
                 breach_action: Some(BreachAction::Pause),
                 ..PolicyLimits::default()
@@ -1255,7 +1263,7 @@ fn the_action_row_decides_the_runs_action_and_legacy_rows_keep_theirs() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     assert_eq!(
@@ -1275,7 +1283,7 @@ fn the_action_row_decides_the_runs_action_and_legacy_rows_keep_theirs() {
             clear: vec![RunLimitField::BreachAction, RunLimitField::TokensPerRun],
         },
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     assert_eq!(
@@ -1406,7 +1414,7 @@ fn the_budget_jobs_edges_mixed_moves_stored_inputs_and_runs_without_an_agent() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     let outcome = set(
@@ -1420,7 +1428,7 @@ fn the_budget_jobs_edges_mixed_moves_stored_inputs_and_runs_without_an_agent() {
             clear: vec![RunLimitField::DollarsPerRun],
         },
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     assert_eq!(outcome.direction, LimitsDirection::Set);
@@ -1567,7 +1575,7 @@ fn n1_a_caller_action_over_a_depth_fallen_back_policy_action_is_effective() {
             breach_action: Some(BreachAction::Block),
             ..PolicyLimits::default()
         },
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     );
     let before = stored_resolution(&seeded, &seeded.run);
     assert_eq!(before.effective_action, BreachAction::Warn);
@@ -1580,7 +1588,7 @@ fn n1_a_caller_action_over_a_depth_fallen_back_policy_action_is_effective() {
             ..RunLimits::default()
         }),
         LimitActor::Caller,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     assert_eq!(outcome.resolution.effective_action, BreachAction::Pause);
@@ -1598,7 +1606,7 @@ fn n2_a_caller_undercutting_an_unpriced_policy_cap_keeps_the_unpriced_anomaly() 
     let seeded = seed_with(50, 50, true);
     let unpriced = InstanceContext {
         inputs: Some(Ok(ResolveInputs::default())),
-        ..context(None, PolicyLimits::default())
+        ..context(false, PolicyLimits::default())
     };
     cap_policy(
         &seeded,
@@ -1648,7 +1656,7 @@ fn n3_a_limits_changed_event_names_the_layer_it_describes() {
                 ..RunLimits::default()
             }),
             actor,
-            context(None, PolicyLimits::default()),
+            context(false, PolicyLimits::default()),
         )
         .unwrap();
     }
@@ -1714,7 +1722,7 @@ fn n4_a_child_open_action_keeps_its_provenance_when_another_limit_is_written() {
             ..RunLimits::default()
         }),
         LimitActor::Operator,
-        context(None, PolicyLimits::default()),
+        context(false, PolicyLimits::default()),
     )
     .unwrap();
     assert_eq!(
@@ -1728,7 +1736,7 @@ fn n4_a_child_open_action_keeps_its_provenance_when_another_limit_is_written() {
 #[test]
 fn n5_a_caller_may_clear_its_own_dormant_row_but_not_one_that_applies() {
     let seeded = seed_with(50, 50, true);
-    let ctx = || context(None, PolicyLimits::default());
+    let ctx = || context(false, PolicyLimits::default());
     cap_policy(
         &seeded,
         PolicyLimits {
@@ -1795,7 +1803,7 @@ fn n5_a_caller_may_clear_its_own_dormant_row_but_not_one_that_applies() {
 #[test]
 fn an_operator_clear_lifts_a_callers_row_too_the_operator_outranks() {
     let seeded = seed_with(50, 50, true);
-    let ctx = || context(None, PolicyLimits::default());
+    let ctx = || context(false, PolicyLimits::default());
     cap_policy(
         &seeded,
         PolicyLimits {
@@ -1880,7 +1888,7 @@ fn an_operator_clear_lifts_a_callers_row_too_the_operator_outranks() {
 #[test]
 fn l2_a_caller_may_not_trade_pause_or_stop_for_the_cooperative_block() {
     let seeded = seed_with(50, 50, true);
-    let ctx = || context(Some(WireFence::default()), PolicyLimits::default());
+    let ctx = || context(true, PolicyLimits::default());
     cap_policy(
         &seeded,
         PolicyLimits {

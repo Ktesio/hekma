@@ -206,7 +206,7 @@ Details:
   or a held, silent or stale status; healthy open Runs are counted in the
   footer, not listed. --all lists every Run inside the window. The CONTROL
   column shows the Control Depth (supervised (no wire) for an agent whose
-  model calls skip the metering listener); the RUN column shows the agent's
+  model calls skip the metering proxy); the RUN column shows the agent's
   name on process-owning rows and the run id on child Runs. ANOMALIES shows
   the breach Anomaly with each latched Breach Action (breach[block]) beside
   the others; LABELS marks caller labels. USAGE is the Run's subtree tokens
@@ -284,6 +284,12 @@ enum Commands {
         #[command(subcommand)]
         command: PolicyCommands,
     },
+    /// Manage the metering proxy's endpoint bindings
+    #[command(about = "Manage the metering proxy's endpoint bindings")]
+    Binding {
+        #[command(subcommand)]
+        command: BindingCommands,
+    },
     /// List the Runs that need you, newest first
     #[command(
         about = "List the Runs that need you, newest first",
@@ -320,12 +326,17 @@ enum Commands {
             value_parser = clap::value_parser!(u64).range(1..=86_400)
         )]
         stop_window: Option<u64>,
-        /// Fixed loopback port for observed metering listeners (default 0 =
-        /// OS-ephemeral). A host restart re-binds the SAME port, so adopted
-        /// observed instances stay live; a port already in use refuses the
-        /// start (never a silent hop).
+        /// The shared metering proxy's loopback port (default 0 = the port
+        /// recorded for this state directory, else an OS pick that is then
+        /// recorded — one stable address across restarts). A port already in
+        /// use is surfaced and engine-observed agents cannot start until it
+        /// is free (never a silent hop).
         #[arg(long, value_name = "PORT", default_value_t = 0)]
         metering_listen: u16,
+        /// Send neither x-hekma-run-id nor x-hekma-labels to the model
+        /// provider (identity headers are on by default)
+        #[arg(long)]
+        no_identity_headers: bool,
         /// Serve this state directory instead of the resolved default
         /// (HEKMA_STATE_DIR, the legacy KTESIO_STATE_DIR, or the platform data dir)
         #[arg(long, value_name = "DIR")]
@@ -526,6 +537,154 @@ impl From<PolicyLimitArgs> for cli::policy::LimitFlags {
             rate_cached: args.rate_cached,
         }
     }
+}
+
+#[derive(Subcommand)]
+enum BindingCommands {
+    /// List every binding by name
+    List {
+        /// Continue after a previous page's last name
+        #[arg(long, value_name = "NAME")]
+        after: Option<String>,
+        /// Page size (default 100, at most 256)
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        /// Print the bindings as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one binding, its client base URL included
+    Show {
+        /// The binding's name
+        name: String,
+        /// Print the binding as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a binding: calls on a path prefix forward to an upstream
+    Create {
+        /// The binding's name (lowercase letters, digits, - and _)
+        name: String,
+        /// The path prefix its calls arrive on (/ plus segments; / alone is
+        /// the catch-all)
+        #[arg(long, value_name = "PREFIX")]
+        prefix: String,
+        /// The upstream base URL they forward to (http:// or https://)
+        #[arg(long, value_name = "URL")]
+        upstream: String,
+        /// A label its Runs carry (key=value; repeatable)
+        #[arg(long, value_name = "K=V")]
+        label: Vec<String>,
+        /// A custodied key stored as a secret:NAME reference (inert until
+        /// key custody ships)
+        #[arg(long, value_name = "REF")]
+        custodied_key: Option<String>,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a binding's prefix, upstream, labels or custodied key
+    Set {
+        /// The binding's name
+        name: String,
+        /// The new path prefix
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
+        /// The new upstream base URL
+        #[arg(long, value_name = "URL")]
+        upstream: Option<String>,
+        /// A label its Runs carry (key=value; repeatable; the whole set)
+        #[arg(long, value_name = "K=V")]
+        label: Vec<String>,
+        /// Remove every label
+        #[arg(long)]
+        clear_labels: bool,
+        /// The new custodied-key reference
+        #[arg(long, value_name = "REF", conflicts_with = "clear_custodied_key")]
+        custodied_key: Option<String>,
+        /// Remove the custodied-key reference
+        #[arg(long)]
+        clear_custodied_key: bool,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a binding (its Run ends with cause binding-removed)
+    Delete {
+        /// The binding's name
+        name: String,
+    },
+    /// Manage a binding's reroute routes
+    Route {
+        #[command(subcommand)]
+        command: BindingRouteCommands,
+    },
+    /// Manage a binding's announce and proxy-access credentials
+    Credential {
+        #[command(subcommand)]
+        command: BindingCredentialCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum BindingRouteCommands {
+    /// Add or replace one reroute route (used when reroute ships)
+    Add {
+        /// The binding's name
+        name: String,
+        /// The route's name
+        route: String,
+        /// The upstream base URL the route forwards to
+        #[arg(long, value_name = "URL")]
+        upstream: String,
+        /// A custodied key stored as a secret:NAME reference
+        #[arg(long, value_name = "REF")]
+        custodied_key: Option<String>,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove one reroute route
+    Remove {
+        /// The binding's name
+        name: String,
+        /// The route's name
+        route: String,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BindingCredentialCommands {
+    /// Issue a binding credential (shown once; rotates the previous one)
+    Issue {
+        /// The binding's name
+        name: String,
+        /// The credential class: announce or proxy-access
+        #[arg(long, value_name = "CLASS")]
+        class: String,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke a binding's active credential of a class
+    Revoke {
+        /// The binding's name
+        name: String,
+        /// The credential class: announce or proxy-access
+        #[arg(long, value_name = "CLASS")]
+        class: String,
+    },
+    /// List a binding's credentials (token ids and states only)
+    List {
+        /// The binding's name
+        name: String,
+        /// Print the credentials as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -756,8 +915,8 @@ enum AgentCommands {
         /// command). Supervised while the host runs; after a host exit the
         /// next host re-adopts it, and until then there is no crash
         /// detection, no budget enforcement and no event delivery. Refused
-        /// for engine-observed instances (their metering listener lives in
-        /// the host).
+        /// for engine-observed instances (the metering proxy they call lives
+        /// in the host).
         #[arg(long)]
         detach: bool,
     },
@@ -967,6 +1126,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Serve {
             stop_window,
             metering_listen,
+            no_identity_headers,
             state_dir,
             listen,
             bearer_secret,
@@ -981,6 +1141,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }) => cli::serve::run(cli::serve::ServeFlags {
             stop_window,
             metering_listen,
+            no_identity_headers,
             state_dir,
             listen,
             bearer_secret,
@@ -1102,6 +1263,76 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 no_cascade,
                 json,
             } => cli::run::revoke_keys(&run_id, !no_cascade, json),
+        },
+        Some(Commands::Binding { command }) => match command {
+            BindingCommands::List { after, limit, json } => {
+                cli::binding::list(after, limit.unwrap_or(100), json)
+            }
+            BindingCommands::Show { name, json } => cli::binding::show(&name, json),
+            BindingCommands::Create {
+                name,
+                prefix,
+                upstream,
+                label,
+                custodied_key,
+                json,
+            } => cli::binding::create(cli::binding::CreateArgs {
+                name,
+                prefix,
+                upstream,
+                labels: label,
+                custodied_key,
+                json,
+            }),
+            BindingCommands::Set {
+                name,
+                prefix,
+                upstream,
+                label,
+                clear_labels,
+                custodied_key,
+                clear_custodied_key,
+                json,
+            } => cli::binding::set(cli::binding::SetArgs {
+                name,
+                prefix,
+                upstream,
+                labels: label,
+                clear_labels,
+                custodied_key,
+                clear_custodied_key,
+                json,
+            }),
+            BindingCommands::Delete { name } => cli::binding::delete(&name),
+            BindingCommands::Route { command } => match command {
+                BindingRouteCommands::Add {
+                    name,
+                    route,
+                    upstream,
+                    custodied_key,
+                    json,
+                } => cli::binding::route_add(cli::binding::RouteArgs {
+                    name,
+                    route,
+                    upstream,
+                    custodied_key,
+                    json,
+                }),
+                BindingRouteCommands::Remove { name, route, json } => {
+                    cli::binding::route_remove(&name, &route, json)
+                }
+            },
+            BindingCommands::Credential { command } => match command {
+                BindingCredentialCommands::Issue { name, class, json } => {
+                    cli::binding::credential_issue(&name, &class, json)
+                }
+                BindingCredentialCommands::Revoke { name, class } => {
+                    cli::binding::credential_revoke(&name, &class)
+                }
+                BindingCredentialCommands::List { name, json } => {
+                    cli::binding::credential_list(&name, json)
+                }
+            },
         },
         Some(Commands::Policy { command }) => match command {
             PolicyCommands::List { json } => cli::policy::list(json),

@@ -144,8 +144,50 @@ fn note<S: RunRecords + ?Sized>(
         &labels,
         limits,
         resolution.as_ref(),
+        store.entry_extras(&record.run_id)?,
     ));
     Ok(())
+}
+
+/// Note a just-inserted Run's `created` event and entry (story 23-1: the
+/// wire-Run job).
+pub(crate) fn note_created<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    record: &RunRecord,
+    cause: Option<String>,
+) -> Result<(), StoreError> {
+    note(
+        store,
+        changes,
+        record,
+        RunEventKind::Created,
+        Prior::default(),
+        cause,
+    )
+}
+
+/// A fresh snapshot entry for `run_id` with no event (story 23-1: a job
+/// that changed only a latch — a `block` breach on a Run already carrying
+/// its `breach` Anomaly, a re-arm — republishes the disposition). `None`
+/// for a Run with no row.
+pub(crate) fn refreshed_entry<S: RunRecords + ?Sized>(
+    store: &S,
+    run_id: &RunId,
+) -> Result<Option<RunEntry>, StoreError> {
+    let Some(record) = store.run_record(run_id)? else {
+        return Ok(None);
+    };
+    let labels = store.run_labels(run_id)?;
+    let limits = store.run_limits(run_id)?;
+    let resolution = store.run_policy(run_id)?.map(|row| row.resolution);
+    Ok(Some(super::snapshot::entry_of(
+        &record,
+        &labels,
+        limits,
+        resolution.as_ref(),
+        store.entry_extras(run_id)?,
+    )))
 }
 
 #[derive(Default)]
@@ -396,6 +438,10 @@ pub(crate) struct SupervisedRun {
     /// Run); a fresh Run with `None` resolves with no explicit instance
     /// limits.
     pub inputs: Option<super::policy::ResolveInputs>,
+    /// Story 23-1: the instance's resolved upstream base URL, recorded on
+    /// the Run (the shared proxy's Run route forwards there); `None` keeps
+    /// what is recorded (an adoption) or records none (self-reported).
+    pub upstream: Option<String>,
 }
 
 /// A supervised launch's credentials (story 22-1), value-free: the Run Key
@@ -609,6 +655,14 @@ pub(crate) fn ensure_supervised<S: RunRecords + ?Sized>(
             )?);
         }
     }
+    // Story 23-1: the instance's upstream rides the Run (the shared proxy's
+    // Run route forwards there); the freshest entry publishes last.
+    if let Some(upstream) = &run.upstream {
+        store.set_run_upstream(&run.run_id, Some(upstream))?;
+        if let Some(entry) = refreshed_entry(store, &run.run_id)? {
+            changes.entries.push(entry);
+        }
+    }
     Ok(changes)
 }
 
@@ -688,6 +742,36 @@ pub(crate) fn sync_bound_labels<S: RunRecords + ?Sized>(
         &next,
         "config",
         inputs,
+        at,
+    )?;
+    Ok(changes)
+}
+
+/// Re-sync a binding Run's `binding`-origin labels to `binding` (story
+/// 23-1: a binding label change re-resolves its Runs in the same job).
+pub(crate) fn sync_binding_labels<S: RunRecords + ?Sized>(
+    store: &S,
+    run_id: &RunId,
+    binding: &[(String, String)],
+    at: &str,
+) -> Result<RunChanges, StoreError> {
+    let mut changes = RunChanges::default();
+    let Some(record) = store.run_record(run_id)? else {
+        return Ok(changes);
+    };
+    let current = store.run_labels(run_id)?;
+    let next = labels::plan_binding_sync(&current, binding);
+    if next == current {
+        return Ok(changes);
+    }
+    write_labels(
+        store,
+        &mut changes,
+        record,
+        &current,
+        &next,
+        "binding",
+        None,
         at,
     )?;
     Ok(changes)
@@ -928,6 +1012,11 @@ pub(crate) fn action_refusal(
     if action == BreachAction::Warn {
         return None;
     }
+    // Story 23-1: `block` executes at any depth with a wire path (the shared
+    // proxy fences the Run and everything beneath it).
+    if action == BreachAction::Block && wire_path {
+        return None;
+    }
     let cell = super::verb_cell(super::RunVerb::BreachActionPauseStopBlock, depth, wire_path);
     if !wire_path {
         Some(
@@ -1135,24 +1224,16 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
         .ok_or_else(|| RunError::NotFound {
             run_id: run_id.as_str().to_string(),
         })?;
-    let usage = match &record.instance {
-        Some(instance) => {
-            let name = InstanceName::new(instance).map_err(|e| {
-                RunError::Store(StoreError::CorruptRow {
-                    name: instance.clone(),
-                    detail: e.to_string(),
-                })
-            })?;
-            let rollup = store.run_rollup(&name, run_id)?;
-            RunUsage {
-                input_tokens: rollup.totals.input_tokens,
-                output_tokens: rollup.totals.output_tokens,
-                cached_tokens: rollup.totals.cached_tokens,
-                cost_micros: rollup.cost,
-                estimate: EstimateLabel::Estimated,
-            }
-        }
-        None => RunUsage::default(),
+    // Story 23-1 (v18): the Run rollup is keyed by the run id alone, so a
+    // Run without an Agent Instance (a wire Run of the shared proxy) shows
+    // its usage too — it used to read as zero.
+    let rollup = store.run_rollup_by_id(run_id)?;
+    let usage = RunUsage {
+        input_tokens: rollup.totals.input_tokens,
+        output_tokens: rollup.totals.output_tokens,
+        cached_tokens: rollup.totals.cached_tokens,
+        cost_micros: rollup.cost,
+        estimate: EstimateLabel::Estimated,
     };
     Ok(RunView {
         labels: store.run_labels(run_id)?,
@@ -1178,6 +1259,7 @@ pub(crate) fn open_entries<S: RunRecords + ?Sized>(store: &S) -> Result<Vec<RunE
                 &labels,
                 limits,
                 resolution.as_ref(),
+                store.entry_extras(&record.run_id)?,
             ))
         })
         .collect()
