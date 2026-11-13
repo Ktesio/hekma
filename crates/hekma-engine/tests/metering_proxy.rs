@@ -637,3 +637,283 @@ fn a_child_runs_key_charges_its_own_run_and_is_refused_once_revoked() {
     );
     assert_eq!(upstream.served().len(), served_after);
 }
+
+#[test]
+fn the_binding_lifecycle_through_the_engine_with_its_refusals_and_the_proxy_in_step() {
+    use hekma_engine::{BindingCredentialClass, BindingError, BindingPatch, RouteSpec};
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    let facade = engine.blocking();
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let spec = |name: &str, prefix: &str, upstream: &str, key: Option<&str>| BindingSpec {
+        name: name.into(),
+        prefix: prefix.into(),
+        upstream: upstream.into(),
+        labels: Vec::new(),
+        custodied_key: key.map(str::to_string),
+    };
+
+    // Create refusals, each with its stable code.
+    for (bad, code) in [
+        (
+            spec("openai", "/other", "http://127.0.0.1:9", None),
+            "binding-exists",
+        ),
+        (
+            spec("dup", "/openai", "http://127.0.0.1:9", None),
+            "binding-prefix-taken",
+        ),
+        (
+            spec("inner", "/_hekma/x", "http://127.0.0.1:9", None),
+            "binding-invalid",
+        ),
+        (
+            spec("dots", "/a/../b", "http://127.0.0.1:9", None),
+            "binding-invalid",
+        ),
+        (
+            spec("userinfo", "/u", "https://u:p@example.com", None),
+            "binding-invalid",
+        ),
+        (
+            spec("query", "/q", "https://example.com/?a=1", None),
+            "binding-invalid",
+        ),
+        (
+            spec("scheme", "/s", "ftp://example.com", None),
+            "binding-invalid",
+        ),
+        (
+            spec("key", "/k", "https://example.com", Some("sk-plain")),
+            "binding-invalid",
+        ),
+        (
+            spec("Bad Name", "/n", "https://example.com", None),
+            "binding-invalid",
+        ),
+    ] {
+        let err = facade.create_binding(bad.clone()).unwrap_err();
+        assert_eq!(err.code(), code, "{bad:?}: {err}");
+    }
+    // A custodied-key reference is stored as given.
+    let keyed = facade
+        .create_binding(spec(
+            "keyed",
+            "/keyed",
+            &upstream.base(),
+            Some("secret:KEY"),
+        ))
+        .unwrap();
+    assert_eq!(keyed.custodied_key.as_deref(), Some("secret:KEY"));
+    assert_eq!(facade.bindings(None, 100).unwrap().len(), 2);
+    assert_eq!(
+        facade.bindings(Some("keyed"), 100).unwrap()[0].name,
+        "openai"
+    );
+
+    // A first call opens the binding's Run.
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    let before = wait_for_usage(&engine, ("binding", "openai"), 10);
+
+    // A prefix change keeps the Run; the old prefix stops routing at once.
+    let changed = facade
+        .update_binding(
+            "openai",
+            BindingPatch {
+                prefix: Some("/llm".into()),
+                ..BindingPatch::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(changed.prefix, "/llm");
+    assert_eq!(post(port, "/openai/chat", &[]).status, 404);
+    assert_eq!(post(port, "/llm/chat", &[]).status, 200);
+    let after = wait_for_usage(&engine, ("binding", "openai"), 20);
+    assert_eq!(after.record.run_id, before.record.run_id);
+    // A label change re-resolves the open Run's labels.
+    facade
+        .update_binding(
+            "openai",
+            BindingPatch {
+                labels: Some(vec![("team".into(), "platform".into())]),
+                ..BindingPatch::default()
+            },
+        )
+        .unwrap();
+    let relabelled = runs(&engine)
+        .into_iter()
+        .find(|run| run.record.run_id == before.record.run_id)
+        .unwrap();
+    assert!(
+        relabelled
+            .labels
+            .iter()
+            .any(|label| label.key == "team" && label.value == "platform"),
+        "{:?}",
+        relabelled.labels
+    );
+    // Set and clear the custodied-key reference; refusals on update.
+    let set = facade
+        .update_binding(
+            "openai",
+            BindingPatch {
+                custodied_key: Some(Some("secret:OPENAI".into())),
+                ..BindingPatch::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(set.custodied_key.as_deref(), Some("secret:OPENAI"));
+    let cleared = facade
+        .update_binding(
+            "openai",
+            BindingPatch {
+                custodied_key: Some(None),
+                ..BindingPatch::default()
+            },
+        )
+        .unwrap();
+    assert!(cleared.custodied_key.is_none());
+    for (name, patch, code) in [
+        ("ghost", BindingPatch::default(), "binding-not-found"),
+        (
+            "openai",
+            BindingPatch {
+                prefix: Some("/keyed".into()),
+                ..BindingPatch::default()
+            },
+            "binding-prefix-taken",
+        ),
+        (
+            "openai",
+            BindingPatch {
+                upstream: Some("not a url".into()),
+                ..BindingPatch::default()
+            },
+            "binding-invalid",
+        ),
+        (
+            "openai",
+            BindingPatch {
+                custodied_key: Some(Some("plain".into())),
+                ..BindingPatch::default()
+            },
+            "binding-invalid",
+        ),
+    ] {
+        let err = facade.update_binding(name, patch).unwrap_err();
+        assert_eq!(err.code(), code, "{name}: {err}");
+    }
+
+    // Routes: add, replace, remove, refusals, and the per-binding cap.
+    let route = |name: &str| RouteSpec {
+        name: name.into(),
+        upstream: "https://backup.example.com/v1".into(),
+        custodied_key: None,
+    };
+    let with = facade.put_binding_route("openai", route("backup")).unwrap();
+    assert_eq!(with.routes.len(), 1);
+    let replaced = facade
+        .put_binding_route(
+            "openai",
+            RouteSpec {
+                upstream: "https://other.example.com".into(),
+                ..route("backup")
+            },
+        )
+        .unwrap();
+    assert_eq!(replaced.routes.len(), 1);
+    assert_eq!(replaced.routes[0].upstream, "https://other.example.com");
+    for n in 1..16 {
+        facade
+            .put_binding_route("openai", route(&format!("r{n}")))
+            .unwrap();
+    }
+    let err = facade
+        .put_binding_route("openai", route("r16"))
+        .unwrap_err();
+    assert_eq!(err.code(), "binding-limit", "{err}");
+    let err = facade
+        .put_binding_route(
+            "openai",
+            RouteSpec {
+                upstream: "ftp://x".into(),
+                ..route("bad")
+            },
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "binding-invalid", "{err}");
+    let fewer = facade.remove_binding_route("openai", "backup").unwrap();
+    assert_eq!(fewer.routes.len(), 15);
+    let err = facade.remove_binding_route("openai", "backup").unwrap_err();
+    assert!(matches!(err, BindingError::RouteNotFound { .. }), "{err}");
+    let err = facade.remove_binding_route("ghost", "r1").unwrap_err();
+    assert_eq!(err.code(), "binding-not-found");
+
+    // Credentials: issue rotates, revoke is per class, listing shows states.
+    let first = facade
+        .issue_binding_credential("openai", BindingCredentialClass::ProxyAccess)
+        .unwrap();
+    let second = facade
+        .issue_binding_credential("openai", BindingCredentialClass::ProxyAccess)
+        .unwrap();
+    assert_ne!(first.token_id, second.token_id);
+    assert!(second.token.expose_secret().starts_with("hk_pxy_"));
+    facade
+        .issue_binding_credential("openai", BindingCredentialClass::Announce)
+        .unwrap();
+    facade
+        .revoke_binding_credential("openai", BindingCredentialClass::Announce)
+        .unwrap();
+    let listing = facade.binding_credentials("openai").unwrap();
+    let state_of = |id: &str| {
+        listing
+            .iter()
+            .find(|credential| credential.token_id == id)
+            .map(|credential| credential.state.clone())
+    };
+    assert_eq!(state_of(&first.token_id).as_deref(), Some("revoked"));
+    assert_eq!(state_of(&second.token_id).as_deref(), Some("active"));
+    assert_eq!(
+        listing
+            .iter()
+            .filter(|c| c.class == BindingCredentialClass::Announce && c.state == "active")
+            .count(),
+        0
+    );
+    for err in [
+        facade
+            .issue_binding_credential("ghost", BindingCredentialClass::Announce)
+            .unwrap_err(),
+        facade
+            .revoke_binding_credential("ghost", BindingCredentialClass::Announce)
+            .unwrap_err(),
+        facade.binding_credentials("ghost").unwrap_err(),
+    ] {
+        assert_eq!(err.code(), "binding-not-found", "{err}");
+    }
+
+    // Delete: the binding's Run ends, its prefix stops routing.
+    facade.delete_binding("openai").unwrap();
+    assert!(facade.binding("openai").unwrap().is_none());
+    assert_eq!(post(port, "/llm/chat", &[]).status, 404);
+    let ended = runs(&engine)
+        .into_iter()
+        .find(|run| run.record.run_id == before.record.run_id)
+        .unwrap();
+    assert_eq!(ended.record.status, hekma_engine::RunStatus::Ended);
+    assert_eq!(
+        facade.delete_binding("openai").unwrap_err().code(),
+        "binding-not-found"
+    );
+
+    // Stopping the proxy closes its port.
+    facade.stop_metering_proxy(Duration::from_secs(1));
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+}
