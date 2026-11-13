@@ -5243,10 +5243,7 @@ fn seed_call_records(base: &Path, rows: &[(&str, &str, Option<i64>, &str, Option
     const BASE_MS: u64 = 1_767_312_000_000;
     for (index, (run, outcome, status, class, model)) in rows.iter().enumerate() {
         let millis = BASE_MS + 1000 + 1000 * index as u64;
-        let started = format!(
-            "2026-01-02T00:00:{:02}.000000Z",
-            index + 1
-        );
+        let started = format!("2026-01-02T00:00:{:02}.000000Z", index + 1);
         conn.execute(
             "INSERT OR IGNORE INTO calls VALUES (?1, ?2, ?3, 'wire', NULL, ?4, NULL, ?5, ?6, ?7, \
              ?8, 10, 5, 2, ?9, ?9, 1000, 900)",
@@ -5258,7 +5255,11 @@ fn seed_call_records(base: &Path, rows: &[(&str, &str, Option<i64>, &str, Option
                 } else {
                     None
                 },
-                if *outcome == "refused" { "block" } else { "pass" },
+                if *outcome == "refused" {
+                    "block"
+                } else {
+                    "pass"
+                },
                 outcome,
                 status,
                 class,
@@ -5292,10 +5293,34 @@ fn the_calls_routes_read_records_page_and_refuse_every_malformed_value() {
     seed_call_records(
         state.path(),
         &[
-            ("run_01JZ6Q9G3S8V2X7K4M1N5P0R2T", "completed", Some(200), "2xx", Some("gpt-demo")),
-            ("run_01JZ6Q9G3S8V2X7K4M1N5P0R2T", "refused", Some(429), "refused", None),
-            ("run_01JZ6Q9G3S8V2X7K4M1N5P0R2V", "upstream-error", None, "transport-error", Some("gpt-demo")),
-            ("run_01JZ6Q9G3S8V2X7K4M1N5P0R2V", "completed", Some(200), "2xx", Some("gpt-demo")),
+            (
+                "run_01JZ6Q9G3S8V2X7K4M1N5P0R2T",
+                "completed",
+                Some(200),
+                "2xx",
+                Some("gpt-demo"),
+            ),
+            (
+                "run_01JZ6Q9G3S8V2X7K4M1N5P0R2T",
+                "refused",
+                Some(429),
+                "refused",
+                None,
+            ),
+            (
+                "run_01JZ6Q9G3S8V2X7K4M1N5P0R2V",
+                "upstream-error",
+                None,
+                "transport-error",
+                Some("gpt-demo"),
+            ),
+            (
+                "run_01JZ6Q9G3S8V2X7K4M1N5P0R2V",
+                "completed",
+                Some(200),
+                "2xx",
+                Some("gpt-demo"),
+            ),
         ],
     );
 
@@ -5322,7 +5347,11 @@ fn the_calls_routes_read_records_page_and_refuse_every_malformed_value() {
 
     // The Run filter never expands a subtree; the problems view drops the
     // clean passes.
-    let mut response = get_ok(&client, &server.addr, "/v0/calls?run=run_01JZ6Q9G3S8V2X7K4M1N5P0R2V");
+    let mut response = get_ok(
+        &client,
+        &server.addr,
+        "/v0/calls?run=run_01JZ6Q9G3S8V2X7K4M1N5P0R2V",
+    );
     let tenant = json_body(&mut response);
     assert_eq!(tenant["items"].as_array().unwrap().len(), 2);
     let mut response = get_ok(&client, &server.addr, "/v0/calls?view=problems");
@@ -5353,7 +5382,10 @@ fn the_calls_routes_read_records_page_and_refuse_every_malformed_value() {
         assert!(left["call_id"].as_str().unwrap() > right["call_id"].as_str().unwrap());
     }
     let mut response = get_ok(&client, &server.addr, "/v0/calls?limit=0");
-    assert_eq!(json_body(&mut response)["items"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        json_body(&mut response)["items"].as_array().unwrap().len(),
+        4
+    );
 
     // The window is half-open on the call start.
     let mut response = get_ok(
@@ -5382,7 +5414,11 @@ fn the_calls_routes_read_records_page_and_refuse_every_malformed_value() {
         assert_eq!(body["error"]["code"], code, "{path}");
     };
     // A cursor that is not the codec's, a v2: prefix, and a RUN cursor.
-    refusal("/v0/calls?cursor=nonsense", StatusCode::BAD_REQUEST, "invalid-cursor");
+    refusal(
+        "/v0/calls?cursor=nonsense",
+        StatusCode::BAD_REQUEST,
+        "invalid-cursor",
+    );
     refusal(
         &format!(
             "/v0/calls?cursor={}",
@@ -5424,14 +5460,26 @@ fn the_calls_routes_read_records_page_and_refuse_every_malformed_value() {
         StatusCode::BAD_REQUEST,
         "invalid-time",
     );
-    refusal("/v0/calls?view=everything", StatusCode::BAD_REQUEST, "invalid-view");
-    refusal("/v0/calls?limit=five", StatusCode::BAD_REQUEST, "invalid-limit");
+    refusal(
+        "/v0/calls?view=everything",
+        StatusCode::BAD_REQUEST,
+        "invalid-view",
+    );
+    refusal(
+        "/v0/calls?limit=five",
+        StatusCode::BAD_REQUEST,
+        "invalid-limit",
+    );
     refusal(
         "/v0/calls?outcome=superceded",
         StatusCode::BAD_REQUEST,
         "invalid-filter",
     );
-    refusal("/v0/calls/not-a-call-id", StatusCode::BAD_REQUEST, "invalid-call-id");
+    refusal(
+        "/v0/calls/not-a-call-id",
+        StatusCode::BAD_REQUEST,
+        "invalid-call-id",
+    );
     refusal(
         "/v0/calls/call_01JZ6Q9G3S8V2X7K4M1N5P0R2T",
         StatusCode::NOT_FOUND,
@@ -5495,7 +5543,10 @@ fn the_calls_routes_refuse_every_credential_class_but_the_operator_bearer() {
     assert_eq!(response.status(), StatusCode::CREATED);
     let opened = json_body(&mut response);
     let child = opened["run"]["run_id"].as_str().unwrap().to_string();
-    let run_key = opened["credentials"]["run_key"].as_str().unwrap().to_string();
+    let run_key = opened["credentials"]["run_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let refresh = opened["credentials"]["refresh_credential"]
         .as_str()
         .unwrap()

@@ -50,10 +50,10 @@ const CALL_COLUMNS: &str = "call_id, run_id, token_id, control_depth, binding, d
 /// The Control Depths a record can carry (the filter's closed list).
 const DEPTHS: [&str; 4] = ["observed", "wire", "announced", "supervised"];
 
-/// The scan-budget test seam: a non-zero value lowers the budget for THIS
-/// THREAD's reads (a `#[cfg(test)]` override, never a user setting; the
-/// tests that use it run single-threaded reads, so the override is private
-/// to the thread that lowered it and never races a sibling test).
+// The scan-budget test seam: a non-zero value lowers the budget for THIS
+// THREAD's reads (a `#[cfg(test)]` override, never a user setting; the
+// tests that use it run single-threaded reads, so the override is private
+// to the thread that lowered it and never races a sibling test).
 #[cfg(test)]
 thread_local! {
     static SCAN_BUDGET_OVERRIDE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

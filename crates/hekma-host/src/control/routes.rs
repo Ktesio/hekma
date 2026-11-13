@@ -883,9 +883,7 @@ pub(crate) async fn call_show(
     if !hekma_engine::is_call_id(&call_id) {
         return Err(ApiError::invalid_query_param(
             "invalid-call-id",
-            format!(
-                "{call_id} is not a call id this engine records (call_ plus 26 characters)"
-            ),
+            format!("{call_id} is not a call id this engine records (call_ plus 26 characters)"),
         ));
     }
     let record = state.engine.call(&call_id).await?;
