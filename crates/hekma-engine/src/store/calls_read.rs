@@ -50,47 +50,6 @@ const CALL_COLUMNS: &str = "call_id, run_id, token_id, control_depth, binding, d
 /// The Control Depths a record can carry (the filter's closed list).
 const DEPTHS: [&str; 4] = ["observed", "wire", "announced", "supervised"];
 
-// The scan-budget test seam: a non-zero value lowers the budget for THIS
-// THREAD's reads (a `#[cfg(test)]` override, never a user setting; the
-// tests that use it run single-threaded reads, so the override is private
-// to the thread that lowered it and never races a sibling test).
-#[cfg(test)]
-thread_local! {
-    static SCAN_BUDGET_OVERRIDE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// The effective scan budget (the constant, or the test seam's override).
-fn scan_budget() -> usize {
-    #[cfg(test)]
-    {
-        let override_with = SCAN_BUDGET_OVERRIDE.get();
-        if override_with > 0 {
-            return override_with;
-        }
-    }
-    CALLS_SCAN_BUDGET
-}
-
-/// A guard that restores the scan-budget seam when dropped.
-#[cfg(test)]
-pub(crate) struct ScanBudgetGuard;
-
-#[cfg(test)]
-impl ScanBudgetGuard {
-    /// Lower the scan budget to `budget` for this thread's reads.
-    pub(crate) fn lower_to(budget: usize) -> Self {
-        SCAN_BUDGET_OVERRIDE.set(budget);
-        ScanBudgetGuard
-    }
-}
-
-#[cfg(test)]
-impl Drop for ScanBudgetGuard {
-    fn drop(&mut self) {
-        SCAN_BUDGET_OVERRIDE.set(0);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Query resolution: validation and the window's id bounds.
 // ---------------------------------------------------------------------------
@@ -425,6 +384,16 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
 /// Read one page over the calls directory. Takes no lock, holds no
 /// transaction, sends nothing to the writer.
 pub(crate) fn read_page(dir: &Path, query: &CallsQuery) -> Result<CallListing, CallError> {
+    read_page_with_budget(dir, query, CALLS_SCAN_BUDGET)
+}
+
+/// [`read_page`] with the scan budget given (the tests lower it; production
+/// always passes [`CALLS_SCAN_BUDGET`]).
+fn read_page_with_budget(
+    dir: &Path,
+    query: &CallsQuery,
+    budget: usize,
+) -> Result<CallListing, CallError> {
     // A directory that exists but cannot be read is a surfaced failure; a
     // missing one is an empty listing.
     if let Err(err) = std::fs::read_dir(dir) {
@@ -446,7 +415,6 @@ pub(crate) fn read_page(dir: &Path, query: &CallsQuery) -> Result<CallListing, C
         };
     }
     let resolved = resolve_calls_query(query)?;
-    let budget = scan_budget();
     let fetch = resolved.limit.saturating_add(1);
     // The statement examines at most `budget` rows per segment (the loop
     // below breaks at the same bound; the LIMIT is the backstop so the
@@ -1294,7 +1262,9 @@ mod tests {
             })
             .collect();
         seed_segment(&dir, "2026-11-12.db", 2, &rows);
-        let _guard = ScanBudgetGuard::lower_to(10);
+        // The scan budget lowered to 10 rows for this test's reads.
+        let listing =
+            |dir: &Path, query: &CallsQuery| read_page_with_budget(dir, query, 10).unwrap();
         let mut query = CallsQuery::all();
         query.model = Some("needle".to_string());
         let page = listing(&dir, &query);
@@ -1337,7 +1307,9 @@ mod tests {
             .map(|index| Row::new(&call_id_at(BASE_MS + index, (index % 32) as u8), PARENT))
             .collect();
         seed_segment(&dir, "2026-11-12.db", 2, &rows);
-        let _guard = ScanBudgetGuard::lower_to(10);
+        // The scan budget lowered to 10 rows for this test's reads.
+        let listing =
+            |dir: &Path, query: &CallsQuery| read_page_with_budget(dir, query, 10).unwrap();
         let mut query = CallsQuery::all();
         query.limit = 5;
         let page = listing(&dir, &query);

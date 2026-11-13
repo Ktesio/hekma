@@ -400,7 +400,10 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
         // The Run listing (story 21-5) is identity-shaped only on its GET —
         // an empty state directory is a valid EMPTY listing. The POST
         // (open) keeps its exactly-one-parent 400 below.
-        || (method == "GET" && url.ends_with("/v0/runs"));
+        || (method == "GET" && url.ends_with("/v0/runs"))
+        // The calls listing (story 19-4): no calls recorded is a valid EMPTY
+        // listing too (the by-id read keeps its 404).
+        || (method == "GET" && url.ends_with("/v0/calls"));
         let register = method == "POST" && url.ends_with("/v0/instances");
         // The ack POST reached its handler but this loop's register-shaped
         // body carries no `seq` — the Json extractor's 422 is the
