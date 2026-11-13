@@ -573,6 +573,16 @@ ALTER TABLE runs ADD COLUMN custody_origin TEXT;
 ALTER TABLE runs ADD COLUMN custody_key_ref TEXT;
 ";
 
+/// Undo v19 on a fully migrated store, for the older upgrade tests (they
+/// stamp a lower version and reopen; v19's columns must be gone first).
+#[cfg(test)]
+pub(crate) const UNDO_V19_FOR_TEST: &str = "\
+ALTER TABLE runs DROP COLUMN custody_state;
+ALTER TABLE runs DROP COLUMN custody_reason;
+ALTER TABLE runs DROP COLUMN custody_origin;
+ALTER TABLE runs DROP COLUMN custody_key_ref;
+";
+
 /// Run the v19 step (DDL + stamp) in one `BEGIN IMMEDIATE`, stepping aside
 /// when another process finished it while this one waited.
 pub(super) fn migrate_v19(conn: &Connection) -> Result<(), StoreError> {

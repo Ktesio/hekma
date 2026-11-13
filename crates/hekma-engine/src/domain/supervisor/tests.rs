@@ -2976,6 +2976,15 @@ fn self_reported_observed_route_is_a_no_op() {
     registry
         .set_config(&name, "metering.upstream_base_url", "http://127.0.0.1:9")
         .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    registry
+        .set_config(&name, "provider.api_key", "secret:HEKMA_TEST_PROVIDER_KEY")
+        .unwrap();
+    registry
+        .set_config(&name, "provider.custody", "off")
+        .unwrap();
     let effective = registry
         .effective_config(&name, crate::domain::ConfigLayer::empty())
         .unwrap();
@@ -3039,6 +3048,15 @@ fn engine_observed_without_a_running_proxy_rejects_naming_the_remediation() {
     registry
         .set_config(&name, "metering.upstream_base_url", "http://127.0.0.1:9")
         .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    registry
+        .set_config(&name, "provider.api_key", "secret:HEKMA_TEST_PROVIDER_KEY")
+        .unwrap();
+    registry
+        .set_config(&name, "provider.custody", "off")
+        .unwrap();
     let effective = registry
         .effective_config(&name, crate::domain::ConfigLayer::empty())
         .unwrap();
@@ -3063,6 +3081,19 @@ fn engine_observed_without_a_running_proxy_rejects_naming_the_remediation() {
 }
 
 // ---- Story 12-1: detached start — the refusal + the in-process shape ----
+
+/// Story 22-2 (FR-19, AD-22): an `engine-observed` agent starts only when
+/// Hekma holds its provider key. Tests about metering, adoption or detach
+/// hold one with custody off (the key resolves from the environment).
+fn hold_provider_key(registry: &Registry, name: &InstanceName) {
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    registry
+        .set_config(name, "provider.api_key", "secret:HEKMA_TEST_PROVIDER_KEY")
+        .unwrap();
+    registry
+        .set_config(name, "provider.custody", "off")
+        .unwrap();
+}
 
 /// Write an `engine-observed` manifest (the `adoption.rs` shape) whose start
 /// exec is `fake_agent` + `args`.
@@ -3104,6 +3135,7 @@ fn detached_start_of_an_engine_observed_instance_is_refused_before_any_side_effe
             &AdapterRef::Manifest(manifest.path().to_path_buf()),
         )
         .unwrap();
+    hold_provider_key(&registry, &InstanceName::new("obsdetach").unwrap());
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let err = sup.start_detached(&registry, "obsdetach").unwrap_err();
     match &err {
@@ -6933,6 +6965,7 @@ fn setup_observed_crashed_engine(
             "http://127.0.0.1:1",
         )
         .unwrap();
+    hold_provider_key(&registry, &parsed);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -9334,6 +9367,7 @@ fn a_foreign_raise_lifts_the_supervising_engines_fence_on_its_tick() {
             "http://127.0.0.1:9",
         )
         .unwrap();
+    hold_provider_key(&registry, &name);
     registry.set_config(&name, "labels.team", "core").unwrap();
     // A `block` Policy at 10 tokens per run (the run has a wire path, so the
     // action executes; a Policy change is also what a FOREIGN engine can
@@ -10608,6 +10642,7 @@ fn two_pre_proxy_adopted_agents_get_no_legacy_route_and_are_named() {
                 "http://127.0.0.1:1",
             )
             .unwrap();
+        hold_provider_key(&registry, &parsed);
         manifests.push(manifest);
         names.push(parsed);
     }
@@ -10674,6 +10709,7 @@ fn a_failed_observed_start_retires_its_pending_run_route() {
             "http://127.0.0.1:9",
         )
         .unwrap();
+    hold_provider_key(&registry, &name);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

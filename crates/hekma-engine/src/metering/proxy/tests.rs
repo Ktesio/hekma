@@ -511,6 +511,180 @@ fn hints_name_children_split_bindings_and_are_ignored_beneath_the_unattributed_r
     assert_eq!(attribution, run("run_P"));
 }
 
+/// Story 22-2 (P4): custody is drawn ONLY by a custody-eligible Run Key —
+/// in the API-key slot or in `x-hekma-run-key` — whose Run (or an
+/// ancestor, or its binding) holds a key; everything else is forwarded as
+/// 23-1 does, or refused `custody_unavailable` when the slot asked for it.
+#[test]
+fn only_an_eligible_run_key_draws_custody_and_a_binding_key_needs_one_too() {
+    use crate::domain::custody::CustodyInfo;
+    let mut w = world();
+    let held = CustodyInfo {
+        key_ref: Arc::from("secret:OPENAI"),
+        origin: Arc::from("https://api.openai.com"),
+    };
+    // run_P holds a key (its child run_C inherits it); run_O holds none.
+    let mut parent = (*w.snapshot.runs[&RunId::from_wire("run_P")]).clone();
+    parent.custody = Some(held.clone());
+    w.snapshot
+        .runs
+        .insert(RunId::from_wire("run_P"), Arc::new(parent));
+    // A binding with a custodied key, its Run run_V and a child run_VC.
+    let vault = BindingEntry {
+        name: "vault".into(),
+        prefix: "/vault".into(),
+        upstream: Arc::from("https://api.anthropic.com"),
+        labels: labels(),
+        custodied_key: Some("secret:VAULT".into()),
+    };
+    let mut entries = vec![openai(), vault.clone()];
+    entries.push(BindingEntry {
+        name: "plain".into(),
+        prefix: "/plain".into(),
+        upstream: Arc::from(BINDING_UPSTREAM),
+        labels: Vec::new(),
+        custodied_key: None,
+    });
+    w.snapshot.bindings = Arc::new(BindingTable::new(entries));
+    let mut binding_run = run_entry("run_V", None, None);
+    binding_run.identity = Some(
+        WireIdentity::Binding {
+            binding: "vault".into(),
+            labels: labels(),
+        }
+        .key(),
+    );
+    w.snapshot
+        .runs
+        .insert(RunId::from_wire("run_V"), Arc::new(binding_run));
+    w.snapshot.identities.insert(
+        WireIdentity::Binding {
+            binding: "vault".into(),
+            labels: labels(),
+        }
+        .key(),
+        RunId::from_wire("run_V"),
+    );
+    w.snapshot.runs.insert(
+        RunId::from_wire("run_VC"),
+        Arc::new(run_entry("run_VC", Some("run_V"), None)),
+    );
+    let mut key = |run: &str, eligible: bool| {
+        let (value, hash) = token(TokenClass::RunKey);
+        let mut entry = (*key_entry(run, TokenClass::RunKey)).clone();
+        entry.custody_eligible = eligible;
+        w.snapshot.keys.insert(hash, Arc::new(entry));
+        value
+    };
+    let child_eligible = key("run_C", true);
+    let child_ineligible = key("run_C", false);
+    let other_eligible = key("run_O", true);
+    let vault_child_eligible = key("run_VC", true);
+    let vault_ineligible = key("run_V", false);
+    let snapshot = &w.snapshot;
+    let vault_held = CustodyInfo {
+        key_ref: Arc::from("secret:VAULT"),
+        origin: Arc::from("https://api.anthropic.com"),
+    };
+
+    let custody_of = |f: CallFacts<'_>| call(identify(snapshot, &f)).0.custody;
+    let refusal = |f: CallFacts<'_>| refused(&identify(snapshot, &f));
+    let run_route = "/_hekma/runs/run_P/v1/chat/completions";
+    let bearer = |key: &str| format!("Bearer {key}");
+
+    // An eligible key draws its chain's custody, in either place.
+    let slot = bearer(&child_eligible);
+    assert_eq!(
+        custody_of(CallFacts {
+            path: run_route,
+            authorization: Some(&slot),
+            ..CallFacts::default()
+        }),
+        Some(held.clone())
+    );
+    assert_eq!(
+        custody_of(CallFacts {
+            path: run_route,
+            run_key: Some(&child_eligible),
+            ..CallFacts::default()
+        }),
+        Some(held.clone())
+    );
+    // An INELIGIBLE key in x-hekma-run-key names the Run but never draws
+    // custody: the call is forwarded with whatever key the client sent.
+    assert_eq!(
+        custody_of(CallFacts {
+            path: run_route,
+            run_key: Some(&child_ineligible),
+            ..CallFacts::default()
+        }),
+        None
+    );
+    // In the slot it is refused (the slot asks for a swap).
+    let slot = bearer(&child_ineligible);
+    assert_eq!(
+        refusal(CallFacts {
+            path: run_route,
+            authorization: Some(&slot),
+            ..CallFacts::default()
+        }),
+        Some(Refusal::CustodyUnavailable)
+    );
+    // An eligible slot key overridden by an ineligible x-hekma-run-key key:
+    // no custody, so the slot's request for one is refused.
+    let slot = bearer(&child_eligible);
+    assert_eq!(
+        refusal(CallFacts {
+            path: run_route,
+            authorization: Some(&slot),
+            run_key: Some(&child_ineligible),
+            ..CallFacts::default()
+        }),
+        Some(Refusal::CustodyUnavailable)
+    );
+    // An eligible key whose Run holds no key: refused in the slot, plain
+    // in x-hekma-run-key.
+    let slot = bearer(&other_eligible);
+    assert_eq!(
+        refusal(CallFacts {
+            path: "/_hekma/runs/run_O/v1/chat",
+            api_key: Some(slot.trim_start_matches("Bearer ")),
+            ..CallFacts::default()
+        }),
+        Some(Refusal::CustodyUnavailable)
+    );
+    assert_eq!(
+        custody_of(CallFacts {
+            path: "/_hekma/runs/run_O/v1/chat",
+            run_key: Some(&other_eligible),
+            ..CallFacts::default()
+        }),
+        None
+    );
+    // A labelled binding with a custodied key: reached bare, never; by an
+    // ineligible key of its Run, never; by an eligible key of a Run
+    // beneath it, its key pinned to the binding's upstream.
+    assert_eq!(custody_of(facts("/vault/v1/messages")), None);
+    assert_eq!(
+        custody_of(CallFacts {
+            path: "/vault/v1/messages",
+            run_key: Some(&vault_ineligible),
+            ..CallFacts::default()
+        }),
+        None
+    );
+    assert_eq!(
+        custody_of(CallFacts {
+            path: "/vault/v1/messages",
+            run_key: Some(&vault_child_eligible),
+            ..CallFacts::default()
+        }),
+        Some(vault_held)
+    );
+    // The unattributed Run never draws custody.
+    assert_eq!(custody_of(facts("/plain/v1/chat")), None);
+}
+
 #[test]
 fn the_legacy_root_route_catches_what_no_binding_or_run_route_claims() {
     let mut w = world();
@@ -601,7 +775,7 @@ mod seams {
         stream
             .write_all(
                 format!(
-                    "POST {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n{extra}\
+                    "POST {path} HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n{extra}\
                      content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
                     body.len()
                 )

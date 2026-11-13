@@ -356,6 +356,13 @@ fn engine_observed_usage_lands_in_the_ledger_tagged_engine_observed() {
     facade
         .set_config("obs", "metering.upstream_base_url", &stub.base_url)
         .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config("obs", "provider.api_key", "secret:HEKMA_TEST_PROVIDER_KEY")
+        .unwrap();
+    facade.set_config("obs", "provider.custody", "off").unwrap();
 
     let started = facade.start("obs").unwrap();
     assert_eq!(started.state, LifecycleState::Running);
@@ -420,6 +427,19 @@ fn a_streamed_completion_is_metered_end_to_end_through_the_terminal_sse_frame() 
         .unwrap();
     facade
         .set_config("obsstream", "metering.upstream_base_url", &stub.base_url)
+        .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            "obsstream",
+            "provider.api_key",
+            "secret:HEKMA_TEST_PROVIDER_KEY",
+        )
+        .unwrap();
+    facade
+        .set_config("obsstream", "provider.custody", "off")
         .unwrap();
 
     facade.start("obsstream").unwrap();
@@ -496,6 +516,19 @@ fn observed_cached_tokens_land_and_price_at_the_configured_cached_rate() {
     facade
         .set_config("obscached", "metering.upstream_base_url", &stub.base_url)
         .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            "obscached",
+            "provider.api_key",
+            "secret:HEKMA_TEST_PROVIDER_KEY",
+        )
+        .unwrap();
+    facade
+        .set_config("obscached", "provider.custody", "off")
+        .unwrap();
     // The Rate: input $3/1M, output $15/1M, cached $0.30/1M.
     facade
         .set_config("obscached", "cost.rate.input", "3.00")
@@ -571,6 +604,19 @@ fn a_token_budget_enforces_on_observed_usage_and_pauses() {
     facade
         .set_config("obsbudget", "metering.upstream_base_url", &stub.base_url)
         .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            "obsbudget",
+            "provider.api_key",
+            "secret:HEKMA_TEST_PROVIDER_KEY",
+        )
+        .unwrap();
+    facade
+        .set_config("obsbudget", "provider.custody", "off")
+        .unwrap();
     // A cumulative token ceiling the observed consumption crosses (100 tokens/call).
     facade
         .set_config("obsbudget", "budget.tokens.cumulative", "150")
@@ -634,6 +680,19 @@ fn a_dollar_cap_enforces_on_observed_usage_labeled_estimated() {
         .unwrap();
     facade
         .set_config("obsdollar", "metering.upstream_base_url", &stub.base_url)
+        .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            "obsdollar",
+            "provider.api_key",
+            "secret:HEKMA_TEST_PROVIDER_KEY",
+        )
+        .unwrap();
+    facade
+        .set_config("obsdollar", "provider.custody", "off")
         .unwrap();
     // A Rate (both directions required) + a cumulative dollar cap the observed cost
     // crosses. $1.00 per 1M tokens each direction.
@@ -712,6 +771,19 @@ fn the_forwarded_api_key_never_leaks_into_any_ktesio_surface() {
         .unwrap();
     facade
         .set_config("noleak", "metering.upstream_base_url", &stub.base_url)
+        .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            "noleak",
+            "provider.api_key",
+            "secret:HEKMA_TEST_PROVIDER_KEY",
+        )
+        .unwrap();
+    facade
+        .set_config("noleak", "provider.custody", "off")
         .unwrap();
 
     // Deliver the sentinel as a SECRET via a pass-through env leaf (mirrors
@@ -819,6 +891,19 @@ fn the_forwarded_api_key_never_leaks_on_the_forward_failure_path() {
     facade
         .set_config("noleakerr", "metering.upstream_base_url", &dead_upstream)
         .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            "noleakerr",
+            "provider.api_key",
+            "secret:HEKMA_TEST_PROVIDER_KEY",
+        )
+        .unwrap();
+    facade
+        .set_config("noleakerr", "provider.custody", "off")
+        .unwrap();
 
     // Deliver the sentinel as a SECRET via a pass-through env leaf (see the
     // happy-path test): resolved at START into the child env, never the snapshot. A
@@ -906,6 +991,15 @@ fn an_engine_observed_instance_with_no_upstream_fails_to_start_cleanly() {
     facade
         .register_with_adapter("noup", &AdapterRef::Manifest(manifest.path().to_path_buf()))
         .unwrap();
+    // Story 22-2: the provider key is held (custody off), so the refusal
+    // below is the missing upstream's, not the missing key's.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config("noup", "provider.api_key", "secret:HEKMA_TEST_PROVIDER_KEY")
+        .unwrap();
+    facade
+        .set_config("noup", "provider.custody", "off")
+        .unwrap();
     // No `metering.upstream_base_url` set → the start must reject.
     let err = facade.start("noup").unwrap_err();
     let msg = err.to_string();
@@ -967,6 +1061,19 @@ fn a_hand_set_memory_dir_never_reaches_an_engine_observed_start_surfaces() {
     };
     facade
         .set_config("obsmem", "metering.upstream_base_url", &dead_upstream)
+        .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            "obsmem",
+            "provider.api_key",
+            "secret:HEKMA_TEST_PROVIDER_KEY",
+        )
+        .unwrap();
+    facade
+        .set_config("obsmem", "provider.custody", "off")
         .unwrap();
     // THE DECOY: a hand-set value at the reserved key in the operator
     // (instance) layer — the tests/cost.rs set_config pattern.
@@ -1054,6 +1161,19 @@ fn an_acp_instance_with_a_base_url_override_meters_engine_observed() {
         .unwrap();
     facade
         .set_config("acpobs", "metering.upstream_base_url", &stub.base_url)
+        .unwrap();
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            "acpobs",
+            "provider.api_key",
+            "secret:HEKMA_TEST_PROVIDER_KEY",
+        )
+        .unwrap();
+    facade
+        .set_config("acpobs", "provider.custody", "off")
         .unwrap();
 
     let started = facade.start("acpobs").unwrap();

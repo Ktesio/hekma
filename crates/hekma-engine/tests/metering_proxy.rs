@@ -1043,7 +1043,7 @@ fn an_oversized_or_over_budget_request_is_refused_before_any_dial() {
         .unwrap();
     stream
         .write_all(
-            b"POST /openai/chat HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\
+            b"POST /openai/chat HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\
               content-type: application/json\r\ncontent-length: 70000000\r\n\r\n{}",
         )
         .unwrap();
@@ -1078,7 +1078,7 @@ fn a_client_that_disconnects_cancels_the_call_and_is_not_metered() {
     {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let request = format!(
-            "POST /openai/chat HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+            "POST /openai/chat HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\n\
              content-length: {}\r\n\r\n{CHAT}",
             CHAT.len()
         );
@@ -1728,7 +1728,7 @@ fn a_streamed_request_body_over_the_budget_is_refused_before_it_is_buffered() {
     stream
         .write_all(
             format!(
-                "POST /openai/chat HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+                "POST /openai/chat HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\n\
                  transfer-encoding: chunked\r\n\r\n{:x}\r\n{chunk}\r\n",
                 chunk.len()
             )

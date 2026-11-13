@@ -165,6 +165,13 @@ fn register(engine: &Engine, dir: &Path, name: &str, observed: bool, args: &[&st
         facade
             .set_config(name, "metering.upstream_base_url", "http://127.0.0.1:9")
             .unwrap();
+        // Story 22-2: an engine-observed agent starts only when Hekma holds its
+        // provider key (FR-19); this metering test holds one with custody off.
+        std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+        facade
+            .set_config(name, "provider.api_key", "secret:HEKMA_TEST_PROVIDER_KEY")
+            .unwrap();
+        facade.set_config(name, "provider.custody", "off").unwrap();
     }
 }
 
