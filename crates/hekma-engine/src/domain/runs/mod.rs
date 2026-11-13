@@ -255,15 +255,21 @@ pub enum Anomaly {
     /// A used refresh credential was presented again (story 22-1): the Run's
     /// credentials were revoked. Cleared by an Operator `revoke-keys`.
     CredentialReuse,
+    /// A call was attributed to this Run without a credential Hekma issued
+    /// while the Run resolved the `shadow` Scent-Check Mode (story 22-3).
+    /// Set by the first such call; cleared when a re-resolution moves the
+    /// Run off `shadow`. It never acts — `enforce` refuses, this records.
+    UnscentedCall,
 }
 
 impl Anomaly {
-    const ALL: [Anomaly; 5] = [
+    const ALL: [Anomaly; 6] = [
         Anomaly::Breach,
         Anomaly::Failed,
         Anomaly::DepthFallback,
         Anomaly::UnpricedModel,
         Anomaly::CredentialReuse,
+        Anomaly::UnscentedCall,
     ];
 
     /// The stable wire form.
@@ -274,6 +280,7 @@ impl Anomaly {
             Anomaly::DepthFallback => "depth-fallback",
             Anomaly::UnpricedModel => "unpriced-model",
             Anomaly::CredentialReuse => "credential-reuse",
+            Anomaly::UnscentedCall => "unscented",
         }
     }
 
@@ -463,6 +470,11 @@ pub struct RunLimits {
     /// The Breach Action for these ceilings (`warn` when unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub breach_action: Option<BreachAction>,
+    /// A Scent-Check Mode set on the Run (story 22-3): only a Caller sets
+    /// one, through the limits route, and only to TIGHTEN the Run's
+    /// resolved mode — the resolver applies it only where it is stricter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scent_check: Option<policy::ScentCheckMode>,
 }
 
 impl RunLimits {
@@ -898,17 +910,6 @@ pub enum RunError {
         /// What it cannot do (`"cannot be deleted"`, `"cannot carry a Selector"`).
         what: &'static str,
     },
-    /// A Scent-Check Mode other than `off` before Scent-Check ships
-    /// (story 21-3, PRD §13 Q9's interim): an accepted-but-inert mode
-    /// would be a silent no-op.
-    #[error(
-        "Scent-Check Modes land with their own story — only `off` is accepted for now; `{mode}` \
-         does nothing until then"
-    )]
-    ScentUnavailable {
-        /// The refused mode.
-        mode: String,
-    },
     /// A listing cursor that is not the codec's form (story 21-5): a bad
     /// base64url body, a foreign version prefix, an empty run id. The typed
     /// `invalid-cursor` refusal — a future key shape never mispages, it
@@ -1000,7 +1001,6 @@ impl RunError {
             RunError::PolicyNotFound { .. } => "policy-not-found",
             RunError::PolicyExists { .. } => "policy-exists",
             RunError::PolicyDefault { .. } => "policy-default",
-            RunError::ScentUnavailable { .. } => "scent-unavailable",
             RunError::InvalidCursor { .. } => "invalid-cursor",
             RunError::Invalid { .. } => "invalid-request",
             RunError::RunOutOfScope { .. } => "run-out-of-scope",

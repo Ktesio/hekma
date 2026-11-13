@@ -528,6 +528,10 @@ struct PolicyLimitArgs {
     /// What a breach does: warn, pause, stop or block
     #[arg(long, value_name = "ACTION")]
     breach_action: Option<String>,
+    /// The Scent-Check Mode for calls without a credential Hekma issued:
+    /// off, shadow (serve and mark the Run) or enforce (refuse)
+    #[arg(long, value_name = "MODE")]
+    scent_check: Option<String>,
     /// Input price in dollars per 1M tokens
     #[arg(long, value_name = "DOLLARS")]
     rate_input: Option<String>,
@@ -547,6 +551,7 @@ impl From<PolicyLimitArgs> for cli::policy::LimitFlags {
             dollars_per_run: args.dollars_per_run,
             dollars_cumulative: args.dollars_cumulative,
             breach_action: args.breach_action,
+            scent_check: args.scent_check,
             rate_input: args.rate_input,
             rate_output: args.rate_output,
             rate_cached: args.rate_cached,

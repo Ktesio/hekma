@@ -36,6 +36,8 @@ pub struct LimitFlags {
     pub dollars_per_run: Option<String>,
     pub dollars_cumulative: Option<String>,
     pub breach_action: Option<String>,
+    /// Story 22-3: `off`, `shadow` or `enforce`.
+    pub scent_check: Option<String>,
     /// Dollars per 1M tokens, as typed.
     pub rate_input: Option<String>,
     pub rate_output: Option<String>,
@@ -178,7 +180,18 @@ fn change_from(args: &WriteArgs, create: bool) -> Result<PolicyChange, Box<dyn s
                 .as_deref()
                 .map(parse_action)
                 .transpose()?,
-            scent_check: None,
+            scent_check: flags
+                .scent_check
+                .as_deref()
+                .map(|value| {
+                    hekma_engine::ScentCheckMode::from_wire(value).ok_or_else(|| {
+                        invalid(format!(
+                            "--scent-check: `{value}` is not a Scent-Check Mode (off, shadow or \
+                             enforce)"
+                        ))
+                    })
+                })
+                .transpose()?,
             rate: flat_rate,
         },
         clear,
@@ -221,6 +234,9 @@ fn limits_summary(limits: &PolicyLimits) -> String {
     }
     if let Some(action) = limits.breach_action {
         parts.push(format!("on breach {}", action_str(action)));
+    }
+    if let Some(mode) = limits.scent_check {
+        parts.push(format!("scent-check {}", mode.as_str()));
     }
     if let Some(rate) = limits.rate {
         parts.push(format!(

@@ -56,6 +56,9 @@ pub enum CallDisposition {
     Pass,
     /// Refused by a `block` reason on the Run or an ancestor.
     Block,
+    /// Refused because the call carried no credential Hekma issued while
+    /// its Run resolved the `enforce` Scent-Check Mode (story 22-3).
+    Enforce,
     /// Held for release (produced by a later story; never written yet).
     Hold,
     /// Rerouted to another endpoint (produced by a later story).
@@ -73,6 +76,7 @@ impl CallDisposition {
         match self {
             CallDisposition::Pass => "pass",
             CallDisposition::Block => "block",
+            CallDisposition::Enforce => "enforce",
             CallDisposition::Hold => "hold",
             CallDisposition::Reroute => "reroute",
             CallDisposition::Reject => "reject",
@@ -87,6 +91,7 @@ impl CallDisposition {
         match raw {
             "pass" => Some(CallDisposition::Pass),
             "block" => Some(CallDisposition::Block),
+            "enforce" => Some(CallDisposition::Enforce),
             "hold" => Some(CallDisposition::Hold),
             "reroute" => Some(CallDisposition::Reroute),
             "reject" => Some(CallDisposition::Reject),
@@ -762,7 +767,7 @@ mod tests {
         ] {
             assert_eq!(CallOutcome::from_filter(raw).unwrap().as_str(), raw);
         }
-        for raw in ["pass", "block", "hold", "reroute", "reject"] {
+        for raw in ["pass", "block", "enforce", "hold", "reroute", "reject"] {
             assert_eq!(CallDisposition::from_filter(raw).unwrap().as_str(), raw);
         }
         for raw in ["2xx", "3xx", "4xx", "5xx", "refused", "transport-error"] {

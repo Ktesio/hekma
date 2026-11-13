@@ -5,7 +5,7 @@ description: "One loopback proxy per state directory meters every model call, at
 
 # The metering proxy
 
-> **On main, not yet released.** The shared metering proxy ships with the next release. It replaces the per-agent metering listener. Key custody is a preview, not yet supported. Scent-Check Modes, announce, wire hold and reroute, and serving beyond loopback are still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **On main, not yet released.** The shared metering proxy ships with the next release. It replaces the per-agent metering listener. Key custody is a preview, not yet supported. Scent-Check Modes are on main. Announce, wire hold and reroute, and serving beyond loopback are still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 Hekma meters model calls by sitting between a client and its model provider. The **metering proxy** is one HTTP listener on `127.0.0.1`, owned by the Service Host (`hekma serve`). Each call it forwards is attributed to a [Run](runs.md), counted once in the usage ledger, checked against that Run's budgets, and relayed back. Supervised agents reach it through the base URL Hekma injects. Any other client reaches it through an **endpoint binding** you create.
 
@@ -109,7 +109,7 @@ A record carries:
 | `token_id` | The 12-hex label of the Run Key the call presented; `null` when it presented none |
 | `control_depth` | The Run's Control Depth at the call |
 | `binding` | The binding the call came through; `null` off a binding |
-| `disposition` | What the proxy did: `pass` or `block` (`hold`, `reroute` and `reject` are reserved) |
+| `disposition` | What the proxy did: `pass`, `block`, or `enforce` (refused under the `enforce` Scent-Check Mode); `hold`, `reroute` and `reject` are reserved |
 | `hold_end` | Always `null` until holds ship |
 | `outcome` | `completed`, `refused`, `upstream-error`, `client-disconnect`, `shutdown`, `crash` or `recovered` |
 | `status`, `status_class` | The status the client got (`null` when none) and its class: `2xx`, `3xx`, `4xx`, `5xx`, `refused` or `transport-error` |
@@ -131,6 +131,10 @@ A record never holds a prompt, a response, a header, a key or the upstream's add
 Usage through the proxy enforces exactly like any other usage: the Run's own budgets and every Run above it, through the same [Policies](policies.md) and [budget verbs](commands.md). A change to a budget applies on the very next call.
 
 Under the `block` [Breach Action](governance.md), the proxy refuses a Run's calls while the Run, or any Run above it (up to eight levels), holds a latched breach. `GET`, `HEAD` and `OPTIONS` stay exempt. `block` now works for every Run with a wire path, not only for supervised agents. `pause` and `stop` still need a process to act on: for a Run without one they record the breach and fall back to `warn`.
+
+## Scent-Check
+
+Right after the `block` check, the proxy applies the [Scent-Check Mode](run-keys.md#scent-check-modes) to a call that no valid Run Key identified (an **unscented** call): the strictest mode of its Run and every Run above it. Under `off` it is served; under `shadow` it is served, counted, and its Run gets the `unscented` Anomaly; under `enforce` it is refused with `401 hekma_unscented_call` and nothing is forwarded. A latched `block` refuses first, and `enforce` has no exemption for `GET`, `HEAD` or `OPTIONS`.
 
 ## Endpoint bindings
 
@@ -189,6 +193,7 @@ No body ever carries a limit, a total, an agent name, a token, a token id, or an
 | 403 | `hekma_bad_host` | The `Host` is not loopback or listed, or an `Origin` is not listed | `false` |
 | 401 | `hekma_unknown_credential` | The credential is not a Run Key Hekma honours | `false` |
 | 401 | `hekma_credential_revoked` | The Run Key was revoked in the last 24 hours | `false` |
+| 401 | `hekma_unscented_call` | The call carries no credential Hekma issued, and its Run's Scent-Check Mode is `enforce` | `false` |
 | 402 | `hekma_budget_block` | `block` holds for the Run or a Run above it | `false` |
 | 403 | `hekma_run_out_of_scope` | The Run Key's Run is not the route's Run or beneath it | `false` |
 | 404 | `hekma_no_route` | No Run route or binding matches | `false` |
@@ -227,7 +232,6 @@ Earlier releases gave each `engine-observed` agent its own listener on its own p
 ## What is still planned
 
 - **Key custody, supported:** it is a preview today, until the pending security rulings are recorded and its test criteria pass in CI.
-- **Scent-Check Modes:** refusing unidentified traffic.
 - **Announce:** self-identifying clients and Leases.
 - **Wire hold, release, reroute and reject.**
 - **Incremental streaming relay.**

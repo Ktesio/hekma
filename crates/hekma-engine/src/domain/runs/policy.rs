@@ -57,10 +57,10 @@ pub const POLICY_EVENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_POLICY_NAME: &str = "default";
 
 /// How Hekma treats a call without a valid Run Key (PRD FR-53). The modes
-/// exist on every Policy row from story 21-3 on, but only `off` is accepted
-/// at create/change until Scent-Check ships with its own story (22.3, PRD
-/// §13 Q9's interim): an accepted-but-inert `enforce` would be the silent
-/// lie the house rules forbid. The default Policy is seeded `off`.
+/// exist on every Policy row from story 21-3 on; story 22-3 makes them act
+/// at the metering proxy (`shadow` marks an unscented call, `enforce`
+/// refuses it). The default Policy is seeded `off`, the decided default
+/// everywhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ScentCheckMode {
@@ -439,7 +439,7 @@ pub(crate) fn caller_action_tightens(caller: BreachAction, effective: BreachActi
 }
 
 /// The Scent-Check Mode tightness order (FR-60's tie rule).
-fn scent_tightness(mode: ScentCheckMode) -> u8 {
+pub(crate) fn scent_tightness(mode: ScentCheckMode) -> u8 {
     match mode {
         ScentCheckMode::Off => 0,
         ScentCheckMode::Shadow => 1,
@@ -650,6 +650,15 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
             .scent_check
             .unwrap_or(ScentCheckMode::Off)
     };
+    // Story 22-3: a Caller's mode applies only where it is TIGHTER (a Caller
+    // cannot lower the Scent-Check Mode).
+    let scent_check = match input.caller_limits.scent_check {
+        Some(caller) if scent_tightness(caller) > scent_tightness(scent_check) => {
+            sources.scent_check = LimitSource::Caller;
+            caller
+        }
+        _ => scent_check,
+    };
 
     // ---- The Rate: the instance's `cost.rate.*` (both directions or
     // absent — a half-configured Rate falls through, FR-20's documented
@@ -789,6 +798,7 @@ pub(crate) fn caller_policy_limits(limits: &RunLimits) -> PolicyLimits {
         dollars_per_run_micros: limits.dollar_per_run_micros.map(micros),
         dollars_cumulative_micros: limits.dollar_cumulative_micros.map(micros),
         breach_action: limits.breach_action,
+        scent_check: limits.scent_check,
         ..PolicyLimits::default()
     }
 }
@@ -1126,6 +1136,12 @@ fn store_changes<S: RunRecords + ?Sized>(
         .filter(|anomaly| !owned.contains(anomaly))
         .collect();
     anomalies.extend(raised);
+    // Story 22-3: `unscented` is raised by calls, and kept only while the
+    // Run still resolves `shadow` — a re-resolution to `off` or `enforce`
+    // clears it in this same job.
+    if resolution.scent_check != ScentCheckMode::Shadow {
+        anomalies.retain(|anomaly| *anomaly != Anomaly::UnscentedCall);
+    }
     // A DIRECTLY SET action (on the Run's limits) that this Run's (depth,
     // wire path) cannot execute keeps its 21-2 loud signal through every
     // re-resolve — the resolver raises `depth-fallback` only for

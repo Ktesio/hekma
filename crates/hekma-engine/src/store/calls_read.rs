@@ -121,7 +121,7 @@ pub(crate) fn resolve_calls_query(query: &CallsQuery) -> Result<ResolvedCallsQue
                     param: "disposition",
                     detail: format!(
                         "one of {} — {raw} is not one this build knows",
-                        ["pass", "block", "hold", "reroute", "reject"].join(", ")
+                        ["pass", "block", "enforce", "hold", "reroute", "reject"].join(", ")
                     ),
                 })?,
             )
@@ -212,6 +212,7 @@ pub(crate) fn resolve_calls_query(query: &CallsQuery) -> Result<ResolvedCallsQue
         disposition: disposition.map(|value| match value {
             CallDisposition::Pass => "pass",
             CallDisposition::Block => "block",
+            CallDisposition::Enforce => "enforce",
             CallDisposition::Hold => "hold",
             CallDisposition::Reroute => "reroute",
             CallDisposition::Reject => "reject",
