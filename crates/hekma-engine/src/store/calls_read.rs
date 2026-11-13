@@ -16,8 +16,8 @@
 //! `skipped_files` — a partial listing that says so, never a silent gap.
 //! A schema 1 segment (before the read indexes) reads correctly too.
 //!
-//! Every page is bounded: the keyset statement fetches `limit + 1` rows
-//! per segment, and the whole page examines at most [`CALLS_SCAN_BUDGET`]
+//! Every page is bounded: the segments are walked together as one merge
+//! by call id, and the whole page examines at most [`CALLS_SCAN_BUDGET`]
 //! rows across segments — a filter that matches sparsely stops there,
 //! returns what it found, and says so (`scan_limited`, the cursor it
 //! continues from, and how far back it looked).
@@ -389,11 +389,23 @@ pub(crate) fn read_page(dir: &Path, query: &CallsQuery) -> Result<CallListing, C
 
 /// [`read_page`] with the scan budget given (the tests lower it; production
 /// always passes [`CALLS_SCAN_BUDGET`]).
+///
+/// The segments are walked TOGETHER, as one merge by call id descending:
+/// every step examines the highest id any segment still holds. So the rows
+/// a page has examined are always a prefix of the merged order, whatever
+/// ids each file holds (a call that started before a rotation and closed
+/// after, a restored backup, a clock step): the next page's keyset
+/// continues below the last of them with no gap and no duplicate, the
+/// budget counts the merged walk, and `searched_back_to` names the start of
+/// the last row examined in that order.
 fn read_page_with_budget(
     dir: &Path,
     query: &CallsQuery,
     budget: usize,
 ) -> Result<CallListing, CallError> {
+    // The query is validated first: a typed refusal stands whether or not
+    // the store exists yet.
+    let resolved = resolve_calls_query(query)?;
     // A directory that exists but cannot be read is a surfaced failure; a
     // missing one is an empty listing.
     if let Err(err) = std::fs::read_dir(dir) {
@@ -414,82 +426,83 @@ fn read_page_with_budget(
             }),
         };
     }
-    let resolved = resolve_calls_query(query)?;
     let fetch = resolved.limit.saturating_add(1);
-    // The statement examines at most `budget` rows per segment (the loop
-    // below breaks at the same bound; the LIMIT is the backstop so the
-    // storage engine never walks further than the page may look).
-    let statement = page_statement(&resolved, budget);
+    // Each segment's statement stops one row past the budget: the merged
+    // walk never examines more than `budget` rows in all, and the one extra
+    // row tells a budget stop from a segment read to its end.
+    let statement = page_statement(&resolved, budget.saturating_add(1));
+    let mut skipped_files: Vec<String> = Vec::new();
+    // A file that will not open, has no calls table, or holds a row that
+    // will not decode is skipped and named: the other segments still serve.
+    let mut conns: Vec<(PathBuf, Connection)> = Vec::new();
+    for segment in segments_newest_first(dir) {
+        match open_segment(&segment) {
+            Ok(conn) => conns.push((segment, conn)),
+            Err(reason) => skipped_files.push(reason),
+        }
+    }
+    let mut statements: Vec<(&Path, rusqlite::Statement<'_>)> = Vec::new();
+    for (path, conn) in &conns {
+        match conn.prepare(&statement.sql) {
+            Ok(stmt) => statements.push((path.as_path(), stmt)),
+            Err(err) => skipped_files.push(unreadable_segment(path, &err)),
+        }
+    }
+    let mut walks: Vec<SegmentWalk<'_>> = Vec::new();
+    for (path, stmt) in statements.iter_mut() {
+        match stmt.query(rusqlite::params_from_iter(statement.params.iter())) {
+            Ok(rows) => {
+                let mut walk = SegmentWalk {
+                    path,
+                    rows: Some(rows),
+                    head: None,
+                };
+                walk.advance(&mut skipped_files);
+                walks.push(walk);
+            }
+            Err(err) => skipped_files.push(unreadable_segment(path, &err)),
+        }
+    }
     let mut found: Vec<CallRecord> = Vec::new();
     let mut examined: usize = 0;
     let mut last_examined: Option<(String, String)> = None;
     let mut budget_stop = false;
-    let mut skipped_files: Vec<String> = Vec::new();
-    for segment in segments_newest_first(dir) {
-        if budget_stop {
+    while found.len() < fetch {
+        // The segment whose next row has the highest id.
+        let Some(next) = walks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, walk)| walk.head.as_ref().map(|head| (index, head)))
+            .max_by(|a, b| a.1.call_id.cmp(&b.1.call_id))
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        if examined >= budget {
+            budget_stop = true;
             break;
         }
-        let conn = match open_segment(&segment) {
-            Ok(conn) => conn,
-            Err(reason) => {
-                skipped_files.push(reason);
-                continue;
-            }
+        let Some(record) = walks[next].head.take() else {
+            break;
         };
-        let mut stmt = conn
-            .prepare(&statement.sql)
-            .map_err(|err| CallError::Unavailable {
-                detail: format!(
-                    "the calls file {} could not be read ({err})",
-                    segment.display()
-                ),
-            })?;
-        let mut rows = stmt
-            .query(rusqlite::params_from_iter(statement.params.iter()))
-            .map_err(|err| CallError::Unavailable {
-                detail: format!(
-                    "the calls file {} could not be read ({err})",
-                    segment.display()
-                ),
-            })?;
-        loop {
-            if examined >= budget {
-                budget_stop = true;
-                break;
-            }
-            let Some(row) = rows.next().map_err(|err| CallError::Unavailable {
-                detail: format!(
-                    "the calls file {} could not be read ({err})",
-                    segment.display()
-                ),
-            })?
-            else {
-                break;
-            };
-            let record = row_to_record(row).map_err(|err| CallError::Unavailable {
-                detail: format!(
-                    "the calls file {} holds a record that could not be read ({err})",
-                    segment.display()
-                ),
-            })?;
-            examined += 1;
-            last_examined = Some((record.call_id.clone(), record.started_at.clone()));
-            if residual_matches(&resolved, &record) {
-                found.push(record);
-            }
-            if found.len() >= fetch {
-                // Enough candidates for the merge: rows beyond this point
-                // in ANY segment sit below the last examined id and are
-                // found by the next page's keyset.
-                break;
+        walks[next].advance(&mut skipped_files);
+        // The same id in another segment (a replay in a re-created file) is
+        // one call: its copies are passed over, not listed twice.
+        for walk in walks.iter_mut() {
+            while walk
+                .head
+                .as_ref()
+                .is_some_and(|head| head.call_id == record.call_id)
+            {
+                walk.advance(&mut skipped_files);
             }
         }
+        examined += 1;
+        last_examined = Some((record.call_id.clone(), record.started_at.clone()));
+        if residual_matches(&resolved, &record) {
+            found.push(record);
+        }
     }
-    // Merge newest-first across segments: sort by id descending and drop a
-    // duplicate id (an overlapping segment's copy — ids are unique, but a
-    // re-created segment could hold a replay).
-    found.sort_by(|a, b| b.call_id.cmp(&a.call_id));
-    found.dedup_by(|a, b| a.call_id == b.call_id);
     let skipped_segments = skipped_files.len() as u64;
     if found.len() > resolved.limit {
         found.truncate(resolved.limit);
@@ -505,7 +518,7 @@ fn read_page_with_budget(
             skipped_files,
         });
     }
-    // The page did not fill. If the budget stopped the scan, the page is
+    // The page did not fill. If the budget stopped the walk, the page is
     // partial and the cursor continues from the last row examined; else
     // every segment was read to its end and the read is exhausted.
     let (next_cursor, scan_limited, searched_back_to) = if budget_stop {
@@ -525,6 +538,48 @@ fn read_page_with_budget(
         skipped_segments,
         skipped_files,
     })
+}
+
+/// One segment's place in the merged walk: its rows in id-descending order
+/// and the next one not yet examined.
+struct SegmentWalk<'s> {
+    path: &'s Path,
+    /// `None` once the segment is read to its end or failed mid-walk.
+    rows: Option<rusqlite::Rows<'s>>,
+    head: Option<CallRecord>,
+}
+
+impl SegmentWalk<'_> {
+    /// Step to the next row. A row that fails to read ends this segment's
+    /// walk and names it in `skipped`; what it already gave stands.
+    fn advance(&mut self, skipped: &mut Vec<String>) {
+        self.head = None;
+        let Some(rows) = self.rows.as_mut() else {
+            return;
+        };
+        let next = match rows.next() {
+            Ok(Some(row)) => row_to_record(row).map(Some),
+            Ok(None) => Ok(None),
+            Err(err) => Err(err),
+        };
+        match next {
+            Ok(Some(record)) => self.head = Some(record),
+            Ok(None) => self.rows = None,
+            Err(err) => {
+                skipped.push(unreadable_segment(self.path, &err));
+                self.rows = None;
+            }
+        }
+    }
+}
+
+/// The skip reason for a segment that opened but could not be read.
+fn unreadable_segment(path: &Path, err: &rusqlite::Error) -> String {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    format!("{name}: could not be read as a calls file ({err})")
 }
 
 /// The residual filter match, applied in the reader (not the SQL) so the
@@ -589,7 +644,10 @@ pub(crate) fn read_call(dir: &Path, call_id: &str) -> Result<CallRecord, CallErr
         });
     }
     let statement = probe_statement(call_id);
+    let mut unreadable: Option<String> = None;
     for segment in segments_newest_first(dir) {
+        // A file the listing skips (newer schema, not SQLite) is skipped
+        // here too.
         let Ok(conn) = open_segment(&segment) else {
             continue;
         };
@@ -603,12 +661,21 @@ pub(crate) fn read_call(dir: &Path, call_id: &str) -> Result<CallRecord, CallErr
         match found {
             Ok(Some(record)) => return Ok(record),
             Ok(None) => continue,
-            Err(_) => continue,
+            // A row that will not decode, or a file with no calls table:
+            // another segment may still serve the id, so keep looking.
+            Err(err) => {
+                unreadable.get_or_insert_with(|| unreadable_segment(&segment, &err));
+            }
         }
     }
-    Err(CallError::NotFound {
-        call_id: call_id.to_string(),
-    })
+    // A file that could not be read might hold the id: that is a surfaced
+    // failure, never "not found".
+    match unreadable {
+        Some(detail) => Err(CallError::Unavailable { detail }),
+        None => Err(CallError::NotFound {
+            call_id: call_id.to_string(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1186,6 +1253,181 @@ mod tests {
         assert_eq!(seen, descending, "descending across the boundary");
     }
 
+    /// Every page of `query` (its own limit) from the first to the end,
+    /// with `budget`: the ids in listing order, and each page's
+    /// `searched_back_to`.
+    fn walk_all(dir: &Path, query: &CallsQuery, budget: usize) -> (Vec<String>, usize) {
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut next = query.clone();
+            next.after = cursor.clone();
+            let page = read_page_with_budget(dir, &next, budget).unwrap();
+            pages += 1;
+            assert!(pages < 200, "the cursor must advance");
+            if let (Some(back_to), Some(last)) = (&page.searched_back_to, page.items.last()) {
+                assert!(
+                    *back_to <= last.started_at,
+                    "searched_back_to {back_to} is newer than an item on its own page"
+                );
+            }
+            seen.extend(page.items.iter().map(|r| r.call_id.clone()));
+            match page.next_cursor {
+                Some(next_cursor) => cursor = Some(next_cursor),
+                None => break,
+            }
+        }
+        (seen, pages)
+    }
+
+    /// A row whose stored start agrees with its id (`BASE_MS + offset`).
+    fn row_at(offset: u64, nonce: u8, model: &'static str) -> Row {
+        let mut row = Row::new(&call_id_at(BASE_MS + offset, nonce), PARENT);
+        let micros = (offset % 60_000) * 1_000;
+        row.started_at = format!(
+            "2026-11-12T00:{:02}:{:02}.{:06}Z",
+            offset / 60_000,
+            micros / 1_000_000,
+            micros % 1_000_000
+        );
+        row.model = Some(model);
+        row
+    }
+
+    #[test]
+    fn interleaved_segments_page_with_no_gap_and_no_duplicate_whatever_their_names_say() {
+        // Review 1, F1: the newest-named segment, an older-named one whose
+        // ids fall BETWEEN the newest's, and an even older-named one whose
+        // ids are ABOVE every other (a clock step across a rotation, a
+        // restored backup). Name order is not id order.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("calls");
+        let newest = [100, 96, 92, 91, 90];
+        let between = [95, 94, 93];
+        let above = [120, 110];
+        let seed = |name: &str, offsets: &[u64], nonce: u8, model: &'static str| {
+            let rows: Vec<Row> = offsets
+                .iter()
+                .map(|offset| row_at(offset * 1_000, nonce, model))
+                .collect();
+            seed_segment(&dir, name, 2, &rows);
+        };
+        seed("2026-11-12.db", &newest, 1, "hay");
+        seed("2026-11-11.db", &between, 2, "needle");
+        seed("2026-11-10.db", &above, 3, "hay");
+        let mut expected: Vec<String> = Vec::new();
+        for (offsets, nonce) in [(&newest[..], 1), (&between[..], 2), (&above[..], 3)] {
+            for offset in offsets {
+                expected.push(call_id_at(BASE_MS + offset * 1_000, nonce));
+            }
+        }
+        expected.sort_by(|a, b| b.cmp(a));
+        for limit in [1, 2, 3, 4, 50] {
+            let mut query = CallsQuery::all();
+            query.limit = limit;
+            let (seen, _) = walk_all(&dir, &query, CALLS_SCAN_BUDGET);
+            assert_eq!(seen, expected, "limit {limit}");
+            // A budget smaller than a page: still every record, once.
+            for budget in [1, 2, 3, 5] {
+                let (seen, _) = walk_all(&dir, &query, budget);
+                assert_eq!(seen, expected, "limit {limit}, budget {budget}");
+            }
+        }
+        // A sparse filter under a tight budget finds every needle, once,
+        // in order, and never names a searched-back time newer than a page
+        // item (asserted in the walk).
+        let mut query = CallsQuery::all();
+        query.model = Some("needle".to_string());
+        query.limit = 1;
+        for budget in [1, 2, 4] {
+            let (seen, _) = walk_all(&dir, &query, budget);
+            let needles: Vec<String> = between
+                .iter()
+                .map(|offset| call_id_at(BASE_MS + offset * 1_000, 2))
+                .collect();
+            assert_eq!(seen, needles, "budget {budget}");
+        }
+    }
+
+    #[test]
+    fn a_replayed_id_in_two_segments_lists_once_and_never_ends_the_read_early() {
+        // Review 1, F4: a re-created segment holding a copy of a newer
+        // file's record must neither list it twice nor make a full page
+        // look like the last one.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("calls");
+        seed_segment(
+            &dir,
+            "2026-11-12.db",
+            2,
+            &[row_at(50_000, 1, "gpt-demo"), row_at(40_000, 1, "gpt-demo")],
+        );
+        seed_segment(
+            &dir,
+            "2026-11-11.db",
+            2,
+            &[row_at(50_000, 1, "gpt-demo"), row_at(30_000, 1, "gpt-demo")],
+        );
+        let mut query = CallsQuery::all();
+        query.limit = 2;
+        let first = listing(&dir, &query);
+        assert_eq!(
+            first.items.iter().map(|r| &r.call_id).collect::<Vec<_>>(),
+            [
+                &call_id_at(BASE_MS + 50_000, 1),
+                &call_id_at(BASE_MS + 40_000, 1)
+            ]
+        );
+        assert!(first.next_cursor.is_some(), "a record remains below");
+        let (seen, _) = walk_all(&dir, &query, CALLS_SCAN_BUDGET);
+        assert_eq!(seen.len(), 3, "{seen:?}");
+    }
+
+    #[test]
+    fn a_file_with_no_calls_table_or_an_unreadable_row_is_skipped_not_fatal() {
+        // Review 1, F5 and F6: another application's SQLite file (a
+        // plausible version stamp, no calls table) and a segment holding a
+        // row that will not decode are skipped and named; the other
+        // segments still serve, and the by-id read never calls a record it
+        // could not read "not found".
+        let (_tmp, dir) = fixture();
+        {
+            let conn = Connection::open(dir.join("2026-11-13.db")).unwrap();
+            conn.execute_batch("CREATE TABLE other (x INTEGER); PRAGMA user_version = 1;")
+                .unwrap();
+        }
+        let bad = call_id_at(BASE_MS + 9_000, 9);
+        seed_segment(&dir, "2026-11-09.db", 2, &[Row::new(&bad, OLD)]);
+        {
+            let conn = Connection::open(dir.join("2026-11-09.db")).unwrap();
+            conn.execute("UPDATE calls SET latency_us = 'not a number'", [])
+                .unwrap();
+        }
+        let page = listing(&dir, &CallsQuery::all());
+        assert_eq!(page.items.len(), 5, "the readable segment still serves");
+        assert_eq!(page.skipped_segments, 2, "{:?}", page.skipped_files);
+        for name in ["2026-11-13.db", "2026-11-09.db"] {
+            assert!(
+                page.skipped_files.iter().any(|note| note.contains(name)),
+                "{name}: {:?}",
+                page.skipped_files
+            );
+        }
+        // By id: a record in a readable segment is served past the foreign
+        // file; the unreadable row is a surfaced failure, not a 404; an id
+        // no file holds is still "not found" only when every file read.
+        let good = call_id_at(BASE_MS + 4_000, 4);
+        assert_eq!(read_call(&dir, &good).unwrap().call_id, good);
+        assert_eq!(
+            read_call(&dir, &bad).unwrap_err().code(),
+            "calls-unavailable"
+        );
+        std::fs::remove_file(dir.join("2026-11-09.db")).unwrap();
+        std::fs::remove_file(dir.join("2026-11-13.db")).unwrap();
+        assert_eq!(read_call(&dir, &bad).unwrap_err().code(), "call-not-found");
+    }
+
     #[test]
     fn skipped_segments_are_counted_named_and_never_fail_the_listing() {
         let (_tmp, dir) = fixture();
@@ -1229,6 +1471,28 @@ mod tests {
         assert!(page.items.is_empty());
         assert!(page.next_cursor.is_none());
         assert_eq!(page.skipped_segments, 0);
+        // Review 1, F2: with no store yet, a malformed query is still
+        // refused, never an empty page.
+        let refusals: [(Setter, &str); 4] = [
+            (
+                Box::new(|q| q.after = Some("not-a-cursor".into())),
+                "invalid-cursor",
+            ),
+            (
+                Box::new(|q| q.outcome = Some("bogus".into())),
+                "invalid-filter",
+            ),
+            (
+                Box::new(|q| q.from = Some("yesterday".into())),
+                "invalid-time",
+            ),
+            (Box::new(|q| q.run = Some("nope".into())), "invalid-run"),
+        ];
+        for (set, code) in refusals {
+            let mut query = CallsQuery::all();
+            set(&mut query);
+            assert_eq!(read_page(&absent, &query).unwrap_err().code(), code);
+        }
         // A schema 1 segment (no read indexes) reads correctly.
         let dir = tmp.path().join("calls2");
         seed_segment(
