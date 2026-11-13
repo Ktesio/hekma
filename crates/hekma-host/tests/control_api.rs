@@ -6226,3 +6226,135 @@ fn the_otlp_intake_accepts_announce_credentials_only_and_meters_forward_differen
         }
     }
 }
+
+#[test]
+fn the_hold_family_routes_act_on_wire_runs_and_refuse_everything_else() {
+    // Story 23-4: POST /v0/runs/{id}/hold|release|reject|reroute and the
+    // set forms — Operator only; a wire Run's reasons set and clear; an
+    // observed Run, an unknown Run and a bad route are refused.
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle.clone());
+    let client = client();
+    let base = format!("http://{}", server.addr);
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{base}/v0/bindings"),
+        Some(serde_json::json!({
+            "name": "openai", "prefix": "/openai",
+            "upstream": "http://127.0.0.1:9/v1", "labels": [["team", "core"]],
+        })),
+    );
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{}",
+        json_body(&mut response)
+    );
+    // One call through the proxy creates the binding's wire Run (the
+    // upstream is unreachable; the Run exists all the same).
+    let mut proxy = get_ok(&client, &server.addr, "/v0/proxy");
+    let proxy_url = json_body(&mut proxy)["url"].as_str().unwrap().to_string();
+    let _ = client
+        .post(format!("{proxy_url}/openai/chat"))
+        .send_json(serde_json::json!({"model": "m", "messages": []}));
+    let mut listing = get_ok(&client, &server.addr, "/v0/runs?view=all");
+    let listing = json_body(&mut listing);
+    let run_id = listing["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["identity"][0] == "binding")
+        .unwrap_or_else(|| panic!("{listing}"))["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let runs = format!("{base}/v0/runs/{run_id}");
+
+    let mut response = call(&client, "POST", &format!("{runs}/hold"), None);
+    assert_eq!(response.status(), StatusCode::OK);
+    let held = json_body(&mut response);
+    assert_eq!(held["changed"], true);
+    assert_eq!(held["reasons"], serde_json::json!(["hold"]));
+    assert!(held["note"]
+        .as_str()
+        .unwrap()
+        .contains("calls already sent complete"));
+    let mut shown = get_ok(&client, &server.addr, &format!("/v0/runs/{run_id}"));
+    let shown = json_body(&mut shown);
+    assert_eq!(shown["run"]["status"], "held");
+    assert_eq!(shown["run"]["dispositions"], serde_json::json!(["hold"]));
+    // Reroute: an unknown route is 400; null clears.
+    let response = call(
+        &client,
+        "POST",
+        &format!("{runs}/reroute"),
+        Some(serde_json::json!({"route": "openai/nope"})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{runs}/reroute"),
+        Some(serde_json::json!({"route": null})),
+    );
+    assert_eq!(json_body(&mut response)["changed"], false);
+    let mut response = call(&client, "POST", &format!("{runs}/release"), None);
+    assert_eq!(json_body(&mut response)["reasons"], serde_json::json!([]));
+    // The set form, through a selected set.
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{base}/v0/runs/select"),
+        Some(serde_json::json!({"selector": "team=core"})),
+    );
+    let token = json_body(&mut response)["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{base}/v0/runs/reject"),
+        Some(serde_json::json!({"set_token": token})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let results = json_body(&mut response);
+    assert_eq!(results["verb"], "reject");
+    assert_eq!(results["results"][0]["outcome"], "reject", "{results}");
+    // A route on a non-reroute set form is 400.
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{base}/v0/runs/select"),
+        Some(serde_json::json!({"selector": "team=core"})),
+    );
+    let token = json_body(&mut response)["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = call(
+        &client,
+        "POST",
+        &format!("{base}/v0/runs/hold"),
+        Some(serde_json::json!({"set_token": token, "route": "openai/x"})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Unknown Run: 404.
+    let response = call(
+        &client,
+        "POST",
+        &format!("{base}/v0/runs/run_NONE/hold"),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // A wire Run's pause and resume act on its calls (no instance).
+    let mut response = call(&client, "POST", &format!("{runs}/pause"), None);
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(&mut response)
+    );
+}
