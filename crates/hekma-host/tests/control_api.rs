@@ -4179,6 +4179,24 @@ fn set_tokens_are_single_use_credential_bound_expiring_and_forgotten_by_a_restar
         assert_eq!(status, 404, "{path}: {response}");
         assert_eq!(response["error"]["code"], "run-not-found");
     }
+    // Story 22-3: an unknown Scent-Check Mode is refused before any Run is
+    // read.
+    let mut response = call_as(
+        &client,
+        BEARER_VALUE,
+        "PATCH",
+        &format!("http://{addr}/v0/runs/run_ghost/limits"),
+        r#"{"scent_check": "loud"}"#,
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(&mut response);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not a Scent-Check Mode"),
+        "{body}"
+    );
     let mut response = get_ok(&client, &addr, "/v0/runs/run_ghost/limits");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     drop(json_body(&mut response));
