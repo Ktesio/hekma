@@ -23,6 +23,13 @@ pub(crate) const RUN_HINT_HEADER: &str = "x-hekma-run";
 pub(crate) const LABELS_HEADER: &str = "x-hekma-labels";
 /// The outbound identity header naming the Run.
 pub(crate) const RUN_ID_HEADER: &str = "x-hekma-run-id";
+/// The announce header (request, story 23-2): claim this external id.
+pub(crate) const ANNOUNCE_HEADER: &str = "x-hekma-announce";
+/// The response header carrying a first announce's Run Key (story 23-2;
+/// the request header of the same name presents one).
+pub(crate) const RUN_KEY_RESPONSE_HEADER: &str = "x-hekma-run-key";
+/// The response header carrying a first announce's refresh credential.
+pub(crate) const REFRESH_RESPONSE_HEADER: &str = "x-hekma-refresh";
 /// The response header naming a Run's latched breaches.
 pub(crate) const BREACH_HEADER: &str = "x-hekma-breach";
 /// Every request header with this prefix is stripped before forwarding.
@@ -384,4 +391,27 @@ mod tests {
         }
         assert_eq!(codes.len(), WireError::ALL.len());
     }
+}
+
+/// Set a first announce's credentials on the call's response (story
+/// 23-2): the Run Key and refresh credential as SENSITIVE headers (no
+/// `Debug` path prints them), and `cache-control: no-store` — a one-time
+/// credential must not sit in a cache. Their only cleartext crossing on
+/// this channel.
+pub(crate) fn set_announce_headers(
+    response: &mut hyper::Response<http_body_util::Full<bytes::Bytes>>,
+    issued: &crate::domain::credential::IssuedCredentials,
+) {
+    use hyper::header::{HeaderValue, CACHE_CONTROL};
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (RUN_KEY_RESPONSE_HEADER, issued.run_key()),
+        (REFRESH_RESPONSE_HEADER, issued.refresh_credential()),
+    ] {
+        if let Ok(mut value) = HeaderValue::from_str(value.expose_secret()) {
+            value.set_sensitive(true);
+            headers.insert(name, value);
+        }
+    }
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
 }

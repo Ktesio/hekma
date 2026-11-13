@@ -24,13 +24,15 @@ use hyper::header::{HeaderName, HeaderValue};
 use hyper::{HeaderMap, Method, Request, Response, Uri};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::identify::{identify, Attribution, CallFacts, Identified, Refusal, Via};
+use super::identify::{identify, Attribution, CallFacts, Identified, Refusal, Target, Via};
 use super::records::{new_call_id, RecordPump};
 use super::wire::{self, WireError};
 use crate::domain::calls::{
     record_model, CallDisposition, CallOutcome, CallRecord, CallStart, StatusClass,
 };
+use crate::domain::credential::IssuedCredentials;
 use crate::domain::pipeline::ProxiedUsage;
+use crate::domain::runs::announce::{AnnounceClaim, Claimed};
 use crate::domain::runs::snapshot::{Disposition, SnapshotPublisher};
 use crate::domain::runs::wire::{ensure_wire_run, Ensured, WireIdentity};
 use crate::domain::RunId;
@@ -61,6 +63,12 @@ pub(crate) struct RefusalCounters {
     pub busy: AtomicU64,
     pub ignored_hints: AtomicU64,
     pub capped_hints: AtomicU64,
+    /// Story 23-2: header announces that created their Run (and minted),
+    /// renewed an open one, or could not claim (a cap, a gone parent, a
+    /// bound label) and stayed on the parent or binding Run.
+    pub announce_created: AtomicU64,
+    pub announce_renewed: AtomicU64,
+    pub announce_capped: AtomicU64,
     /// Responses buffered past the byte budget: the provider had already
     /// billed the call, so it is recorded and relayed, never refused.
     pub relay_overshoot: AtomicU64,
@@ -174,6 +182,25 @@ impl ProxyShared {
                 "metering proxy: a split or child hint could not open its own Run (1,000 Runs \
                  are already open beneath its parent, it is 8 levels deep, or the parent \
                  ended), so the call was counted on the parent Run ({total} such calls so far)"
+            ));
+        }
+    }
+
+    /// An announce that could not claim its identity (story 23-2): the call
+    /// stays on the parent or binding Run, attributed, never refused
+    /// (NFR-9), and this says so at most once a minute.
+    fn note_capped_announce(&self) {
+        let total = self
+            .counters
+            .announce_capped
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if once_a_minute(&self.counters.hint_note_minute) {
+            (self.diagnostics)(format!(
+                "metering proxy: an x-hekma-announce could not claim its identity (1,000 Runs \
+                 are already open beneath its binding, parent or root, its parent ended, or it \
+                 named a label the binding sets), so the call was counted on the parent or \
+                 binding Run and no Run Key was issued ({total} such calls so far)"
             ));
         }
     }
@@ -519,6 +546,88 @@ async fn ensure(shared: &ProxyShared, identity: WireIdentity) -> Result<Ensured,
     }
 }
 
+/// Claim an announce through the writer (story 23-2), sharing the
+/// identity's pending-creation gate with hints and concurrent announces.
+/// The pair is minted here, before the job; the job issues it only when
+/// the claim creates the Run, and the cleartext comes back for the
+/// response headers. `Err(())` → the writer did not take it within the ack
+/// bound.
+async fn claim_announce(
+    shared: &ProxyShared,
+    claim: AnnounceClaim,
+) -> Result<(Option<RunId>, Option<IssuedCredentials>), ()> {
+    use crate::domain::credential::{mint, TokenClass};
+    let key = claim.key();
+    let gate = PendingGate::join(&shared.pending, key);
+    let _held = gate.gate.lock().await;
+    let Some(handle) = shared
+        .pump
+        .writer
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+    else {
+        return Err(());
+    };
+    // No random source: claim without a pair (a renewal needs none; a
+    // creation then issues none and the caller can refresh nothing — it
+    // is told nothing, and the Run is still attributed).
+    let minted = match (mint(TokenClass::RunKey), mint(TokenClass::Refresh)) {
+        (Ok(key), Ok(refresh)) => Some((key, refresh)),
+        _ => None,
+    };
+    let pair = minted
+        .as_ref()
+        .map(|(key, refresh)| (key.stub(), refresh.stub()));
+    let publisher = Arc::clone(&shared.snapshot);
+    let leases = shared.pump.leases;
+    let result = handle
+        .call_async(move |ctx| {
+            let now = crate::time::now_unix_secs();
+            match crate::domain::runs::announce::announce(
+                ctx.store(),
+                &claim,
+                RunId::mint(),
+                pair,
+                &leases,
+                now,
+            ) {
+                Ok((claimed, changes)) => {
+                    let committed = crate::domain::runs::ops::commit(ctx, &publisher, changes)?;
+                    Ok((Some(claimed), committed))
+                }
+                Err(crate::domain::RunError::Store(err)) => Err(err),
+                // A refusal (a bound Caller label): nothing was written.
+                Err(_) => Ok((None, Vec::new())),
+            }
+        })
+        .await;
+    let Ok((claimed, committed)) = result else {
+        return Err(());
+    };
+    shared.pump.inbox.push_run_events(committed);
+    Ok(match claimed {
+        Some(Claimed::Created { run, minted: true }) => {
+            shared
+                .counters
+                .announce_created
+                .fetch_add(1, Ordering::Relaxed);
+            let issued =
+                minted.map(|(key, refresh)| IssuedCredentials::new(run.clone(), key, refresh));
+            (Some(run), issued)
+        }
+        Some(Claimed::Created { run, .. }) => (Some(run), None),
+        Some(Claimed::Renewed { run }) => {
+            shared
+                .counters
+                .announce_renewed
+                .fetch_add(1, Ordering::Relaxed);
+            (Some(run), None)
+        }
+        Some(Claimed::Capped | Claimed::ParentGone) | None => (None, None),
+    })
+}
+
 /// One call's share of an identity's pending-creation gate. Dropping it, on
 /// every return of [`ensure`], removes the map's entry once no other call
 /// still holds the gate.
@@ -548,9 +657,42 @@ impl Drop for PendingGate<'_> {
     }
 }
 
-/// Resolve an attribution to an open Run id (creating it when needed).
-async fn resolve(shared: &ProxyShared, attribution: Attribution) -> Result<Option<RunId>, ()> {
+/// Resolve an attribution to an open Run id (creating it when needed), and
+/// the credentials a first announce minted (story 23-2).
+async fn resolve(
+    shared: &ProxyShared,
+    attribution: Attribution,
+) -> Result<(Option<RunId>, Option<IssuedCredentials>), ()> {
     match attribution {
+        Attribution::Announce {
+            claim,
+            fallback,
+            fallback_identity,
+        } => match claim_announce(shared, claim).await? {
+            (Some(run), issued) => Ok((Some(run), issued)),
+            (None, _) => {
+                shared.note_capped_announce();
+                if let Some(run) = fallback {
+                    return Ok((Some(run), None));
+                }
+                match fallback_identity {
+                    Some(identity) => match ensure(shared, identity).await? {
+                        Ensured::Run(run) => Ok((Some(run), None)),
+                        _ => Ok((None, None)),
+                    },
+                    None => Ok((None, None)),
+                }
+            }
+        },
+        other => resolve_wire(shared, other).await.map(|run| (run, None)),
+    }
+}
+
+/// Resolve a Run or hint attribution to an open Run id.
+async fn resolve_wire(shared: &ProxyShared, attribution: Attribution) -> Result<Option<RunId>, ()> {
+    match attribution {
+        // Announces resolve in [`resolve`].
+        Attribution::Announce { .. } => Ok(None),
         Attribution::Run(run) => Ok(Some(run)),
         Attribution::Ensure {
             identity,
@@ -633,6 +775,7 @@ async fn serve_admitted(
                     .or_else(|| header(headers, "api-key")),
                 hint: header(headers, wire::RUN_HINT_HEADER),
                 hint_labels: header(headers, wire::LABELS_HEADER),
+                announce: header(headers, wire::ANNOUNCE_HEADER),
             },
         )
     };
@@ -654,9 +797,10 @@ async fn serve_admitted(
             .ignored_hints
             .fetch_add(1, Ordering::Relaxed);
     }
-    let run_id = match resolve(shared, attribution).await {
-        Ok(Some(run)) => run,
-        Ok(None) => {
+    let announcing = matches!(attribution, Attribution::Announce { .. });
+    let (run_id, issued) = match resolve(shared, attribution).await {
+        Ok((Some(run), issued)) => (run, issued),
+        Ok((None, _)) => {
             shared.count(Refusal::NoRoute);
             drain_request_body(req.into_body()).await;
             return WireError::NoRoute.response();
@@ -666,6 +810,32 @@ async fn serve_admitted(
             return WireError::RunUnavailable.response();
         }
     };
+    let mut response = serve_resolved(
+        shared, req, started, &path, query, target, run_id, announcing,
+    )
+    .await;
+    // Story 23-2: a first announce's credentials ride the call's response —
+    // whatever status it answers (a fenced call's 402 too) — once, after
+    // the claim's publish, as sensitive headers.
+    if let Some(issued) = issued {
+        wire::set_announce_headers(&mut response, &issued);
+    }
+    response
+}
+
+/// The rest of a call once its Run is known: the fence, the Scent-Check
+/// Mode, the dial and the relay.
+#[allow(clippy::too_many_arguments)]
+async fn serve_resolved(
+    shared: &Arc<ProxyShared>,
+    req: Request<Incoming>,
+    started: Instant,
+    path: &str,
+    query: Option<String>,
+    target: Target,
+    run_id: RunId,
+    announcing: bool,
+) -> Response<Full<Bytes>> {
     // Re-read after a creation (its publish preceded the ack).
     let snapshot = shared.snapshot.current();
     // A pending Run route (the launch job has not committed yet) has no
@@ -750,6 +920,16 @@ async fn serve_admitted(
             crate::domain::runs::policy::ScentCheckMode::Off => {}
             crate::domain::runs::policy::ScentCheckMode::Shadow => {
                 guard.get().unscented = true;
+                shared
+                    .counters
+                    .unscented_served
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            // Story 23-2: an announcing call is SERVED under `enforce` —
+            // announcing is how a caller obtains the identity the mode
+            // demands (attribution, not authentication); its later calls
+            // present the minted key and are scented.
+            crate::domain::runs::policy::ScentCheckMode::Enforce if announcing => {
                 shared
                     .counters
                     .unscented_served

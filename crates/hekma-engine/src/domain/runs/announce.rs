@@ -34,12 +34,11 @@ pub(crate) enum AnnounceScope {
     /// Beneath a binding (`binding:<name>`), carrying its labels as bound.
     Binding(String),
     /// Beneath a Run (`run:<parent>`): a child.
-    #[cfg_attr(not(test), allow(dead_code))] // The header channel's (next).
     Parent(RunId),
 }
 
 /// One claim, as either channel sends it to the writer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AnnounceClaim {
     pub scope: AnnounceScope,
     pub external: String,
