@@ -615,6 +615,111 @@ ALTER TABLE runs DROP COLUMN last_activity_at;
 ALTER TABLE runs DROP COLUMN created_by_hash;
 ";
 
+/// The telemetry metering source (story 23-3): usage an `observed` Run's
+/// own telemetry reported, always `estimated`. An engine-side value — no
+/// adapter can declare it.
+pub(crate) const TELEMETRY_SOURCE: &str = "telemetry-reported";
+
+impl SqliteStore {
+    /// The last cumulative value a Run's telemetry reported for
+    /// `token_type` (story 23-3), when one was stored.
+    pub(crate) fn telemetry_counter(
+        &self,
+        run_id: &RunId,
+        token_type: &str,
+    ) -> Result<Option<u64>, StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT last_value FROM telemetry_counters WHERE run_id = ?1 AND token_type = ?2",
+                rusqlite::params![run_id.as_str(), token_type],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(backend)
+            .map(|value| value.map(|v| v.max(0) as u64))
+    }
+
+    /// Store a Run's last cumulative value for `token_type` (story 23-3).
+    pub(crate) fn set_telemetry_counter(
+        &self,
+        run_id: &RunId,
+        token_type: &str,
+        value: u64,
+        at: &str,
+    ) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "INSERT INTO telemetry_counters (run_id, token_type, last_value, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT (run_id, token_type) \
+                 DO UPDATE SET last_value = excluded.last_value, updated_at = excluded.updated_at",
+                rusqlite::params![
+                    run_id.as_str(),
+                    token_type,
+                    i64::try_from(value).unwrap_or(i64::MAX),
+                    at
+                ],
+            )
+            .map_err(backend)
+            .map(|_| ())
+    }
+}
+
+/// Schema v21 (story 23-3): inbound telemetry's durable diff state — the
+/// last cumulative token count a Run's telemetry reported, per token type.
+/// The ingest job commits each delta and its counter in one transaction,
+/// which is the no-double-count guarantee and a client retry's idempotence.
+const SCHEMA_V21: &str = "\
+CREATE TABLE IF NOT EXISTS telemetry_counters (
+    run_id     TEXT NOT NULL,
+    token_type TEXT NOT NULL CHECK (token_type IN ('input','output','cached')),
+    last_value INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, token_type)
+);
+";
+
+/// Undo v21 on a fully migrated store, for the older upgrade tests.
+#[cfg(test)]
+pub(crate) const UNDO_V21_FOR_TEST: &str = "DROP TABLE telemetry_counters;";
+
+/// Run the v21 step (DDL + stamp) in one `BEGIN IMMEDIATE`, stepping aside
+/// when another process finished it while this one waited.
+pub(super) fn migrate_v21(conn: &Connection) -> Result<(), StoreError> {
+    migrate_runs_step(conn, 21, SCHEMA_V21)
+}
+
+/// One crash-atomic runs-schema step: the DDL and its `user_version` stamp
+/// in one `BEGIN IMMEDIATE`, skipped when another process already ran it.
+fn migrate_runs_step(conn: &Connection, version: i64, ddl: &str) -> Result<(), StoreError> {
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
+    let body = || -> Result<bool, StoreError> {
+        let current: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(backend)?;
+        if current >= version {
+            return Ok(false);
+        }
+        conn.execute_batch(ddl).map_err(backend)?;
+        conn.execute_batch(&format!("PRAGMA user_version = {version}"))
+            .map_err(backend)?;
+        Ok(true)
+    };
+    match body() {
+        Ok(true) => conn.execute_batch("COMMIT").map_err(|err| {
+            let _ = conn.execute_batch("ROLLBACK");
+            backend(err)
+        }),
+        Ok(false) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
 /// Run the v20 step (DDL + stamp) in one `BEGIN IMMEDIATE`, stepping aside
 /// when another process finished it while this one waited.
 pub(super) fn migrate_v20(conn: &Connection) -> Result<(), StoreError> {

@@ -106,7 +106,10 @@ use crate::ports::{
 /// v20 (story 23-2): Leases — `runs.last_activity_at`
 /// (seeded from `updated_at` for open Runs), `created_by_hash`, and the two
 /// partial indexes the sweeper reads (`lease_expires_at` exists since v13) — see [`super::runs_sqlite`].
-pub(crate) const SCHEMA_VERSION: i64 = 20;
+/// v21 (story 23-3): `telemetry_counters`, the last cumulative token count
+/// inbound telemetry reported per (Run, token type) — see
+/// [`super::runs_sqlite`].
+pub(crate) const SCHEMA_VERSION: i64 = 21;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -764,6 +767,11 @@ fn migrate(
     }
     if version < 20 {
         super::runs_sqlite::migrate_v20(conn)?;
+    }
+    // Story 23-3: v21 adds the inbound-telemetry counters (one
+    // crash-atomic step, one-way, no backfill).
+    if version < 21 {
+        super::runs_sqlite::migrate_v21(conn)?;
     }
     Ok(notes)
 }

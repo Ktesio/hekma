@@ -113,6 +113,7 @@ pub use registry::{Registry, RemoveDisposition};
 pub use registry_policy::{PolicyChange, PolicyOutcome};
 pub use resync::{ResyncBatch, ResyncCursor};
 pub use runs::announce::{Announced, LeaseActor};
+pub use runs::telemetry::{TelemetryOutcome, TelemetryPoint, TelemetryReport, TelemetryTokenType};
 pub use runs::{
     decode_cursor, encode_cursor, ended_run_cutoff, CustodyView, LatchedBreach, ListRunsQuery,
     ListingCounts, ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument,

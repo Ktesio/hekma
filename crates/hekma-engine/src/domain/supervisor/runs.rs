@@ -697,6 +697,7 @@ impl Supervisor {
             created_by: Some(credential.hash),
             issuer: credential.token_id.clone(),
             wire: false,
+            telemetry: false,
         };
         let run_id = RunId::mint();
         let (claimed, events) = registry.run_job(move |store| {
@@ -734,6 +735,64 @@ impl Supervisor {
             // The binding is gone, and its credentials with it.
             Claimed::ParentGone => Err(RunError::CredentialUnknown),
         }
+    }
+
+    /// The inbound-telemetry job (story 23-3): claim or renew the
+    /// identity beneath the credential's binding, then commit the forward
+    /// difference of its cumulative token counts (see
+    /// [`runs::telemetry`]). One writer job, within the writer's ack bound.
+    pub(crate) fn ingest_telemetry(
+        &self,
+        registry: &Registry,
+        report: crate::domain::TelemetryReport,
+        leases: crate::domain::runs::lease::LeaseOptions,
+    ) -> Result<crate::domain::TelemetryOutcome, RunError> {
+        use crate::domain::runs::telemetry::{ingest, Ingested};
+        use crate::domain::TelemetryOutcome;
+        runs::announce::validate(&report.external_id, &report.labels)?;
+        let publisher = std::sync::Arc::clone(registry.run_publisher());
+        let inbox = self.proxy_inbox();
+        let run_id = RunId::mint();
+        let ingested = registry
+            .writer()
+            .call(move |ctx| {
+                ingest(
+                    ctx,
+                    &report,
+                    run_id,
+                    &leases,
+                    crate::time::now_unix_secs(),
+                    &publisher,
+                    &inbox,
+                )
+            })
+            .map_err(RunError::Store)??;
+        Ok(match ingested {
+            Ingested::Committed {
+                run,
+                deltas,
+                rebased,
+                skipped_labels,
+            } => TelemetryOutcome::Committed {
+                run: Box::new(registry.run_view(&run)?),
+                input: deltas[0],
+                output: deltas[1],
+                cached: deltas[2],
+                rebased,
+                skipped_labels,
+            },
+            Ingested::NoDelta {
+                run,
+                skipped_labels,
+            } => TelemetryOutcome::NoDelta {
+                run: Box::new(registry.run_view(&run)?),
+                skipped_labels,
+            },
+            Ingested::SkippedWireRun { run, points } => TelemetryOutcome::SkippedWireRun {
+                run: Box::new(registry.run_view(&run)?),
+                points,
+            },
+        })
     }
 
     /// The heartbeat job (story 23-2) and its events.

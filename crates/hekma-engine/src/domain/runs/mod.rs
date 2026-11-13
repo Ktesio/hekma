@@ -41,6 +41,7 @@ pub(crate) mod ops;
 pub(crate) mod policy;
 pub mod selector;
 pub(crate) mod snapshot;
+pub mod telemetry;
 pub mod verbs;
 pub(crate) mod wire;
 

@@ -377,6 +377,7 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
                     created_by: None,
                     issuer: "announce".to_string(),
                     wire: true,
+                    telemetry: false,
                 },
                 fallback,
                 fallback_identity,
