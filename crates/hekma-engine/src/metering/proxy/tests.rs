@@ -543,3 +543,193 @@ fn the_legacy_root_route_catches_what_no_binding_or_run_route_claims() {
     let (target, _, _) = call(identify(&w.snapshot, &facts("/openai/v1")));
     assert_eq!(target.via, Via::Binding("openai".into()));
 }
+
+// ---- The failure seams, end to end inside the crate ----
+
+mod seams {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use crate::{BindingSpec, Engine, EngineOptions, ListRunsQuery, ListingView};
+
+    const COMPLETION: &str =
+        r#"{"model":"gpt-demo","usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+
+    /// An upstream answering every request with [`COMPLETION`], counting.
+    fn upstream() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&served);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let count = Arc::clone(&count);
+                std::thread::spawn(move || {
+                    let mut buffer = [0u8; 8192];
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = stream.read(&mut buffer);
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n{COMPLETION}",
+                            COMPLETION.len()
+                        )
+                        .as_bytes(),
+                    );
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1"), served)
+    }
+
+    /// POST a small chat body; (status, body).
+    fn post(port: u16, path: &str, extra: &str) -> (u16, String) {
+        let body = r#"{"model":"gpt-demo"}"#;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        stream
+            .write_all(
+                format!(
+                    "POST {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n{extra}\
+                     content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut raw = String::new();
+        let _ = stream.read_to_string(&mut raw);
+        let status = raw
+            .split(' ')
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0);
+        let body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string());
+        (status, body.unwrap_or_default())
+    }
+
+    fn engine_with_binding(
+        labels: &[(&str, &str)],
+    ) -> (tempfile::TempDir, Engine, u16, Arc<AtomicUsize>) {
+        let state = tempfile::tempdir().unwrap();
+        let engine =
+            Engine::open_with_options(Some(state.path().to_path_buf()), EngineOptions::default())
+                .unwrap();
+        let port = engine.metering_proxy().unwrap().port;
+        let (base, served) = upstream();
+        engine
+            .blocking()
+            .create_binding(BindingSpec {
+                name: "gw".into(),
+                prefix: "/gw".into(),
+                upstream: base,
+                labels: labels
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                custodied_key: None,
+            })
+            .unwrap();
+        (state, engine, port, served)
+    }
+
+    fn input_tokens(engine: &Engine) -> u64 {
+        engine
+            .blocking()
+            .list_runs(ListRunsQuery {
+                view: ListingView::All,
+                limit: 0,
+                ..ListRunsQuery::default()
+            })
+            .unwrap()
+            .items
+            .iter()
+            .map(|run| run.usage.input_tokens)
+            .sum()
+    }
+
+    #[test]
+    fn a_run_not_created_within_the_ack_bound_is_a_retryable_refusal_never_forwarded() {
+        // The writer's bound is on a job being TAKEN: one slow creation
+        // holds the writer, so a second creation queued behind it is not
+        // taken within the bound and its call is refused, never forwarded.
+        let (_state, engine, port, served) = engine_with_binding(&[("team", "core")]);
+        let shared = engine.proxy_shared_for_tests().unwrap();
+        *shared.ensure_delay.lock().unwrap() = Some(Duration::from_millis(2_500));
+        let slow = std::thread::spawn(move || post(port, "/gw/chat", "x-hekma-run: slow\r\n"));
+        std::thread::sleep(Duration::from_millis(300));
+        let (status, body) = post(port, "/gw/chat", "x-hekma-run: queued\r\n");
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("hekma_run_unavailable"), "{body}");
+        // The slow creation itself completes and is served.
+        assert_eq!(slow.join().unwrap().0, 200);
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "the refused call was forwarded"
+        );
+        *shared.ensure_delay.lock().unwrap() = None;
+        assert_eq!(post(port, "/gw/chat", "x-hekma-run: queued\r\n").0, 200);
+    }
+
+    #[test]
+    fn no_free_record_permit_refuses_before_any_dial() {
+        let (_state, engine, port, served) = engine_with_binding(&[("team", "core")]);
+        let shared = engine.proxy_shared_for_tests().unwrap();
+        // Open the binding's Run first (Run creation is not the subject).
+        assert_eq!(post(port, "/gw/chat", "").0, 200);
+        let before = served.load(Ordering::SeqCst);
+        let held =
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(Arc::clone(&shared.pump.permits).acquire_many_owned(
+                    u32::try_from(super::super::records::RECORD_PERMITS).unwrap(),
+                ))
+                .unwrap();
+        let started = Instant::now();
+        let (status, body) = post(port, "/gw/chat", "");
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("hekma_ledger_unavailable"), "{body}");
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert_eq!(served.load(Ordering::SeqCst), before);
+        drop(held);
+        assert_eq!(post(port, "/gw/chat", "").0, 200);
+    }
+
+    #[test]
+    fn a_failing_close_job_is_retried_then_skipped_loudly_never_double_counted() {
+        let (_state, engine, port, _served) = engine_with_binding(&[("team", "core")]);
+        let shared = engine.proxy_shared_for_tests().unwrap();
+        // Three failures, then success: counted exactly once.
+        shared.pump.fail_closes.store(3, Ordering::SeqCst);
+        assert_eq!(post(port, "/gw/chat", "").0, 200);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while input_tokens(&engine) < 10 {
+            assert!(Instant::now() < deadline, "the retried close never landed");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(input_tokens(&engine), 10);
+        assert!(shared.pump.stats.retried.load(Ordering::SeqCst) >= 3);
+        // More failures than the attempt bound: skipped, and counted as such.
+        shared.pump.fail_closes.store(1_000, Ordering::SeqCst);
+        assert_eq!(post(port, "/gw/chat", "").0, 200);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while shared.pump.stats.skipped.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the poisoned close was never skipped"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        shared.pump.fail_closes.store(0, Ordering::SeqCst);
+        assert_eq!(input_tokens(&engine), 10, "a skipped close counted");
+    }
+}

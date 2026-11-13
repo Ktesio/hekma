@@ -44,8 +44,49 @@ struct Upstream {
     seen: Arc<Mutex<Vec<Seen>>>,
 }
 
+/// How the upstream fake answers.
+#[derive(Clone, Copy)]
+enum Reply {
+    /// [`COMPLETION`] as JSON.
+    Completion,
+    /// A streamed completion whose final frame carries the usage.
+    Sse,
+    /// Headers promising more body than is sent, then a close.
+    Truncated,
+    /// [`COMPLETION`] after a pause.
+    Slow(Duration),
+}
+
+const SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n\
+data: [DONE]\n\n";
+
+fn reply_bytes(reply: Reply) -> Vec<u8> {
+    match reply {
+        Reply::Completion | Reply::Slow(_) => format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{COMPLETION}",
+            COMPLETION.len()
+        )
+        .into_bytes(),
+        Reply::Sse => format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{SSE}",
+            SSE.len()
+        )
+        .into_bytes(),
+        Reply::Truncated => b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+            content-length: 500\r\nconnection: close\r\n\r\n{\"partial\""
+            .to_vec(),
+    }
+}
+
 impl Upstream {
     fn start() -> Self {
+        Self::start_with(Reply::Completion)
+    }
+
+    fn start_with(reply: Reply) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
@@ -57,12 +98,10 @@ impl Upstream {
                 std::thread::spawn(move || {
                     if let Some(request) = read_request(&mut stream) {
                         record.lock().unwrap().push(request);
-                        let reply = format!(
-                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
-                             content-length: {}\r\nconnection: close\r\n\r\n{COMPLETION}",
-                            COMPLETION.len()
-                        );
-                        let _ = stream.write_all(reply.as_bytes());
+                        if let Reply::Slow(pause) = reply {
+                            std::thread::sleep(pause);
+                        }
+                        let _ = stream.write_all(&reply_bytes(reply));
                     }
                 });
             }
@@ -916,4 +955,144 @@ fn the_binding_lifecycle_through_the_engine_with_its_refusals_and_the_proxy_in_s
     // Stopping the proxy closes its port.
     facade.stop_metering_proxy(Duration::from_secs(1));
     assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+}
+
+#[test]
+fn a_streamed_completion_is_metered_from_its_final_usage_frame() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start_with(Reply::Sse);
+    let (engine, port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let answer = post(port, "/openai/chat", &[]);
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert!(
+        answer.body.contains("[DONE]"),
+        "the stream is relayed whole"
+    );
+    let run = wait_for_usage(&engine, ("binding", "openai"), 7);
+    assert_eq!(run.usage.output_tokens, 3);
+}
+
+#[test]
+fn a_truncated_upstream_body_is_a_typed_502_and_nothing_is_metered() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start_with(Reply::Truncated);
+    let (engine, port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let answer = post(port, "/openai/chat", &[]);
+    assert_eq!(answer.status, 502, "{}", answer.body);
+    assert_eq!(answer.error_type(), "hekma_upstream_error");
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(runs(&engine).iter().all(|run| run.usage.input_tokens == 0));
+}
+
+#[test]
+fn an_oversized_or_over_budget_request_is_refused_before_any_dial() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let engine = Engine::open_with_options(
+        Some(state.path().to_path_buf()),
+        EngineOptions {
+            metering_proxy: MeteringProxyOptions {
+                // One KiB of buffer for every call at once.
+                max_buffered_bytes: 1024,
+                ..MeteringProxyOptions::default()
+            },
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let port = engine.metering_proxy().unwrap().port;
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    // A declared body over the 64 MiB cap: 413 from the header alone.
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    stream
+        .write_all(
+            b"POST /openai/chat HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\
+              content-type: application/json\r\ncontent-length: 70000000\r\n\r\n{}",
+        )
+        .unwrap();
+    let mut raw = String::new();
+    let _ = stream.read_to_string(&mut raw);
+    assert!(raw.starts_with("HTTP/1.1 413"), "{raw}");
+    assert!(raw.contains("hekma_body_too_large"), "{raw}");
+    // A body larger than the whole buffer budget: busy, retryable.
+    let big = format!(r#"{{"model":"gpt-demo","pad":"{}"}}"#, "x".repeat(4096));
+    let answer = send(port, "POST /openai/chat HTTP/1.1", &[], Some(&big));
+    assert_eq!(answer.status, 503, "{}", answer.body);
+    assert_eq!(answer.error_type(), "hekma_proxy_busy");
+    assert_eq!(answer.header("x-should-retry"), Some("true"));
+    assert_eq!(answer.header("retry-after"), Some("1"));
+    assert!(upstream.served().is_empty());
+    // A small call still fits.
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+}
+
+#[test]
+fn a_client_that_disconnects_cancels_the_call_and_is_not_metered() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start_with(Reply::Slow(Duration::from_millis(1_500)));
+    let (engine, port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let request = format!(
+            "POST /openai/chat HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\n\r\n{CHAT}",
+            CHAT.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        // Wait until the call reached the upstream, then hang up.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while upstream.served().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the call never reached the upstream"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+    std::thread::sleep(Duration::from_millis(2_500));
+    assert!(
+        runs(&engine).iter().all(|run| run.usage.input_tokens == 0),
+        "a cancelled call was metered"
+    );
+    // The proxy keeps serving.
+    let upstream2 = Upstream::start();
+    bind(
+        &engine,
+        "next",
+        "/next",
+        &upstream2.base(),
+        &[("team", "core")],
+    );
+    assert_eq!(post(port, "/next/chat", &[]).status, 200);
 }

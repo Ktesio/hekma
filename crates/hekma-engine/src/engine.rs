@@ -750,6 +750,19 @@ impl Engine {
         }
     }
 
+    /// The running proxy's shared call state (the proxy seam tests).
+    #[cfg(test)]
+    pub(crate) fn proxy_shared_for_tests(
+        &self,
+    ) -> Option<Arc<crate::metering::proxy::forward::ProxyShared>> {
+        self.inner
+            .metering_proxy
+            .lock()
+            .expect("metering proxy mutex poisoned")
+            .as_ref()
+            .map(|proxy| Arc::clone(proxy.shared()))
+    }
+
     /// Where the shared Metering Proxy listens (story 23-1), when it runs.
     pub fn metering_proxy(&self) -> Option<crate::metering::proxy::ProxyInfo> {
         self.inner

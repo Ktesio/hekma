@@ -83,7 +83,8 @@ pub(crate) struct ProxyShared {
     pub diagnostics: Arc<dyn Fn(String) + Send + Sync>,
     /// The minute of the last pre-identification refusal note.
     pub last_note_minute: AtomicU64,
-    /// cfg(test) seam: hold Run creation past the ack bound.
+    /// cfg(test) seam: slow each Run creation down inside the writer, so a
+    /// creation queued behind it is not taken within the ack bound.
     #[cfg(test)]
     pub ensure_delay: std::sync::Mutex<Option<std::time::Duration>>,
 }
