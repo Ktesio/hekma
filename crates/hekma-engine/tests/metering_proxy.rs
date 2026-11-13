@@ -1096,3 +1096,104 @@ fn a_client_that_disconnects_cancels_the_call_and_is_not_metered() {
     );
     assert_eq!(post(port, "/next/chat", &[]).status, 200);
 }
+
+/// A `Write` into a shared buffer (the engine's diagnostic sink).
+#[derive(Clone)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn calls_left_open_by_a_dead_host_are_closed_crash_or_recovered_at_the_next_open() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (run_id, call_id) = {
+        let (engine, port) = open(&state, true);
+        bind(
+            &engine,
+            "openai",
+            "/openai",
+            &upstream.base(),
+            &[("team", "core")],
+        );
+        assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+        let run = wait_for_usage(&engine, ("binding", "openai"), 10);
+        let db = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        let call_id: String = db
+            .query_row(
+                "SELECT call_id FROM usage_events WHERE run_id = ?1",
+                [run.record.run_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (run.record.run_id.as_str().to_string(), call_id)
+    };
+    // Two calls a host that died left open: one whose usage made it into
+    // the ledger (recovered), one whose did not (crash). Their owner is a
+    // process that does not exist.
+    let segment = std::fs::read_dir(state.path().join("calls"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "db"))
+        .expect("the calls segment");
+    let calls = rusqlite::Connection::open(&segment).unwrap();
+    for id in [call_id.as_str(), "call_LOST"] {
+        calls
+            .execute(
+                "INSERT INTO open_calls (call_id, run_id, token_id, control_depth, binding, \
+                 started_at, owner_pid, owner_start_time) \
+                 VALUES (?1, ?2, NULL, 'wire', 'openai', 't', 2147483000, 1)",
+                rusqlite::params![id, run_id],
+            )
+            .unwrap();
+    }
+    drop(calls);
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let sink: hekma_engine::DiagnosticSink =
+        Arc::new(Mutex::new(Box::new(Capture(Arc::clone(&captured)))));
+    let engine = Engine::open_with_diagnostics(Some(state.path().to_path_buf()), sink).unwrap();
+    let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(
+        text.contains(
+            "1 proxied call(s) in flight when the previous host stopped were closed as \
+                       crashed"
+        ) && text.contains("1 as recovered"),
+        "{text}"
+    );
+    let calls = rusqlite::Connection::open(&segment).unwrap();
+    let open: i64 = calls
+        .query_row("SELECT count(*) FROM open_calls", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(open, 0);
+    let lost: String = calls
+        .query_row(
+            "SELECT outcome FROM calls WHERE call_id = 'call_LOST'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lost, "crash");
+    // Nothing was counted twice: the usage is the one real call's.
+    let run = runs(&engine)
+        .into_iter()
+        .find(|run| run.record.run_id.as_str() == run_id)
+        .unwrap();
+    assert_eq!(run.usage.input_tokens, 10);
+    drop(engine);
+    // A second open finds nothing left to close.
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let sink: hekma_engine::DiagnosticSink =
+        Arc::new(Mutex::new(Box::new(Capture(Arc::clone(&captured)))));
+    drop(Engine::open_with_diagnostics(Some(state.path().to_path_buf()), sink).unwrap());
+    let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(!text.contains("proxied call(s)"), "{text}");
+}

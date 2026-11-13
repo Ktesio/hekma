@@ -284,4 +284,118 @@ mod tests {
             ("run:run_P".to_string(), "job-7".to_string())
         );
     }
+
+    fn ensured(store: &SqliteStore, identity: &WireIdentity) -> Ensured {
+        ensure_wire_run(store, identity, RunId::mint(), "t")
+            .unwrap()
+            .0
+    }
+
+    fn created(store: &SqliteStore, identity: &WireIdentity) -> RunId {
+        match ensured(store, identity) {
+            Ensured::Run(run) => run,
+            other => panic!("not created: {other:?}"),
+        }
+    }
+
+    fn set_status(store: &SqliteStore, run: &RunId, status: RunStatus) {
+        let mut record = store.run_record(run).unwrap().unwrap();
+        record.status = status;
+        if status == RunStatus::Ended {
+            record.ended_at = Some("t".into());
+        }
+        store.save_run(&record).unwrap();
+    }
+
+    fn child(parent: &RunId, external: &str) -> WireIdentity {
+        WireIdentity::Child {
+            parent: parent.clone(),
+            external: external.into(),
+            caller_labels: vec![("step".into(), "plan".into())],
+        }
+    }
+
+    #[test]
+    fn an_identity_maps_to_one_open_run_and_an_ended_one_is_replaced() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let binding = WireIdentity::Binding {
+            binding: "openai".into(),
+            labels: vec![("team".into(), "core".into())],
+        };
+        let first = created(&store, &binding);
+        assert_eq!(created(&store, &binding), first, "an open Run is reused");
+        let record = store.run_record(&first).unwrap().unwrap();
+        assert_eq!(record.control_depth, ControlDepth::Wire);
+        assert!(record.wire_path && record.instance.is_none());
+        assert!(store
+            .run_labels(&first)
+            .unwrap()
+            .iter()
+            .any(|label| label.key == "team" && label.value == "core"));
+        set_status(&store, &first, RunStatus::Ended);
+        let second = created(&store, &binding);
+        assert_ne!(second, first, "an ended Run's identity goes to a new Run");
+    }
+
+    #[test]
+    fn a_hint_child_needs_an_open_parent_within_the_nesting_bound() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // No such parent, then an ended one: nothing is created.
+        let ghost = RunId::from_wire("run_GHOST");
+        assert!(matches!(
+            ensured(&store, &child(&ghost, "a")),
+            Ensured::ParentGone
+        ));
+        let root = created(&store, &WireIdentity::Unattributed);
+        let ended = created(&store, &child(&root, "ended"));
+        set_status(&store, &ended, RunStatus::Ended);
+        assert!(matches!(
+            ensured(&store, &child(&ended, "b")),
+            Ensured::ParentGone
+        ));
+        // A held parent's child starts held, with its Caller labels.
+        let held = created(&store, &child(&root, "held"));
+        set_status(&store, &held, RunStatus::Held);
+        let beneath = created(&store, &child(&held, "c"));
+        let record = store.run_record(&beneath).unwrap().unwrap();
+        assert_eq!(record.status, RunStatus::Held);
+        assert_eq!(record.parent_run_id.as_ref(), Some(&held));
+        assert!(store
+            .run_labels(&beneath)
+            .unwrap()
+            .iter()
+            .any(|label| label.key == "step"));
+        // A chain at the nesting bound takes no deeper child.
+        let mut deepest = root.clone();
+        for level in 1..MAX_RUN_NESTING {
+            deepest = created(&store, &child(&deepest, &format!("level{level}")));
+        }
+        assert_eq!(store.run_chain(&deepest).unwrap().len(), MAX_RUN_NESTING);
+        assert!(matches!(
+            ensured(&store, &child(&deepest, "too-deep")),
+            Ensured::Capped
+        ));
+    }
+
+    #[test]
+    fn splits_stop_at_the_breadth_cap() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let split = |external: String| WireIdentity::Split {
+            binding: "openai".into(),
+            external,
+            labels: Vec::new(),
+        };
+        for n in 0..crate::domain::MAX_CALLER_OPEN_CHILDREN {
+            created(&store, &split(format!("s{n}")));
+        }
+        assert!(matches!(
+            ensured(&store, &split("one-more".into())),
+            Ensured::Capped
+        ));
+        // An existing split is still found past the cap.
+        assert!(matches!(
+            ensured(&store, &split("s0".into())),
+            Ensured::Run(_)
+        ));
+    }
 }
