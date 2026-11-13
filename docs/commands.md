@@ -716,7 +716,7 @@ hekma calls show call_01KD7Q4A2B3C4D5E6F7G8H9J0K
 | `--problems` | Only the calls that did not pass cleanly |
 | `--limit <n>` | Page size: default 50, at most 1000; `0` means the maximum; above the cap it clamps with a note |
 | `--cursor <c>` | Continue after a previous page (stderr prints the exact command, every filter repeated) |
-| `--json` | Print the same document as `GET /v0/calls`: `{"schema_version": 1, "filters", "skipped_segments", "items", "next_cursor", "scan_limited", "searched_back_to"}` |
+| `--json` | Print the same document as `GET /v0/calls`: `{"schema_version": 1, "filters", "skipped_segments", "items", "next_cursor", "scan_limited", "searched_back_to"}`, plus `skipped_files` when a calls file was skipped |
 
 The table's columns are **CALL**, **RUN**, **OUTCOME** (with the disposition when the proxy did not pass the call, as in `refused (block)`), **STATUS**, **MODEL**, **TOKENS** (in/out, `?` when unknown) and **STARTED**. A page the scan budget stopped says so on stderr, with the command that continues the search. `hekma calls show <call-id>` prints one record field by field; `--json` prints the record as the listing's item.
 
@@ -827,7 +827,7 @@ Set these with `hekma agent config set <name> <key> <value>`.
 | `model` | string | Model name or identifier passed to the agent through its declared config mapping (if any; the builtin `mock` maps it to the `MODEL` env var, `hermes` does not map it) |
 | `budget.tokens.per_run` | integer | Per-run token ceiling |
 | `budget.tokens.cumulative` | integer | Cumulative token ceiling |
-| `budget.breach_action` | `pause` \| `stop` \| `warn` \| `block` | Action on any budget/cap breach (default `pause`). `warn` records the breach event only — it performs no lifecycle transition. `block` keeps the agent running but its metering proxy refuses further model calls (engine-observed instances only — see below) |
+| `budget.breach_action` | `pause` \| `stop` \| `warn` \| `block` | Action on any budget/cap breach (default `pause`). `warn` records the breach event only — it performs no lifecycle transition. `block` keeps the agent running but the metering proxy refuses its further model calls (any Run whose calls go through the proxy — see below) |
 | `cost.rate.input` | dollar string (e.g. `3.00`) | Input price per 1M tokens |
 | `cost.rate.output` | dollar string | Output price per 1M tokens |
 | `cost.rate.cached` | dollar string | Cached-token price per 1M tokens (optional; unset prices cached tokens at the input rate) |

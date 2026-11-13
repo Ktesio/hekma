@@ -62,7 +62,7 @@ hekma run close run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
 
 `--parent` takes a run id or an agent name (meaning that agent's open Run). A child of a supervised agent is depth `announced` and runs inside that agent's process (opened while the agent is paused, it starts `held`). Its usage counts on itself and on every ancestor, and every ancestor's ceilings apply to it: a child's own ceiling breaching records a breach on the child, and its parent's breaching acts on the agent as configured. A child's own ceilings take the `warn` Breach Action; `pause`, `stop` and `block` set directly on a child are refused until Hekma can hold or reject one Run's calls. Labels given at `open` are *caller* labels; `--external-id` makes a retried open return the same Run. Pausing or stopping the agent holds or ends its child Runs too, recording `parent-paused`, `parent-resumed`, `parent-stopped` or `parent-ended`. Runs nest at most 8 levels; a parent that does not exist or has ended is refused with an error naming the cause. `--json` prints the Run as a document; the same operations are on the [Control API](control-api.md) at `/v0/runs`.
 
-Until model calls carry a Run's identity, usage reaches child Runs only from Hosts embedding the engine; the shared Metering Proxy will attribute calls to them.
+Usage reaches a child Run from Hosts embedding the engine, and through the [metering proxy](metering-proxy.md) from any call that presents the child's Run Key or names the child in `x-hekma-run`.
 
 **`hekma ps` — the Runs that need you, newest first.** One exception-first listing over every Run in the state directory ([the command reference](commands.md#hekma-ps---selector-sel--all---limit-n---cursor-c---json)):
 

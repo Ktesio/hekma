@@ -104,7 +104,7 @@ A record carries:
 | `hold_end` | Always `null` until holds ship |
 | `outcome` | `completed`, `refused`, `upstream-error`, `client-disconnect`, `shutdown`, `crash` or `recovered` |
 | `status`, `status_class` | The status the client got (`null` when none) and its class: `2xx`, `3xx`, `4xx`, `5xx`, `refused` or `transport-error` |
-| `model` | The model the response or request named. A value shaped like a Hekma credential reads back as `[redacted]` |
+| `model` | The model the response or request named. A value that contains anything shaped like a Hekma credential (an `hk_run_`, `hk_ref_`, `hk_ann_` or `hk_pxy_` prefix in any case, followed by credential characters) reads back as `[redacted]` |
 | `input_tokens`, `output_tokens`, `cached_tokens` | The counts the provider reported; `null` when unknown, never a made-up `0` |
 | `started_at`, `ended_at`, `latency_us`, `upstream_us` | When the call started and ended, the whole call's time, and the upstream leg's (`null` when nothing was dialled) |
 
@@ -114,7 +114,7 @@ A record never holds a prompt, a response, a header, a key or the upstream's add
 - **Freshness:** a call is listed within one batch window (about a quarter of a second) after its response is relayed. A call still in flight is not listed.
 - **The problems view** (`--problems`, `view=problems`) lists every call that did not pass cleanly: a disposition other than `pass`, an outcome other than `completed`, or a status class other than `2xx` or `3xx`.
 - **The scan budget:** a page examines at most 100,000 records. A filter that matches almost nothing can stop before the page fills; the page then says `scan_limited: true`, names how far back it searched (`searched_back_to`), and its cursor continues the search. The unfiltered, Run-scoped and problems listings always read an index.
-- **Segments:** the calls store is a set of SQLite files. A file written by a newer Hekma, or one that cannot be read, is skipped: `skipped_segments` counts it, a diagnostic names it, and the other files are still served.
+- **Segments:** the calls store is a set of SQLite files. A file written by a newer Hekma, or one that cannot be read (not SQLite, no calls table, or a record that will not decode), is skipped: `skipped_segments` counts it, `skipped_files` names it and says why (`hekma calls list` prints the same note), and the other files are still served. The files are merged by call id, whatever their names say, so a page never skips or repeats a record. Looking one call up by id over a file that could not be read answers `503 calls-unavailable` rather than `404`, because the record might be in it.
 - **Who can read them:** the Operator only. Reads take no lock the proxy or supervision uses, and work from a read-only open while a Service Host writes.
 
 ## Budgets and `block`
@@ -211,7 +211,7 @@ Earlier releases gave each `engine-observed` agent its own listener on its own p
   - With an unpinned old host, their listeners died with it, as before. Restart them.
   - With a pinned port, one agent could have been listening on it. When the new host adopts exactly one such agent, its calls (which carry no Run route) reach its own Run through a **legacy root route** until that Run ends. `hekma ps` notes it, and creating a `/` binding meanwhile is refused.
   - When more than one such agent is adopted, none gets the route, and a diagnostic names them. Restart each one.
-- **An adopted agent's base URL stays live** across host restarts, because the port is sticky. `--detach` no longer strands an `engine-observed` agent.
+- **An adopted agent's base URL stays live** across host restarts, because the port is sticky. A detached start of an `engine-observed` instance is still refused (exit 5), because the proxy lives inside the host.
 
 ## What is still planned
 

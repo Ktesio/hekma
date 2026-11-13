@@ -470,8 +470,8 @@ pub struct CallListing {
     /// How many segment files were skipped (unreadable, or written by a
     /// newer Hekma): the listing is partial and says so.
     pub skipped_segments: u64,
-    /// The skipped files' names and reasons (surfaced by the CLI's note;
-    /// not part of the wire document).
+    /// The skipped files' names and reasons (the CLI's note; the wire
+    /// document carries them as `skipped_files` when any was skipped).
     #[serde(skip)]
     pub skipped_files: Vec<String>,
 }
@@ -594,15 +594,16 @@ pub fn decode_call_cursor(raw: &str) -> Result<String, CallError> {
 pub const MODEL_REDACTED: &str = "[redacted]";
 
 /// Render a stored `model` value for exposure: masked with
-/// `[redacted]` when it carries a Hekma token shape (the exact shape
-/// [`parse_presented`](crate::parse_presented) knows — a client could paste
-/// a key into the model field), and any character outside visible ASCII
+/// `[redacted]` when it carries a Hekma token shape ANYWHERE in it — a
+/// token prefix in any case followed by the credential alphabet, the rule
+/// the URL scan applies (a client could paste a key into the model field,
+/// decorated or lowercased) — and any character outside visible ASCII
 /// replaced with `?` (a tampered or foreign file). The value is client text
 /// the docs say is shown as recorded; these two shapes are the exceptions.
 /// A provider key of another shape (`sk-…`) cannot be recognised and is not
 /// masked.
 pub fn expose_model(raw: &str) -> String {
-    if crate::parse_presented(raw).is_some() {
+    if crate::domain::credential::scan_url_text(raw).found {
         return MODEL_REDACTED.to_string();
     }
     raw.chars()
@@ -837,14 +838,25 @@ mod tests {
     fn the_model_mask_hides_credential_shapes_and_foreign_bytes() {
         assert_eq!(expose_model("gpt-4o"), "gpt-4o");
         assert_eq!(expose_model("claude-3-5-sonnet"), "claude-3-5-sonnet");
-        // The exact shape the credential parser knows is masked — the full
-        // prefix plus the exact body length. A shorter fragment is not the
-        // known shape and is shown as recorded.
+        // A token shape anywhere in the value is masked: every prefix, the
+        // whole token, a decorated one, a lowercased echo, and a fragment
+        // long enough to be one (the URL scan's rule).
         for prefix in ["hk_run_", "hk_ref_", "hk_ann_", "hk_pxy_"] {
-            let value = format!("{prefix}{}", "A".repeat(52));
-            assert_eq!(expose_model(&value), MODEL_REDACTED, "{value}");
+            let token = format!("{prefix}{}", "A".repeat(52));
+            for value in [
+                token.clone(),
+                format!("openai/{token}"),
+                format!("{token} (backup)"),
+                token.to_ascii_lowercase(),
+                token.to_ascii_uppercase(),
+                format!("{prefix}ABCDEFGH"),
+            ] {
+                assert_eq!(expose_model(&value), MODEL_REDACTED, "{value}");
+            }
         }
-        assert_eq!(expose_model("hk_run_ABCDEFGH"), "hk_run_ABCDEFGH");
+        // Too short to be a token, or no prefix: shown as recorded.
+        assert_eq!(expose_model("hk_run_ABCDEFG"), "hk_run_ABCDEFG");
+        assert_eq!(expose_model("hk_runner-7b"), "hk_runner-7b");
         // Another provider's shape is NOT recognised: shown as recorded.
         assert_eq!(expose_model("sk-live-abc123"), "sk-live-abc123");
         // Bytes outside visible ASCII become `?` (a tampered file).

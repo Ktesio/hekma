@@ -217,7 +217,7 @@ The binding credentials are issued and listed now. Nothing accepts either class 
 
 `GET /v0/calls` and `GET /v0/calls/{call_id}` read the [metering proxy's](metering-proxy.md#reading-the-records) per-call records. They are for the Operator bearer only; every other credential class, a Run Key for its own Run included, gets `403 forbidden`. Neither adds an event or an SSE frame.
 
-The listing's query parameters are all optional: `run` (one Run's calls, never its child Runs'), `token_id`, `outcome`, `disposition`, `status_class`, `model`, `depth`, `binding`, `from` and `to` (an RFC 3339 window on the call's start, `from` inclusive and `to` exclusive), `view` (`all` or `problems`), `limit` (default 50; `0` means the maximum of 1,000, and a larger value clamps to it) and `cursor`. The answer is `{"schema_version": 1, "filters", "skipped_segments", "items", "next_cursor", "scan_limited", "searched_back_to"}`, the same document `hekma calls list --json` prints.
+The listing's query parameters are all optional: `run` (one Run's calls, never its child Runs'), `token_id`, `outcome`, `disposition`, `status_class`, `model`, `depth`, `binding`, `from` and `to` (an RFC 3339 window on the call's start, `from` inclusive and `to` exclusive), `view` (`all` or `problems`), `limit` (default 50; `0` means the maximum of 1,000, and a larger value clamps to it) and `cursor`. The answer is `{"schema_version": 1, "filters", "skipped_segments", "items", "next_cursor", "scan_limited", "searched_back_to"}`, the same document `hekma calls list --json` prints. When a calls file was skipped, `skipped_files` is added: each skipped file's name and why it could not be read.
 
 A refusal carries an `error.code`:
 
@@ -231,7 +231,7 @@ A refusal carries an `error.code`:
 | `invalid-filter` | 400 | `outcome`, `disposition`, `status_class` or `depth` has a value this build does not know; the message names the parameter |
 | `invalid-call-id` | 400 | The path's id is not a call id |
 | `call-not-found` | 404 | No record has the call id |
-| `calls-unavailable` | 503 | The calls store could not be read; retry |
+| `calls-unavailable` | 503 | The calls store could not be read, or a lookup by id met a calls file it could not read (the record might be in it); retry |
 
 ## Runs
 

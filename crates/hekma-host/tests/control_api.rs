@@ -5574,12 +5574,6 @@ fn the_calls_routes_refuse_every_credential_class_but_the_operator_bearer() {
         ],
     );
 
-    // The announce and proxy-access classes are pinned by the auth
-    // layer's own matrix test (their cells are refused on the Operator
-    // family, which the calls routes belong to): binding credentials do
-    // not resolve anywhere in this release, so an HTTP proof would need a
-    // resolver seam the release does not carry.
-
     // The matrix's calls cells: the Run Key — INCLUDING the key of the very
     // Run whose calls are asked for — and the refresh credential are all
     // refused; no credential is a 401; the operator bearer reads
@@ -5608,6 +5602,53 @@ fn the_calls_routes_refuse_every_credential_class_but_the_operator_bearer() {
             let body = json_body(&mut response);
             assert_eq!(body["error"]["code"], "forbidden");
             assert!(!body.to_string().contains(presented));
+        }
+    }
+    // The binding credential classes, issued for real on a binding: an
+    // announce and a proxy-access credential read no calls either (review
+    // 1, F9 — the HTTP cells of the matrix, beside the auth layer's unit
+    // table).
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("http://{}/v0/bindings", server.addr),
+        Some(serde_json::json!({
+            "name": "callsauth",
+            "prefix": "/callsauth",
+            "upstream": "https://api.example.com/v1",
+        })),
+    );
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{}",
+        json_body(&mut response)
+    );
+    for class in ["announce", "proxy-access"] {
+        let mut response = call(
+            &client,
+            "POST",
+            &format!("http://{}/v0/bindings/callsauth/credentials", server.addr),
+            Some(serde_json::json!({ "class": class })),
+        );
+        assert_eq!(response.status(), StatusCode::OK, "{class}");
+        let token = json_body(&mut response)["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for path in &calls_paths {
+            let response = client
+                .get(format!("http://{}{}", server.addr, path))
+                .header("Authorization", format!("Bearer {token}"))
+                .call()
+                .unwrap();
+            let status = response.status();
+            assert!(
+                status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN,
+                "{path} with a {class} credential: {status}"
+            );
+            let mut response = response;
+            assert!(!json_body(&mut response).to_string().contains(&token));
         }
     }
     // An unknown Run Key shape is a 401, never a 403 oracle.
