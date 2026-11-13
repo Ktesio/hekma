@@ -5,7 +5,7 @@ description: "One loopback proxy per state directory meters every model call, at
 
 # The metering proxy
 
-> **On main, not yet released.** The shared metering proxy ships with the next release. It replaces the per-agent metering listener. Key custody is a preview, not yet supported. Scent-Check Modes and [announce](announce.md) are on main. Wire hold and reroute, and serving beyond loopback, are still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **On main, not yet released.** The shared metering proxy ships with the next release. It replaces the per-agent metering listener. Key custody is a preview, not yet supported. Scent-Check Modes, [announce](announce.md) and [hold, release, reroute and reject](#hold-release-reroute-and-reject) are on main. Serving beyond loopback is still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 Hekma meters model calls by sitting between a client and its model provider. The **metering proxy** is one HTTP listener on `127.0.0.1`, owned by the Service Host (`hekma serve`). Each call it forwards is attributed to a [Run](runs.md), counted once in the usage ledger, checked against that Run's budgets, and relayed back. Supervised agents reach it through the base URL Hekma injects. Any other client reaches it through an **endpoint binding** you create.
 
@@ -141,7 +141,26 @@ A record never holds a prompt, a response, a header, a key or the upstream's add
 
 Usage through the proxy enforces exactly like any other usage: the Run's own budgets and every Run above it, through the same [Policies](policies.md) and [budget verbs](commands.md). A change to a budget applies on the very next call.
 
-Under the `block` [Breach Action](governance.md), the proxy refuses a Run's calls while the Run, or any Run above it (up to eight levels), holds a latched breach. `GET`, `HEAD` and `OPTIONS` stay exempt. `block` now works for every Run with a wire path, not only for supervised agents. `pause` and `stop` still need a process to act on: for a Run without one they record the breach and fall back to `warn`.
+Under the `block` [Breach Action](governance.md), the proxy refuses a Run's calls while the Run, or any Run above it (up to eight levels), holds a latched breach. `GET`, `HEAD` and `OPTIONS` stay exempt. `block` works for every Run with a wire path, not only for supervised agents. So do `pause` and `stop`: on a Run that owns no process, a latched `pause` **holds** the Run's calls and a latched `stop` **refuses** them like `block`, both until the ceiling is raised or reset. Only a Run with no wire path still falls back to `warn` for them.
+
+## Hold, release, reroute and reject
+
+An Operator or a Host can act on a Run's model calls at the proxy, with `hekma hold`, `hekma release`, `hekma reroute` and `hekma reject` (or the [Control API](control-api.md#hold-release-reroute-and-reject)). Each acts on one Run, or every open Run a Selector matches. Each sets or clears only its own reason, and a reason on a Run applies to every Run beneath it. The process keeps running, and a call already forwarded completes and is billed.
+
+| Reason | What a new call gets |
+|---|---|
+| **reject** (`hekma reject`), or a breach latched under `block` or `stop` | Refused with a `402`, never forwarded. A breach answers `hekma_budget_block` as before; an Operator's reject answers `hekma_run_reject`. `GET`, `HEAD` and `OPTIONS` pass. |
+| **hold** (`hekma hold`), or a breach latched under `pause` | Parked until released |
+| **reroute** (`hekma reroute --via <binding>/<route>`) | Forwarded to the route's upstream instead |
+| none | Forwarded as usual |
+
+When reasons combine, the strongest wins: reject, then hold, then reroute. `hekma release` clears only the hold, `hekma reroute --off` only the reroute, a raised or reset ceiling only its breach, and an Operator's reject lasts until the Run ends.
+
+**Holding.** A held call waits at the proxy, after the `block` and Scent-Check checks and before its body is read. Calls are released in the order they arrived. Hekma sets no time limit on a hold: only the client's own timeout ends one. Each Run holds at most 32 calls (`MeteringProxyOptions.max_held_per_run`); past that, a call gets `503 hekma_hold_full`, which SDKs retry. When a hold is released, each call is checked again before it is forwarded. A call whose Run Key was revoked meanwhile, whose Run ended, whose Run now refuses unscented calls, or whose Run gained a reject reason gets that refusal instead, never a forward. If the Service Host stops gracefully, each held call gets `503 hekma_hold_interrupted`; a retried call is held again, because the hold belongs to the Run and is stored.
+
+**Rerouting.** A route is one you stored with `hekma binding route add`. A rerouted call goes to the route's upstream with its own path after the binding prefix and its query, so set the route's base to fit the paths your client sends. A route with its own custodied key uses that key. Otherwise a Run whose provider key Hekma holds can be rerouted only to the origin its key is pinned to: a held key never leaves its origin. A reroute under a hold forwards the held calls to the route when the hold is released.
+
+**Seeing it.** A held Run that owns no process shows `held`, and `hekma ps` shows how many calls it holds and how long the oldest has waited. Run documents carry `dispositions`, `held_calls`, `oldest_held_at` and `last_hold_end` (how its most recent held call ended without a release: `disconnect` for a dropped connection, `shutdown` for a stop). Per-call records carry the disposition (`hold`, `reroute`, `reject`) and the `hold_end` (`released`, `rerouted`, `rejected`, `disconnect`, `shutdown`).
 
 ## Scent-Check
 
@@ -205,7 +224,8 @@ No body ever carries a limit, a total, an agent name, a token, a token id, or an
 | 401 | `hekma_unknown_credential` | The credential is not a Run Key Hekma honours | `false` |
 | 401 | `hekma_credential_revoked` | The Run Key was revoked in the last 24 hours | `false` |
 | 401 | `hekma_unscented_call` | The call carries no credential Hekma issued, and its Run's Scent-Check Mode is `enforce` | `false` |
-| 402 | `hekma_budget_block` | `block` holds for the Run or a Run above it | `false` |
+| 402 | `hekma_budget_block` | A breach latched under `block` or `stop` holds for the Run or a Run above it | `false` |
+| 402 | `hekma_run_reject` | An Operator rejected the Run's (or a Run above it) calls | `false` |
 | 403 | `hekma_run_out_of_scope` | The Run Key's Run is not the route's Run or beneath it | `false` |
 | 404 | `hekma_no_route` | No Run route or binding matches | `false` |
 | 413 | `hekma_body_too_large` | The request body is over 64 MiB | `false` |
@@ -213,6 +233,8 @@ No body ever carries a limit, a total, an agent name, a token, a token id, or an
 | 503 | `hekma_proxy_busy` | The proxy is at its concurrency or buffer limit | `true` |
 | 503 | `hekma_ledger_unavailable` | The call could not be recorded, so it was not sent | `true` |
 | 503 | `hekma_run_unavailable` | Its new Run was not created in time | `true` |
+| 503 | `hekma_hold_full` | The Run's calls are held and its hold queue is full | `true` |
+| 503 | `hekma_hold_interrupted` | The call was held when the proxy stopped | `true` |
 
 The `402` body and headers are unchanged from earlier releases; see [Governance](governance.md).
 
@@ -246,8 +268,7 @@ Earlier releases gave each `engine-observed` agent its own listener on its own p
 ## What is still planned
 
 - **Key custody, supported:** it is a preview today, until the pending security rulings are recorded and its test criteria pass in CI.
-- **Announce over OpenTelemetry,** and helpers for CrewAI and LangGraph.
-- **Wire hold, release, reroute and reject.**
+- **Helpers for CrewAI and LangGraph.**
 - **Incremental streaming relay.**
 - **An authenticated proxy beyond loopback.**
 

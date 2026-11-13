@@ -545,10 +545,34 @@ event; repeating it changes nothing and emits nothing.
 `POST /v0/runs/{id}/stop`, `/pause`, `/resume` and `/drain` act on the Run
 that owns an agent's supervised process exactly as the instance routes do —
 same ladder, same bounds, same refusals — and answer with the run id and the
-instance's read-back. A child Run's lifecycle verbs act on its model calls,
-which Hekma cannot hold or reject yet, so they are a `409 verb-unavailable`
-naming the Run's depth (a held child's `resume` names the parent that holds
-it). An ended Run is a `409 run-ended`.
+instance's read-back. On a Run that owns no process and has a wire path,
+they act on its model calls at the metering proxy: `pause` holds them,
+`resume` releases them, `stop` and `drain` reject them and close the Run;
+the answer carries no instance. Any other depth is a `409 verb-unavailable`
+naming it. An ended Run is a `409 run-ended`.
+
+### Hold, release, reroute and reject
+
+Operator or Host bearer only (a Run Key or announce credential is `403
+forbidden`):
+
+```text
+POST /v0/runs/{id}/hold        hold the Run's calls at the metering proxy
+POST /v0/runs/{id}/release     release them
+POST /v0/runs/{id}/reject      refuse them (until the Run ends)
+POST /v0/runs/{id}/reroute     {"route": "<binding>/<route>"}, or {"route": null}
+POST /v0/runs/hold|release|reject|reroute   {"set_token": …, "route"?: …}
+```
+
+Each answers `{"schema_version":1,"run_id":…,"changed":…,"reasons":[…],
+"note":…}`: whether the verb changed anything, and the reasons standing
+afterwards (`hold`, `reject`, `reroute <binding>/<route>`). Each verb sets
+or clears only its own reason. An unknown route, or a route that would take
+a held provider key off its origin, is `400 invalid-request`; an `observed`
+Run, or one whose calls skip the metering proxy, is `409 verb-unavailable`;
+an ended Run is `409 run-ended`. The set forms answer one result per Run,
+like every set act. See [the metering proxy](metering-proxy.md#hold-release-reroute-and-reject)
+for what each reason does to a call.
 
 ### Limits on a Run
 

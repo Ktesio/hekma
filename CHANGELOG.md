@@ -4,6 +4,19 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — hold, release, reroute and reject at the metering proxy (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **Four new verbs:** `hekma hold`, `hekma release`, `hekma reroute --via <binding>/<route>|--off` and `hekma reject`, on one Run or a Selector (`--dry-run`, `--yes`, `--json`), and `POST /v0/runs/{id}/hold|release|reject|reroute` with set forms on the Control API (Operator or Host bearer only). Each sets or clears only its own reason; a reason applies to the Run and every Run beneath it.
+> - **What a call gets:** reject first (a breach latched under `block` or `stop` answers `402 hekma_budget_block` as before; an Operator's reject answers the new `402 hekma_run_reject`; safe methods pass), then hold (parked in arrival order, re-checked against the current state when released — a revoked key, an ended Run, `enforce` or a reject refuses it), then reroute (forwarded to the route's upstream; a route's own custodied key is used, and a held key never leaves its pinned origin), else pass.
+> - **New `proxy-wire v1` rows:** `402 hekma_run_reject` (non-retryable), `503 hekma_hold_full` (retryable; each Run holds at most 32 calls, `MeteringProxyOptions.max_held_per_run`), `503 hekma_hold_interrupted` (retryable, a graceful stop).
+> - **Breach Actions at wire depth:** a latched `pause` now holds a wire Run's calls and a latched `stop` refuses them, until the ceiling is raised or reset; the `depth-fallback` Anomaly remains only with no wire path. A child Run with a wire path accepts its own `pause`, `stop` and `block`.
+> - **Lifecycle verbs on wire Runs:** `pause`, `resume`, `stop` and `drain` on a Run that owns no process hold, release, or reject and end its calls, with a note.
+> - **Visible:** a held Run shows `held` and, on `hekma ps`, its parked count and the oldest wait; Run documents and listing rows carry `dispositions`, `held_calls`, `oldest_held_at` / `oldest_held_age_secs` and `last_hold_end`; per-call records carry the disposition and `hold_end`. A new Run event, `disposition-changed`.
+> - **Governance vectors stay 1.4.0;** the two wire-depth `pause`/`stop` cases now execute (`policy-wire-pause-holds-at-wire-depth`, `policy-wire-stop-rejects-at-announced-depth`; 79 cases, new checksum). The verb × depth fixture marks 12 more cells delivered.
+> - **One-way upgrade.** The first open migrates `state.db` to schema 22 (`run_dispositions`, and the held-call columns on `runs`).
+> - **Engine surface within the unreleased `hekma-engine` 0.12.0** (no version bump): `Engine::set_disposition` and its `Blocking` twin, `DispositionVerb`, `DispositionOutcome`, `disposition_for`, `RunEventKind::DispositionChanged`, `MeteringProxyOptions.max_held_per_run`, and the new `RunView`/`RunSummary` fields.
+
 > **Unreleased — inbound OTLP: `observed` Runs from their own telemetry (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >

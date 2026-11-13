@@ -31,8 +31,8 @@ against its implementation and assert byte-exact agreement.
   unchanged 1.3.0 set, then six `policy-caller-*` cases for the resolver's
   Caller layer (a Run's own limits, applied only where tighter), then four
   `policy-wire-*` cases: `block` executes at every depth with a wire path,
-  while `pause` and `stop` there act as `warn` with the `depth-fallback`
-  Anomaly, then three Scent-Check Mode cases, then three `policy-observed-*`
+  and so do `pause` (holding the Run's calls) and `stop` (refusing them),
+  then three Scent-Check Mode cases, then three `policy-observed-*`
   cases: at `observed` depth (no wire path, no process) a Policy's `warn`
   executes, while `block` and `pause` act as `warn` with the
   `depth-fallback` Anomaly.
