@@ -793,6 +793,108 @@ pub(crate) async fn run_show(
     }))
 }
 
+/// The `?run=&token_id=&outcome=&disposition=&status_class=&model=&depth=&
+/// binding=&from=&to=&view=&limit=&cursor=` query of the calls listing (the
+/// per-call read surface). RAW strings parsed in [`calls_list`] so every
+/// malformed value stays inside the versioned envelope; the engine
+/// validates the cursor, the run filter, the window and the closed-list
+/// filters (one validation site for the API, the CLI and embedders).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct CallsListQuery {
+    pub run: Option<String>,
+    pub token_id: Option<String>,
+    pub outcome: Option<String>,
+    pub disposition: Option<String>,
+    pub status_class: Option<String>,
+    pub model: Option<String>,
+    pub depth: Option<String>,
+    pub binding: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// `all` (the default) or `problems`.
+    pub view: Option<String>,
+    /// The page size (raw — parsed in [`calls_list`]; `0` = the maximum).
+    pub limit: Option<String>,
+    /// The cursor the previous page printed.
+    pub cursor: Option<String>,
+}
+
+/// `GET /v0/calls` — the per-call records listing: the engine's own
+/// document, byte-shape-equal to `hekma calls list --json`. Operator
+/// bearer (the auth layer — the calls routes sit in the Operator family,
+/// and every other credential class answers `403 forbidden`). A `view`
+/// that is neither `all` nor `problems` is a `400 invalid-view`; a limit
+/// that is not a whole number is a `400 invalid-limit`; everything else
+/// the engine refuses carries its own machine code.
+pub(crate) async fn calls_list(
+    State(state): State<ApiState>,
+    Query(query): Query<CallsListQuery>,
+) -> ApiResult<Json<hekma_engine::CallListingDocument>> {
+    let view = match &query.view {
+        None => hekma_engine::CallView::All,
+        Some(raw) => hekma_engine::CallView::from_wire(raw).ok_or_else(|| {
+            ApiError::invalid_query_param(
+                "invalid-view",
+                format!("the view query parameter must be \"all\" or \"problems\": {raw}"),
+            )
+        })?,
+    };
+    // The limit parses INSIDE the handler so every failure is a versioned
+    // envelope (the export `limit` discipline). Absent, the documented
+    // default page (50 — the CLI's default, so the two first pages agree);
+    // `0` takes the maximum; anything above the house page cap clamps to
+    // it quietly (the CLI's `--limit` parity — its clamp notes on stderr).
+    let limit = match &query.limit {
+        None => hekma_engine::CALLS_DEFAULT_LIMIT,
+        Some(text) => text.parse::<usize>().map_err(|err| {
+            ApiError::invalid_query_param(
+                "invalid-limit",
+                format!("the limit query parameter must be a whole number ≥ 0: {err}"),
+            )
+        })?,
+    };
+    let query = hekma_engine::CallsQuery {
+        run: query.run,
+        token_id: query.token_id,
+        outcome: query.outcome,
+        disposition: query.disposition,
+        status_class: query.status_class,
+        model: query.model,
+        depth: query.depth,
+        binding: query.binding,
+        from: query.from,
+        to: query.to,
+        view,
+        after: query.cursor,
+        limit,
+    };
+    let filters = query.echoed_filters();
+    let listing = state.engine.list_calls(query).await?;
+    Ok(Json(listing.into_document(filters)))
+}
+
+/// `GET /v0/calls/{call_id}` — one per-call record. The id's shape is
+/// checked here (`400 invalid-call-id`) so the refusal is a versioned
+/// envelope; an unknown id is the engine's `404 call-not-found`.
+pub(crate) async fn call_show(
+    State(state): State<ApiState>,
+    Path(call_id): Path<String>,
+) -> ApiResult<Json<dto::CallDocument>> {
+    if !hekma_engine::is_call_id(&call_id) {
+        return Err(ApiError::invalid_query_param(
+            "invalid-call-id",
+            format!(
+                "{call_id} is not a call id this engine records (call_ plus 26 characters)"
+            ),
+        ));
+    }
+    let record = state.engine.call(&call_id).await?;
+    Ok(Json(dto::CallDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        call: record,
+    }))
+}
+
 /// `POST /v0/runs/{id}/close` — close a child Run (idempotent; a Run that
 /// owns a process is a `409` naming the stop remediation).
 pub(crate) async fn run_close(

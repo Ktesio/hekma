@@ -30,7 +30,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use crate::domain::calls::{
     decode_call_cursor, encode_call_cursor, expose_model, is_call_id, is_run_id, CallDisposition,
     CallError, CallListing, CallOutcome, CallRecord, CallView, CallsQuery, StatusClass,
-    CALLS_DEFAULT_LIMIT, CALLS_SCAN_BUDGET,
+    CALLS_SCAN_BUDGET,
 };
 use crate::domain::RunId;
 use crate::store::calls_sqlite::CALLS_SCHEMA_VERSION;
