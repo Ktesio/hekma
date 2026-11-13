@@ -111,6 +111,38 @@ pub(crate) fn note_activity<S: RunRecords + ?Sized>(
     Ok(())
 }
 
+/// A proxied call on a Run that announced without traffic (story 23-2):
+/// its first identified call gives it a wire path, so it moves `observed →
+/// announced` (one `depth-changed`, id kept). Only a Run that holds a Lease
+/// at `observed` — an endpoint announce — moves; a process-owning Run's
+/// depth is supervision's.
+pub(crate) fn note_wire_call<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    run_id: &RunId,
+    now_unix: u64,
+) -> Result<(), StoreError> {
+    let Some(record) = store.run_record(run_id)? else {
+        return Ok(());
+    };
+    if record.is_ended()
+        || record.process_owner
+        || record.control_depth != super::ControlDepth::Observed
+        || store.run_lease(run_id)?.0.is_none()
+    {
+        return Ok(());
+    }
+    let at = crate::time::format_rfc3339(now_unix);
+    changes.extend(super::ops::sync_depth(
+        store,
+        record,
+        super::ControlDepth::Announced,
+        true,
+        &at,
+    )?);
+    Ok(())
+}
+
 /// One sweep (story 23-2): Runs whose Lease expired, or that hold none and
 /// were idle past the inactivity window, go `silent`; Runs `silent` past
 /// the silent window end (`silent-window`). Process-owning Runs are never

@@ -1573,6 +1573,25 @@ impl RunRecords for SqliteStore {
             .map_err(backend)
     }
 
+    fn open_descendants(&self, root: &RunId) -> Result<u64, StoreError> {
+        // Bounded by the nesting limit, so a cycle (impossible through the
+        // engine, which never re-parents) cannot loop.
+        self.conn()
+            .query_row(
+                "WITH RECURSIVE beneath(id, depth) AS ( \
+                     SELECT run_id, 1 FROM runs WHERE parent_run_id = ?1 \
+                     UNION ALL \
+                     SELECT r.run_id, b.depth + 1 FROM runs r JOIN beneath b \
+                     ON r.parent_run_id = b.id WHERE b.depth < ?2) \
+                 SELECT COUNT(*) FROM runs r JOIN beneath b ON r.run_id = b.id \
+                 WHERE r.status <> 'ended'",
+                rusqlite::params![root.as_str(), crate::domain::MAX_RUN_NESTING as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n.max(0) as u64)
+            .map_err(backend)
+    }
+
     fn open_runs(&self) -> Result<Vec<RunRecord>, StoreError> {
         self.records("WHERE r.status <> 'ended' ORDER BY r.run_id", [])
     }

@@ -461,6 +461,10 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// How many of a Run's children have not ended.
     fn open_children(&self, run_id: &RunId) -> Result<u64, StoreError>;
 
+    /// How many open Runs nest beneath `root`, at any depth up to
+    /// [`crate::domain::MAX_RUN_NESTING`] (story 23-2: the per-root cap).
+    fn open_descendants(&self, root: &RunId) -> Result<u64, StoreError>;
+
     /// Every non-ended Run (the snapshot's initial load).
     fn open_runs(&self) -> Result<Vec<RunRecord>, StoreError>;
 

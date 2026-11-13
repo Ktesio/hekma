@@ -30,6 +30,7 @@ use super::lifecycle::LifecycleState;
 use super::usage::RunId;
 use crate::ports::StoreError;
 
+pub mod announce;
 pub mod bindings;
 pub(crate) mod keys;
 pub(crate) mod labels;
@@ -74,6 +75,12 @@ pub const MAX_RUN_NESTING: usize = 8;
 /// a Run Key (story 22-1, threat T1.9: a Run Key can create Runs). The
 /// Operator and Host are not capped.
 pub const MAX_CALLER_OPEN_CHILDREN: u64 = 1000;
+
+/// The most open Runs one root's subtree may hold when Callers open or
+/// announce them (story 23-2, threat T1.9 / L8: without it, a Run Key could
+/// fan out 1,000 children per level, seven levels deep). The Operator and
+/// Host are not capped.
+pub const MAX_ROOT_OPEN_DESCENDANTS: u64 = 1000;
 
 /// Who acts on a Run (story 22-1, spine AD-20): the Operator, a Host, or a
 /// Run's own Caller presenting its Run Key. A Caller may open, close and
@@ -581,6 +588,15 @@ pub struct RunView {
     /// Run that owns no process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custody: Option<listing::CustodyView>,
+    /// Story 23-2: when its Lease expires (RFC 3339), for a Run that
+    /// announced or was heartbeated. Absent on a Run that holds none (a
+    /// wire Run goes `silent` on inactivity instead; a supervised Run's
+    /// process is its heartbeat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<String>,
+    /// Story 23-2: its last identified call or heartbeat (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<String>,
 }
 
 /// Where a child Run is opened.
@@ -965,6 +981,18 @@ pub enum RunError {
         /// [`MAX_CALLER_OPEN_CHILDREN`].
         max: u64,
     },
+    /// A Caller's open or announce found its scope full (story 23-2): a
+    /// binding's announced identities, or a root's whole subtree.
+    #[error(
+        "{scope} already holds {max} open Runs that Callers opened or announced — close some \
+         before adding more"
+    )]
+    TooManyCallerRuns {
+        /// The full scope (``binding `openai` `` or ``the Run tree under `run_…` ``).
+        scope: String,
+        /// The cap.
+        max: u64,
+    },
     /// The store refused or failed.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -1008,7 +1036,9 @@ impl RunError {
             RunError::CredentialRevoked => "credential-revoked",
             RunError::CredentialUnknown => "unauthorized",
             RunError::CredentialUnavailable { .. } => "credential-unavailable",
-            RunError::TooManyChildren { .. } => "too-many-children",
+            RunError::TooManyChildren { .. } | RunError::TooManyCallerRuns { .. } => {
+                "too-many-children"
+            }
             RunError::Store(_) => "store",
         }
     }

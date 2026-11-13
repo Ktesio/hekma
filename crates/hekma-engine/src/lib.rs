@@ -191,11 +191,12 @@ pub use engine::{Blocking, DrainReport, Engine, EngineOptions, EventSubscription
 /// to refuse a credential in a path or query.
 pub use domain::credential::{percent_decode, scan_url, UrlScan, URL_SCAN_MAX_TOKENS};
 pub use domain::{
-    parse_presented, CredentialChange, CredentialError, CredentialEvent, CredentialMatch,
-    CredentialSummary, IssuedCredentials, MintedToken, OpenedRun, PresentedState, RevokeOutcome,
-    RevokedCredential, RunActor, SecretString, TokenClass, TokenHash, TokenState, ANNOUNCE_PREFIX,
-    CREDENTIAL_EVENT_SCHEMA_VERSION, MAX_CALLER_OPEN_CHILDREN, REFRESH_PREFIX, RUN_KEY_PREFIX,
-    TOKEN_BODY_LEN, TOKEN_ID_LEN,
+    parse_presented, AnnounceCredential, AnnounceCredentialState, Announced, CredentialChange,
+    CredentialError, CredentialEvent, CredentialMatch, CredentialSummary, IssuedCredentials,
+    LeaseActor, MintedToken, OpenedRun, PresentedState, RevokeOutcome, RevokedCredential, RunActor,
+    SecretString, TokenClass, TokenHash, TokenState, ANNOUNCE_PREFIX,
+    CREDENTIAL_EVENT_SCHEMA_VERSION, MAX_CALLER_OPEN_CHILDREN, MAX_ROOT_OPEN_DESCENDANTS,
+    REFRESH_PREFIX, RUN_KEY_PREFIX, TOKEN_BODY_LEN, TOKEN_ID_LEN,
 };
 // Story 23-1: the shared Metering Proxy's endpoint bindings.
 pub use domain::{

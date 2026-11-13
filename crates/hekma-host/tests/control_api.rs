@@ -5766,3 +5766,201 @@ fn the_reveal_route_records_a_custodied_key_and_nothing_else() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// One request as `bearer` (any class), no panic on a non-2xx.
+fn as_bearer(
+    client: &ureq::Agent,
+    method: &str,
+    url: &str,
+    bearer: &str,
+    body: Option<serde_json::Value>,
+) -> ureq::http::Response<ureq::Body> {
+    let auth = format!("Bearer {bearer}");
+    match (method, body) {
+        ("POST", Some(json)) => client
+            .post(url)
+            .header("Authorization", &auth)
+            .send_json(json),
+        ("POST", None) => client.post(url).header("Authorization", &auth).send_empty(),
+        (other, _) => panic!("unsupported test method {other}"),
+    }
+    .unwrap_or_else(|err| panic!("{method} {url}: {err}"))
+}
+
+#[test]
+fn the_announce_and_heartbeat_routes_follow_the_matrix_and_show_credentials_once() {
+    // Story 23-2: `POST /v0/runs/announce` under a binding's announce
+    // credential (201 with the pair once, 200 renew-only), the heartbeat
+    // route (204; 403 outside the credential's creations; 409 on an ended
+    // Run), and close by the creating credential — each cell over HTTP.
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle.clone());
+    let client = client();
+    let base = format!("http://{}", server.addr);
+    let issue = |name: &str, labels: serde_json::Value| -> String {
+        let mut response = call(
+            &client,
+            "POST",
+            &format!("{base}/v0/bindings"),
+            Some(serde_json::json!({
+                "name": name,
+                "prefix": format!("/{name}"),
+                "upstream": "https://api.example.com/v1",
+                "labels": labels,
+            })),
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "{}",
+            json_body(&mut response)
+        );
+        let mut response = call(
+            &client,
+            "POST",
+            &format!("{base}/v0/bindings/{name}/credentials"),
+            Some(serde_json::json!({"class": "announce"})),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(&mut response)["token"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let ours = issue("openai", serde_json::json!([["team", "core"]]));
+    let theirs = issue("other", serde_json::json!([]));
+    assert!(ours.starts_with("hk_ann_"));
+    let announce_url = format!("{base}/v0/runs/announce");
+    let body = serde_json::json!({"external_id": "job-7", "labels": {"step": "plan"}});
+
+    // A first announce: 201, the Run at `observed`, the pair once.
+    let mut response = as_bearer(&client, "POST", &announce_url, &ours, Some(body.clone()));
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+    let created = json_body(&mut response);
+    assert_eq!(created["created"], true);
+    let run = &created["run"];
+    assert_eq!(run["control_depth"], "observed");
+    assert_eq!(run["wire_path"], false);
+    assert!(run["lease_expires_at"].is_string(), "{run}");
+    assert!(run["last_activity_at"].is_string(), "{run}");
+    let run_id = run["run_id"].as_str().unwrap().to_string();
+    let run_key = created["credentials"]["run_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let refresh = created["credentials"]["refresh_credential"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(run_key.starts_with("hk_run_") && refresh.starts_with("hk_ref_"));
+    assert!(created["note"].as_str().unwrap().contains("shown once"));
+    // The Run carries the binding's labels, bound, and the Caller's.
+    let mut shown = get_ok(&client, &server.addr, &format!("/v0/runs/{run_id}"));
+    let shown = json_body(&mut shown).to_string();
+    assert!(shown.contains("core") && shown.contains("plan"), "{shown}");
+    assert!(!shown.contains(&run_key) && !shown.contains(&refresh));
+
+    // A re-announce: 200, the same Run, no credentials.
+    let mut response = as_bearer(&client, "POST", &announce_url, &ours, Some(body.clone()));
+    assert_eq!(response.status(), StatusCode::OK);
+    let renewed = json_body(&mut response);
+    assert_eq!(renewed["created"], false);
+    assert_eq!(renewed["run"]["run_id"], run_id.as_str());
+    assert!(renewed.get("credentials").is_none());
+    assert!(renewed["note"].as_str().unwrap().contains("no new Run Key"));
+    // Another binding's credential claims its OWN namespace: a new Run.
+    let mut response = as_bearer(&client, "POST", &announce_url, &theirs, Some(body.clone()));
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let other_run = json_body(&mut response)["run"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(other_run, run_id);
+
+    // Every other class is refused on the announce route.
+    for presented in [BEARER_VALUE, run_key.as_str(), refresh.as_str()] {
+        let mut response = as_bearer(
+            &client,
+            "POST",
+            &announce_url,
+            presented,
+            Some(body.clone()),
+        );
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{presented}");
+        assert_eq!(json_body(&mut response)["error"]["code"], "forbidden");
+    }
+    // A malformed identity is a 400.
+    let response = as_bearer(
+        &client,
+        "POST",
+        &announce_url,
+        &ours,
+        Some(serde_json::json!({"external_id": "has space"})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Heartbeat: the creating credential and the Run's own key → 204;
+    // another binding's credential → 403; the operator bearer → 403.
+    let beat = format!("{base}/v0/runs/{run_id}/heartbeat");
+    for presented in [ours.as_str(), run_key.as_str()] {
+        let response = as_bearer(&client, "POST", &beat, presented, None);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "{presented}");
+    }
+    let mut response = as_bearer(&client, "POST", &beat, &theirs, None);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "run-out-of-scope"
+    );
+    let mut response = as_bearer(&client, "POST", &beat, BEARER_VALUE, None);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(&mut response)["error"]["code"], "forbidden");
+
+    // Close: another binding's credential → 403; the creator → 200; then
+    // the heartbeat is 409 `run-ended`, naming the re-announce path.
+    let close = format!("{base}/v0/runs/{run_id}/close");
+    let response = as_bearer(&client, "POST", &close, &theirs, None);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let mut response = as_bearer(&client, "POST", &close, &ours, None);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(&mut response)["run"]["status"], "ended");
+    let mut response = as_bearer(&client, "POST", &beat, &ours, None);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let refused = json_body(&mut response);
+    assert_eq!(refused["error"]["code"], "run-ended");
+    assert!(refused["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("announce again"));
+    // The closed Run's key is revoked with it.
+    let response = as_bearer(&client, "POST", &beat, &run_key, None);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Announcing the ended identity again creates a new Run.
+    let mut response = as_bearer(&client, "POST", &announce_url, &ours, Some(body.clone()));
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_ne!(json_body(&mut response)["run"]["run_id"], run_id.as_str());
+
+    // A revoked announce credential is 401 `credential-revoked`; one never
+    // issued is 401 `unauthorized`.
+    let response = call(
+        &client,
+        "POST",
+        &format!("{base}/v0/bindings/openai/credentials/revoke"),
+        Some(serde_json::json!({"class": "announce"})),
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let mut response = as_bearer(&client, "POST", &announce_url, &ours, Some(body.clone()));
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "credential-revoked"
+    );
+    let never = format!("hk_ann_{}", "9".repeat(52));
+    let mut response = as_bearer(&client, "POST", &announce_url, &never, Some(body));
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let refused = json_body(&mut response);
+    assert_eq!(refused["error"]["code"], "unauthorized");
+    assert!(!refused.to_string().contains(&never));
+}

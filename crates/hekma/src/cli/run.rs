@@ -469,7 +469,8 @@ pub(crate) fn run_error_class(err: &RunError, message: String) -> Box<dyn std::e
         RunError::RunOutOfScope { .. }
         | RunError::CredentialRevoked
         | RunError::CredentialUnknown
-        | RunError::TooManyChildren { .. } => RunInvalid { message }.into(),
+        | RunError::TooManyChildren { .. }
+        | RunError::TooManyCallerRuns { .. } => RunInvalid { message }.into(),
         RunError::CredentialUnavailable { .. } => AgentStore { message }.into(),
         RunError::Store(_) => AgentStore { message }.into(),
     }
@@ -511,6 +512,14 @@ fn render_text(view: &RunView, verb: &str) -> String {
         row("CUSTODY", crate::cli::ps::custody_cell(Some(custody)));
     }
     row("STATUS", record.status.as_str().to_string());
+    // Story 23-2: the Lease (announced or heartbeated Runs) and the last
+    // sign of life, when the Run has them.
+    if let Some(lease) = &view.lease_expires_at {
+        row("LEASE", format!("until {lease}"));
+    }
+    if let Some(activity) = &view.last_activity_at {
+        row("LAST SEEN", activity.clone());
+    }
     row(
         "ANOMALIES",
         if record.anomalies.is_empty() {
@@ -670,5 +679,45 @@ mod tests {
             "x".into(),
         )));
         assert!(store.is::<AgentStore>());
+    }
+
+    #[test]
+    fn run_show_renders_a_lease_and_the_last_sign_of_life_only_when_present() {
+        // Story 23-2: an announced Run shows its Lease and last activity; a
+        // Run without either shows neither line.
+        let view = |lease: bool| -> RunView {
+            let mut doc = serde_json::json!({
+                "run_id": "run_01JZ6Q9G3S8V2X7K4M1N5P0R2T",
+                "control_depth": "observed",
+                "wire_path": false,
+                "status": "silent",
+                "anomalies": [],
+                "process_owner": false,
+                "created_at": "2026-11-13T00:00:00Z",
+                "updated_at": "2026-11-13T00:00:00Z",
+                "labels": [],
+                "limits": {},
+                "usage": {"input_tokens": 0, "output_tokens": 0, "cost_micros": 0,
+                          "estimate": "estimated"},
+                "open_children": 0,
+            });
+            if lease {
+                doc["lease_expires_at"] = "2026-11-13T00:01:00Z".into();
+                doc["last_activity_at"] = "2026-11-13T00:00:00Z".into();
+            }
+            serde_json::from_value(doc).unwrap()
+        };
+        let text = render_text(&view(true), "");
+        assert!(
+            text.contains("LEASE        until 2026-11-13T00:01:00Z"),
+            "{text}"
+        );
+        assert!(text.contains("LAST SEEN    2026-11-13T00:00:00Z"), "{text}");
+        assert!(text.contains("STATUS       silent"), "{text}");
+        let text = render_text(&view(false), "");
+        assert!(
+            !text.contains("LEASE") && !text.contains("LAST SEEN"),
+            "{text}"
+        );
     }
 }

@@ -733,12 +733,14 @@ pub(crate) fn commit_proxied_call(
     // a held Lease extends, a `silent` Run returns to `active`.
     {
         let mut changes = RunChanges::default();
+        let now = crate::time::now_unix_secs();
+        runs::lease::note_wire_call(store, &mut changes, &close.record.run_id, now)?;
         runs::lease::note_activity(
             store,
             &mut changes,
             &close.record.run_id,
             leases,
-            crate::time::now_unix_secs(),
+            now,
             false,
         )?;
         if !changes.events.is_empty() || !changes.entries.is_empty() {

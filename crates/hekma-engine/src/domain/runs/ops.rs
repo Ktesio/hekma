@@ -827,6 +827,30 @@ fn write_labels<S: RunRecords + ?Sized>(
     Ok(())
 }
 
+/// Note a Caller-label change on `record` (already saved; story 23-2: a
+/// re-announce upserts its Caller labels): one `labels-changed` event with
+/// `cause`. Caller labels never select a Policy (FR-60), so nothing
+/// re-resolves.
+pub(crate) fn note_caller_labels<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    record: &RunRecord,
+    cause: &str,
+) -> Result<(), StoreError> {
+    let labels = store.run_labels(&record.run_id)?;
+    note(
+        store,
+        changes,
+        record,
+        RunEventKind::LabelsChanged,
+        Prior {
+            labels: Some(bound_only(&labels)),
+            ..Prior::default()
+        },
+        Some(cause.to_string()),
+    )
+}
+
 /// Note a `limits-changed` event for `record` (story 21-6): the changed
 /// layer of the Run's own limits before (`prior`) and after (`after`), with
 /// the actor as the cause. The change is the Run's latest update: the row
@@ -1253,7 +1277,10 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
     } else {
         None
     };
+    let (lease_expires_at, last_activity_at) = store.run_lease(run_id)?;
     Ok(RunView {
+        lease_expires_at,
+        last_activity_at,
         labels: store.run_labels(run_id)?,
         limits: store.run_limits(run_id)?,
         policy: store.run_policy(run_id)?.map(|row| row.resolution),

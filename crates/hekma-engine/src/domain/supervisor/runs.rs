@@ -669,6 +669,114 @@ impl Supervisor {
         Ok(crate::domain::OpenedRun { view, credentials })
     }
 
+    /// The endpoint announce (story 23-2): claim `external` beneath the
+    /// credential's binding. The pair is minted here, before the job (an
+    /// RNG failure refuses with nothing written); the job issues it only
+    /// when the claim creates the Run, custody-eligible (the endpoint
+    /// presented a credential).
+    pub(crate) fn announce(
+        &self,
+        registry: &Registry,
+        credential: crate::domain::AnnounceCredential,
+        external: String,
+        labels: Vec<(String, String)>,
+        leases: crate::domain::runs::lease::LeaseOptions,
+    ) -> Result<crate::domain::Announced, RunError> {
+        use crate::domain::credential::{mint, IssuedCredentials, TokenClass};
+        use crate::domain::runs::announce::{self, AnnounceClaim, AnnounceScope, Claimed};
+        announce::validate(&external, &labels)?;
+        let key = mint(TokenClass::RunKey)?;
+        let refresh = mint(TokenClass::Refresh)?;
+        let pair = (key.stub(), refresh.stub());
+        let binding = credential.binding.clone();
+        let claim = AnnounceClaim {
+            scope: AnnounceScope::Binding(credential.binding.clone()),
+            external,
+            caller_labels: labels,
+            credentialed: true,
+            created_by: Some(credential.hash),
+            issuer: credential.token_id.clone(),
+            wire: false,
+        };
+        let run_id = RunId::mint();
+        let (claimed, events) = registry.run_job(move |store| {
+            // The credential is re-read inside the job (time of check).
+            match store.announce_credential(&credential.hash)? {
+                Some((_, _, true)) => {}
+                Some(_) => return Err(RunError::CredentialRevoked),
+                None => return Err(RunError::CredentialUnknown),
+            }
+            announce::announce(
+                store,
+                &claim,
+                run_id,
+                Some(pair),
+                &leases,
+                crate::time::now_unix_secs(),
+            )
+        })?;
+        self.publish_run_events(events);
+        match claimed {
+            Claimed::Created { run, minted } => Ok(crate::domain::Announced {
+                view: registry.run_view(&run)?,
+                created: true,
+                credentials: minted.then(|| IssuedCredentials::new(run, key, refresh)),
+            }),
+            Claimed::Renewed { run } => Ok(crate::domain::Announced {
+                view: registry.run_view(&run)?,
+                created: false,
+                credentials: None,
+            }),
+            Claimed::Capped => Err(RunError::TooManyCallerRuns {
+                scope: format!("binding `{binding}`"),
+                max: crate::domain::MAX_CALLER_OPEN_CHILDREN,
+            }),
+            // The binding is gone, and its credentials with it.
+            Claimed::ParentGone => Err(RunError::CredentialUnknown),
+        }
+    }
+
+    /// The heartbeat job (story 23-2) and its events.
+    pub(crate) fn heartbeat(
+        &self,
+        registry: &Registry,
+        actor: crate::domain::LeaseActor,
+        run_id: &RunId,
+        leases: crate::domain::runs::lease::LeaseOptions,
+    ) -> Result<RunView, RunError> {
+        let id = run_id.clone();
+        let ((), events) = registry.run_job(move |store| {
+            let changes = runs::announce::heartbeat(
+                store,
+                &actor,
+                &id,
+                &leases,
+                crate::time::now_unix_secs(),
+            )?;
+            Ok(((), changes))
+        })?;
+        self.publish_run_events(events);
+        registry.run_view(run_id)
+    }
+
+    /// Close a Run as a Lease actor (story 23-2: an announcer closes only
+    /// the Runs its credential created) and publish its events.
+    pub(crate) fn close_run_by(
+        &self,
+        registry: &Registry,
+        actor: crate::domain::LeaseActor,
+        run_id: &RunId,
+    ) -> Result<RunView, RunError> {
+        let id = run_id.clone();
+        let ((), events) = registry.run_job(move |store| {
+            let changes =
+                runs::announce::close_as(store, &actor, &id, &crate::time::now_rfc3339())?;
+            Ok(((), changes))
+        })?;
+        self.publish_run_events(events);
+        registry.run_view(run_id)
+    }
+
     /// Close a child Run as `actor` (story 22-1) and publish its events.
     pub(crate) fn close_run_as(
         &self,
