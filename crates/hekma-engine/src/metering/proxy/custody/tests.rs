@@ -350,6 +350,8 @@ fn revealing_a_custodied_key_records_one_event_naming_it_and_never_its_value() {
     facade
         .set_config("revealer", "provider.api_key", &format!("secret:{SECRET}"))
         .unwrap();
+    // A malformed instance name is refused before anything is read.
+    assert!(facade.note_secret_revealed("Bad Name").is_err());
     let mut events = facade.subscribe();
     let event = facade
         .note_secret_revealed("revealer")

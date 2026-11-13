@@ -15,6 +15,7 @@
 //! → the rest are aborted (`shutdown`) → the record pump closes.
 
 #[cfg(test)]
+#[path = "custody/tests.rs"]
 mod custody_tests;
 pub(crate) mod forward;
 pub(crate) mod identify;

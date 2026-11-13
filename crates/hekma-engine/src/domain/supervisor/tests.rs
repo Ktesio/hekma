@@ -11071,3 +11071,32 @@ fn an_origin_the_key_cannot_be_pinned_to_refuses_the_start() {
     );
     assert!(registry.spawn_record(&name).unwrap().is_none());
 }
+
+#[test]
+fn home_isolation_points_the_home_variables_inside_the_agent_home() {
+    // `provider.isolate_home = "on"` (opt-in): the agent's home variables
+    // name a directory inside its Agent Home, created before the spawn.
+    let (_state, _manifest, dump, registry, name) =
+        custody_subject("isolated", "engine-observed", "");
+    registry
+        .set_config(&name, "provider.isolate_home", "on")
+        .unwrap();
+    let rt = runtime();
+    let mut sup = custody_supervisor(&rt);
+    sup.start(&registry, name.as_str()).unwrap();
+    wait_for_marker(&dump.path().join("ready.marker"));
+    let dumped = wait_for_dump(&dump.path().join("dump.txt"));
+    let isolated = registry.agent_home(&name).join("isolated-home");
+    assert!(isolated.is_dir(), "the isolated home exists");
+    let expected = isolated.to_string_lossy().into_owned();
+    for var in crate::backends::isolated_home_env_vars() {
+        assert!(
+            dumped
+                .lines()
+                .any(|line| line == format!("env={var}={expected}")),
+            "{var} must point inside the Agent Home:\n{dumped}"
+        );
+    }
+    sup.stop(&registry, name.as_str(), Some(Duration::from_secs(5)))
+        .unwrap();
+}

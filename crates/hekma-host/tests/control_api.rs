@@ -5688,3 +5688,62 @@ fn the_calls_routes_refuse_every_credential_class_but_the_operator_bearer() {
 
     server.stop().unwrap();
 }
+
+#[test]
+fn the_reveal_route_records_a_custodied_key_and_nothing_else() {
+    // Story 22-2: `POST /v0/instances/{name}/config/revealed` commits one
+    // `secret_revealed` event and answers the secret names; an instance
+    // that custodies nothing answers an empty list. Operator bearer only.
+    let state = tempfile::tempdir().unwrap();
+    let _held = registered_fake_agent(state.path(), "held");
+    let _plain = registered_fake_agent(state.path(), "plain");
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
+    let client = client();
+    let base = format!("http://{}/v0/instances", server.addr);
+    let mut response = call(
+        &client,
+        "PUT",
+        &format!("{base}/held/config"),
+        Some(serde_json::json!({"key": "provider.api_key", "value": "secret:HELD_KEY"})),
+    );
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        json_body(&mut response)
+    );
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{base}/held/config/revealed"),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(&mut response);
+    assert_eq!(body["secrets"], serde_json::json!(["HELD_KEY"]));
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{base}/plain/config/revealed"),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(&mut response)["secrets"], serde_json::json!([]));
+    // An unknown instance is the config read's own 404.
+    let response = call(
+        &client,
+        "POST",
+        &format!("{base}/ghost/config/revealed"),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // A Run Key is refused on the Operator route.
+    let run_key = format!("hk_run_{}", "9".repeat(52));
+    let response = client
+        .post(format!("{base}/held/config/revealed"))
+        .header("Authorization", format!("Bearer {run_key}"))
+        .send_empty()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
