@@ -586,6 +586,22 @@ pub fn refuse_credential_targets(mapping: &ConfigMapping) -> Result<(), (String,
             }
         }
     }
+    // Key custody: the provider key is the ONE credential an Adapter may map
+    // to its API-key variable, and only ever an `env` target — under custody
+    // the delivered value is the launch's Run Key, so a flag would put it on
+    // the command line and a file would write it into the Agent Home.
+    match mapping.target(crate::domain::config::PROVIDER_API_KEY_KEY) {
+        None | Some(ConfigTarget::Env { .. }) => {}
+        Some(ConfigTarget::Flag { .. }) | Some(ConfigTarget::File(_)) => {
+            return Err((
+                crate::domain::config::PROVIDER_API_KEY_KEY.to_string(),
+                "The provider key can only be delivered to an environment variable under key \
+                 custody; map 'provider.api_key' to an env target — a flag puts it on the \
+                 command line and a file puts it in the Agent Home."
+                    .to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -2170,6 +2186,47 @@ flag = "--model"
         assert_eq!(mapping.target("model").unwrap().env_var(), Some("MODEL"));
         // An unknown native kind → an empty mapping (delivers nothing), not an err.
         assert!(resolve_config_mapping("nope", None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_provider_key_mapping_may_only_target_an_env_variable() {
+        // Key custody: `provider.api_key` is a known key an Adapter maps to
+        // its API-key variable — `env` targets only. A `flag` or `file`
+        // mapping is refused at start (and at registration, the same
+        // `refuse_credential_targets` gate) naming the key and the
+        // remediation, mirroring `run.key`.
+        let tmp = TempDir::new().unwrap();
+        for target in ["flag = \"--api-key\"", "file = { path = \"key.txt\", key = \"k\" }"] {
+            let body = format!(
+                "contract_version = \"1.0.0\"\n[adapter]\nkind = \"demo\"\n[lifecycle.start]\n\
+                 exec = \"the-agent\"\n[capabilities.interaction]\nlinux = \"guaranteed\"\n\
+                 [metering]\nsource = \"self-reported\"\n[config.\"provider.api_key\"]\n{target}\n"
+            );
+            let path = write_manifest(tmp.path(), &body);
+            let err = resolve_config_mapping("demo", Some(&path)).unwrap_err();
+            match err {
+                LaunchResolveError::InvalidConfigMapping { key, detail, .. } => {
+                    assert_eq!(key, "provider.api_key");
+                    assert!(
+                        detail.contains("map 'provider.api_key' to an env target"),
+                        "the remediation names the migration: {detail}"
+                    );
+                    assert!(
+                        detail.contains("a flag puts it on the command line"),
+                        "the remediation names why: {detail}"
+                    );
+                }
+                other => panic!("expected InvalidConfigMapping, got {other:?}"),
+            }
+        }
+        // An env mapping is accepted, and no mapping at all is accepted (the
+        // agent then receives only HEKMA_RUN_KEY).
+        let body = "contract_version = \"1.0.0\"\n[adapter]\nkind = \"demo\"\n[lifecycle.start]\n\
+                    exec = \"the-agent\"\n[capabilities.interaction]\nlinux = \"guaranteed\"\n\
+                    [metering]\nsource = \"self-reported\"\n[config.\"provider.api_key\"]\n\
+                    env = \"DEMO_API_KEY\"\n";
+        let path = write_manifest(tmp.path(), body);
+        assert!(resolve_config_mapping("demo", Some(&path)).is_ok());
     }
 
     #[test]

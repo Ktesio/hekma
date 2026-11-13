@@ -182,6 +182,67 @@ pub const RUN_KEY_ENV: &str = "HEKMA_RUN_KEY";
 /// (`run-key:<token id>`) wherever the config renders at all.
 pub const RUN_KEY_MARKER_PREFIX: &str = "run-key:";
 
+/// The unified key that names the provider key Hekma holds under key
+/// custody. Its value MUST be a `secret:NAME` reference (any other value
+/// is refused at write with a remediation): the operator hands Hekma the
+/// NAME of a secret, and from then on the agent never holds the real
+/// provider key — its API-key environment variable receives each launch's
+/// Run Key and its calls cross the Metering Proxy, which swaps the
+/// custodied key in on the way out. Setting this key turns custody ON by
+/// default for the instance at its next start (`provider.custody = "off"`
+/// opts out). A KNOWN, OPERATOR-set key (unlike the engine-reserved
+/// `run.*` keys): it renders masked like every secret reference and is
+/// persisted to the effective-config snapshot as the reference, never a
+/// value. An Adapter maps it to its API-key variable — `env` targets only
+/// (a `flag` or `file` target is refused at registration, mirroring
+/// `run.key`).
+pub const PROVIDER_API_KEY_KEY: &str = "provider.api_key";
+
+/// The unified key that opts an instance OUT of key custody
+/// (`"off"`), or back in (`"on"`). Custody is ON by default once
+/// [`PROVIDER_API_KEY_KEY`] is set; this key exists because some agents
+/// break under the forced child-environment allowlist (no inherited
+/// variables beyond `PATH`/`HOME`) and their operators need the previous
+/// behaviour back. Values: `"on"`, `"off"`.
+pub const PROVIDER_CUSTODY_KEY: &str = "provider.custody";
+
+/// The unified key that opts an instance INTO home isolation
+/// (`"on"`; `"off"` is the default). Under key custody the agent's
+/// environment is cleared but `HOME` stays in the OS floor (many agents
+/// need the user's Git and SSH configuration). With `"on"`, the launch
+/// points `HOME` and the XDG base variables (Unix) or `USERPROFILE` and
+/// the profile variables (Windows) at a directory INSIDE the Agent Home,
+/// keeping the agent from finding the user's other stored logins by
+/// default — it does not hide them from a shell that names a full path.
+/// Values: `"on"`, `"off"`.
+pub const PROVIDER_ISOLATE_HOME_KEY: &str = "provider.isolate_home";
+
+/// The provider credential variables, version 1 (a CLOSED, VERSIONED list
+/// — the version surface is the table in `docs/config-secrets-memory.md`).
+/// Under key custody a start is refused if any of these would be
+/// delivered to the agent a second way (a pass-through `agent.<VAR>` key
+/// or an entry in the manifest's launch environment): the custodied key
+/// is delivered once, by Hekma, or not at all. Additions are additive and
+/// ride the docs version (v2, v3, …); nothing infers membership.
+pub const PROVIDER_ENV_VARS_V1: &[&str] = &[
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "MISTRAL_API_KEY",
+    "GROQ_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENROUTER_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "HF_TOKEN",
+];
+
+/// Whether `var` names a variable on the current provider-variable list.
+pub fn is_provider_env_var(var: &str) -> bool {
+    PROVIDER_ENV_VARS_V1.contains(&var)
+}
+
 /// Whether `key` is one of the reserved credential keys.
 pub fn is_reserved_credential_key(key: &str) -> bool {
     key == RUN_KEY_KEY || key == RUN_REFRESH_KEY_KEY
@@ -667,6 +728,14 @@ const KNOWN_KEYS: &[&str] = &[
     // Adapter's mapping can target them; every write is refused below.
     RUN_KEY_KEY,
     RUN_REFRESH_KEY_KEY,
+    // Key custody: the operator-set provider-key reference and its two
+    // switches. Engine-namespace keys (NOT `agent.*` pass-through); the
+    // value rules are checked in `validate_provider_value` below. They do
+    // NOT touch the Adapter Contract surface (no CONTRACT_VERSION bump) —
+    // an Adapter that adopts `provider.api_key` maps it like any known key.
+    PROVIDER_API_KEY_KEY,
+    PROVIDER_CUSTODY_KEY,
+    PROVIDER_ISOLATE_HOME_KEY,
     // Story 14-1 (spine AD-19, the builtin `acp` kind): the operator-set
     // ACP launch keys. `acp.command` (REQUIRED at start — the executable)
     // and `acp.args` (optional). Engine-namespace keys (NOT `agent.*`
@@ -802,6 +871,7 @@ pub fn validate_write(key: &str, value: &str) -> Result<(), ConfigError> {
         // (and any future value-free known key) skips this.
         validate_budget_value(key, value)?;
         validate_cost_value(key, value)?;
+        validate_provider_value(key, value)?;
         return Ok(());
     }
     if is_pass_through(key) {
@@ -811,6 +881,41 @@ pub fn validate_write(key: &str, value: &str) -> Result<(), ConfigError> {
         key: key.to_string(),
         suggestion: nearest_known_key(key),
     })
+}
+
+/// Type-check the VALUE of a key-custody key at write time. The provider
+/// key must be NAMED, never pasted: only a `secret:NAME` reference is
+/// accepted, so a value typed at the console never lands in config
+/// storage. The two switches take exactly `"on"` or `"off"`. A non-custody
+/// key is a no-op.
+fn validate_provider_value(key: &str, value: &str) -> Result<(), ConfigError> {
+    match key {
+        PROVIDER_API_KEY_KEY => {
+            if !is_secret_ref(value.trim()) {
+                return Err(ConfigError::InvalidValue {
+                    key: key.to_string(),
+                    value: SECRET_MASK.to_string(),
+                    reason: "the provider key must be named, never pasted: set it to a \
+                             \"secret:NAME\" reference that resolves in Hekma's secrets file \
+                             or environment, and Hekma will hold the key while the agent \
+                             receives a Run Key"
+                        .to_string(),
+                });
+            }
+            Ok(())
+        }
+        PROVIDER_CUSTODY_KEY | PROVIDER_ISOLATE_HOME_KEY => {
+            if value.trim() != "on" && value.trim() != "off" {
+                return Err(ConfigError::InvalidValue {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                    reason: "expected \"on\" or \"off\"".to_string(),
+                });
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Type-check the VALUE of a story-3-2 Token-Budget key at write time (AC-C).
@@ -1951,7 +2056,8 @@ mod tests {
         // keys (the operator-set upstream URL + the engine-injected loopback base_url)
         // + the story 5-1 engine-injected managed-memory key + the two story 14-1
         // acp launch keys (`acp.command` required + `acp.args` optional, spine
-        // AD-19) are the known set.
+        // AD-19) + the three key-custody keys (the operator-set provider-key
+        // reference + the custody and home-isolation switches) are the known set.
         assert_eq!(
             KNOWN_KEYS,
             &[
@@ -1969,6 +2075,9 @@ mod tests {
                 "memory.dir",
                 "run.key",
                 "run.refresh_key",
+                "provider.api_key",
+                "provider.custody",
+                "provider.isolate_home",
                 "acp.command",
                 "acp.args",
             ]
@@ -1988,6 +2097,56 @@ mod tests {
         // Adapter Contract surface (no CONTRACT_VERSION bump, DC-5).
         assert!(is_known_key("memory.dir"));
         assert!(!is_pass_through("memory.dir"));
+    }
+
+    #[test]
+    fn the_provider_key_must_be_named_never_pasted() {
+        // Only a `secret:NAME` reference is accepted — a pasted key value is
+        // refused at write with a remediation, and the value is never echoed
+        // back (the mask stands in).
+        assert!(validate_write("provider.api_key", "secret:PROVIDER").is_ok());
+        for pasted in ["sk-live-abc123", "secret:", ""] {
+            let err = validate_write("provider.api_key", pasted).unwrap_err();
+            match err {
+                ConfigError::InvalidValue { key, value, .. } => {
+                    assert_eq!(key, "provider.api_key");
+                    assert_eq!(value, SECRET_MASK, "the offending value is never echoed");
+                }
+                other => panic!("expected InvalidValue, got {other:?}"),
+            }
+        }
+        // The switch keys take exactly on/off.
+        for key in [PROVIDER_CUSTODY_KEY, PROVIDER_ISOLATE_HOME_KEY] {
+            assert!(validate_write(key, "on").is_ok());
+            assert!(validate_write(key, "off").is_ok());
+            assert!(validate_write(key, "maybe").is_err());
+        }
+    }
+
+    #[test]
+    fn the_provider_variable_list_is_closed_and_versioned() {
+        // The v1 list, verbatim: additions are a docs-versioned change, and
+        // membership is enumerated — never inferred from a value's shape.
+        assert_eq!(
+            PROVIDER_ENV_VARS_V1,
+            &[
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "GEMINI_API_KEY",
+                "GOOGLE_API_KEY",
+                "MISTRAL_API_KEY",
+                "GROQ_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "OPENROUTER_API_KEY",
+                "AZURE_OPENAI_API_KEY",
+                "XAI_API_KEY",
+                "HF_TOKEN",
+            ]
+        );
+        assert!(is_provider_env_var("OPENAI_API_KEY"));
+        assert!(is_provider_env_var("HF_TOKEN"));
+        assert!(!is_provider_env_var("OPENAI_ORG"));
+        assert!(!is_provider_env_var("MY_OPENAI_API_KEY"));
     }
 
     #[test]

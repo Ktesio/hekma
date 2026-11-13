@@ -15,6 +15,7 @@ pub mod calls;
 pub(crate) mod config;
 mod cost;
 pub(crate) mod credential;
+pub(crate) mod custody;
 mod error;
 mod event;
 mod fleet;
