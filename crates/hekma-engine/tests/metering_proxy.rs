@@ -1197,3 +1197,49 @@ fn calls_left_open_by_a_dead_host_are_closed_crash_or_recovered_at_the_next_open
     let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
     assert!(!text.contains("proxied call(s)"), "{text}");
 }
+
+#[test]
+fn a_wire_runs_usage_and_breach_reach_the_event_bus() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    let mut events = engine.subscribe();
+    engine
+        .blocking()
+        .create_policy(
+            PolicyChange {
+                name: "core-warn".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits {
+                    tokens_per_run: Some(10),
+                    breach_action: Some(BreachAction::Warn),
+                    ..PolicyLimits::default()
+                },
+                ..PolicyChange::default()
+            },
+            false,
+        )
+        .unwrap();
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (mut usage, mut breach) = (false, false);
+    while !(usage && breach) {
+        assert!(
+            Instant::now() < deadline,
+            "usage {usage}, breach {breach}: not both published"
+        );
+        match events.try_recv() {
+            Ok(hekma_engine::EngineEvent::UsageUpdate(_)) => usage = true,
+            Ok(hekma_engine::EngineEvent::BudgetBreach(_)) => breach = true,
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
