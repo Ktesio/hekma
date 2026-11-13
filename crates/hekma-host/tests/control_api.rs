@@ -3290,6 +3290,14 @@ fn call(
             .put(url)
             .header("Authorization", &auth)
             .send_json(json),
+        ("PATCH", Some(json)) => client
+            .patch(url)
+            .header("Authorization", &auth)
+            .send_json(json),
+        ("PATCH", None) => client
+            .patch(url)
+            .header("Authorization", &auth)
+            .send_empty(),
         ("DELETE", _) => client.delete(url).header("Authorization", &auth).call(),
         (other, _) => panic!("unsupported test method {other}"),
     }
@@ -3628,4 +3636,266 @@ fn an_auto_started_host_leaves_when_its_state_root_disappears() {
         "{}",
         sink_handle.text()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Story 21-3: the /v0/policies routes — CRUD, the reserved default, the
+// matched/fallback counts, and the typed refusals.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
+    let client = client();
+    let base = format!("http://{}/v0/policies", server.addr);
+
+    // The seeded default Policy reads before any write: warn, `off`, no
+    // ceilings, an empty Rate table (absent when empty).
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/default");
+    assert_eq!(response.status(), StatusCode::OK);
+    let document = json_body(&mut response);
+    assert_eq!(document["policy"]["limits"]["breach_action"], "warn");
+    assert_eq!(document["policy"]["limits"]["scent_check"], "off");
+
+    // Create: 201 + the Location header, answering the matched counts.
+    let mut response = call(
+        &client,
+        "POST",
+        &base,
+        Some(serde_json::json!({
+            "name": "nightly",
+            "selector": "team=research",
+            "tokens_per_run": 2_000_000,
+            "breach_action": "pause",
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response.headers()["location"].to_str().unwrap(),
+        "/v0/policies/nightly"
+    );
+    let document = json_body(&mut response);
+    assert_eq!(document["matched"], 0);
+    assert_eq!(document["fallbacks"], 0);
+
+    // A duplicate name is 409 policy-exists.
+    let mut response = call(
+        &client,
+        "POST",
+        &base,
+        Some(serde_json::json!({"name": "nightly", "selector": "team=x"})),
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(&mut response)["error"]["code"], "policy-exists");
+
+    // The default Policy's reserved shape: delete and a Selector are 409
+    // policy-default.
+    let mut response = call(&client, "DELETE", &format!("{base}/default"), None);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(&mut response)["error"]["code"], "policy-default");
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({"selector": "team=core"})),
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(&mut response)["error"]["code"], "policy-default");
+
+    // A Scent-Check Mode before Scent-Check ships is 400
+    // scent-unavailable (never stored-and-ignored).
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({"set": {"scent_check": "enforce"}})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "scent-unavailable"
+    );
+
+    // The Rate table edits through PATCH's `rates`: set, read back, remove.
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({
+            "rates": {"set": {"gpt-demo": {
+                "input_micros_per_1m": 2_000_000,
+                "output_micros_per_1m": 8_000_000,
+            }}},
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/default");
+    let document = json_body(&mut response);
+    assert_eq!(
+        document["policy"]["rates"]["gpt-demo"]["input_micros_per_1m"],
+        2_000_000
+    );
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({"rates": {"remove": ["gpt-demo"]}})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/default");
+    assert!(
+        json_body(&mut response)["policy"]["rates"].is_null(),
+        "the removed entry leaves an absent table"
+    );
+
+    // A dry run plans and writes nothing; unknown fields are 422.
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"set": {"tokens_per_run": 9_000_000}, "dry_run": true})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(&mut response)["dry_run"], true);
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/nightly");
+    assert_eq!(
+        json_body(&mut response)["policy"]["limits"]["tokens_per_run"],
+        2_000_000,
+        "the dry run wrote nothing"
+    );
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"tokens_per_run": 9})),
+    );
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Unknown fields are refused at EVERY level: a misspelled limit inside
+    // `set` (or inside a Rate) would otherwise be silently dropped, and an
+    // unknown `clear` name silently clear nothing.
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"set": {"tokens_per_rn": 5}})),
+    );
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"set": {"rate": {
+            "input_micros_per_1m": 1, "output_micros_per_1m": 1, "input_micros": 2,
+        }}})),
+    );
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // A Rate needs BOTH directions in the body: a missing one (or an
+    // empty object) is a 422, never an implicit $0; a $0 direction is the
+    // engine's 400 refusal.
+    for body in [
+        serde_json::json!({"rates": {"set": {"gpt-x": {"input_micros_per_1m": 3_000_000}}}}),
+        serde_json::json!({"rates": {"set": {"gpt-x": {"output_micros_per_1m": 3_000_000}}}}),
+        serde_json::json!({"rates": {"set": {"gpt-x": {}}}}),
+        serde_json::json!({"set": {"rate": {"input_micros_per_1m": 1}}}),
+    ] {
+        let response = call(&client, "PATCH", &format!("{base}/nightly"), Some(body));
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"set": {"rate": {
+            "input_micros_per_1m": 0, "output_micros_per_1m": 1_000_000,
+        }}})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"clear": ["tokens-per-rn"]})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "invalid-request",
+        "an unknown clear name is an engine refusal"
+    );
+
+    // The list carries every Policy, `default` included.
+    let mut response = get_ok(&client, &server.addr, "/v0/policies");
+    let document = json_body(&mut response);
+    let names: Vec<&str> = document["policies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|policy| policy["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"default"), "{names:?}");
+    assert!(names.contains(&"nightly"), "{names:?}");
+
+    // A create dry run plans and writes nothing (200, no Location).
+    let response = call(
+        &client,
+        "POST",
+        &base,
+        Some(serde_json::json!({
+            "name": "previewed", "selector": "team=x", "tokens_per_run": 5, "dry_run": true,
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = get_ok(&client, &server.addr, "/v0/policies/previewed");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND, "nothing written");
+
+    // A delete dry run reports what would loosen instead of deleting.
+    let response = call(
+        &client,
+        "DELETE",
+        &format!("{base}/nightly?dry_run=true"),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // A model in both rates.set and rates.remove is a contradiction
+    // (400), not a silent remove.
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({
+            "rates": {"set": {"gpt-x": {"input_micros_per_1m": 1, "output_micros_per_1m": 1}},
+                      "remove": ["gpt-x"]}
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // A $0 CACHED direction prices cached tokens at nothing — the engine
+    // refuses it like a $0 direction.
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({
+            "rates": {"set": {"gpt-x": {
+                "input_micros_per_1m": 1, "output_micros_per_1m": 1, "cached_micros_per_1m": 0,
+            }}}
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // An unknown name is 404 policy-not-found; delete answers 204.
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/ghost");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "policy-not-found"
+    );
+    let response = call(&client, "DELETE", &format!("{base}/nightly"), None);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = get_ok(&client, &server.addr, "/v0/policies/nightly");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    server.stop().unwrap();
 }

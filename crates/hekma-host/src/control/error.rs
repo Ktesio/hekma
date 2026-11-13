@@ -306,9 +306,13 @@ impl From<RunError> for ApiError {
     fn from(err: RunError) -> Self {
         let message = err.to_string();
         let kind = match &err {
-            RunError::NotFound { .. } | RunError::InstanceNotFound { .. } => {
-                ApiErrorKind::NotFound
-            }
+            RunError::NotFound { .. }
+            | RunError::InstanceNotFound { .. }
+            | RunError::PolicyNotFound { .. } => ApiErrorKind::NotFound,
+            // Story 21-3: the name is already taken, and the default
+            // Policy's reserved shape forbids the change (409, per the
+            // spec's error table).
+            RunError::PolicyExists { .. } | RunError::PolicyDefault { .. } => ApiErrorKind::Conflict,
             // The Run's (or its parent's) state forbids the request.
             RunError::NoOpenRun { .. }
             | RunError::ParentEnded { .. }
@@ -322,6 +326,8 @@ impl From<RunError> for ApiError {
             RunError::NestingTooDeep { .. }
             | RunError::ActionUnavailable { .. }
             | RunError::TooManyRuns { .. }
+            // Story 21-3: a Scent-Check Mode before Scent-Check ships.
+            | RunError::ScentUnavailable { .. }
             | RunError::Invalid { .. } => ApiErrorKind::InvalidBody,
             RunError::Store(_) => ApiErrorKind::Internal,
         };

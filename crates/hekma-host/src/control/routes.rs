@@ -761,3 +761,136 @@ pub(crate) async fn run_labels_patch(
         dry_run: outcome.dry_run,
     }))
 }
+
+/// One change answer from an engine outcome.
+fn policy_change_document(
+    outcome: hekma_engine::PolicyOutcome,
+    dry_run: bool,
+) -> dto::PolicyChangeDocument {
+    dto::PolicyChangeDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        policy: outcome.record,
+        matched: outcome.matched,
+        fallbacks: outcome.fallbacks,
+        notes: outcome.notes,
+        dry_run,
+    }
+}
+
+/// `GET /v0/policies` — every stored Policy (story 21-3), `default`
+/// included, by name.
+pub(crate) async fn policies_list(
+    State(state): State<ApiState>,
+) -> ApiResult<Json<dto::PolicyListDocument>> {
+    let policies = state.engine.policies().await?;
+    Ok(Json(dto::PolicyListDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        policies,
+    }))
+}
+
+/// `GET /v0/policies/{name}` — one Policy; `404 policy-not-found` when no
+/// Policy has the name.
+pub(crate) async fn policy_show(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<dto::PolicyShowDocument>> {
+    let policy = state.engine.policy(&name).await?;
+    Ok(Json(dto::PolicyShowDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        policy,
+    }))
+}
+
+/// `POST /v0/policies` — create a Policy (story 21-3). `201` with a
+/// `Location` and the matched and fallback counts (`200` on a dry run);
+/// `409 policy-exists` when the name is taken; a malformed request is
+/// `400 invalid_body`.
+pub(crate) async fn policy_create(
+    State(state): State<ApiState>,
+    ApiJson(request): ApiJson<dto::PolicyCreate>,
+) -> ApiResult<Response> {
+    let dry_run = request.dry_run;
+    let change = hekma_engine::PolicyChange {
+        name: request.name.clone(),
+        selector: Some(request.selector),
+        set: hekma_engine::PolicyLimits {
+            tokens_per_run: request.tokens_per_run,
+            tokens_cumulative: request.tokens_cumulative,
+            dollars_per_run_micros: request.dollars_per_run_micros,
+            dollars_cumulative_micros: request.dollars_cumulative_micros,
+            breach_action: request.breach_action,
+            scent_check: request.scent_check,
+            rate: request.rate.map(dto::RatePatch::into_rate),
+        },
+        clear: Vec::new(),
+        rates: std::collections::BTreeMap::new(),
+    };
+    let outcome = state.engine.create_policy(change, dry_run).await?;
+    let document = Json(policy_change_document(outcome, dry_run));
+    if dry_run {
+        return Ok(document.into_response());
+    }
+    let location = format!("/v0/policies/{}", request.name);
+    Ok((
+        StatusCode::CREATED,
+        [(header::LOCATION, location)],
+        document,
+    )
+        .into_response())
+}
+
+/// `PATCH /v0/policies/{name}` — change a Policy, the `default` Policy
+/// included (story 21-3). `200` with the Policy after (or as planned) and
+/// the matched and fallback counts; `404 policy-not-found`; a malformed
+/// change is `400 invalid_body`.
+pub(crate) async fn policy_change(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    ApiJson(request): ApiJson<dto::PolicyPatch>,
+) -> ApiResult<Json<dto::PolicyChangeDocument>> {
+    let dry_run = request.dry_run;
+    // A model named in BOTH `set` and `remove` is a contradiction, not a
+    // silent remove (the remove once won the map insert and the priced
+    // entry quietly disappeared).
+    for model in &request.rates.remove {
+        if request.rates.set.contains_key(model) {
+            return Err(ApiError::invalid_body(format!(
+                "the model `{model}` is named in both rates.set and rates.remove — pick one"
+            )));
+        }
+    }
+    let mut rates: std::collections::BTreeMap<String, Option<hekma_engine::Rate>> = request
+        .rates
+        .set
+        .into_iter()
+        .map(|(model, rate)| (model, Some(rate.into_rate())))
+        .collect();
+    for model in request.rates.remove {
+        rates.insert(model, None);
+    }
+    let change = hekma_engine::PolicyChange {
+        name,
+        selector: request.selector,
+        set: request.set.into_limits(),
+        clear: request.clear,
+        rates,
+    };
+    let outcome = state.engine.change_policy(change, dry_run).await?;
+    Ok(Json(policy_change_document(outcome, dry_run)))
+}
+
+/// `DELETE /v0/policies/{name}` — delete a Policy (story 21-3). `204`
+/// (`200` with the counts on `?dry_run=true`); `404 policy-not-found`;
+/// deleting `default` is `409 policy-default`.
+pub(crate) async fn policy_delete(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    Query(query): Query<dto::PolicyDeleteQuery>,
+) -> ApiResult<Response> {
+    let outcome = state.engine.delete_policy(&name, query.dry_run).await?;
+    if query.dry_run {
+        return Ok(Json(policy_change_document(outcome, true)).into_response());
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}

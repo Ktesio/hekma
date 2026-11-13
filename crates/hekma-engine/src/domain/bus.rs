@@ -124,6 +124,17 @@ pub enum EngineEvent {
     /// status changed, Anomalies changed, labels changed or ended —
     /// published after the writer job that caused it committed.
     Run(super::runs::RunEvent),
+    /// A Policy change (story 21-3, AD-14 amendment): created, changed or
+    /// deleted — committed with the outbox row in the change's own writer
+    /// job, published after commit. Boxed: it is the largest payload, and
+    /// the bus's fixed ring holds every variant at the enum's size, so an
+    /// inline Policy event would grow all 1024 slots (the perf-budgets RSS
+    /// ratchet caught about 120 KiB of resident memory).
+    Policy(Box<super::runs::policy::PolicyEvent>),
+    /// The one event the FR-21 breach-default upgrade emits (story 21-3):
+    /// which instances were kept on `pause`, and whether each one's config
+    /// was written.
+    BreachDefaultUpgraded(super::runs::policy::BreachDefaultUpgradedEvent),
 }
 
 /// The in-supervisor handle to the event bus: a cloneable [`broadcast::Sender`]

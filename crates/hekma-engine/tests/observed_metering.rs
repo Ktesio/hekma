@@ -575,6 +575,9 @@ fn a_token_budget_enforces_on_observed_usage_and_pauses() {
     facade
         .set_config("obsbudget", "budget.tokens.cumulative", "150")
         .unwrap();
+    facade
+        .set_config("obsbudget", "budget.breach_action", "pause")
+        .unwrap();
 
     facade.start("obsbudget").unwrap();
 
@@ -643,6 +646,9 @@ fn a_dollar_cap_enforces_on_observed_usage_labeled_estimated() {
     // 100 tokens/call at $1/1M ≈ $0.0001/call; cap $0.00015 → crossed by call 2.
     facade
         .set_config("obsdollar", "budget.dollars.cumulative", "0.00015")
+        .unwrap();
+    facade
+        .set_config("obsdollar", "budget.breach_action", "pause")
         .unwrap();
 
     facade.start("obsdollar").unwrap();

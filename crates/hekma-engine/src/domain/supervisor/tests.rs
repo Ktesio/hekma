@@ -5990,6 +5990,9 @@ fn the_release_pass_freezes_a_breach_paused_detached_child() {
     registry
         .set_config(&name, "budget.tokens.cumulative", "15")
         .unwrap();
+    registry
+        .set_config(&name, "budget.breach_action", "pause")
+        .unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let sink = install_capture_sink(&mut sup);
     sup.start_detached(&registry, "brz").unwrap();
@@ -6207,6 +6210,9 @@ fn a_breach_pause_resumes_through_the_signal_even_under_a_declared_pair() {
     let name = InstanceName::new("brpair").unwrap();
     registry
         .set_config(&name, "budget.tokens.cumulative", "15")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.breach_action", "pause")
         .unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
     sup.start(&registry, "brpair").unwrap();
@@ -7540,6 +7546,9 @@ fn adopted_breach_paused_child_notes_the_between_commands_freeze() {
     registry
         .set_config(&name, "budget.tokens.cumulative", "15")
         .unwrap();
+    registry
+        .set_config(&name, "budget.breach_action", "pause")
+        .unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
     sup.start_detached(&registry, "adopbrz").unwrap();
     drain_until_state(&mut sup, &registry, "adopbrz", LifecycleState::Paused);
@@ -8393,6 +8402,107 @@ fn a_relaunch_keeps_its_run_so_a_per_run_block_fence_carries() {
 }
 
 #[test]
+fn a_fresh_run_under_a_policy_block_ceiling_is_fenced_before_its_first_call() {
+    // Round 2, N3: a FRESH Run's start fence must resolve the Policies its
+    // configuration-bound labels select (the Run row does not exist yet at
+    // fence time). A named Policy's `block` CUMULATIVE ceiling over an
+    // already-spent lifetime refuses the agent's very first model call —
+    // 19-2's guarantee, extended to Policy-sourced ceilings. Before the
+    // fix the fresh-start resolve carried no labels, resolved the default
+    // `warn`, and let the first call through.
+    let (_state, _manifest, registry) = setup_fake("fencepolicy", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("fencepolicy").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[labels]\nteam = \"core\"\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    // The Policy: 1M cumulative tokens, `block`, matching the label the
+    // configuration binds.
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "wirecap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_cumulative: Some(1_000_000),
+                breach_action: Some(BreachAction::Block),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    // A prior Run spent 1.5M lifetime tokens. Seeded directly through the
+    // writer (the ingest path evaluates live and would fire the block
+    // itself — the fence test needs the ledger spent and NOTHING fired).
+    let earlier = RunId::mint();
+    let seed_usage = earlier.clone();
+    registry
+        .writer
+        .call(move |ctx| {
+            use crate::ports::{NewRun, RunRecords as _, RunStore as _};
+            let store = ctx.store();
+            store.insert_run(&NewRun {
+                record: crate::domain::RunRecord {
+                    run_id: seed_usage.clone(),
+                    control_depth: crate::domain::ControlDepth::Supervised,
+                    wire_path: true,
+                    status: crate::domain::runs::RunStatus::Ended,
+                    anomalies: Vec::new(),
+                    parent_run_id: None,
+                    instance: Some("fencepolicy".to_string()),
+                    process_owner: true,
+                    end_cause: Some("stopped".to_string()),
+                    created_at: "t".to_string(),
+                    updated_at: "t".to_string(),
+                    ended_at: Some("t".to_string()),
+                },
+                labels: Vec::new(),
+                limits: Default::default(),
+                identity: None,
+            })?;
+            store.insert_usage(
+                &crate::domain::usage::UsageEvent {
+                    instance: "fencepolicy".to_string(),
+                    run_id: seed_usage,
+                    input_tokens: 1_500_000,
+                    output_tokens: 0,
+                    cached_tokens: Some(0),
+                    metering_source: "engine-observed".to_string(),
+                    sequence: 1,
+                    occurred_at: "t".to_string(),
+                },
+                None,
+                1,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(Supervisor::read_breach_events(&registry, "fencepolicy")
+        .unwrap()
+        .is_empty());
+    // The FRESH start fences: the Policy's cumulative `block` ceiling
+    // refuses the first call.
+    let fresh = crate::metering::WireFence::default();
+    assert!(
+        sup.run_start_fence(&registry, &name, &fresh, None),
+        "the Policy's cumulative block ceiling fences the fresh Run"
+    );
+    assert_eq!(fresh.refusal().unwrap().code, "tokens_cumulative");
+    // `block_configured` agrees (the spawn path's belt-and-braces check).
+    assert!(sup.block_configured(&registry, &name));
+    // Without the label the Policy does not select: no fence.
+    registry.set_config(&name, "labels.team", "other").unwrap();
+    sup.sync_run_labels(&registry, &name);
+    let unfenced = crate::metering::WireFence::default();
+    assert!(!sup.run_start_fence(&registry, &name, &unfenced, None));
+}
+
+#[test]
 fn block_is_never_the_resolved_default() {
     let (_state, _manifest, registry) = setup_fake("fencedefault", &["--linger-ms", "600000"]);
     let name = InstanceName::new("fencedefault").unwrap();
@@ -8852,6 +8962,7 @@ fn adoption_bumps_the_launch_generation_so_a_restarted_sequence_still_counts() {
     };
     // The previous attach's committed sequence 0.
     let first = crate::domain::pipeline::UsageJob {
+        row_rate: None,
         event: assemble_usage_event(
             &usage,
             name.as_str(),
@@ -9179,6 +9290,1137 @@ fn child_usage_rolls_up_and_every_ancestor_ceiling_applies() {
 }
 
 #[test]
+fn the_policy_delete_dry_run_reports_and_default_is_refused_at_the_supervisor() {
+    // The delete dry run plans (the matched count) and writes nothing; the
+    // `default` Policy is refused on the dry path too.
+    let (_state, _manifest, registry) = setup_fake("poldel", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "poldel").unwrap();
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "gone".to_string(),
+            selector: Some("team=absent".parse().unwrap()),
+            set: crate::domain::PolicyLimits::default(),
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    let dry = sup
+        .delete_policy(&registry, "gone", true)
+        .expect("the dry run plans");
+    assert_eq!(dry.matched, 0);
+    assert!(
+        registry.policy("gone").unwrap().is_some(),
+        "nothing written"
+    );
+    let refusal = sup.delete_policy(&registry, "default", true).unwrap_err();
+    assert!(
+        matches!(refusal, crate::domain::RunError::PolicyDefault { .. }),
+        "{refusal}"
+    );
+    let applied = sup.delete_policy(&registry, "gone", false).unwrap();
+    assert_eq!(applied.matched, 0);
+    assert!(registry.policy("gone").unwrap().is_none());
+    let _ = sup.stop(&registry, "poldel", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_child_prices_at_the_evaluators_rate_when_its_stored_rate_is_instance_sourced() {
+    // Round 3, L5: only a POLICY-sourced Rate rides the child's stored
+    // resolution onto its ledger rows. An instance-sourced one can go
+    // stale after a `cost.rate.*` write (only the process-owning Run
+    // re-resolves then), so those rows price at the evaluator's FRESH
+    // Rate — never at a price the config no longer carries.
+    let (_state, _manifest, registry) = setup_fake("stalechild", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("stalechild").unwrap();
+    registry
+        .set_config(&name, "cost.rate.input", "2.00")
+        .unwrap();
+    registry
+        .set_config(&name, "cost.rate.output", "2.00")
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "stalechild").unwrap();
+    let child = sup
+        .open_child_run(
+            &registry,
+            crate::domain::ChildRunRequest::under(crate::domain::RunParent::Instance(
+                "stalechild".to_string(),
+            )),
+        )
+        .unwrap();
+    // The child's stored resolution carries the INSTANCE rate ($2/$2).
+    let view = registry.run_view(&child.record.run_id).unwrap();
+    assert_eq!(
+        view.policy.as_ref().unwrap().rate,
+        Some(crate::domain::Rate::new(2_000_000, 2_000_000)),
+        "the stored resolution is instance-priced"
+    );
+    // The operator then changes the instance rate; only the owner
+    // re-resolves — the child's stored row is now stale.
+    registry
+        .set_config(&name, "cost.rate.input", "1.00")
+        .unwrap();
+    sup.sync_run_policy(&registry, &name);
+    let view = registry.run_view(&child.record.run_id).unwrap();
+    assert_eq!(
+        view.policy.as_ref().unwrap().rate,
+        Some(crate::domain::Rate::new(2_000_000, 2_000_000)),
+        "the child's stored row is one read behind (by design)"
+    );
+    // The child's usage rows price at the evaluator's FRESH $1/$2 rate.
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &child.record.run_id,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    let view = registry.run_view(&child.record.run_id).unwrap();
+    // 1M input at $1/1M = $1 = 1,000,000 micros (not the stale $2).
+    assert_eq!(view.usage.cost_micros, crate::domain::Micros(1_000_000));
+    let _ = sup.stop(&registry, "stalechild", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_child_priced_by_its_own_policy_rate_breaches_its_own_dollar_cap() {
+    // Round 2, N4: the owner Run is UNPRICED (no instance Rate, no table
+    // entry). A child bound `team=core` sits under a Policy with a flat
+    // Rate ($1/$1 per 1M) and a child-only per-run Cost Cap. The child's
+    // usage rows price at the CHILD's resolved Rate, so its own dollar
+    // arm sees real cost and FIRES — before the fix the rows priced at
+    // the owner's Rate (none), the cost stayed 0, the cap never fired and
+    // no `unpriced-model` Anomaly existed to say so.
+    let (_state, _manifest, registry) = setup_fake("poldchild", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("poldchild").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "poldchild").unwrap();
+    let owner = open_run(&registry, "poldchild").record.run_id;
+    let child = sup
+        .open_child_run(
+            &registry,
+            crate::domain::ChildRunRequest::under(crate::domain::RunParent::Instance(
+                "poldchild".to_string(),
+            )),
+        )
+        .unwrap();
+    let child_id = child.record.run_id.clone();
+    registry
+        .run_job(move |store| {
+            crate::domain::runs::ops::label(
+                store,
+                &child_id,
+                &crate::domain::LabelChange::set([("team", "core")]),
+                &[],
+                false,
+                &crate::time::now_rfc3339(),
+            )
+        })
+        .unwrap();
+    // The Policy: $1/$1 per 1M, a 100-micro-dollar per-run cap on the
+    // child's own level (warn — a child breach never acts on the process).
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "kidrate".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                dollars_per_run_micros: Some(100),
+                rate: Some(crate::domain::Rate::new(1_000_000, 1_000_000)),
+                breach_action: Some(BreachAction::Warn),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    // 150 tokens on the child = 150 micro-dollars at the child's Rate —
+    // over the 100-micro cap.
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &child.record.run_id,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    // The child's ledger rows priced at its own Rate: the derived cost is
+    // real, the child's dollar arm fired, and the owner (no cap) stayed
+    // quiet.
+    let child_view = registry.run_view(&child.record.run_id).unwrap();
+    assert_eq!(child_view.usage.cost_micros, crate::domain::Micros(150));
+    let breaches = Supervisor::read_breach_events(&registry, "poldchild").unwrap();
+    assert_eq!(breaches.len(), 1, "{breaches:?}");
+    assert_eq!(breaches[0].run_id, child.record.run_id.as_str());
+    assert_eq!(
+        breaches[0].dimension,
+        crate::domain::BreachDimension::Dollars
+    );
+    assert_eq!(breaches[0].limit, 100);
+    assert_eq!(breaches[0].action, BreachAction::Warn);
+    assert!(child_view
+        .record
+        .anomalies
+        .contains(&crate::domain::Anomaly::Breach));
+    let owner_view = registry.run_view(&owner).unwrap();
+    assert!(!owner_view
+        .record
+        .anomalies
+        .contains(&crate::domain::Anomaly::Breach));
+    assert_eq!(state_of(&registry, "poldchild"), LifecycleState::Running);
+    let _ = sup.stop(&registry, "poldchild", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_foreign_engines_change_leaves_the_breach_to_the_supervising_engine() {
+    // Round 2, N2, end to end: engine B (no supervision of the agent)
+    // lowers a Policy below a Run's usage — it must NOT latch or record
+    // the breach (a foreign latch once spent the scope for the
+    // supervising engine's decide, and the crossing never fired). Engine
+    // A — the supervising engine — picks the new set up at its next tick
+    // and its own live evaluation fires the breach under its own fence
+    // and lifecycle.
+    let (_state, _manifest, registry) = setup_fake("polghost", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("polghost").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "polghost").unwrap();
+    let run = open_run(&registry, "polghost").record.run_id;
+    registry.set_config(&name, "labels.team", "ghost").unwrap();
+    sup.sync_run_labels(&registry, &name);
+    // Spend under a high ceiling.
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "ghostcap".to_string(),
+            selector: Some("team=ghost".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(1_000_000),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 2_000,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    assert!(Supervisor::read_breach_events(&registry, "polghost")
+        .unwrap()
+        .is_empty());
+    // ENGINE B: a second registry on the same state dir lowers the
+    // ceiling below the usage. No breach may be recorded or latched.
+    let second = Registry::open(Some(_state.path().to_path_buf())).unwrap();
+    second
+        .apply_policy_change(
+            second.policy("ghostcap").unwrap(),
+            crate::domain::PolicyChange {
+                name: "ghostcap".to_string(),
+                selector: Some("team=ghost".parse().unwrap()),
+                set: crate::domain::PolicyLimits {
+                    tokens_per_run: Some(1_000),
+                    ..Default::default()
+                },
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            Default::default(),
+        )
+        .unwrap();
+    assert!(
+        Supervisor::read_breach_events(&registry, "polghost")
+            .unwrap()
+            .is_empty(),
+        "the foreign engine recorded nothing"
+    );
+    use crate::ports::RunStore as _;
+    assert!(
+        registry.reader().latches(&run).unwrap().is_empty(),
+        "the foreign engine latched nothing"
+    );
+    // ENGINE A: one tick refreshes its set, and the very next usage event
+    // fires the breach under A's own lifecycle (warn action: recorded,
+    // process untouched).
+    registry.refresh_policy_cache();
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 2,
+            input_tokens: 1,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    let breaches = Supervisor::read_breach_events(&registry, "polghost").unwrap();
+    assert_eq!(breaches.len(), 1, "{breaches:?}");
+    assert_eq!(breaches[0].limit, 1_000);
+    assert_eq!(breaches[0].run_id, run.as_str());
+    let _ = sup.stop(&registry, "polghost", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn an_unsupervised_instances_re_resolve_uses_fresh_inputs() {
+    // Round 2, N16: a matched Run whose instance this engine does NOT
+    // supervise still re-resolves with FRESH inputs (the change facade
+    // builds contexts for every instance with an open Run) — its stored
+    // row does not run one config read behind, and a ceiling the operator
+    // set between changes shows up on the next change. The money half
+    // still never runs for it (the supervising engine owns the latch).
+    let (_state, _manifest, registry) = setup_fake("staleinputs", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("staleinputs").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    // An open process-owning Run for an instance that is NOT running here.
+    let ghost = RunId::mint();
+    let run = crate::domain::runs::ops::SupervisedRun {
+        instance: name.clone(),
+        run_id: ghost.clone(),
+        wire_path: false,
+        labels: vec![crate::domain::Label::bound("team", "ghost")],
+        fresh: true,
+        inputs: None,
+    };
+    registry.ensure_supervised_run(run).unwrap();
+    // A first change resolves and stores a row (no explicit inputs yet).
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "ghostact".to_string(),
+            selector: Some("team=ghost".parse().unwrap()),
+            set: crate::domain::PolicyLimits::default(),
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    // The operator then sets an explicit ceiling in the config — the
+    // stored row knows nothing of it.
+    std::fs::create_dir_all(registry.paths().instance_config(&name).parent().unwrap()).unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget.tokens]\nper_run = 400\n",
+    )
+    .unwrap();
+    // Any later change re-resolves with the FRESH inputs: the row carries
+    // the explicit 400 (the stored inputs would have stayed empty).
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "ghostact2".to_string(),
+            selector: Some("team=ghost".parse().unwrap()),
+            set: crate::domain::PolicyLimits::default(),
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    let view = registry.run_view(&ghost).unwrap();
+    assert_eq!(
+        view.policy.as_ref().unwrap().tokens.per_run,
+        Some(400),
+        "the fresh inputs resolved for the unsupervised instance"
+    );
+    // And no breach/latch was recorded here (the money half did not run).
+    assert!(Supervisor::read_breach_events(&registry, "staleinputs")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn a_policy_change_publishes_on_the_bus_in_commit_order() {
+    // Round 2, N7: bus order == outbox (commit) order. A change that fires
+    // a breach appends the BREACH row first (inside the re-resolution),
+    // then the Policy event, then the Run events — the bus must publish
+    // them in that same order (the pre-fix order was Policy, Runs,
+    // breaches, so SSE and export consumers saw different sequences).
+    let (_state, _manifest, registry) = setup_fake("polbus", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("polbus").unwrap();
+    registry.set_config(&name, "labels.team", "core").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "polbus").unwrap();
+    let run = open_run(&registry, "polbus").record.run_id;
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 1_000,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    let mut receiver = sup.events.subscribe();
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "buscap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(500),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    // Drain what the change published and reduce to the three families.
+    let mut order: Vec<&'static str> = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        let family = match event {
+            crate::domain::EngineEvent::BudgetBreach(_) => "breach",
+            crate::domain::EngineEvent::Policy(_) => "policy",
+            crate::domain::EngineEvent::Run(_) => "run",
+            _ => continue,
+        };
+        if order.last().copied() != Some(family) {
+            order.push(family);
+        }
+    }
+    assert_eq!(
+        order,
+        vec!["breach", "policy", "run"],
+        "the bus publishes in outbox order"
+    );
+    // The outbox itself agrees (the durable order the bus mirrors) —
+    // from the change's own first row on (the earlier history is the
+    // start's, not the change's).
+    let batch = crate::domain::export_core(&registry, None, 0).unwrap();
+    let first_change_seq = batch
+        .events
+        .iter()
+        .position(|entry| {
+            matches!(
+                &entry.event,
+                crate::domain::EngineEvent::BudgetBreach(breach) if breach.limit == 500
+            )
+        })
+        .expect("the change's breach row");
+    let durable: Vec<&'static str> = batch.events[first_change_seq..]
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            crate::domain::EngineEvent::BudgetBreach(_) => Some("breach"),
+            crate::domain::EngineEvent::Policy(_) => Some("policy"),
+            crate::domain::EngineEvent::Run(_) => Some("run"),
+            _ => None,
+        })
+        .collect();
+    let mut reduced: Vec<&'static str> = Vec::new();
+    for family in durable {
+        if reduced.last().copied() != Some(family) {
+            reduced.push(family);
+        }
+    }
+    assert_eq!(reduced, vec!["breach", "policy", "run"], "the outbox order");
+    let _ = sup.stop(&registry, "polbus", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_degraded_cache_still_breaches_an_explicit_instance_ceiling() {
+    // The N1 end-to-end pin: a corrupt Policy row degrades the cache, and
+    // the instance carries an EXPLICIT token ceiling in its config. The
+    // usage event must still breach at that ceiling — action held at
+    // `pause`, arms kept — never the armless fail-open that turned every
+    // budget in the fleet off. (Pause is guaranteed on this OS so the
+    // forced action really applies.)
+    let state = tempfile::TempDir::new().unwrap();
+    let manifest = tempfile::TempDir::new().unwrap();
+    write_pause_guaranteed_manifest(manifest.path(), "keeparms", &["--linger-ms", "600000"]);
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "keeparms",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("keeparms").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget.tokens]\nper_run = 100\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "keeparms").unwrap();
+    let run = open_run(&registry, "keeparms").record.run_id;
+    // A corrupt Policy row degrades the cache (the whole policies read
+    // fails on it).
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "INSERT INTO policies (name, selector, created_at, updated_at) \
+                 VALUES ('broken', 'team=', 't', 't')",
+            );
+            Ok(())
+        })
+        .unwrap();
+    let note = registry
+        .load_policy_cache()
+        .expect("the corrupt row degrades the cache");
+    assert!(note.contains("could not be read"), "{note}");
+    // The usage event breaches the EXPLICIT ceiling under the degraded
+    // cache, and the forced `pause` applies.
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 150,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    let breaches = Supervisor::read_breach_events(&registry, "keeparms").unwrap();
+    assert_eq!(breaches.len(), 1, "{breaches:?}");
+    assert_eq!(breaches[0].limit, 100);
+    assert_eq!(breaches[0].action, BreachAction::Pause);
+    assert_eq!(state_of(&registry, "keeparms"), LifecycleState::Paused);
+    let _ = sup.stop(&registry, "keeparms", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn the_tick_degradation_notice_latches_and_re_arms() {
+    // The tick-time reload failure surfaces ONCE per continuous degraded
+    // state (never an unbounded open-notes growth), and the notice
+    // re-arms once the cache reads healthy again.
+    let (_state, _manifest, registry) = setup_fake("ticknote", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    let insert_corrupt = |registry: &Registry| {
+        registry
+            .writer
+            .call(|ctx| {
+                ctx.store().execute_batch_for_test(
+                    "INSERT INTO policies (name, selector, created_at, updated_at) \
+                     VALUES ('broken', 'team=', 't', 't')",
+                );
+                Ok(())
+            })
+            .unwrap()
+    };
+    let remove_corrupt = |registry: &Registry| {
+        registry
+            .writer
+            .call(|ctx| {
+                ctx.store()
+                    .execute_batch_for_test("DELETE FROM policies WHERE name = 'broken'");
+                Ok(())
+            })
+            .unwrap()
+    };
+    // A healthy tick says nothing.
+    sup.drain_usage_all(&registry);
+    assert!(!sink_text(&buffer).contains("Policies could not be reloaded"));
+    // A corrupt row moves the fingerprint: the next tick's reload fails,
+    // and the FIRST failing tick says so while the second stays quiet.
+    insert_corrupt(&registry);
+    sup.drain_usage_all(&registry);
+    let first = sink_text(&buffer);
+    assert!(
+        first.contains("Policies could not be reloaded"),
+        "the degradation is surfaced: {first}"
+    );
+    assert!(
+        first.contains("last good set"),
+        "the notice says enforcement continues: {first}"
+    );
+    sup.drain_usage_all(&registry);
+    assert_eq!(
+        sink_text(&buffer),
+        first,
+        "the notice latches: no second emission while the state holds"
+    );
+    // Removing the row heals the cache; a later degradation says so again
+    // (the latch re-armed on the healthy tick).
+    remove_corrupt(&registry);
+    sup.drain_usage_all(&registry);
+    let healthy_len = sink_text(&buffer).len();
+    insert_corrupt(&registry);
+    sup.drain_usage_all(&registry);
+    assert!(
+        sink_text(&buffer).len() > healthy_len,
+        "the re-armed notice fires on the next degradation"
+    );
+}
+
+#[test]
+fn a_corrupt_default_row_is_restored_by_a_change() {
+    // Round 3, M2's corrupt-default arm: the row cannot be read or
+    // deleted (the name is reserved), so `change default` (the CLI's
+    // route) falls back to the KNOWN SEED as the prior and restores it —
+    // the one write that can heal the cache.
+    let (_state, _manifest, registry) = setup_fake("healdefault", &["--linger-ms", "600000"]);
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "UPDATE policies SET scent_check = 'maybe' WHERE name = 'default'",
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(registry.policy("default").is_err());
+    let note = registry
+        .load_policy_cache()
+        .expect("the corrupt default degrades the load");
+    assert!(note.contains("could not be read"), "{note}");
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let outcome = sup
+        .change_policy(
+            &registry,
+            crate::domain::PolicyChange {
+                name: "default".to_string(),
+                selector: None,
+                set: crate::domain::PolicyLimits {
+                    breach_action: Some(BreachAction::Warn),
+                    ..Default::default()
+                },
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            false,
+        )
+        .expect("the change falls back to the seed and restores the row");
+    assert_eq!(outcome.record.as_ref().unwrap().name, "default");
+    assert!(registry.policy("default").unwrap().is_some());
+    assert!(
+        registry.load_policy_cache().is_none(),
+        "the change healed the cache"
+    );
+}
+
+#[test]
+fn a_foreign_raise_re_arms_the_supervising_engines_latched_run() {
+    // Round 3, M1: engine A supervises `x` and latches a per-run breach at
+    // 500 tokens. The Operator RAISES the Policy to 2M through engine B
+    // (no supervision of `x`): the unlatch still happens (a shared-DB
+    // write), and engine A's tick reload re-arms its own view — the next
+    // crossing of the raised ceiling FIRES AGAIN. The round-2 gate once
+    // skipped the whole re-arm for unsupervised instances, leaving the
+    // latch forever and spend unbounded.
+    let (_state, _manifest, registry) = setup_fake("forenraise", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("forenraise").unwrap();
+    registry.set_config(&name, "labels.team", "core").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "forenraise").unwrap();
+    let run = open_run(&registry, "forenraise").record.run_id;
+    // The Policy at 500: the first usage breaches and pauses.
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "raiser".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(500),
+                breach_action: Some(BreachAction::Warn),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 600,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        Supervisor::read_breach_events(&registry, "forenraise")
+            .unwrap()
+            .len(),
+        1
+    );
+    use crate::ports::RunStore as _;
+    assert_eq!(registry.reader().latches(&run).unwrap().len(), 1);
+    // ENGINE B raises to 2M (a foreign change; no context for `x`).
+    let second = Registry::open(Some(_state.path().to_path_buf())).unwrap();
+    second
+        .apply_policy_change(
+            second.policy("raiser").unwrap(),
+            crate::domain::PolicyChange {
+                name: "raiser".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: crate::domain::PolicyLimits {
+                    tokens_per_run: Some(2_000_000),
+                    breach_action: Some(BreachAction::Warn),
+                    ..Default::default()
+                },
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            Default::default(),
+        )
+        .unwrap();
+    // The unlatch happened (any engine may write it).
+    assert!(
+        registry.reader().latches(&run).unwrap().is_empty(),
+        "the foreign raise unlatched the shared latch"
+    );
+    // ENGINE A's tick picks the raise up; the next crossing fires AGAIN.
+    registry.refresh_policy_cache();
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 2,
+            input_tokens: 2_000_000,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    let breaches = Supervisor::read_breach_events(&registry, "forenraise").unwrap();
+    assert_eq!(
+        breaches.len(),
+        2,
+        "the raised ceiling re-armed: the second crossing fires: {breaches:?}"
+    );
+    assert_eq!(breaches[1].limit, 2_000_000);
+    let _ = sup.stop(&registry, "forenraise", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn the_supervisors_delete_of_a_corrupt_policy_row_plans_and_deletes_by_name() {
+    // Round 3, coverage of the supervisor delete path's corrupt-row arm:
+    // the dry run reports the unreadable scope instead of failing, and
+    // the real delete removes the row by name and heals the cache.
+    let (_state, _manifest, registry) = setup_fake("delcorrupt", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "INSERT INTO policies (name, selector, created_at, updated_at) \
+                 VALUES ('broken', 'team=', 't', 't')",
+            );
+            Ok(())
+        })
+        .unwrap();
+    // The dry run answers with the unreadable-scope note.
+    let dry = sup.delete_policy(&registry, "broken", true).unwrap();
+    assert_eq!(dry.matched, 0);
+    assert!(
+        dry.notes
+            .iter()
+            .any(|note| note.contains("unreadable shape")),
+        "{:?}",
+        dry.notes
+    );
+    // The real delete removes it and heals the cache.
+    let applied = sup.delete_policy(&registry, "broken", false).unwrap();
+    assert!(
+        applied
+            .notes
+            .iter()
+            .any(|note| note.contains("unreadable Selector")),
+        "{:?}",
+        applied.notes
+    );
+    assert!(registry.policy("broken").unwrap().is_none());
+    assert!(registry.load_policy_cache().is_none(), "healed");
+}
+
+#[test]
+fn a_foreign_raise_lifts_the_supervising_engines_fence_on_its_tick() {
+    // Round 3, M1's fence half: engine A's listener fence holds a `block`
+    // reason whose latch engine B's raise removed. A's tick reload clears
+    // the orphaned fence reason — the fence comes DOWN without a new
+    // breach.
+    let upstream = start_fence_upstream();
+    let (state, _manifest, registry, rt, name) =
+        setup_block_instance("fencreload", &upstream.base_url, &[("labels.team", "core")]);
+    let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    sup.start(&registry, "fencreload").unwrap();
+    let base = fence_listener_url(&sup, &name);
+    let run = open_run(&registry, "fencreload").record.run_id;
+    // One proxied call generates the observed usage the breach needs.
+    let (status, _, _) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
+    assert_eq!(status, 200);
+    // A `block` Policy at 10 tokens per run: the observed usage breaches
+    // and the fence goes up.
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "fencecap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(10),
+                breach_action: Some(BreachAction::Block),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    let breaches = drain_observed_until_breaches(&mut sup, &registry, "fencreload", 1);
+    assert_eq!(breaches[0].action, BreachAction::Block);
+    let (status, _, _) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
+    assert_eq!(status, 402, "the block breach fenced the listener");
+    // ENGINE B (no supervision of the agent) RAISES the ceiling above the
+    // usage: the latch unlatches, and engine A's tick clears the orphaned
+    // fence reason.
+    let second = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    second
+        .apply_policy_change(
+            second.policy("fencecap").unwrap(),
+            crate::domain::PolicyChange {
+                name: "fencecap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: crate::domain::PolicyLimits {
+                    tokens_per_run: Some(10_000_000),
+                    breach_action: Some(BreachAction::Block),
+                    ..Default::default()
+                },
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            Default::default(),
+        )
+        .unwrap();
+    use crate::ports::RunStore as _;
+    assert!(
+        registry.reader().latches(&run).unwrap().is_empty(),
+        "the foreign raise unlatched"
+    );
+    // Engine A's TICK (the reaper cadence): the reload's re-check clears
+    // the fence reason whose latch is gone.
+    sup.drain_usage_all(&registry);
+    let (status, _, body) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
+    assert_eq!(status, 200, "the fence lifted on the reload: {body}");
+    sup.stop(&registry, "fencreload", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn a_foreign_lowering_fires_on_the_supervising_engines_tick() {
+    // Round 3, M1's other half: engine B lowers the Policy below the
+    // usage of an agent engine A supervises (B cannot latch what it
+    // cannot execute). Engine A's tick reloads the set and its re-check
+    // evaluates — the breach fires WITHOUT any new usage event, under
+    // A's own fence and lifecycle.
+    let (_state, _manifest, registry) = setup_fake("forenlower", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("forenlower").unwrap();
+    registry.set_config(&name, "labels.team", "core").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "forenlower").unwrap();
+    let run = open_run(&registry, "forenlower").record.run_id;
+    // High ceiling, some usage: nothing fires.
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "lowerer".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(2_000_000),
+                breach_action: Some(BreachAction::Warn),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 600,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    assert!(Supervisor::read_breach_events(&registry, "forenlower")
+        .unwrap()
+        .is_empty());
+    // ENGINE B lowers below the usage.
+    let second = Registry::open(Some(_state.path().to_path_buf())).unwrap();
+    second
+        .apply_policy_change(
+            second.policy("lowerer").unwrap(),
+            crate::domain::PolicyChange {
+                name: "lowerer".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: crate::domain::PolicyLimits {
+                    tokens_per_run: Some(500),
+                    breach_action: Some(BreachAction::Warn),
+                    ..Default::default()
+                },
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            Default::default(),
+        )
+        .unwrap();
+    // No breach yet (B latched nothing).
+    assert!(Supervisor::read_breach_events(&registry, "forenlower")
+        .unwrap()
+        .is_empty());
+    // ENGINE A's TICK (the reaper cadence): the reload re-check fires it.
+    sup.drain_usage_all(&registry);
+    let breaches = Supervisor::read_breach_events(&registry, "forenlower").unwrap();
+    assert_eq!(
+        breaches.len(),
+        1,
+        "the tick re-check fired the foreign lowering: {breaches:?}"
+    );
+    assert_eq!(breaches[0].limit, 500);
+    let _ = sup.stop(&registry, "forenlower", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_raise_during_a_restart_backoff_re_arms_the_kept_run() {
+    // Round 3, M1's second topology, one engine: the crash path removes
+    // the instance from `running` while its Run stays open (the Restart
+    // Policy backoff window). A raise in that window has no supervised
+    // context — the unlatch must still happen, so the relaunched Run's
+    // raised ceiling is live (and its old latch does not silence the
+    // next crossing).
+    let (_state, _manifest, registry) = setup_fake(
+        "backoffraise",
+        &["--crash-after-ms", "450", "--linger-ms", "600000"],
+    );
+    let name = InstanceName::new("backoffraise").unwrap();
+    registry
+        .set_restart_policy(&name, RestartPolicy::OnFailure)
+        .unwrap();
+    registry.set_config(&name, "labels.team", "core").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "backoffraise").unwrap();
+    let run = open_run(&registry, "backoffraise").record.run_id;
+    // Latch at 500 (warn: the process keeps running until the crash).
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "backoffcap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(500),
+                breach_action: Some(BreachAction::Warn),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 600,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    use crate::ports::RunStore as _;
+    assert_eq!(registry.reader().latches(&run).unwrap().len(), 1);
+    // The crash lands the instance in the backoff window (not running,
+    // Run still open).
+    let plans = wait_for_crash(&mut sup, &registry);
+    assert_eq!(plans.len(), 1);
+    assert!(registry.reader().latches(&run).unwrap().len() == 1);
+    // The Operator RAISES during the backoff: no supervised context, but
+    // the unlatch happens anyway.
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "backoffcap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(2_000_000),
+                breach_action: Some(BreachAction::Warn),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    assert!(
+        registry.reader().latches(&run).unwrap().is_empty(),
+        "the raise during the backoff re-armed the kept Run"
+    );
+    // The relaunch keeps the Run; the raised ceiling is live.
+    std::thread::sleep(plans[0].delay);
+    sup.restart(&registry, "backoffraise", plans[0].attempt, plans[0].delay)
+        .unwrap();
+    assert_eq!(open_run(&registry, "backoffraise").record.run_id, run);
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 2,
+            input_tokens: 2_000_000,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    let breaches = Supervisor::read_breach_events(&registry, "backoffraise").unwrap();
+    assert_eq!(
+        breaches.len(),
+        2,
+        "the raised ceiling fired on the relaunched Run: {breaches:?}"
+    );
+    let _ = sup.stop(&registry, "backoffraise", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_child_run_bound_into_a_policy_breaches_from_its_own_usage() {
+    // Story 21-3 (review round 1, finding 2): a child Run bound into a
+    // Policy BY LABEL (the verb — the announce path's labels are Caller
+    // labels) enforces the Policy's ceiling on its OWN level: usage
+    // attributed to the child breaches on the child's Run (under `warn` at
+    // its depth — a child breach never acts on the shared process), while
+    // the process-owning Run, whose labels do not match, stays unbreached
+    // and the process keeps running.
+    let (_state, _manifest, registry) = setup_fake("polkid", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("polkid").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "polkid").unwrap();
+    let owner = open_run(&registry, "polkid");
+    assert!(
+        owner.labels.is_empty(),
+        "no configuration label: the owner must not match"
+    );
+    // The child, opened under the owner, binds the label through the verb.
+    let child = sup
+        .open_child_run(
+            &registry,
+            crate::domain::ChildRunRequest::under(crate::domain::RunParent::Instance(
+                "polkid".to_string(),
+            )),
+        )
+        .unwrap();
+    let child_id = child.record.run_id.clone();
+    registry
+        .run_job(move |store| {
+            crate::domain::runs::ops::label(
+                store,
+                &child_id,
+                &crate::domain::LabelChange::set([("team", "core")]),
+                &[],
+                false,
+                &crate::time::now_rfc3339(),
+            )
+        })
+        .unwrap();
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "kidcap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(60),
+                breach_action: Some(BreachAction::Warn),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    // The child's stored resolution carries the Policy ceiling (its own
+    // level is armed); the owner's does not.
+    let child_view = registry.run_view(&child.record.run_id).unwrap();
+    let resolution = child_view.policy.as_ref().expect("the child resolved");
+    assert_eq!(resolution.tokens.per_run, Some(60));
+    assert!(matches!(
+        resolution.sources.tokens_per_run,
+        crate::domain::LimitSource::Policy(ref policy) if policy == "kidcap"
+    ));
+    let owner_view = registry.run_view(&owner.record.run_id).unwrap();
+    assert!(owner_view.policy.as_ref().unwrap().tokens.per_run.is_none());
+
+    // Usage THROUGH the child's id: 3 events × 30 = 90 > 60 → the child's
+    // own level breaches.
+    let usage = |sequence, tokens| ParsedUsage {
+        sequence,
+        input_tokens: tokens,
+        output_tokens: 0,
+        cached_tokens: 0,
+    };
+    for sequence in 1..=3 {
+        sup.commit_run_usage(&registry, &name, &child.record.run_id, &usage(sequence, 30))
+            .unwrap();
+    }
+    let breaches = Supervisor::read_breach_events(&registry, "polkid").unwrap();
+    assert_eq!(breaches.len(), 1, "{breaches:?}");
+    assert_eq!(breaches[0].run_id, child.record.run_id.as_str());
+    assert_eq!(breaches[0].action, BreachAction::Warn);
+    assert_eq!(breaches[0].limit, 60);
+    let child_view = registry.run_view(&child.record.run_id).unwrap();
+    assert!(child_view
+        .record
+        .anomalies
+        .contains(&crate::domain::Anomaly::Breach));
+    let owner_view = registry.run_view(&owner.record.run_id).unwrap();
+    assert!(!owner_view
+        .record
+        .anomalies
+        .contains(&crate::domain::Anomaly::Breach));
+    // A child breach never acts on the shared process.
+    assert_eq!(state_of(&registry, "polkid"), LifecycleState::Running);
+    let _ = sup.stop(&registry, "polkid", Some(Duration::from_secs(5)));
+}
+
+#[test]
 fn a_relaunch_re_applies_a_latched_process_breach_action() {
     // Review round 1 (finding 1): a relaunch keeps the Run and its spent
     // latch, so a `stop` (or `pause`) the Run already fired must be applied
@@ -9218,6 +10460,109 @@ fn a_relaunch_re_applies_a_latched_process_breach_action() {
     assert!(sink_text(&buffer).contains("re-applying it"));
     let ended = registry.run_view(&run).unwrap();
     assert_eq!(ended.record.status, crate::domain::RunStatus::Ended);
+}
+
+#[test]
+fn a_relaunch_does_not_re_apply_a_breach_the_operator_raised_away() {
+    // Round 3, L3: the relaunch re-applies only breaches whose
+    // `(dimension, scope)` is STILL latched. The Operator raising the
+    // ceiling (or clearing it) unlatches; re-applying the spent breach
+    // once re-paused a relaunched agent under a ceiling it no longer
+    // crosses.
+    let state = tempfile::TempDir::new().unwrap();
+    let manifest = tempfile::TempDir::new().unwrap();
+    write_pause_guaranteed_manifest(manifest.path(), "rununlatch", &["--crash-after-ms", "450"]);
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "rununlatch",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("rununlatch").unwrap();
+    registry
+        .set_restart_policy(&name, RestartPolicy::OnFailure)
+        .unwrap();
+    registry.set_config(&name, "labels.team", "core").unwrap();
+    // The Policy (pause: the breach pauses without ending the Run) exists
+    // before the start.
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "relatch".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(10),
+                breach_action: Some(BreachAction::Pause),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    sup.start(&registry, "rununlatch").unwrap();
+    let run = open_run(&registry, "rununlatch").record.run_id;
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 12,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    use crate::ports::RunStore as _;
+    assert_eq!(registry.reader().latches(&run).unwrap().len(), 1);
+    // The agent resumes, then crashes into the backoff window (the
+    // instance leaves `running` while its Run stays open). Poll until it
+    // does — bounded.
+    sup.resume(&registry, "rununlatch").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sup.running.contains_key(&name) {
+        sup.poll_once(&registry);
+        assert!(Instant::now() < deadline, "the crash was never detected");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The Operator RAISES the ceiling above the usage during the backoff:
+    // the latch re-arms away (no supervised context, but the unlatch is a
+    // shared-DB write), and the relaunch must NOT re-apply the spent
+    // `pause`.
+    let outcome = sup
+        .change_policy(
+            &registry,
+            crate::domain::PolicyChange {
+                name: "relatch".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: crate::domain::PolicyLimits {
+                    tokens_per_run: Some(10_000_000),
+                    breach_action: Some(BreachAction::Pause),
+                    ..Default::default()
+                },
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(outcome.matched, 1, "{:?}", outcome.notes);
+    assert!(
+        registry.reader().latches(&run).unwrap().is_empty(),
+        "the raise unlatched the spent breach"
+    );
+    sup.restart(&registry, "rununlatch", 1, Duration::from_millis(1))
+        .unwrap();
+    assert_eq!(
+        state_of(&registry, "rununlatch"),
+        LifecycleState::Running,
+        "the spent breach is not re-applied after the raise"
+    );
+    let _ = sup.stop(&registry, "rununlatch", Some(Duration::from_secs(5)));
 }
 
 #[test]

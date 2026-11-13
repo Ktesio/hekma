@@ -121,7 +121,8 @@ fn wait_for_usage_rows(state_dir: &Path, name: &str, expected: u64, within: Dura
 #[test]
 fn a_cumulative_budget_breach_pauses_by_default_and_records_the_breach() {
     // AC-A: a Token Budget on a running instance, when metered consumption REACHES
-    // it, drives the DEFAULT Breach Action (pause) via the Epic-1 lifecycle, and a
+    // it, drives the configured Breach Action (pause, set below) via the Epic-1
+    // lifecycle, and a
     // breach event is ALWAYS recorded. 5 events × 30 tokens = 150; a cumulative
     // budget of 90 breaches on the 3rd event (90 >= 90). The instance reaches
     // `paused` (asserted on committed STATE), a BudgetBreachEvent is recorded, and
@@ -140,9 +141,13 @@ fn a_cumulative_budget_breach_pauses_by_default_and_records_the_breach() {
         .register_with_adapter("cap", &AdapterRef::Manifest(manifest.path().to_path_buf()))
         .unwrap();
     // Budget BEFORE start: a cumulative ceiling of 90 tokens (breaches at event 3).
-    // Default action (pause) — not set explicitly, proving the ratified default.
+    // `pause` set explicitly (the shipped default is `warn` since Policies
+    // landed; this test pins the pause path).
     facade
         .set_config("cap", "budget.tokens.cumulative", "90")
+        .unwrap();
+    facade
+        .set_config("cap", "budget.breach_action", "pause")
         .unwrap();
 
     facade.start("cap").unwrap();
@@ -228,6 +233,9 @@ fn the_ge_boundary_a_total_exactly_at_the_budget_breaches() {
             "budget.tokens.cumulative",
             &TOKENS_PER_EVENT.to_string(),
         )
+        .unwrap();
+    facade
+        .set_config("edge", "budget.breach_action", "pause")
         .unwrap();
 
     facade.start("edge").unwrap();
@@ -513,6 +521,9 @@ fn a_per_run_budget_breaches_within_the_run() {
     facade
         .set_config("perrun", "budget.tokens.per_run", "60")
         .unwrap();
+    facade
+        .set_config("perrun", "budget.breach_action", "pause")
+        .unwrap();
 
     facade.start("perrun").unwrap();
     wait_for_state(
@@ -580,6 +591,9 @@ fn cached_tokens_enforce_inside_the_inclusive_input_never_added_again() {
     // (inside input) counts.
     facade
         .set_config("cached", "budget.tokens.cumulative", "25")
+        .unwrap();
+    facade
+        .set_config("cached", "budget.breach_action", "pause")
         .unwrap();
     facade.start("cached").unwrap();
     wait_for_state(
@@ -649,6 +663,9 @@ fn cached_tokens_enforce_inside_the_inclusive_input_never_added_again() {
     facade2
         .set_config("cached2", "budget.tokens.cumulative", "35")
         .unwrap();
+    facade2
+        .set_config("cached2", "budget.breach_action", "pause")
+        .unwrap();
     facade2.start("cached2").unwrap();
     wait_for_usage_rows(state2.path(), "cached2", 1, Duration::from_secs(30));
     assert_eq!(
@@ -682,6 +699,9 @@ fn a_budget_changed_while_running_applies_immediately() {
     // Start with a HIGH cumulative budget — no breach initially.
     facade
         .set_config("live", "budget.tokens.cumulative", "1000000")
+        .unwrap();
+    facade
+        .set_config("live", "budget.breach_action", "pause")
         .unwrap();
 
     facade.start("live").unwrap();
@@ -789,6 +809,9 @@ fn with_both_budgets_armed_the_token_breach_wins_the_pause() {
         .unwrap();
     facade
         .set_config("bothpause", "budget.tokens.cumulative", "90")
+        .unwrap();
+    facade
+        .set_config("bothpause", "budget.breach_action", "pause")
         .unwrap();
     facade
         .set_config("bothpause", "budget.dollars.cumulative", "0.00009")

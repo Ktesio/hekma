@@ -140,6 +140,12 @@ fn assert_payload_validates(event: &EngineEvent) {
         EngineEvent::Run(e) => {
             assert_eq!(e.schema_version, hekma_engine::RUN_EVENT_SCHEMA_VERSION);
         }
+        EngineEvent::Policy(e) => {
+            assert_eq!(e.schema_version, hekma_engine::POLICY_EVENT_SCHEMA_VERSION);
+        }
+        EngineEvent::BreachDefaultUpgraded(e) => {
+            assert_eq!(e.schema_version, hekma_engine::POLICY_EVENT_SCHEMA_VERSION);
+        }
     }
 }
 
@@ -296,6 +302,11 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
             EngineEvent::BudgetBreach(e) => e.instance.as_str(),
             EngineEvent::UsageUpdate(e) => e.event.instance.as_str(),
             EngineEvent::Run(e) => e.instance.as_deref().unwrap_or_default(),
+            // This flow changes no Policy and its fresh state dir has nothing
+            // to upgrade, so neither family can appear.
+            EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => {
+                panic!("unexpected policy-family event in this flow: {event:?}")
+            }
         };
         assert_eq!(
             instance,

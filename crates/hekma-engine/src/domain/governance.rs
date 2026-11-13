@@ -55,7 +55,7 @@ pub const GOVERNANCE_VECTORS_ARTIFACT_PATH: &str = "crates/hekma-engine/governan
 /// release notes (the pinning contract, docs/governance.md). Mirrored inside
 /// the artifact's `vectors_version` field by the generator — they cannot
 /// drift.
-pub const GOVERNANCE_VECTORS_VERSION: &str = "1.2.0";
+pub const GOVERNANCE_VECTORS_VERSION: &str = "1.3.0";
 
 /// The artifact's schema version — `1` until the DOCUMENT shape itself
 /// changes (a breaking schema change is a major `vectors_version` bump).
@@ -63,7 +63,7 @@ pub const GOVERNANCE_VECTORS_SCHEMA_VERSION: u32 = 1;
 
 /// The provenance list — the engine symbols every case is generated from and
 /// verified against (fixed order; the byte-compare pins it).
-const GENERATED_FROM: [&str; 7] = [
+const GENERATED_FROM: [&str; 8] = [
     "BudgetEvaluator",
     "CostEvaluator",
     "cost_micros",
@@ -71,6 +71,7 @@ const GENERATED_FROM: [&str; 7] = [
     "governance::decide",
     "governance::fence_refusal",
     "governance::decide_chain",
+    "runs::policy::resolve",
 ];
 
 // ---------------------------------------------------------------------------
@@ -471,6 +472,13 @@ pub enum CoverTag {
     /// ceiling binds its children's usage, and outcomes come deepest level
     /// first, token before dollar within a level.
     AncestorCeilings,
+    /// Policy resolution (story 21-3, vectors 1.3.0): explicit Run limits,
+    /// then explicit instance config, then per limit the most specific
+    /// matching Selector (a strict term-set superset; incomparable ties to
+    /// the tightest value), then the default Policy — with the malformed
+    /// fail-closed, the upgrade marker's `pause`, the depth fallback to
+    /// `warn`, the Rate chain, and the unpriced cap made loud.
+    PolicyResolution,
 }
 
 impl CoverTag {
@@ -487,6 +495,7 @@ impl CoverTag {
             CoverTag::NoRetroRepricing => "no-retro-repricing",
             CoverTag::BlockFence => "block-fence",
             CoverTag::AncestorCeilings => "ancestor-ceilings",
+            CoverTag::PolicyResolution => "policy-resolution",
         }
     }
 }
@@ -505,6 +514,7 @@ pub const ALL_COVERS: &[CoverTag] = &[
     CoverTag::NoRetroRepricing,
     CoverTag::BlockFence,
     CoverTag::AncestorCeilings,
+    CoverTag::PolicyResolution,
 ];
 
 /// A `decision` case (story 19-1): a [`GovernanceInput`] (ledger state,
@@ -626,9 +636,12 @@ pub struct FenceCase {
 
 /// ONE case of the vectors artifact. The `kind` tag discriminates the case
 /// kinds; the variant's fields are inlined beside it. A consumer pinned to
-/// an older minor skips a kind it does not know (docs/governance.md).
+/// an older minor skips a kind it does not know (docs/governance.md). The
+/// cases are built once per generation and read once per verification —
+/// never in a hot path — so the variant size difference is accepted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[allow(clippy::large_enum_variant)]
 pub enum Case {
     /// A full decision: [`GovernanceInput`] → [`GovernanceOutcome`].
     Decision(DecisionCase),
@@ -640,6 +653,9 @@ pub enum Case {
     /// An ancestor chain: per-level inputs → per-level outcomes (story 21-2,
     /// vectors 1.2.0).
     Chain(ChainCase),
+    /// A Policy resolution: input → expected resolution (story 21-3,
+    /// vectors 1.3.0).
+    Policy(PolicyCase),
 }
 
 /// A `chain` case (story 21-2, vectors 1.2.0): the decision inputs of each
@@ -656,6 +672,22 @@ pub struct ChainCase {
     pub levels: Vec<GovernanceInput>,
     /// One outcome per level, in the same order.
     pub expected: Vec<GovernanceOutcome>,
+}
+
+/// A `policy` case (story 21-3, vectors 1.3.0): one resolution input and
+/// the EXACT expected resolution — generated from
+/// [`crate::domain::runs::policy::resolve`] itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyCase {
+    /// The case's unique, stable id.
+    pub id: String,
+    /// Which rules this case pins.
+    pub covers: Vec<CoverTag>,
+    /// The resolution input (depth, wire path, labels, explicit limits,
+    /// the policy set, the marker, the model).
+    pub input: crate::domain::runs::policy::ResolutionInput,
+    /// The expected resolution.
+    pub expected: crate::domain::runs::PolicyResolution,
 }
 
 /// Where the artifact's cases come from — the exact engine symbols the
@@ -704,6 +736,7 @@ impl VectorsDocument {
                 Case::Derivation(derivation) => &derivation.covers,
                 Case::Fence(fence) => &fence.covers,
                 Case::Chain(chain) => &chain.covers,
+                Case::Policy(policy) => &policy.covers,
             };
             for tag in covers {
                 if !seen.contains(tag) {
@@ -757,12 +790,18 @@ pub fn generate() -> VectorsDocument {
         },
         // Story 19-2 (1.1.0) APPENDS its cases after the 1.0.0 set, so every
         // 1.0.0 case keeps its bytes and its position; story 21-2 (1.2.0)
-        // appends the `chain` cases after both.
+        // appends the `chain` cases after both; story 21-3 (1.3.0) appends
+        // the `policy` cases after all of them.
         cases: decision_cases()
             .into_iter()
             .chain(derivation_cases())
             .chain(block_fence_cases())
             .chain(chain_cases())
+            .chain(policy_cases())
+            // The policy-change decide-level pins (round 3, N12): appended
+            // AFTER every shipped case, so the 1.2.0 sequence keeps its
+            // original indices byte-for-byte.
+            .chain(policy_decision_cases())
             .collect(),
     }
 }
@@ -1365,6 +1404,350 @@ fn decision_case(id: &str, covers: &[CoverTag], input: GovernanceInput) -> Case 
 /// The `derivation` cases, in fixed canonical order. Each case's
 /// `expected_micros` is computed by the real derivation (via
 /// [`derivation_case`]).
+/// The `policy` cases (story 21-3, vectors 1.3.0), in fixed canonical
+/// order. Each case's `expected` is computed by
+/// [`crate::domain::runs::policy::resolve`] itself (via [`policy_case`]) —
+/// the authoring below states only the INPUTS and the coverage tags.
+fn policy_cases() -> Vec<Case> {
+    let policy = |name: &str,
+                  selector: &str,
+                  limits: crate::domain::runs::PolicyLimits|
+     -> crate::domain::runs::PolicyRecord {
+        crate::domain::runs::PolicyRecord {
+            name: name.to_string(),
+            selector: Some(selector.parse().unwrap()),
+            limits,
+            rates: Default::default(),
+        }
+    };
+    let limits = |tokens_per_run: Option<u64>, breach_action: Option<BreachAction>| {
+        crate::domain::runs::PolicyLimits {
+            tokens_per_run,
+            breach_action,
+            ..Default::default()
+        }
+    };
+    vec![
+        // Explicit limits outrank every Policy; the Run outranks the
+        // instance.
+        policy_case(
+            "policy-explicit-run-instance-policy",
+            crate::domain::runs::policy::ResolutionInput {
+                bound_labels: labels(&[("team", "core")]),
+                run_limits: crate::domain::runs::RunLimits {
+                    token_per_run: Some(100),
+                    ..Default::default()
+                },
+                inputs: crate::domain::runs::ResolveInputs {
+                    explicit: limits(Some(5_000), Some(BreachAction::Pause)),
+                    ..Default::default()
+                },
+                policies: vec![
+                    crate::domain::runs::PolicyRecord::default_policy(),
+                    policy(
+                        "p",
+                        "team=core",
+                        limits(Some(1_000), Some(BreachAction::Stop)),
+                    ),
+                ],
+                ..Default::default()
+            },
+        ),
+        // Per limit, the most specific Selector wins — a strict term-set
+        // superset beats a subset even where its value is LOOSER, and a
+        // limit only the less-specific Policy sets still applies.
+        policy_case(
+            "policy-most-specific-per-limit",
+            crate::domain::runs::policy::ResolutionInput {
+                bound_labels: labels(&[("team", "core"), ("env", "prod")]),
+                policies: vec![
+                    crate::domain::runs::PolicyRecord::default_policy(),
+                    policy(
+                        "loose",
+                        "team=core",
+                        crate::domain::runs::PolicyLimits {
+                            tokens_per_run: Some(1_000),
+                            tokens_cumulative: Some(50_000),
+                            breach_action: Some(BreachAction::Pause),
+                            ..Default::default()
+                        },
+                    ),
+                    policy(
+                        "tight",
+                        "team=core,env=prod",
+                        crate::domain::runs::PolicyLimits {
+                            tokens_per_run: Some(2_000),
+                            breach_action: Some(BreachAction::Warn),
+                            ..Default::default()
+                        },
+                    ),
+                ],
+                ..Default::default()
+            },
+        ),
+        // Incomparable Selectors tie, and a tie takes the TIGHTEST value:
+        // the lower ceiling and `pause` over `warn`.
+        policy_case(
+            "policy-tie-takes-the-tightest",
+            crate::domain::runs::policy::ResolutionInput {
+                bound_labels: labels(&[("a", "1"), ("b", "2"), ("c", "3")]),
+                policies: vec![
+                    crate::domain::runs::PolicyRecord::default_policy(),
+                    policy(
+                        "left",
+                        "a=1,b=2",
+                        limits(Some(5_000), Some(BreachAction::Warn)),
+                    ),
+                    policy(
+                        "right",
+                        "a=1,c=3",
+                        limits(Some(3_000), Some(BreachAction::Pause)),
+                    ),
+                ],
+                ..Default::default()
+            },
+        ),
+        // The default Policy fills only what is unset — the action always
+        // resolves (`warn` from the seeded default).
+        policy_case(
+            "policy-default-fills-the-action",
+            crate::domain::runs::policy::ResolutionInput::default(),
+        ),
+        // A malformed `breach_action` fails CLOSED to `pause` with a note;
+        // the upgrade marker holds `pause` above every Policy.
+        policy_case(
+            "policy-fail-closed-malformed-and-marker",
+            crate::domain::runs::policy::ResolutionInput {
+                inputs: crate::domain::runs::ResolveInputs {
+                    malformed_action: Some("throttle".to_string()),
+                    ..Default::default()
+                },
+                policies: vec![
+                    crate::domain::runs::PolicyRecord::default_policy(),
+                    policy("p", "team=core", limits(None, Some(BreachAction::Stop))),
+                ],
+                ..Default::default()
+            },
+        ),
+        policy_case(
+            "policy-upgrade-marker-holds-pause",
+            crate::domain::runs::policy::ResolutionInput {
+                bound_labels: labels(&[("team", "core")]),
+                kept_on_pause: true,
+                policies: vec![
+                    crate::domain::runs::PolicyRecord::default_policy(),
+                    policy("p", "team=core", limits(None, Some(BreachAction::Stop))),
+                ],
+                ..Default::default()
+            },
+        ),
+        // A Policy action a Run's depth cannot execute acts as `warn` with
+        // the `depth-fallback` Anomaly; `block` needs a wire path.
+        policy_case(
+            "policy-depth-fallback-and-wire-path",
+            crate::domain::runs::policy::ResolutionInput {
+                depth: crate::domain::runs::ControlDepth::Supervised,
+                wire_path: false,
+                bound_labels: labels(&[("team", "core")]),
+                policies: vec![
+                    crate::domain::runs::PolicyRecord::default_policy(),
+                    policy("p", "team=core", limits(None, Some(BreachAction::Block))),
+                ],
+                ..Default::default()
+            },
+        ),
+        // The Rate chain: a matching Policy's flat Rate beats the default
+        // Policy's model-keyed table, and the model match is exact.
+        policy_case(
+            "policy-rate-chain",
+            crate::domain::runs::policy::ResolutionInput {
+                bound_labels: labels(&[("team", "core")]),
+                inputs: crate::domain::runs::ResolveInputs {
+                    model: Some("gpt-demo".to_string()),
+                    ..Default::default()
+                },
+                policies: vec![
+                    {
+                        let mut default = crate::domain::runs::PolicyRecord::default_policy();
+                        default.rates.insert(
+                            "gpt-demo".to_string(),
+                            crate::domain::cost::Rate::new(1_000_000, 2_000_000),
+                        );
+                        default
+                    },
+                    policy(
+                        "p",
+                        "team=core",
+                        crate::domain::runs::PolicyLimits {
+                            rate: Some(crate::domain::cost::Rate::new(3_000_000, 4_000_000)),
+                            ..Default::default()
+                        },
+                    ),
+                ],
+                ..Default::default()
+            },
+        ),
+        // A Policy Cost Cap with no resolvable Rate is loud, never silently
+        // inert: the `unpriced-model` signal names the model and the Policy.
+        policy_case(
+            "policy-unpriced-cap-is-loud",
+            crate::domain::runs::policy::ResolutionInput {
+                bound_labels: labels(&[("team", "core")]),
+                inputs: crate::domain::runs::ResolveInputs {
+                    model: Some("gpt-demo".to_string()),
+                    ..Default::default()
+                },
+                policies: vec![
+                    crate::domain::runs::PolicyRecord::default_policy(),
+                    policy(
+                        "p",
+                        "team=core",
+                        crate::domain::runs::PolicyLimits {
+                            dollars_per_run_micros: Some(5_000_000),
+                            ..Default::default()
+                        },
+                    ),
+                ],
+                ..Default::default()
+            },
+        ),
+        // Bound labels only: a Run whose labels lack the Selector's term
+        // never selects the Policy — the limit stays unset (the
+        // caller-vs-bound distinction itself is the Selector scope's own
+        // pin; this case pins the resolution-side negative).
+        policy_case(
+            "policy-no-bound-term-no-match",
+            crate::domain::runs::policy::ResolutionInput {
+                bound_labels: labels(&[("team", "other")]),
+                policies: vec![
+                    crate::domain::runs::PolicyRecord::default_policy(),
+                    policy(
+                        "p",
+                        "team=core",
+                        limits(Some(1_000), Some(BreachAction::Stop)),
+                    ),
+                ],
+                ..Default::default()
+            },
+        ),
+        // A malformed explicit `breach_action` fails closed to `pause`
+        // WITHOUT dropping the other explicit inputs: the ceilings, the
+        // Rate and the model survive (only the action fails closed — the
+        // review round 1 finding that once dropped them all).
+        policy_case(
+            "policy-malformed-keeps-explicit-ceilings",
+            crate::domain::runs::policy::ResolutionInput {
+                bound_labels: labels(&[("team", "core")]),
+                inputs: crate::domain::runs::ResolveInputs {
+                    explicit: crate::domain::runs::PolicyLimits {
+                        tokens_per_run: Some(7_000),
+                        rate: Some(crate::domain::cost::Rate::new(1_000_000, 2_000_000)),
+                        ..Default::default()
+                    },
+                    malformed_action: Some("throttle".to_string()),
+                    model: Some("gpt-demo".to_string()),
+                },
+                policies: vec![
+                    crate::domain::runs::PolicyRecord::default_policy(),
+                    policy(
+                        "p",
+                        "team=core",
+                        limits(Some(1_000), Some(BreachAction::Warn)),
+                    ),
+                ],
+                ..Default::default()
+            },
+        ),
+        // The malformed rule outranks EVERY other source, the Run's own
+        // action included (the precedence chain's rule 1).
+        policy_case(
+            "policy-malformed-outranks-the-run-action",
+            crate::domain::runs::policy::ResolutionInput {
+                bound_labels: labels(&[("team", "core")]),
+                run_limits: crate::domain::runs::RunLimits {
+                    breach_action: Some(BreachAction::Warn),
+                    ..Default::default()
+                },
+                inputs: crate::domain::runs::ResolveInputs {
+                    malformed_action: Some("1".to_string()),
+                    ..Default::default()
+                },
+                policies: vec![crate::domain::runs::PolicyRecord::default_policy()],
+                ..Default::default()
+            },
+        ),
+    ]
+}
+
+/// The two decide-level pins for the policy-change rules (round 3's
+/// N12): emitted AFTER every shipped case so the 1.2.0 sequence is
+/// order-identical.
+fn policy_decision_cases() -> Vec<Case> {
+    let key = LatchKey::new;
+    vec![
+        // ---- policy-resolution: a ceiling LOWERED below usage breaches at
+        // once even while ANOTHER scope's latch holds — the latch is per
+        // (dimension, scope), so the lowered scope fires now (the
+        // policy-change breach-at-once rule's decide-level pin) ----
+        decision_case(
+            "decision-policy-lowered-per-run-fires-while-cumulative-latched",
+            &[CoverTag::PolicyResolution, CoverTag::LatchPerScope],
+            GovernanceInput {
+                token: Some(TokenArm {
+                    run_total: 2_000,
+                    cumulative_total: 9_000,
+                    budget: TokenBudget {
+                        per_run: Some(1_000),
+                        cumulative: Some(5_000),
+                    },
+                    action: BreachAction::Pause,
+                }),
+                dollar: None,
+                latched: vec![key(BreachDimension::Tokens, BreachScope::Cumulative)],
+            },
+        ),
+        // ---- policy-resolution: a ceiling RAISED above usage re-arms —
+        // the cleared latch means the NEXT crossing fires again (the
+        // policy-change re-arm rule's decide-level pin) ----
+        decision_case(
+            "decision-policy-raised-then-recrossed-refires",
+            &[CoverTag::PolicyResolution, CoverTag::LatchReArm],
+            GovernanceInput {
+                token: Some(TokenArm {
+                    run_total: 4_000,
+                    cumulative_total: 0,
+                    budget: TokenBudget {
+                        per_run: Some(5_000),
+                        cumulative: None,
+                    },
+                    action: BreachAction::Pause,
+                }),
+                dollar: None,
+                latched: vec![],
+            },
+        ),
+    ]
+}
+
+/// The bound-label pairs of a resolution input.
+fn labels(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+/// Author ONE policy case: the input as written, the expected resolution
+/// computed by [`crate::domain::runs::policy::resolve`].
+fn policy_case(id: &str, input: crate::domain::runs::policy::ResolutionInput) -> Case {
+    Case::Policy(PolicyCase {
+        id: id.to_string(),
+        covers: vec![CoverTag::PolicyResolution],
+        expected: crate::domain::runs::policy::resolve(&input),
+        input,
+    })
+}
+
 fn derivation_cases() -> Vec<Case> {
     vec![
         // ---- integer-micros: split per-direction rates price
@@ -1955,6 +2338,7 @@ mod tests {
             CoverTag::NoRetroRepricing => (7, "no-retro-repricing"),
             CoverTag::BlockFence => (8, "block-fence"),
             CoverTag::AncestorCeilings => (9, "ancestor-ceilings"),
+            CoverTag::PolicyResolution => (10, "policy-resolution"),
         }
     }
 
@@ -2146,6 +2530,14 @@ mod tests {
                         case.id
                     );
                 }
+                Case::Policy(case) => {
+                    assert_eq!(
+                        crate::domain::runs::policy::resolve(&case.input),
+                        case.expected,
+                        "case `{}`: the committed resolution does not match resolve()",
+                        case.id
+                    );
+                }
             }
         }
     }
@@ -2162,6 +2554,7 @@ mod tests {
                 Case::Derivation(case) => (&case.id, &case.covers),
                 Case::Fence(case) => (&case.id, &case.covers),
                 Case::Chain(case) => (&case.id, &case.covers),
+                Case::Policy(case) => (&case.id, &case.covers),
             };
             assert!(!ids.contains(&id), "duplicate case id `{id}`");
             assert!(!covers.is_empty(), "case `{id}` carries no covers tags");
@@ -2198,6 +2591,7 @@ mod tests {
                 "governance::decide",
                 "governance::fence_refusal",
                 "governance::decide_chain",
+                "runs::policy::resolve",
             ]
         );
     }
@@ -2207,13 +2601,17 @@ mod tests {
         // Story 19-2: the minor bump is ADDITIVE — the 26 cases 1.0.0
         // shipped keep their position, and every story-19-2 case follows
         // them. A consumer pinned to 1.0.0 sees its cases unchanged.
+        // 1.3.0 adds two decision cases tagged `policy-resolution` (the
+        // policy-change lower/raise consequences); they are exempt from
+        // the block-only rule, which stays true for the 1.1.0 fence-era
+        // decision cases.
         let document = generate();
         let first_fence_era = document
             .cases
             .iter()
             .position(|case| match case {
                 Case::Decision(case) => case.id.starts_with("decision-block-"),
-                Case::Fence(_) | Case::Chain(_) => true,
+                Case::Fence(_) | Case::Chain(_) | Case::Policy(_) => true,
                 Case::Derivation(_) => false,
             })
             .expect("the 1.1.0 cases exist");
@@ -2221,29 +2619,119 @@ mod tests {
         assert!(document.cases[first_fence_era..]
             .iter()
             .all(|case| match case {
-                Case::Decision(case) =>
-                    case.input.token.map(|arm| arm.action) == Some(BreachAction::Block),
-                Case::Fence(_) | Case::Chain(_) => true,
+                Case::Decision(case) => {
+                    let policy_tagged = case.covers.contains(&CoverTag::PolicyResolution);
+                    policy_tagged
+                        || case.input.token.map(|arm| arm.action) == Some(BreachAction::Block)
+                }
+                Case::Fence(_) | Case::Chain(_) | Case::Policy(_) => true,
                 Case::Derivation(_) => false,
             }));
     }
 
     #[test]
+    fn the_shipped_1_2_0_sequence_keeps_its_original_indices() {
+        // Round 3, N12: every case the 1.2.0 artifact shipped sits at its
+        // original index, in the original order — new cases only append.
+        // (The exact shipped sequence, as committed at the 1.2.0 tag.)
+        const SHIPPED: &[&str] = &[
+            "decision-threshold-ge-exact-at-ceiling",
+            "decision-threshold-ge-one-below-ceiling",
+            "decision-threshold-ge-zero-ceiling-breaches-on-zero",
+            "decision-threshold-ge-dollar-exact-at-cap",
+            "decision-threshold-ge-zero-dollar-cap-breaches-on-zero",
+            "decision-threshold-ge-token-both-scopes-trip-per-run-reported",
+            "decision-threshold-ge-dollar-both-scopes-trip-per-run-reported",
+            "decision-latch-per-scope-holds-across-re-evaluation",
+            "decision-latch-per-scope-token-and-dollar-same-scope-fire",
+            "decision-latch-scope-and-dimension-independence",
+            "decision-latch-per-scope-dollar-hold-suppresses-the-dollar-dimension",
+            "decision-latch-per-scope-doubled-key-normalizes-to-one",
+            "decision-latch-re-arm-empty-latch-refires",
+            "decision-token-before-dollar-both-armed-both-tripping",
+            "decision-unarmed-token-dimension-skipped-dollar-only",
+            "derivation-integer-micros-split-per-direction-rates",
+            "derivation-integer-micros-single-token-sub-cent",
+            "derivation-integer-micros-cached-resplit",
+            "derivation-integer-micros-unset-cached-rate-conservative",
+            "derivation-round-half-up-tie-rounds-up",
+            "derivation-round-half-up-output-tie-rounds-up",
+            "derivation-round-half-up-below-tie-rounds-down",
+            "derivation-round-half-up-per-direction-independence",
+            "derivation-saturation-max-tokens-max-rate",
+            "derivation-saturation-cached-derivation-saturates",
+            "derivation-no-retro-repricing-rows-sum-at-their-own-rates",
+            "decision-block-fires-at-exact-ceiling",
+            "decision-block-both-dimensions-token-first",
+            "decision-block-latch-holds",
+            "fence-no-reason-passes",
+            "fence-single-dollar-cumulative",
+            "fence-reports-tokens-before-dollars",
+            "fence-reports-per-run-before-cumulative",
+            "fence-duplicate-reason-is-one-reason",
+            "chain-child-and-parent-both-breach-deepest-first",
+            "chain-latch-is-per-level",
+            "chain-parent-ceiling-binds-the-subtree",
+            "chain-three-levels-token-before-dollar-per-level",
+            "chain-one-level-is-decide",
+        ];
+        let document = generate();
+        assert_eq!(
+            document.cases.len(),
+            SHIPPED.len() + 14,
+            "39 shipped + the 14 cases 21-3 appends"
+        );
+        for (index, id) in SHIPPED.iter().enumerate() {
+            let actual = match &document.cases[index] {
+                Case::Decision(case) => &case.id,
+                Case::Derivation(case) => &case.id,
+                Case::Fence(case) => &case.id,
+                Case::Chain(case) => &case.id,
+                Case::Policy(case) => &case.id,
+            };
+            assert_eq!(actual, id, "index {index}: the shipped order is frozen");
+        }
+    }
+
+    #[test]
     fn the_1_2_0_chain_cases_follow_every_earlier_case() {
         // Story 21-2: additive — the 1.1.0 cases keep their positions and
-        // the `chain` cases come last.
+        // the `chain` cases follow them. Story 21-3 (1.3.0) appends the
+        // `policy` cases after the chain era; round 3 (N12) additionally
+        // moved the two policy-tagged DECISION cases to the very end (the
+        // 1.2.0 sequence keeps its original indices byte-for-byte), so
+        // the closing block is every 1.3.0 case in either kind.
         let document = generate();
         let first_chain = document
             .cases
             .iter()
             .position(|case| matches!(case, Case::Chain(_)))
             .expect("the 1.2.0 cases exist");
-        assert!(document.cases[first_chain..]
+        let first_appended = document
+            .cases
             .iter()
-            .all(|case| matches!(case, Case::Chain(_))));
+            .position(|case| match case {
+                Case::Policy(_) => true,
+                Case::Decision(case) => case.covers.contains(&CoverTag::PolicyResolution),
+                _ => false,
+            })
+            .expect("the 1.3.0 cases exist");
         assert!(document.cases[..first_chain]
             .iter()
-            .all(|case| !matches!(case, Case::Chain(_))));
+            .all(|case| !matches!(case, Case::Chain(_) | Case::Policy(_))));
+        assert!(document.cases[first_chain..first_appended]
+            .iter()
+            .all(|case| matches!(case, Case::Chain(_))));
+        assert!(
+            document.cases[first_appended..]
+                .iter()
+                .all(|case| match case {
+                    Case::Policy(_) => true,
+                    Case::Decision(case) => case.covers.contains(&CoverTag::PolicyResolution),
+                    _ => false,
+                }),
+            "the 1.3.0 cases close the artifact"
+        );
     }
 
     #[test]

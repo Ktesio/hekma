@@ -141,6 +141,11 @@ masked, exactly as the CLI displays it).
 | `POST` | `/v0/runs/{id}/close` | Close a child Run (idempotent; a Run that owns an agent's process is a 409 — stop the instance) | 200 + the Run |
 | `GET` | `/v0/runs/{id}/labels` | One Run's labels, bound and caller, each with its `source` and (bound) `origin` | 200 |
 | `PATCH` | `/v0/runs/{id}/labels` | Bind and unbind labels as the Operator (below): `{"set": {…}, "remove": […], "dry_run": bool}` | 200 + the labels after |
+| `GET` | `/v0/policies` | Every Policy, `default` included, ordered by name | 200 |
+| `GET` | `/v0/policies/{name}` | One Policy: its Selector, limits and (on `default`) its model-keyed Rate table | 200 |
+| `POST` | `/v0/policies` | Create a Policy: `{"name", "selector", "tokens_per_run"?, "tokens_cumulative"?, "dollars_per_run_micros"?, "dollars_cumulative_micros"?, "breach_action"?, "rate"?}` — answers the matched and fallback counts | 201 + `Location: /v0/policies/{name}` |
+| `PATCH` | `/v0/policies/{name}` | Change a Policy: `{"selector"?, "set": {limits}, "clear": […], "rates": {"set": {model: rate}, "remove": [models]}, "dry_run": bool}` | 200 + the Policy after (or as planned) |
+| `DELETE` | `/v0/policies/{name}` | Delete a Policy; its matched Runs re-resolve under what remains (`default` is refused) | 204 |
 
 The identity-bearing reads return the engine's own documents — the same wire
 shapes (and schema versions) the CLI already renders. A `POST` lifecycle verb
