@@ -725,7 +725,6 @@ pub(crate) fn commit_proxied_call(
     inbox: &Arc<EvaluationInbox>,
     leases: &runs::lease::LeaseOptions,
 ) -> Result<(), StoreError> {
-    use crate::ports::PolicyRecords as _;
     let store = ctx.store();
     store.insert_call_record(&close.record)?;
     // Story 23-2: every identified call is activity on its Run — a refused
@@ -777,11 +776,56 @@ pub(crate) fn commit_proxied_call(
             ctx.after_commit(move || inbox.push_run_events(events));
         }
     }
-    let store = ctx.store();
     let Some(usage) = close.usage else {
         return Ok(());
     };
-    let run_id = close.record.run_id.clone();
+    commit_run_usage(
+        ctx,
+        RunUsageRow {
+            run_id: close.record.run_id.clone(),
+            usage,
+            source: "engine-observed",
+            call_id: Some(close.record.call_id.clone()),
+            model: close.record.model.clone(),
+            occurred_at: close.record.ended_at.clone(),
+        },
+        runs,
+        inbox,
+    )
+}
+
+/// One usage row to commit against a Run (the proxied close, or inbound
+/// telemetry — story 23-3).
+pub(crate) struct RunUsageRow {
+    pub run_id: RunId,
+    pub usage: ProxiedUsage,
+    /// The ledger's `metering_source` (`engine-observed` for a proxied
+    /// call, `telemetry-reported` for inbound telemetry).
+    pub source: &'static str,
+    /// The call id (a proxied call); `None` for telemetry, whose dedup is
+    /// its counter diff.
+    pub call_id: Option<String>,
+    /// The model the usage reported, for pricing only (never stored).
+    pub model: Option<String>,
+    pub occurred_at: String,
+}
+
+/// Commit one usage row on a Run with no process of its own in the chain
+/// or under one (story 23-1, shared with 23-3): the row priced per the
+/// wire-Run rule, both rollups, the outbox row, and the evaluation over the
+/// Run's ancestor chain, all in the caller's job; the committed evaluation
+/// reaches the Supervisor through the inbox. A replayed proxied row (same
+/// run and call id) changes nothing.
+pub(crate) fn commit_run_usage(
+    ctx: &mut WriterCtx<'_>,
+    row: RunUsageRow,
+    runs: &Arc<SnapshotPublisher>,
+    inbox: &Arc<EvaluationInbox>,
+) -> Result<(), StoreError> {
+    use crate::ports::PolicyRecords as _;
+    let store = ctx.store();
+    let usage = row.usage;
+    let run_id = row.run_id.clone();
     let chain = store.run_chain(&run_id)?;
     let Some(record) = chain.first().cloned() else {
         // The Run's row is not committed yet (a call on a pending Run route
@@ -790,7 +834,7 @@ pub(crate) fn commit_proxied_call(
         return Err(StoreError::Backend(format!(
             "the Run {} of call {} is not recorded yet",
             run_id.as_str(),
-            close.record.call_id
+            row.call_id.as_deref().unwrap_or("(telemetry)")
         )));
     };
     let instance = record
@@ -807,7 +851,7 @@ pub(crate) fn commit_proxied_call(
         store,
         own_resolution.as_ref(),
         owner_resolution.as_ref().filter(|_| owner.is_some()),
-        close.record.model.as_deref(),
+        row.model.as_deref(),
     )?;
     let generation = match &instance {
         Some(name) => store.launch_generation(name).unwrap_or(0),
@@ -816,13 +860,13 @@ pub(crate) fn commit_proxied_call(
     let event = UsageEvent {
         instance: instance.as_ref().map(|name| name.as_str().to_string()),
         run_id: run_id.clone(),
-        call_id: Some(close.record.call_id.clone()),
+        call_id: row.call_id.clone(),
         input_tokens: usage.input,
         output_tokens: usage.output,
         cached_tokens: Some(usage.cached.min(usage.input)),
-        metering_source: "engine-observed".to_string(),
+        metering_source: row.source.to_string(),
         sequence: 0,
-        occurred_at: close.record.ended_at.clone(),
+        occurred_at: row.occurred_at.clone(),
     };
     if store.insert_usage(&event, rate, generation)? == RecordOutcome::DuplicateReplay {
         return Ok(());
@@ -844,7 +888,7 @@ pub(crate) fn commit_proxied_call(
     let input = EvalInput {
         name: owner.and(instance.clone()),
         run_id: run_id.clone(),
-        metering_source: "engine-observed".to_string(),
+        metering_source: row.source.to_string(),
         token_budget,
         token_action: action,
         rate: owner_resolution.as_ref().and_then(|r| r.rate),

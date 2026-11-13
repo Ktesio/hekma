@@ -5994,3 +5994,235 @@ fn the_announce_and_heartbeat_routes_follow_the_matrix_and_show_credentials_once
     server.stop().unwrap();
     scan("after shutdown");
 }
+
+/// One OTLP/HTTP+JSON metrics batch for `id` with cumulative input/output.
+fn otlp_batch(id: &str, input: u64, output: u64) -> serde_json::Value {
+    let point = |kind: &str, value: u64| {
+        serde_json::json!({
+            "attributes": [{"key": "gen_ai.token.type", "value": {"stringValue": kind}}],
+            "asInt": value.to_string(),
+        })
+    };
+    serde_json::json!({"resourceMetrics": [{
+        "resource": {"attributes": [
+            {"key": "hekma.run.external_id", "value": {"stringValue": id}},
+            {"key": "hekma.label.step", "value": {"stringValue": "plan"}},
+            {"key": "service.name", "value": {"stringValue": "SENTINEL-ignored"}},
+        ]},
+        "scopeMetrics": [{"metrics": [
+            {"name": "gen_ai.client.token_usage", "sum": {
+                "aggregationTemporality": 2, "isMonotonic": true,
+                "dataPoints": [point("input", input), point("output", output)]}},
+            {"name": "SENTINEL-other", "gauge": {"dataPoints": [{"asInt": "1"}]}},
+        ]}],
+    }]})
+}
+
+#[test]
+fn the_otlp_intake_accepts_announce_credentials_only_and_meters_forward_differences() {
+    // Story 23-3: `POST /v1/metrics` under a binding's announce credential:
+    // the class cells, the content-type and size refusals, a first and a
+    // second cumulative batch (the forward difference), `partialSuccess`
+    // for the unread points, no Run Key for the Run, and no client string
+    // or credential in the state directory.
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle.clone());
+    let client = client();
+    let base = format!("http://{}", server.addr);
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{base}/v0/bindings"),
+        Some(serde_json::json!({
+            "name": "openai", "prefix": "/openai",
+            "upstream": "https://api.example.com/v1", "labels": [["team", "core"]],
+        })),
+    );
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "{}",
+        json_body(&mut response)
+    );
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{base}/v0/bindings/openai/credentials"),
+        Some(serde_json::json!({"class": "announce"})),
+    );
+    let announce = json_body(&mut response)["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let url = format!("{base}/v1/metrics");
+
+    // The first batch: 200 with partialSuccess for the unread gauge point.
+    let mut response = as_bearer(
+        &client,
+        "POST",
+        &url,
+        &announce,
+        Some(otlp_batch("job-7", 1200, 40)),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(&mut response);
+    assert_eq!(body["partialSuccess"]["rejectedDataPoints"], "1");
+    assert!(!body.to_string().contains("SENTINEL"));
+    let mut listing = get_ok(&client, &server.addr, "/v0/runs?view=all");
+    let listing = json_body(&mut listing);
+    let run = listing["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["identity"][1] == "job-7")
+        .unwrap_or_else(|| panic!("{listing}"))
+        .clone();
+    assert_eq!(run["control_depth"], "observed");
+    assert_eq!(run["usage"]["input_tokens"], 1200);
+    let run_id = run["run_id"].as_str().unwrap().to_string();
+    // The second batch commits only the difference.
+    let response = as_bearer(
+        &client,
+        "POST",
+        &url,
+        &announce,
+        Some(otlp_batch("job-7", 1500, 40)),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut shown = get_ok(&client, &server.addr, &format!("/v0/runs/{run_id}"));
+    let shown = json_body(&mut shown);
+    assert_eq!(shown["run"]["usage"]["input_tokens"], 1500, "{shown}");
+    assert_eq!(shown["run"]["usage"]["output_tokens"], 40);
+    // The same batch again records nothing (a plain 200 with the unread
+    // point reported), and the totals stand.
+    let mut response = as_bearer(
+        &client,
+        "POST",
+        &url,
+        &announce,
+        Some(otlp_batch("job-7", 1500, 40)),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(&mut response)["partialSuccess"]["rejectedDataPoints"],
+        "1"
+    );
+    let mut again = get_ok(&client, &server.addr, &format!("/v0/runs/{run_id}"));
+    assert_eq!(json_body(&mut again)["run"]["usage"]["input_tokens"], 1500);
+    let mut keys = get_ok(&client, &server.addr, &format!("/v0/runs/{run_id}/keys"));
+    let keys = json_body(&mut keys);
+    assert_eq!(
+        keys["keys"],
+        serde_json::json!([]),
+        "telemetry issues no Run Key: {keys}"
+    );
+
+    // The class cells: the operator bearer is 403; nothing, or a value
+    // never issued, is 401.
+    let mut response = as_bearer(
+        &client,
+        "POST",
+        &url,
+        BEARER_VALUE,
+        Some(otlp_batch("x", 1, 1)),
+    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(&mut response)["error"]["code"], "forbidden");
+    let never = format!("hk_ann_{}", "9".repeat(52));
+    let response = as_bearer(&client, "POST", &url, &never, Some(otlp_batch("x", 1, 1)));
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Content types and size.
+    let raw = |content_type: &str, body: Vec<u8>| {
+        client
+            .post(&url)
+            .header("Authorization", format!("Bearer {announce}"))
+            .header("content-type", content_type)
+            .send(&body[..])
+            .unwrap()
+    };
+    let mut response = raw("application/x-protobuf", b"\x0a\x00".to_vec());
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(json_body(&mut response)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Collector"));
+    let response = raw("application/json; charset=utf-8", b"{}".to_vec());
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = raw("application/json", b"not json".to_vec());
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = raw("application/json", vec![b' '; 4 * 1024 * 1024 + 1]);
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // The binding's cap: 1,000 open identities, then `409 too-many-children`
+    // and no Run for the next one.
+    let batch_of = |ids: Vec<String>| {
+        let resources: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| otlp_batch(id, 1, 0)["resourceMetrics"][0].clone())
+            .collect();
+        serde_json::json!({ "resourceMetrics": resources })
+    };
+    // job-7 is open already: 999 more fill the binding.
+    let ids: Vec<String> = (0..999).map(|n| format!("cap-{n}")).collect();
+    for chunk in ids.chunks(8) {
+        let response = as_bearer(
+            &client,
+            "POST",
+            &url,
+            &announce,
+            Some(batch_of(chunk.to_vec())),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let mut response = as_bearer(
+        &client,
+        "POST",
+        &url,
+        &announce,
+        Some(batch_of(vec!["one-too-many".to_string()])),
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "too-many-children"
+    );
+
+    // Revoked: 401.
+    let response = call(
+        &client,
+        "POST",
+        &format!("{base}/v0/bindings/openai/credentials/revoke"),
+        Some(serde_json::json!({"class": "announce"})),
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = as_bearer(
+        &client,
+        "POST",
+        &url,
+        &announce,
+        Some(otlp_batch("job-7", 1600, 40)),
+    );
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // Nothing the receiver does not consume, and no credential, reached
+    // the state directory.
+    server.stop().unwrap();
+    let mut stack = vec![state.path().to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                for needle in ["SENTINEL", announce.as_str()] {
+                    assert!(
+                        !bytes.windows(needle.len()).any(|w| w == needle.as_bytes()),
+                        "{} carries {needle}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}

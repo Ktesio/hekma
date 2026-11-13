@@ -1081,6 +1081,7 @@ pub fn generate() -> VectorsDocument {
             // Story 22-3 (still 1.4.0, unreleased): the Scent-Check Mode's
             // tie and the Caller's tighten-only rule.
             .chain(scent_policy_cases())
+            .chain(observed_policy_cases())
             .collect(),
     }
 }
@@ -2427,6 +2428,43 @@ fn scent_policy_cases() -> Vec<Case> {
     ]
 }
 
+/// Story 23-3 (still 1.4.0): inbound telemetry gives `observed` depth a
+/// producer. An observed Run has no wire path and no process, so a Policy's
+/// `warn` executes while `block`, `pause` and `stop` act as `warn` with the
+/// `depth-fallback` Anomaly. Appended after every case.
+fn observed_policy_cases() -> Vec<Case> {
+    use crate::domain::runs::ControlDepth;
+    let case = |id: &str, action: BreachAction| {
+        policy_case(
+            id,
+            crate::domain::runs::policy::ResolutionInput {
+                depth: ControlDepth::Observed,
+                wire_path: false,
+                bound_labels: labels(&[("team", "core")]),
+                policies: vec![
+                    crate::domain::runs::PolicyRecord::default_policy(),
+                    crate::domain::runs::PolicyRecord {
+                        name: "p".to_string(),
+                        selector: Some("team=core".parse().unwrap()),
+                        limits: crate::domain::runs::PolicyLimits {
+                            tokens_per_run: Some(1_000),
+                            breach_action: Some(action),
+                            ..Default::default()
+                        },
+                        rates: Default::default(),
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+    };
+    vec![
+        case("policy-observed-warn-executes", BreachAction::Warn),
+        case("policy-observed-block-falls-back", BreachAction::Block),
+        case("policy-observed-pause-falls-back", BreachAction::Pause),
+    ]
+}
+
 fn policy_case(id: &str, input: crate::domain::runs::policy::ResolutionInput) -> Case {
     Case::Policy(PolicyCase {
         id: id.to_string(),
@@ -3377,10 +3415,10 @@ mod tests {
         let document = generate();
         assert_eq!(
             document.cases.len(),
-            SHIPPED.len() + 14 + 10 + 6 + 4 + 3,
+            SHIPPED.len() + 14 + 10 + 6 + 4 + 3 + 3,
             "39 shipped + the 14 cases 21-3 appends + the 10 cases 21-6 appends + the 6 \
              Caller-layer cases 22-1 appends + the 4 wire-depth cases 23-1 appends + the 3 \
-             Scent-Check cases 22-3 appends"
+             Scent-Check cases 22-3 appends + the 3 observed-depth cases 23-3 appends"
         );
         for (index, id) in SHIPPED.iter().enumerate() {
             assert_eq!(
@@ -3439,11 +3477,12 @@ mod tests {
             .all(|case| matches!(case, Case::Rearm(_))));
         // Story 22-1 appends the 6 Caller-layer `policy` cases after them,
         // story 23-1 the 4 wire-depth `policy` cases after those, and story
-        // 22-3 the 3 Scent-Check `policy` cases after those.
+        // 22-3 the 3 Scent-Check `policy` cases after those, and story
+        // 23-3 the 3 observed-depth `policy` cases last.
         assert!(document.cases[63..]
             .iter()
             .all(|case| matches!(case, Case::Policy(_))));
-        assert_eq!(document.cases.len() - 53, 23);
+        assert_eq!(document.cases.len() - 53, 26);
     }
 
     /// The SHA-256 of the 1.3.0 artifact's 53 cases, pretty-printed as one
@@ -3644,10 +3683,22 @@ mod tests {
             ),
             "the wire-depth cases follow the Caller-layer cases"
         );
+        let first_observed = document
+            .cases
+            .iter()
+            .position(
+                |case| matches!(case, Case::Policy(case) if case.id.starts_with("policy-observed-")),
+            )
+            .expect("the observed-depth cases exist");
         assert_eq!(
-            document.cases.len() - first_scent,
+            first_observed - first_scent,
             3,
-            "the 3 Scent-Check cases close the artifact"
+            "the 3 Scent-Check cases follow the wire-depth cases"
+        );
+        assert_eq!(
+            document.cases.len() - first_observed,
+            3,
+            "the 3 observed-depth cases close the artifact"
         );
         assert!(
             document.cases[first_rearm..first_caller]

@@ -2759,6 +2759,27 @@ impl Engine {
         .await
     }
 
+    /// Ingest one identity's inbound telemetry (story 23-3, the Control
+    /// API's `/v1/metrics`): claim or renew its Run beneath the
+    /// credential's binding — never issuing a Run Key — and commit the
+    /// forward difference of its cumulative token counts as
+    /// `telemetry-reported` usage, always estimated. A Run with a wire path
+    /// keeps per-call metering: its points are skipped. Past the writer's
+    /// ack bound the store answers busy and nothing is committed.
+    pub async fn ingest_telemetry(
+        &self,
+        report: crate::domain::TelemetryReport,
+    ) -> Result<crate::domain::TelemetryOutcome, RunError> {
+        self.refuse_if_read_only().map_err(RunError::Store)?;
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.ingest_telemetry(&registry, report, inner.leases)
+        })
+        .await
+    }
+
     /// Heartbeat a Run (story 23-2, `POST /v0/runs/{id}/heartbeat`): extend
     /// its Lease (granting one when it held none) and return a `silent` Run
     /// to `active`. A Caller only within its own subtree; an announcer only
@@ -4115,6 +4136,16 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.announce(credential, external_id, labels))
+    }
+
+    /// Blocking twin of [`Engine::ingest_telemetry`].
+    pub fn ingest_telemetry(
+        &self,
+        report: crate::domain::TelemetryReport,
+    ) -> Result<crate::domain::TelemetryOutcome, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.ingest_telemetry(report))
     }
 
     /// Blocking twin of [`Engine::heartbeat`].

@@ -2401,3 +2401,282 @@ fn a_refused_claim_stays_on_the_binding_and_enforce_serves_an_announce() {
         200
     );
 }
+
+// ---------------------------------------------------------------------------
+// Story 23-3: inbound telemetry through the engine facade.
+// ---------------------------------------------------------------------------
+
+fn announce_credential(engine: &Engine, binding: &str) -> hekma_engine::AnnounceCredential {
+    let facade = engine.blocking();
+    let issued = facade
+        .issue_binding_credential(binding, hekma_engine::BindingCredentialClass::Announce)
+        .unwrap();
+    match facade
+        .announce_credential(issued.token.expose_secret())
+        .unwrap()
+    {
+        hekma_engine::AnnounceCredentialState::Active(credential) => credential,
+        other => panic!("not active: {other:?}"),
+    }
+}
+
+fn report(
+    credential: &hekma_engine::AnnounceCredential,
+    id: &str,
+    labels: &[(&str, &str)],
+    points: &[(&str, u64)],
+) -> hekma_engine::TelemetryReport {
+    hekma_engine::TelemetryReport {
+        credential: credential.clone(),
+        external_id: id.to_string(),
+        labels: labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        points: points
+            .iter()
+            .map(|(t, v)| hekma_engine::TelemetryPoint {
+                token_type: hekma_engine::TelemetryTokenType::from_wire(t).unwrap(),
+                value: *v,
+                model: Some("gpt-demo".to_string()),
+            })
+            .collect(),
+    }
+}
+
+/// One stored usage row: `(input, output, cached, source, call id)`.
+type UsageRow = (i64, i64, Option<i64>, String, Option<String>);
+
+/// The usage rows a Run holds.
+fn usage_rows(state: &TempDir, run: &str) -> Vec<UsageRow> {
+    let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT input_tokens, output_tokens, cached_tokens, metering_source, call_id \
+             FROM usage_events WHERE run_id = ?1 ORDER BY id",
+        )
+        .unwrap();
+    stmt.query_map([run], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ))
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// Story 23-3: a first post creates one `observed` Run in the credential's
+/// binding namespace with a Lease and no Run Key; cumulative counts commit
+/// their forward difference as `telemetry-reported` rows; a restart
+/// re-bases; a repeat commits nothing; a bound-key Caller label is skipped.
+#[test]
+fn telemetry_creates_an_observed_run_and_commits_only_forward_differences() {
+    use hekma_engine::TelemetryOutcome;
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, _port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let credential = announce_credential(&engine, "openai");
+    let facade = engine.blocking();
+    let first = facade
+        .ingest_telemetry(report(
+            &credential,
+            "job-7",
+            &[("step", "plan"), ("team", "edge")],
+            &[("input", 1200), ("cached", 100)],
+        ))
+        .unwrap();
+    let TelemetryOutcome::Committed {
+        run,
+        input,
+        cached,
+        skipped_labels,
+        rebased,
+        ..
+    } = first
+    else {
+        panic!("{first:?}")
+    };
+    assert_eq!(
+        (input, cached, skipped_labels, rebased),
+        (1200, 100, 1, false)
+    );
+    assert_eq!(run.record.control_depth.as_str(), "observed");
+    assert!(!run.record.wire_path);
+    assert!(run.lease_expires_at.is_some());
+    assert!(run
+        .labels
+        .iter()
+        .any(|l| l.key == "team" && l.value == "core"));
+    assert!(run.labels.iter().any(|l| l.key == "step"));
+    assert!(!run.labels.iter().any(|l| l.value == "edge"));
+    let run_id = run.record.run_id.as_str().to_string();
+    assert!(
+        facade.run_keys(&run_id).unwrap().is_empty(),
+        "telemetry never issues a Run Key"
+    );
+    // The second post: only the forward difference.
+    let second = facade
+        .ingest_telemetry(report(
+            &credential,
+            "job-7",
+            &[],
+            &[("input", 1500), ("cached", 100)],
+        ))
+        .unwrap();
+    let TelemetryOutcome::Committed {
+        run, input, cached, ..
+    } = second
+    else {
+        panic!("{second:?}")
+    };
+    assert_eq!((input, cached), (300, 0));
+    assert_eq!(run.record.run_id.as_str(), run_id, "one identity, one Run");
+    assert_eq!(run.usage.input_tokens, 1500);
+    assert_eq!(run.usage.estimate.to_string(), "estimated");
+    // A restart re-bases; a repeat commits nothing.
+    let third = facade
+        .ingest_telemetry(report(&credential, "job-7", &[], &[("input", 200)]))
+        .unwrap();
+    assert!(matches!(
+        third,
+        TelemetryOutcome::Committed {
+            input: 200,
+            rebased: true,
+            ..
+        }
+    ));
+    let repeat = facade
+        .ingest_telemetry(report(&credential, "job-7", &[], &[("input", 200)]))
+        .unwrap();
+    assert!(
+        matches!(repeat, TelemetryOutcome::NoDelta { .. }),
+        "{repeat:?}"
+    );
+    let listed = runs(&engine)
+        .into_iter()
+        .find(|r| r.record.run_id.as_str() == run_id)
+        .unwrap();
+    assert_eq!(listed.usage.input_tokens, 1700);
+    drop(engine);
+    let rows = usage_rows(&state, &run_id);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(rows
+        .iter()
+        .all(|(_, _, _, source, call)| source == "telemetry-reported" && call.is_none()));
+    assert_eq!(rows[0].0, 1200);
+    assert_eq!(rows[1].0, 300);
+    assert_eq!(rows[2].0, 200);
+}
+
+/// Story 23-3: a Run with a wire path keeps per-call metering — its
+/// telemetry is skipped (the Lease still renews); a revoked credential is
+/// refused; a malformed id is refused before any write; and a `block`
+/// Policy on an observed Run acts as `warn` with the depth fallback.
+#[test]
+fn telemetry_skips_wire_runs_and_breaches_observed_runs_as_warn() {
+    use hekma_engine::{RunError, TelemetryOutcome};
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    engine
+        .blocking()
+        .create_policy(
+            PolicyChange {
+                name: "core-cap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits {
+                    tokens_per_run: Some(1000),
+                    breach_action: Some(BreachAction::Block),
+                    ..PolicyLimits::default()
+                },
+                ..PolicyChange::default()
+            },
+            false,
+        )
+        .unwrap();
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let credential = announce_credential(&engine, "openai");
+    let facade = engine.blocking();
+    // A Run on the wire: announced through the proxy, metered per call.
+    assert_eq!(
+        post(port, "/openai/chat", &[("x-hekma-announce", "wired")]).status,
+        200
+    );
+    let wired = wait_for_usage(&engine, ("binding:openai", "wired"), 10);
+    let skipped = facade
+        .ingest_telemetry(report(
+            &credential,
+            "wired",
+            &[],
+            &[("input", 5000), ("output", 9)],
+        ))
+        .unwrap();
+    assert!(
+        matches!(skipped, TelemetryOutcome::SkippedWireRun { points: 2, .. }),
+        "{skipped:?}"
+    );
+    let after = runs(&engine)
+        .into_iter()
+        .find(|r| r.record.run_id == wired.record.run_id)
+        .unwrap();
+    assert_eq!(
+        after.usage.input_tokens, wired.usage.input_tokens,
+        "never summed"
+    );
+    // An observed Run crossing a `block` Policy ceiling: `warn` + fallback.
+    facade
+        .ingest_telemetry(report(&credential, "observed", &[], &[("input", 1200)]))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let observed = loop {
+        let found = runs(&engine)
+            .into_iter()
+            .find(|r| r.identity.as_ref().is_some_and(|(_, id)| id == "observed"));
+        if let Some(run) = found.filter(|r| {
+            let anomalies: Vec<&str> = r.record.anomalies.iter().map(|a| a.as_str()).collect();
+            anomalies.contains(&"breach") && anomalies.contains(&"depth-fallback")
+        }) {
+            break run;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no breach with the depth fallback"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        observed.record.status.as_str(),
+        "active",
+        "nothing is stopped"
+    );
+    // Refusals.
+    assert!(matches!(
+        facade.ingest_telemetry(report(&credential, "has space", &[], &[("input", 1)])),
+        Err(RunError::Invalid { .. })
+    ));
+    facade
+        .revoke_binding_credential("openai", hekma_engine::BindingCredentialClass::Announce)
+        .unwrap();
+    assert!(matches!(
+        facade.ingest_telemetry(report(&credential, "observed", &[], &[("input", 1300)])),
+        Err(RunError::CredentialRevoked)
+    ));
+}

@@ -20,6 +20,7 @@
 //! the outbox stays the only durable export surface.
 
 pub mod client;
+pub(crate) mod intake;
 pub mod payload;
 pub mod task;
 

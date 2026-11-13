@@ -22,6 +22,68 @@ The export is **metrics-only**. No prompts, no responses, no agent content,
 and no secrets ever ride a payload — the attribute vocabulary is closed
 (instance and run identifiers, budget words, state names, estimate labels).
 
+## Inbound telemetry: `/v1/metrics`
+
+> **On main, not yet released.** The receiver ships with the next release.
+
+The export above sends Hekma's metrics out. The **receiver** takes a client's metrics in: a framework flow or plain client that only exports OpenTelemetry becomes an [`observed` Run](runs.md#observed), metered from its own token counts. It is the third way to [announce](announce.md) a Run, and the only one that never issues a Run Key.
+
+`POST /v1/metrics` on the [Control API](control-api.md#inbound-telemetry) takes **OTLP/HTTP+JSON** under a binding's **announce credential** (`hekma binding credential issue <binding> --class announce`), sent as `authorization: Bearer hk_ann_…`. It rides the Control API listener and is always on. It does nothing until you issue an announce credential: the credential is the switch.
+
+**What it reads.** Exactly three things, and nothing else is stored:
+
+| Input | Where | Rule |
+|---|---|---|
+| The Run's identity | the resource attribute `hekma.run.external_id` | 1 to 128 visible ASCII characters. It is claimed beneath the credential's binding, the same identity an `x-hekma-run` split or an announce uses, so one identity is one Run on every channel. |
+| Caller labels | resource attributes `hekma.label.<key>` | At most 16, each a valid label. A key the binding sets is skipped, never written. |
+| Token usage | the metric `gen_ai.client.token_usage`, a **cumulative sum**, one point per `gen_ai.token.type` (`input`, `output` or `cached`) | The point's `gen_ai.request.model` attribute is read to price the usage, and never stored. |
+
+**Cumulative counts, counted once.** OpenTelemetry SDKs export running totals. Hekma keeps the last total it saw per Run and token type, and records only the increase as usage, in the same transaction that updates the total. A batch sent twice therefore records nothing the second time, so a retry is always safe. A total that goes down means the client restarted: the new total is recorded as the increase, and the host notes it.
+
+**What the usage is.** Each increase is one usage row with metering source `telemetry-reported`, priced like any Run the proxy found (the Run's Policy flat Rate, else the default Policy's entry for the model). Its dollars are always **estimated**. It counts toward the Run's budgets. An `observed` Run has no wire path and no process, so `warn` is the only Breach Action that executes there: a Policy's `block`, `pause` or `stop` acts as `warn` with the `depth-fallback` Anomaly. Telemetry never moves a Run's depth.
+
+**One Run, one source.** A Run whose calls pass through the [metering proxy](metering-proxy.md) is metered per call. Its telemetry is skipped, so the two are never summed. The post still renews its Lease.
+
+**Leases.** Every post is a sign of life: it renews the Run's Lease and brings a `silent` Run back to `active`. A Run whose telemetry stops goes `silent`, then ends after the silent window, as any announced Run does.
+
+**Answers.**
+
+| Answer | When |
+|---|---|
+| `200` | The batch was read. When points were skipped, the body is OTLP's `partialSuccess` with `rejectedDataPoints` and a fixed message naming why: no valid identity, an unread metric shape, a batch bound, or a Run metered by the proxy. |
+| `400` | The body is not an OTLP JSON metrics request. |
+| `401` | No credential, or an unknown or revoked one. |
+| `403` | Any credential class other than an announce credential. |
+| `409 too-many-children` | The binding already has 1,000 open announced Runs. |
+| `413` | The body is over 4 MiB. Nothing is read. |
+| `415` | The body is not JSON (`application/x-protobuf`, gRPC). |
+| `503` | The state store did not take the batch within one second, with `x-should-retry: true`. Retrying is safe. |
+
+A batch carries at most 8 resources and 64 token-usage points; the rest are skipped and counted. Batches without `hekma.run.external_id` create nothing.
+
+**Protobuf and gRPC.** The receiver reads JSON only. To send from a client that exports protobuf or gRPC, run an OpenTelemetry Collector between them: its `otlp` receiver accepts any encoding, and its `otlphttp` exporter posts JSON to Hekma.
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+exporters:
+  otlphttp/hekma:
+    endpoint: http://127.0.0.1:8477
+    encoding: json
+    headers:
+      authorization: "Bearer ${env:HEKMA_ANNOUNCE_CREDENTIAL}"
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [otlphttp/hekma]
+```
+
+The client sets its resource attributes, for example `OTEL_RESOURCE_ATTRIBUTES=hekma.run.external_id=nightly-report,hekma.label.step=draft`.
+
 ## Configuration
 
 ```bash

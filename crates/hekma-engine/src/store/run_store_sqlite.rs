@@ -830,7 +830,11 @@ impl RunStore for SqliteStore {
         // distinct on every replay).
         let id = match &event.instance {
             Some(instance) => Some(self.require_instance_id(instance)?),
-            None if event.call_id.is_none() => {
+            // Story 23-3: inbound telemetry carries no call id; its dedup
+            // is the durable counter diff committed with the row.
+            None if event.call_id.is_none()
+                && event.metering_source != super::runs_sqlite::TELEMETRY_SOURCE =>
+            {
                 return Err(StoreError::Backend(
                     "a usage row on a Run with no agent instance must carry a call id".to_string(),
                 ))

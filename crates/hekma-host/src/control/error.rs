@@ -159,6 +159,13 @@ impl ApiError {
         Self::store_unreachable()
     }
 
+    /// Answer with `status` instead of the kind's (story 23-3: the OTLP
+    /// intake's `413` and `415`).
+    pub(crate) fn with_status(mut self, status: StatusCode) -> Self {
+        self.status_override = Some(status);
+        self
+    }
+
     /// Replace the message, keeping the kind and code (story 23-2: a
     /// route that names its own remediation).
     pub(crate) fn with_message(mut self, message: impl Into<String>) -> Self {

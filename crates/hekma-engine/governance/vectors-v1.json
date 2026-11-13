@@ -3811,6 +3811,215 @@
           "rate": "unset"
         }
       }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-observed-warn-executes",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "observed",
+        "wire_path": false,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "tokens_per_run": 1000,
+              "breach_action": "warn"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 1000,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "warn",
+        "effective_action": "warn",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": {
+            "policy": "p"
+          },
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": {
+            "policy": "p"
+          },
+          "scent_check": "default",
+          "rate": "unset"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-observed-block-falls-back",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "observed",
+        "wire_path": false,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "tokens_per_run": 1000,
+              "breach_action": "block"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 1000,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "block",
+        "effective_action": "warn",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": {
+            "policy": "p"
+          },
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": {
+            "policy": "p"
+          },
+          "scent_check": "default",
+          "rate": "unset"
+        },
+        "fallback": {
+          "policy": "p",
+          "action": "block"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-observed-pause-falls-back",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "observed",
+        "wire_path": false,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "tokens_per_run": 1000,
+              "breach_action": "pause"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 1000,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "pause",
+        "effective_action": "warn",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": {
+            "policy": "p"
+          },
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": {
+            "policy": "p"
+          },
+          "scent_check": "default",
+          "rate": "unset"
+        },
+        "fallback": {
+          "policy": "p",
+          "action": "pause"
+        }
+      }
     }
   ]
 }
