@@ -81,6 +81,13 @@ pub use unix::harden_host_memory;
 #[cfg(windows)]
 pub use windows::harden_host_memory;
 
+/// Owner-only file permissions (`0600` on Unix; a fresh profile file
+/// already is on Windows) — the secrets-file posture.
+#[cfg(all(test, unix))]
+pub use unix::restrict_to_owner;
+#[cfg(all(test, windows))]
+pub use windows::restrict_to_owner;
+
 // ---- Story 11-2 review-1: atomic-write filesystem glue (the cfg home) ----
 // The per-OS bits of `paths::write_atomically` (permission preservation and
 // the rename with the Windows sharing-retry), cfg-selected exactly like the

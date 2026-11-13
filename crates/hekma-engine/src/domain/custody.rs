@@ -799,11 +799,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secrets.toml");
         std::fs::write(&path, "PROVIDER = \"sentinel-one\"\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
+        crate::backends::restrict_to_owner(&path).unwrap();
         let cache = CustodyCache::new(path.clone());
         cache.seed(
             "PROVIDER",
@@ -816,22 +812,14 @@ mod tests {
         // The refresh re-resolves through the file: a rotated key is
         // picked up, pins included.
         std::fs::write(&path, "PROVIDER = \"sentinel-two\"\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
+        crate::backends::restrict_to_owner(&path).unwrap();
         assert_eq!(cache.refresh(), 0);
         let entry = cache.get("PROVIDER").unwrap();
         assert_eq!(entry.value.expose_secret(), "sentinel-two");
 
         // A failed re-resolution keeps the last good value and is counted.
         std::fs::write(&path, "OTHER = \"x\"\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
+        crate::backends::restrict_to_owner(&path).unwrap();
         assert_eq!(cache.refresh(), 1);
         let entry = cache.get("PROVIDER").unwrap();
         assert_eq!(

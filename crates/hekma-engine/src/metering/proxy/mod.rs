@@ -14,6 +14,8 @@
 //! Graceful stop: stop accepting → in-flight calls finish within the grace
 //! → the rest are aborted (`shutdown`) → the record pump closes.
 
+#[cfg(test)]
+mod custody_tests;
 pub(crate) mod forward;
 pub(crate) mod identify;
 pub(crate) mod records;
@@ -60,6 +62,20 @@ pub struct MeteringProxyOptions {
     /// SDKs send none, and a browser page's cross-site request is the
     /// threat).
     pub allowed_origins: Vec<String>,
+    /// cfg(test) seam: one extra trusted root (DER) for the custody tests'
+    /// TLS fake upstream.
+    #[cfg(test)]
+    pub(crate) test_root_der: Option<Vec<u8>>,
+}
+
+/// The upstream client's TLS config (the cfg(test) seam adds one root).
+fn tls_config(options: &MeteringProxyOptions) -> std::sync::Arc<rustls::ClientConfig> {
+    #[cfg(test)]
+    if let Some(der) = &options.test_root_der {
+        return crate::metering::relay::tls_config_with_root(der);
+    }
+    let _ = options;
+    crate::metering::relay::default_tls_config()
 }
 
 impl Default for MeteringProxyOptions {
@@ -73,6 +89,8 @@ impl Default for MeteringProxyOptions {
             max_buffered_bytes: 512 * 1024 * 1024,
             allowed_hosts: Vec::new(),
             allowed_origins: Vec::new(),
+            #[cfg(test)]
+            test_root_der: None,
         }
     }
 }
@@ -171,9 +189,7 @@ impl MeteringProxy {
         let shared = Arc::new(forward::ProxyShared {
             snapshot: deps.snapshot,
             pump,
-            client: crate::metering::relay::proxy_client(
-                crate::metering::relay::default_tls_config(),
-            ),
+            client: crate::metering::relay::proxy_client(tls_config(options)),
             identity_headers: options.identity_headers,
             inflight: Arc::new(Semaphore::new(options.max_concurrent_calls.max(1))),
             max_calls: options.max_concurrent_calls.max(1),

@@ -214,6 +214,15 @@ pub fn harden_host_memory() -> Result<(), String> {
     Ok(())
 }
 
+/// Make `path` readable and writable by its owner only (`0600`): the
+/// secrets-file posture (story 22-2 — the custody tests write secrets
+/// files, and the file resolver refuses a looser one on Unix).
+#[cfg(test)]
+pub fn restrict_to_owner(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
 /// Story 22-2: not Linux — nothing is changed (see the Linux variant).
 #[cfg(not(target_os = "linux"))]
 pub fn harden_host_memory() -> Result<(), String> {

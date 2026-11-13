@@ -271,6 +271,14 @@ const ENV_FLOOR: &[&str] = &[
     "HOME",
 ];
 
+/// Make `path` owner-only: on Windows a fresh file in the user's profile
+/// already is (the secrets file's documented portable posture), so this
+/// changes nothing.
+#[cfg(test)]
+pub fn restrict_to_owner(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Story 22-2: Windows — nothing is changed (crash-report behaviour is
 /// documented per OS in the hosting docs).
 pub fn harden_host_memory() -> Result<(), String> {
