@@ -27,7 +27,7 @@ use hekma_engine::{
 use serde::Deserialize;
 
 use super::dto;
-use super::error::{ApiError, ApiErrorKind, ApiJson, ApiResult};
+use super::error::{ApiError, ApiJson, ApiResult};
 use super::ApiState;
 
 /// `GET /v0/version` — the self-description (routes, auth, and stability
@@ -1703,12 +1703,11 @@ pub(crate) async fn binding_show(
     State(state): State<ApiState>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<dto::BindingDocument>> {
-    let binding = state.engine.binding(&name).await?.ok_or_else(|| {
-        ApiError::new(
-            ApiErrorKind::NotFound,
-            format!("no binding is named `{name}`"),
-        )
-    })?;
+    let binding = state
+        .engine
+        .binding(&name)
+        .await?
+        .ok_or_else(|| hekma_engine::BindingError::NotFound { name: name.clone() })?;
     Ok(Json(dto::BindingDocument {
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
         binding,

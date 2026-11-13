@@ -206,7 +206,7 @@ Details:
   or a held, silent or stale status; healthy open Runs are counted in the
   footer, not listed. --all lists every Run inside the window. The CONTROL
   column shows the Control Depth (supervised (no wire) for an agent whose
-  model calls skip the metering listener); the RUN column shows the agent's
+  model calls skip the metering proxy); the RUN column shows the agent's
   name on process-owning rows and the run id on child Runs. ANOMALIES shows
   the breach Anomaly with each latched Breach Action (breach[block]) beside
   the others; LABELS marks caller labels. USAGE is the Run's subtree tokens
@@ -915,8 +915,8 @@ enum AgentCommands {
         /// command). Supervised while the host runs; after a host exit the
         /// next host re-adopts it, and until then there is no crash
         /// detection, no budget enforcement and no event delivery. Refused
-        /// for engine-observed instances (their metering listener lives in
-        /// the host).
+        /// for engine-observed instances (the metering proxy they call lives
+        /// in the host).
         #[arg(long)]
         detach: bool,
     },

@@ -81,8 +81,22 @@ pub struct BindingPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<Vec<(String, String)>>,
     /// `Some(None)` clears the reference.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // `null` must mean "clear", which plain serde reads as "unchanged".
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_or_null"
+    )]
     pub custodied_key: Option<Option<String>>,
+}
+
+/// A present field, `null` included, is `Some`: absent is `None`
+/// (unchanged), `null` is `Some(None)` (clear), a value is `Some(Some(v))`.
+fn present_or_null<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// A route to put on a binding.

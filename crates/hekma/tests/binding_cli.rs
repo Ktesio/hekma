@@ -275,6 +275,40 @@ fn create_show_set_and_delete_route_through_the_host_with_typed_refusals() {
         assert!(run.stderr.contains("hekma binding list"), "{}", run.stderr);
     }
 
+    // A custodied-key reference is stored, and `--clear-custodied-key`
+    // really removes it (JSON `null` in the PATCH, not "unchanged").
+    let run = run_hekma_agent(
+        &[
+            "binding",
+            "set",
+            "openai",
+            "--custodied-key",
+            "secret:OPENAI_KEY",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(run.success, "{}", run.stderr);
+    let custodied = || {
+        let run = run_hekma_agent(
+            &["binding", "show", "openai", "--json"],
+            &ctx.project_dir,
+            state_dir,
+        );
+        let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+        json["binding"]["custodied_key"]
+            .as_str()
+            .map(str::to_string)
+    };
+    assert_eq!(custodied().as_deref(), Some("secret:OPENAI_KEY"));
+    let run = run_hekma_agent(
+        &["binding", "set", "openai", "--clear-custodied-key"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(run.success, "{}", run.stderr);
+    assert_eq!(custodied(), None, "the reference was not cleared");
+
     let run = run_hekma_agent(
         &["binding", "delete", "openai"],
         &ctx.project_dir,

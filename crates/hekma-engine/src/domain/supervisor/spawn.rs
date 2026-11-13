@@ -171,24 +171,23 @@ impl Supervisor {
         };
 
         // Story 12-1 — the DETACHED REFUSAL for engine-observed instances,
-        // BEFORE ANY SIDE EFFECT (no `starting` transition, no loopback
-        // listener, no spawn — every fallible step below still lies ahead, so
-        // the instance keeps its prior state). A detached observed instance is
-        // structurally broken: the loopback forward listener lives inside THIS
-        // engine process, so a detached start would inject a `base_url` whose
-        // server dies the moment the CLI exits — the agent's model calls would
-        // then hit a dead port (the loud stranded-listener condition adoption
-        // already announces). Refuse with the why + the remediation; a
-        // self-reported instance detaches fine (no listener to strand).
+        // BEFORE ANY SIDE EFFECT (no `starting` transition, no spawn — every
+        // fallible step below still lies ahead, so the instance keeps its
+        // prior state). The agent's injected `base_url` is this engine's
+        // shared Metering Proxy (story 23-1), which dies with this engine.
+        // Under a Service Host the proxy port is sticky, so a later host
+        // would serve it again; whether to lift the refusal there is an
+        // owner decision (it changes a frozen exit-5 contract), so it stays.
+        // A self-reported instance detaches fine (no proxy to depend on).
         if detach && metering_source == "engine-observed" {
             return Err(EngineError::DetachRefused {
                 name: name.as_str().to_string(),
-                detail: "the instance meters via the engine-observed channel, whose loopback \
-                         forward listener lives inside the engine that starts it (for the hekma \
-                         CLI, the local Service Host) — detaching would leave the agent pointed \
-                         at a listener that dies with the command or host that started it. \
-                         Start it without --detach (the supervising engine keeps the listener \
-                         alive), or switch the adapter's metering source to self-reported."
+                detail: "the instance meters via the engine-observed channel: its base URL points \
+                         at the metering proxy's listener inside the engine that starts it (for \
+                         the hekma CLI, the local Service Host), so detaching would leave the \
+                         agent pointed at a listener that dies with the command or host that \
+                         started it. Start it without --detach (the supervising engine keeps the \
+                         proxy alive), or switch the adapter's metering source to self-reported."
                     .to_string(),
             });
         }
