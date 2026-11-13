@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hekma_engine::{
-    BindingSpec, BreachAction, Engine, EngineOptions, ListRunsQuery, ListingView,
-    MeteringProxyOptions, PolicyChange, PolicyLimits, RunSummary,
+    BindingSpec, BreachAction, CallView, CallsQuery, Engine, EngineOptions, ListRunsQuery,
+    ListingView, MeteringProxyOptions, PolicyChange, PolicyLimits, RunSummary,
 };
 use tempfile::TempDir;
 
@@ -1741,4 +1741,182 @@ fn a_streamed_request_body_over_the_budget_is_refused_before_it_is_buffered() {
         .expect("answered before the body ends");
     assert_eq!(&head, b"HTTP/1.1 503");
     assert!(upstream.served().is_empty());
+}
+
+/// Poll the calls listing until `done` holds for it (records commit within
+/// the writer's batch window; the stream is unacknowledged).
+fn wait_for_calls(
+    engine: &Engine,
+    done: impl Fn(&[hekma_engine::CallRecord]) -> bool,
+) -> Vec<hekma_engine::CallRecord> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let items = engine
+            .blocking()
+            .list_calls(CallsQuery::all())
+            .unwrap()
+            .items;
+        if done(&items) {
+            return items;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the calls never landed: {items:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn recorded_calls_read_back_with_their_shapes_and_nothing_secret_anywhere() {
+    // The per-call read surface over records the real proxy wrote: a clean
+    // pass, an upstream transport failure, and a `block` refusal; read by
+    // the proxy-owning engine and by a read-only engine on the same state
+    // directory; and no provider key, prompt or upstream address in the
+    // listing, the by-id record or the calls segment's bytes.
+    const KEY: &str = "sk-SENTINEL-provider-4b1d";
+    const PROMPT: &str = "SENTINEL-prompt-9c2e";
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    // A binding whose upstream refuses connections: a transport failure.
+    let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_base = format!("http://{}", dead.local_addr().unwrap());
+    drop(dead);
+    bind(&engine, "dead", "/dead", &dead_base, &[("team", "dead")]);
+    let body =
+        format!(r#"{{"model":"gpt-demo","messages":[{{"role":"user","content":"{PROMPT}"}}]}}"#);
+    let auth = format!("Bearer {KEY}");
+    let ok = send(
+        port,
+        "POST /openai/chat HTTP/1.1",
+        &[("authorization", &auth)],
+        Some(&body),
+    );
+    assert_eq!(ok.status, 200, "{}", ok.body);
+    let failed = send(
+        port,
+        "POST /dead/chat HTTP/1.1",
+        &[("authorization", &auth)],
+        Some(&body),
+    );
+    assert_eq!(failed.status, 502, "{}", failed.body);
+    // A block Policy on the binding's labels, then one call over it.
+    wait_for_usage(&engine, ("binding", "openai"), 10);
+    engine
+        .blocking()
+        .create_policy(
+            PolicyChange {
+                name: "cap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits {
+                    tokens_per_run: Some(1),
+                    breach_action: Some(BreachAction::Block),
+                    ..PolicyLimits::default()
+                },
+                ..PolicyChange::default()
+            },
+            false,
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let refused = loop {
+        let answer = send(
+            port,
+            "POST /openai/chat HTTP/1.1",
+            &[("authorization", &auth)],
+            Some(&body),
+        );
+        if answer.status == 402 {
+            break answer;
+        }
+        assert!(Instant::now() < deadline, "the block never fenced");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(refused.error_type(), "hekma_budget_block");
+
+    let items = wait_for_calls(&engine, |items| {
+        items
+            .iter()
+            .any(|call| call.disposition.as_str() == "block")
+    });
+    let completed = items
+        .iter()
+        .find(|call| call.outcome.as_str() == "completed")
+        .expect("the clean pass");
+    assert_eq!(completed.status, Some(200));
+    assert_eq!(completed.input_tokens, Some(10));
+    assert_eq!(completed.binding.as_deref(), Some("openai"));
+    assert!(completed.token_id.is_none(), "no Run Key was presented");
+    assert!(completed.hold_end.is_none());
+    let transport = items
+        .iter()
+        .find(|call| call.binding.as_deref() == Some("dead"))
+        .expect("the transport failure");
+    assert_eq!(transport.outcome.as_str(), "upstream-error");
+    assert!(transport.input_tokens.is_none(), "unknown, never 0");
+    let blocked = items
+        .iter()
+        .find(|call| call.disposition.as_str() == "block")
+        .expect("the block refusal");
+    assert_eq!(blocked.status, Some(402));
+    // Newest first, and the problems view drops only the clean pass.
+    assert!(items.windows(2).all(|w| w[0].call_id > w[1].call_id));
+    let problems = engine
+        .blocking()
+        .list_calls(CallsQuery {
+            view: CallView::Problems,
+            ..CallsQuery::all()
+        })
+        .unwrap();
+    assert!(problems
+        .items
+        .iter()
+        .all(|call| call.call_id != completed.call_id));
+    assert!(problems.items.len() >= 2);
+
+    // A read-only engine reads the same records while the host writes.
+    let reader = Engine::open_read_only(Some(state.path().to_path_buf())).unwrap();
+    let read = reader.blocking().list_calls(CallsQuery::all()).unwrap();
+    assert_eq!(read.items.len(), items.len());
+    let by_id = reader.blocking().call(&blocked.call_id).unwrap();
+    assert_eq!(&by_id, blocked);
+
+    // Nothing secret in any surface, nor in the segment's bytes.
+    let upstream_addr = upstream.base().trim_start_matches("http://").to_string();
+    let document = serde_json::to_string(
+        &read
+            .clone()
+            .into_document(CallsQuery::all().echoed_filters()),
+    )
+    .unwrap();
+    for needle in [KEY, PROMPT, upstream_addr.as_str()] {
+        assert!(!document.contains(needle), "the listing carries {needle}");
+        assert!(
+            !serde_json::to_string(&by_id).unwrap().contains(needle),
+            "the record carries {needle}"
+        );
+    }
+    drop(reader);
+    drop(engine);
+    for entry in std::fs::read_dir(state.path().join("calls")).unwrap() {
+        let path = entry.unwrap().path();
+        let bytes = std::fs::read(&path).unwrap();
+        for needle in [KEY, PROMPT, upstream_addr.as_str()] {
+            assert!(
+                !bytes
+                    .windows(needle.len())
+                    .any(|window| window == needle.as_bytes()),
+                "{} carries {needle}",
+                path.display()
+            );
+        }
+    }
 }
