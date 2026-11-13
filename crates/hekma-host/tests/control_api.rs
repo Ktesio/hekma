@@ -5823,10 +5823,15 @@ fn the_announce_and_heartbeat_routes_follow_the_matrix_and_show_credentials_once
             Some(serde_json::json!({"class": "announce"})),
         );
         assert_eq!(response.status(), StatusCode::OK);
-        json_body(&mut response)["token"]
-            .as_str()
-            .unwrap()
-            .to_string()
+        let issued = json_body(&mut response);
+        assert!(
+            issued["note"]
+                .as_str()
+                .unwrap()
+                .contains("announces Runs beneath binding"),
+            "{issued}"
+        );
+        issued["token"].as_str().unwrap().to_string()
     };
     let ours = issue("openai", serde_json::json!([["team", "core"]]));
     let theirs = issue("other", serde_json::json!([]));
@@ -5963,4 +5968,29 @@ fn the_announce_and_heartbeat_routes_follow_the_matrix_and_show_credentials_once
     let refused = json_body(&mut response);
     assert_eq!(refused["error"]["code"], "unauthorized");
     assert!(!refused.to_string().contains(&never));
+
+    // No credential value ever reached the state directory, before or after
+    // the host's shutdown checkpoint.
+    let scan = |phase: &str| {
+        let mut stack = vec![state.path().to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    for secret in [&ours, &theirs, &run_key, &refresh] {
+                        assert!(
+                            !bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
+                            "{phase}: {} carries a credential",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+    };
+    scan("live");
+    server.stop().unwrap();
+    scan("after shutdown");
 }

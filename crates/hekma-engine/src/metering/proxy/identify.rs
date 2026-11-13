@@ -126,6 +126,20 @@ pub(crate) enum Identified {
     Refused(Refusal),
 }
 
+/// Where a call stays when its split or announce cannot claim its own Run:
+/// the base Run, or the identity the base would ensure.
+fn fallback_of(base: Attribution) -> (Option<RunId>, Option<WireIdentity>) {
+    match base {
+        Attribution::Run(run) => (Some(run), None),
+        Attribution::Ensure { identity, .. } => (None, Some(identity)),
+        Attribution::Announce {
+            fallback,
+            fallback_identity,
+            ..
+        } => (fallback, fallback_identity),
+    }
+}
+
 fn bearer(value: &str) -> Option<&str> {
     let value = value.trim();
     let (scheme, rest) = value.split_once(' ')?;
@@ -323,59 +337,29 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
 
     // Story 23-2: the announce, before the hint (it wins; a hint on the
     // same call is counted as ignored). A malformed external id is ignored
-    // like a malformed hint.
+    // like a malformed hint. A key or a Run route always resolves to a Run,
+    // so every well-formed announce has a scope.
     let announce = facts.announce.map(str::trim).filter(|a| !a.is_empty());
-    if let Some(external) = announce {
-        if !valid_external_id(external) {
-            return Identified::Call {
-                target: Target {
-                    upstream,
-                    rest,
-                    via,
-                    token_id,
-                    custody,
-                },
-                attribution: base,
-                hint_ignored: true,
-            };
-        }
+    let announce_ignored = announce.is_some_and(|a| !valid_external_id(a));
+    let scope =
+        announce
+            .filter(|a| valid_external_id(a))
+            .and_then(|_| match (&key, &route, &base) {
+                (Some(_), _, Attribution::Run(parent))
+                | (None, Route::Run(_), Attribution::Run(parent)) => {
+                    Some(AnnounceScope::Parent(parent.clone()))
+                }
+                (None, Route::Binding { name, .. }, _) => {
+                    Some(AnnounceScope::Binding(name.clone()))
+                }
+                _ => None,
+            });
+    if let (Some(scope), Some(external)) = (scope, announce) {
         let caller_labels = facts
             .hint_labels
             .and_then(parse_hint_labels)
             .unwrap_or_default();
-        let (scope, fallback, fallback_identity) = match (&key, &route, base) {
-            (Some(_), _, Attribution::Run(parent))
-            | (None, Route::Run(_), Attribution::Run(parent)) => {
-                (AnnounceScope::Parent(parent.clone()), Some(parent), None)
-            }
-            (None, Route::Binding { name, .. }, base) => {
-                let (fallback, fallback_identity) = match base {
-                    Attribution::Run(run) => (Some(run), None),
-                    Attribution::Ensure { identity, .. } => (None, Some(identity)),
-                    Attribution::Announce { .. } => (None, None),
-                };
-                (
-                    AnnounceScope::Binding(name.clone()),
-                    fallback,
-                    fallback_identity,
-                )
-            }
-            // Unreachable (a key or a Run route always resolves to a Run),
-            // kept total: the call stays where it was.
-            (_, _, base) => {
-                return Identified::Call {
-                    target: Target {
-                        upstream,
-                        rest,
-                        via,
-                        token_id,
-                        custody,
-                    },
-                    attribution: base,
-                    hint_ignored: true,
-                };
-            }
-        };
+        let (fallback, fallback_identity) = fallback_of(base);
         return Identified::Call {
             target: Target {
                 upstream,
@@ -402,7 +386,7 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
     }
 
     // The hint.
-    let mut hint_ignored = false;
+    let mut hint_ignored = announce_ignored;
     let attribution = match facts.hint.map(str::trim).filter(|h| !h.is_empty()) {
         None => base,
         Some(hint) if !valid_external_id(hint) => {
@@ -446,11 +430,7 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
                     external: hint.to_string(),
                     labels: labels.clone(),
                 };
-                let (fallback, fallback_identity) = match base {
-                    Attribution::Run(run) => (Some(run), None),
-                    Attribution::Ensure { identity, .. } => (None, Some(identity)),
-                    Attribution::Announce { .. } => (None, None),
-                };
+                let (fallback, fallback_identity) = fallback_of(base);
                 match snapshot.identities.get(&identity.key()) {
                     Some(split) => Attribution::Run(split.clone()),
                     None => Attribution::Ensure {

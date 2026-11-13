@@ -179,6 +179,12 @@ Under [key custody](run-keys.md#key-custody-preview--not-yet-supported) (a previ
 
 The secrets file lives in the state directory, so backups, snapshots and sync tools copy it with the volume. Exclude it, or give `hekma serve` its keys through its own environment instead, which the resolver reads first.
 
+## Leases and the sweeper
+
+The Service Host that owns the metering proxy also runs its **sweeper**: every 5 seconds it marks `silent` each [announced](announce.md) Run whose Lease lapsed and each Run without a Lease that had no traffic for 15 minutes, and ends each Run that stayed `silent` for 60 minutes (cause `silent-window`, its keys revoked). Silence never stops, pauses or fences a Run, and a supervised agent's Run is never swept: its process is its heartbeat. Only the engine that owns the proxy sweeps: a read-only open, such as `hekma ps`, never does. Statuses are stored, so a host restarted after a crash resumes from them: a Run that went silent before the crash is still silent, with no second event.
+
+A Host embedding the engine sets the windows in `MeteringProxyOptions.leases` (`LeaseOptions { lease_secs, wire_inactivity_secs, silent_window_secs, sweep_interval_secs }`, defaults 60, 900, 3600 and 5). They are host settings, not Policy limits.
+
 ## The meter is cooperative — the container is not a fence
 
 Engine-observed metering works inside the container as it does on a machine.

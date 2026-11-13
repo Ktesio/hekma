@@ -1245,7 +1245,7 @@ pub(crate) struct BindingDocument {
 
 /// `POST /v0/bindings/{name}/credentials` — issue (rotating any previous
 /// one). The token is in this answer ONCE and is never stored or shown
-/// again; nothing accepts it in this release.
+/// again; the note says what accepts it.
 #[derive(Serialize)]
 pub(crate) struct BindingCredentialDocument {
     /// [`CONTROL_API_SCHEMA_VERSION`].

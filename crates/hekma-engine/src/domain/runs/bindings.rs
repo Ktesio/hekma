@@ -6,8 +6,8 @@
 //! binding's own Run (created on the first call), an unlabelled binding's
 //! to the single unattributed Run. A binding also stores named reroute
 //! routes, an inert custodied-key reference and one announce and one
-//! proxy-access credential — nothing accepts either credential in this
-//! release.
+//! proxy-access credential — the announce credential announces Runs
+//! beneath its binding (story 23-2); nothing accepts a proxy-access one yet.
 //!
 //! Every change is one writer job and one `binding` event committed with
 //! its outbox row; the binding table rides the published snapshot.

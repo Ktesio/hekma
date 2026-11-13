@@ -1988,8 +1988,9 @@ pub(crate) async fn binding_route_delete(
 /// `POST /v0/bindings/{name}/credentials` (Operator bearer only, body
 /// `{"class":"announce"|"proxy-access"}`) — issue the binding's credential
 /// of that class, rotating any previous one in the same job. The token is
-/// in this answer ONCE (its hash and token id are all that is stored);
-/// nothing accepts it in this release, and the note says so.
+/// in this answer ONCE (its hash and token id are all that is stored). The
+/// note says what accepts it: an announce credential announces beneath its
+/// binding (story 23-2); nothing accepts a proxy-access one yet.
 pub(crate) async fn binding_credential_issue(
     State(state): State<ApiState>,
     Path(name): Path<String>,
@@ -2003,11 +2004,27 @@ pub(crate) async fn binding_credential_issue(
         token_id: issued.token_id.clone(),
         token: issued.token.expose_secret().to_string(),
         note: format!(
-            "This credential is shown once and is not stored. Nothing accepts it yet; the \
-             release that does will say so. (token id {})",
+            "{} (token id {})",
+            credential_note(class, &name),
             issued.token_id
         ),
     }))
+}
+
+/// What a freshly issued binding credential is for (story 23-2).
+pub(crate) fn credential_note(
+    class: hekma_engine::BindingCredentialClass,
+    binding: &str,
+) -> String {
+    match class {
+        hekma_engine::BindingCredentialClass::Announce => format!(
+            "This credential is shown once and is not stored. It announces Runs beneath binding \
+             `{binding}` on POST /v0/runs/announce, and heartbeats or closes the Runs it creates."
+        ),
+        hekma_engine::BindingCredentialClass::ProxyAccess => "This credential is shown once and \
+             is not stored. Nothing accepts it yet; the release that does will say so."
+            .to_string(),
+    }
 }
 
 /// `POST /v0/bindings/{name}/credentials/revoke` (Operator bearer only,

@@ -156,12 +156,12 @@ pub(crate) fn sweep<S: RunRecords + ?Sized>(
     let at = crate::time::format_rfc3339(now_unix);
     let silent_before = minus(now_unix, options.silent_window_secs);
     for run_id in store.silent_runs_past(&silent_before, SWEEP_BATCH)? {
-        let Some(record) = store.run_record(&run_id)? else {
+        // Re-read: skip a Run that changed since the index read.
+        let current = store.run_record(&run_id)?;
+        let Some(record) = current.filter(|r| !r.process_owner && r.status == RunStatus::Silent)
+        else {
             continue;
         };
-        if record.process_owner || record.status != RunStatus::Silent {
-            continue;
-        }
         let anomalies = record.anomalies.clone();
         move_to(
             store,
@@ -176,12 +176,12 @@ pub(crate) fn sweep<S: RunRecords + ?Sized>(
     }
     let inactive_before = minus(now_unix, options.wire_inactivity_secs);
     for run_id in store.runs_going_silent(&at, &inactive_before, SWEEP_BATCH)? {
-        let Some(record) = store.run_record(&run_id)? else {
+        // Re-read: skip a Run that changed since the index read.
+        let current = store.run_record(&run_id)?;
+        let Some(record) = current.filter(|r| !r.process_owner && r.status == RunStatus::Active)
+        else {
             continue;
         };
-        if record.process_owner || record.status != RunStatus::Active {
-            continue;
-        }
         let anomalies = record.anomalies.clone();
         move_to(
             store,

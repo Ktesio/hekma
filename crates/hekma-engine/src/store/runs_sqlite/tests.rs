@@ -1572,3 +1572,58 @@ fn the_sweep_silences_expired_and_idle_runs_ends_long_silent_ones_and_never_touc
     let again = sweep(&store, &LeaseOptions::default(), now).unwrap();
     assert!(again.events.is_empty(), "{:?}", again.events);
 }
+
+#[test]
+fn a_v19_state_dir_migrates_to_v20_seeding_activity_and_changing_no_run() {
+    // Story 23-2: rebuild the v19 shape (v20 adds two columns and two
+    // indexes) with an open and an ended Run; reopen — the open Run's
+    // `last_activity_at` is its `updated_at`, the ended one has none, no
+    // Run holds a Lease, and no status or depth moved.
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("state.db");
+    {
+        let store = SqliteStore::open(&db).unwrap();
+        store
+            .conn()
+            .execute_batch(crate::store::runs_sqlite::UNDO_V20_FOR_TEST)
+            .unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "INSERT INTO runs (run_id, control_depth, wire_path, status, process_owner, \
+                 created_at, updated_at) VALUES \
+                 ('run_OPEN', 'wire', 1, 'active', 0, 't', '2026-11-12T10:00:00Z'), \
+                 ('run_DONE', 'wire', 1, 'ended', 0, 't', '2026-11-12T09:00:00Z'); \
+                 PRAGMA user_version = 19;",
+            )
+            .unwrap();
+    }
+    let reopened = SqliteStore::open(&db).unwrap();
+    let version: i64 = reopened
+        .conn()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    let open = RunId::from_wire("run_OPEN");
+    let done = RunId::from_wire("run_DONE");
+    assert_eq!(
+        reopened.run_lease(&open).unwrap(),
+        (None, Some("2026-11-12T10:00:00Z".to_string()))
+    );
+    assert_eq!(reopened.run_lease(&done).unwrap(), (None, None));
+    let record = reopened.run_record(&open).unwrap().unwrap();
+    assert_eq!(record.status, RunStatus::Active);
+    assert_eq!(record.control_depth.as_str(), "wire");
+    assert_eq!(
+        reopened.run_record(&done).unwrap().unwrap().status,
+        RunStatus::Ended
+    );
+    assert_eq!(reopened.run_created_by(&open).unwrap(), None);
+    // Reopening at v20 runs nothing again.
+    drop(reopened);
+    let again = SqliteStore::open(&db).unwrap();
+    assert_eq!(
+        again.run_lease(&open).unwrap().1.as_deref(),
+        Some("2026-11-12T10:00:00Z")
+    );
+}

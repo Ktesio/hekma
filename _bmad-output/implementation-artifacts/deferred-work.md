@@ -485,6 +485,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: The Caller guard (`labels::check_caller_labels`) has one caller today, the child open, where it is vacuous for a fresh Run; the store's Caller upsert (`RunRecords::replace_labels` with `LabelSource::Caller`, which never replaces a bound row at the SQL level) has no production caller yet.
   evidence: `domain/runs/ops.rs` (`open_child`), `store/runs_sqlite.rs` (`replace_labels`, `#[cfg_attr(not(test), allow(dead_code))]` on the port method). Trigger: stories 22.1/23.1 (announce and identity-header Caller labels) — route every Caller-label write through both.
   partly-absorbed: story 22-1 (2026-11-12) — a Run-Key child open routes its Caller labels through `check_caller_labels` (`domain/runs/keys.rs::open_child_as` → `ops::open_child`). There is still no Caller label update after creation, so the Caller upsert's first caller stays with 23.1/23.2. Re-pointed trigger: stories 23.1/23.2 (identity-header and announce Caller labels).
+  resolved: story 23-2 (a re-announce of an open identity upserts its Caller labels through `check_caller_labels` and `replace_labels(LabelSource::Caller)` — `domain/runs/announce.rs::renew`; the port method's dead-code allow stays only on its doc) 2026-11-13
 - source_spec: `spec-21-9-bound-labels.md` (Design Notes: the planners)
   summary: A configured key replaces a Caller label on the same key, and if the configuration later drops the key, the Caller's value does not come back (the Caller row was replaced, not shadowed). The same holds for a verb label set over a Caller key and then removed. Bound wins by design; the Caller can set the label again where its surface allows.
   evidence: `domain/runs/labels.rs` (`plan_config_sync`, `plan_label_change`). Trigger: an operator or Host report of a lost Caller label, or story 23.1 if identity-header labels need to survive an Operator override.
@@ -610,6 +611,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-22-1-run-keys.md` (Deferrals: announce credentials)
   summary: `hk_ann_` announce credentials have their format, class, store CHECK value, key-index slot and authority-matrix row (Heartbeat, OtlpIntake — no route yet), but nothing issues one: there is no endpoint binding to scope one to, and no announce endpoint or heartbeat route.
   evidence: `domain/credential.rs` (`TokenClass::Announce`), `crates/hekma-host/src/control/auth.rs` (the matrix). Trigger: story 23.1 (`hekma binding`, announce-credential issuance) and story 23.2 (the announce endpoint, heartbeats and Leases).
+  resolved: story 23-2 (`POST /v0/runs/announce`, `POST /v0/runs/{id}/heartbeat` and close by the creating credential; the matrix opens `Announce → Announce | Heartbeat | OtlpIntake | RunClose`) 2026-11-13
 
 - source_spec: `spec-22-1-run-keys.md` (Design Notes: the snapshot index)
   summary: Cross-engine revocation propagation: a second engine on the same state dir (an embedder beside `hekma serve`) publishes its own snapshot, so a revocation it commits reaches the host's snapshot only on the host's next open. Harmless for the Control API — every Run Key action is a write that re-validates the key's row inside its job, and a snapshot miss falls back to one store read (`Engine::credential_state`) — but a proxy that reads only the snapshot would honour a key another engine revoked.
@@ -622,10 +624,12 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-22-1-run-keys.md` (Design Notes: Breadth)
   summary: The Caller breadth cap counts ALL open children of the parent (`open_children`), not only those a Caller opened, so an Operator-opened child counts against a Caller's 1000; and an announce-created Run has no cap yet. Simpler and stricter; revisit with announce.
   evidence: `domain/runs/keys.rs` (`open_child_as`). Trigger: story 23.2 (announce creates Runs).
+  resolved: story 23-2 (announce claims count in the per-binding cap, the per-parent cap and the new per-root cap; the all-children counting rule is kept) 2026-11-13
 
 - source_spec: `spec-22-1-run-keys.md` (security review pass 1, L8)
   summary: The Caller breadth cap bounds one PARENT, not one key: nesting is 8 deep, so a single Run Key can create about 1000^7 Runs, each its own writer job, and every `publish_changes` clones the whole snapshot (Runs and key maps), so the cost per write grows with N. Accepted for this story (the spec's breadth rule); the fix is a per-root-key (or per-subtree) cap counted inside the open job.
   evidence: `domain/runs/keys.rs` (`open_child_as`, `MAX_CALLER_OPEN_CHILDREN`), `domain/runs/snapshot.rs` (`RunSnapshot::with` clones). Trigger: story 23.2 (announce creates Runs and revisits the breadth rule) or story 24.4 (snapshot scale), whichever lands first.
+  resolved: story 23-2 (`MAX_ROOT_OPEN_DESCENDANTS` = 1,000 open Runs per root subtree, counted inside `open_child_as` and the announce job; the snapshot-clone cost stays with 24.4) 2026-11-13
 
 - source_spec: `spec-22-1-run-keys.md` (security review pass 1, L9 remainder)
   summary: `hekma rm --force` now drops the removed instance's Runs' keys from the published key index in the same commit (fixed in the review's fix round), but the `tokens` rows themselves still go with the instance through `ON DELETE CASCADE`, so `hekma run keys` can no longer list them; the credential events in the outbox keep the history. Decide whether a removed instance's credential rows should be kept as an audit trail (and the foreign key relaxed).
@@ -649,6 +653,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-23-1-shared-metering-proxy.md` (Design Notes: Hints)
   summary: A hint's `x-hekma-labels` apply only when it creates the Run; later different labels on the same hint are ignored. Caller label updates come with announce.
   evidence: `domain/runs/wire.rs` (`ensure_wire_run` takes the labels on creation only). Trigger: story 23.2 (announce and Caller label updates).
+  partly-absorbed: story 23-2 (2026-11-13) — a re-announce updates the Caller labels; a bare hint with different labels is still creation-only. Re-pointed trigger: a user report that hint labels must update.
 
 - source_spec: `spec-23-1-shared-metering-proxy.md` (Design Notes: Bind and auth posture)
   summary: The proxy binds `127.0.0.1` only; IPv6 loopback (`::1`) is not served.
@@ -744,3 +749,27 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-22-3-scent-check-modes.md` (the I/O matrix's reserved rows)
   summary: Credentialed and uncredentialed announce, and proxy-access-only calls, have no Scent-Check rows yet.
   evidence: the matrix's reserved row. Trigger: 23.2 (announce) and 22.5 (proxy-access acceptance).
+  partly-absorbed: story 23-2 (2026-11-13) — the announce rows are filled: an announcing call is served under every mode (`enforce` included) and its Run takes `unscented` under `shadow` (`metering/proxy/forward.rs`). Proxy-access-only calls stay with 22.5.
+
+## From spec-23-2 (announce and Leases) — build, 2026-11-13
+
+- source_spec: `spec-23-2-self-announce-run-identities-and-leases.md` (Ask First O4)
+  summary: The CrewAI and LangGraph helpers are not built; `docs/announce.md` carries the framework-agnostic recipe (the announce header, then the Run Key).
+  evidence: `docs/announce.md`. Trigger: the follow-up story that ships the helpers with CI lanes against real flows (the house rule gates "supported" on real-flow validation).
+
+- source_spec: `spec-23-2-self-announce-run-identities-and-leases.md` (Design Notes: one identity across channels)
+  summary: A Host-opened child's external id lives in the `host` namespace (21-2), which does not unify with `run:<parent>` beneath the same parent, so a Host-opened child and a header announce of the same id beneath its parent are two Runs.
+  evidence: `domain/runs/keys.rs` (`open_child_as` binds `host`/`caller:<run>`), `domain/runs/announce.rs` (`AnnounceClaim::key`). Trigger: a Host that opens children and lets them announce.
+
+- source_spec: `spec-23-2-self-announce-run-identities-and-leases.md` (Ask First 3)
+  summary: The Lease and the windows are host settings (`MeteringProxyOptions.leases`), not Policy limits; there is no per-Policy or per-Run window.
+  evidence: `domain/runs/lease.rs` (`LeaseOptions`). Trigger: an FR for a Policy-scoped window.
+
+- source_spec: `spec-23-2-self-announce-run-identities-and-leases.md` (Design Notes: the OTel channel)
+  summary: The OpenTelemetry announce channel is not built; the announce job's claim shape (`AnnounceClaim`) is what it will send.
+  evidence: `domain/runs/announce.rs`. Trigger: story 23.3.
+
+- source_spec: `spec-23-2-self-announce-run-identities-and-leases.md` (Design Notes: the header channel)
+  summary: A header announce whose pair cannot be minted (the OS random source failed) still claims the identity and creates the Run, with no credentials; the call is served, and the client has no key to present.
+  evidence: `metering/proxy/forward.rs` (`claim_announce`). Trigger: a report of an RNG failure on a host.
+
