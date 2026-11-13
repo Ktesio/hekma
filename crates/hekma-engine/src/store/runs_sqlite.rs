@@ -634,7 +634,10 @@ pub(crate) struct DispositionRow {
 
 impl SqliteStore {
     /// A Run's verb disposition reasons (story 23-4), by reason.
-    pub(crate) fn run_dispositions(&self, run_id: &RunId) -> Result<Vec<DispositionRow>, StoreError> {
+    pub(crate) fn run_dispositions(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<DispositionRow>, StoreError> {
         let mut stmt = self
             .conn()
             .prepare_cached(
@@ -676,7 +679,11 @@ impl SqliteStore {
     }
 
     /// Clear one verb disposition reason (story 23-4); whether one was set.
-    pub(crate) fn delete_disposition(&self, run_id: &RunId, reason: &str) -> Result<bool, StoreError> {
+    pub(crate) fn delete_disposition(
+        &self,
+        run_id: &RunId,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
         self.conn()
             .execute(
                 "DELETE FROM run_dispositions WHERE run_id = ?1 AND reason = ?2",
@@ -1841,6 +1848,24 @@ impl RunRecords for SqliteStore {
             )
             .map(|n| n.max(0) as u64)
             .map_err(backend)
+    }
+
+    fn run_held(
+        &self,
+        run_id: &RunId,
+    ) -> Result<(u64, Option<String>, Option<String>), StoreError> {
+        self.held_stats(run_id)
+    }
+
+    fn run_disposition_reasons(&self, run_id: &RunId) -> Result<Vec<String>, StoreError> {
+        Ok(self
+            .run_dispositions(run_id)?
+            .into_iter()
+            .map(|row| match row.route {
+                Some(route) => format!("{} {route}", row.reason),
+                None => row.reason,
+            })
+            .collect())
     }
 
     fn open_descendants(&self, root: &RunId) -> Result<u64, StoreError> {

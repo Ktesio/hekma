@@ -1296,9 +1296,14 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
         None
     };
     let (lease_expires_at, last_activity_at) = store.run_lease(run_id)?;
+    let (held_calls, oldest_held_at, last_hold_end) = store.run_held(run_id)?;
     Ok(RunView {
         lease_expires_at,
         last_activity_at,
+        dispositions: store.run_disposition_reasons(run_id)?,
+        held_calls,
+        oldest_held_at,
+        last_hold_end,
         labels: store.run_labels(run_id)?,
         limits: store.run_limits(run_id)?,
         policy: store.run_policy(run_id)?.map(|row| row.resolution),

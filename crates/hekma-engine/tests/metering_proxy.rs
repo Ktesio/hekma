@@ -2680,3 +2680,310 @@ fn telemetry_skips_wire_runs_and_breaches_observed_runs_as_warn() {
         Err(RunError::CredentialRevoked)
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Story 23-4: hold, release, reroute and reject at the metering proxy.
+// ---------------------------------------------------------------------------
+
+/// The open Run with `identity`.
+fn run_with(engine: &Engine, identity: (&str, &str)) -> RunSummary {
+    runs(engine)
+        .into_iter()
+        .find(|run| {
+            run.identity
+                .as_ref()
+                .is_some_and(|(ns, id)| ns == identity.0 && id == identity.1)
+        })
+        .unwrap_or_else(|| panic!("no Run {identity:?}"))
+}
+
+/// The calls the calls store holds for a Run: `(disposition, hold_end)`,
+/// once at least `expected` are recorded.
+fn call_dispositions(
+    engine: &Engine,
+    run_id: &str,
+    expected: usize,
+) -> Vec<(String, Option<String>)> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let listed = engine
+            .blocking()
+            .list_calls(CallsQuery {
+                run: Some(run_id.to_string()),
+                limit: 100,
+                ..CallsQuery::default()
+            })
+            .unwrap();
+        let items: Vec<(String, Option<String>)> = listed
+            .items
+            .iter()
+            .map(|call| (call.disposition.as_str().to_string(), call.hold_end.clone()))
+            .collect();
+        if items.len() >= expected || Instant::now() > deadline {
+            return items;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_held_run_parks_its_calls_and_release_forwards_them_in_arrival_order() {
+    use hekma_engine::DispositionVerb;
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    let run = wait_for_usage(&engine, ("binding", "openai"), 10);
+    let run_id = run.record.run_id.as_str().to_string();
+    let facade = engine.blocking();
+    let held = facade
+        .set_disposition(&run_id, DispositionVerb::Hold, "operator")
+        .unwrap();
+    assert!(held.changed && held.reasons == vec!["hold".to_string()]);
+    assert_eq!(
+        run_with(&engine, ("binding", "openai"))
+            .record
+            .status
+            .as_str(),
+        "held"
+    );
+    // The snapshot carries the hold before the next call arrives.
+    std::thread::sleep(Duration::from_millis(300));
+    let served = upstream.served().len();
+    let calls: Vec<_> = (0..3)
+        .map(|n| {
+            let path = format!("/openai/chat/{n}");
+            let handle = std::thread::spawn(move || post(port, &path, &[]));
+            // Arrival order: each call is parked before the next is sent.
+            std::thread::sleep(Duration::from_millis(150));
+            handle
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        upstream.served().len(),
+        served,
+        "nothing is forwarded while held"
+    );
+    // A safe method passes a hold? No: a hold parks every method but the
+    // fence's exempt ones.
+    let listing = send(port, "GET /openai/models HTTP/1.1", &[], None);
+    assert_eq!(listing.status, 200);
+    let released = facade
+        .set_disposition(&run_id, DispositionVerb::Release, "operator")
+        .unwrap();
+    assert!(released.changed && released.reasons.is_empty());
+    for call in calls {
+        assert_eq!(call.join().unwrap().status, 200);
+    }
+    let order: Vec<String> = upstream
+        .served()
+        .iter()
+        .skip(served + 1)
+        .map(|seen| seen.request_line.clone())
+        .collect();
+    assert_eq!(
+        order,
+        (0..3)
+            .map(|n| format!("POST /v1/chat/{n} HTTP/1.1"))
+            .collect::<Vec<_>>(),
+        "released in arrival order"
+    );
+    assert_eq!(
+        run_with(&engine, ("binding", "openai"))
+            .record
+            .status
+            .as_str(),
+        "active"
+    );
+    let dispositions = call_dispositions(&engine, &run_id, 5);
+    assert_eq!(
+        dispositions
+            .iter()
+            .filter(|(_, end)| end.as_deref() == Some("released"))
+            .count(),
+        3,
+        "{dispositions:?}"
+    );
+}
+
+#[test]
+fn reject_refuses_reroute_retargets_and_a_full_hold_queue_is_retryable() {
+    use hekma_engine::{DispositionVerb, RouteSpec};
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let backup = Upstream::start();
+    let engine = Engine::open_with_options(
+        Some(state.path().to_path_buf()),
+        EngineOptions {
+            metering_proxy: MeteringProxyOptions {
+                max_held_per_run: 1,
+                ..MeteringProxyOptions::default()
+            },
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let port = engine.metering_proxy().unwrap().port;
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let facade = engine.blocking();
+    facade
+        .put_binding_route(
+            "openai",
+            RouteSpec {
+                name: "backup".to_string(),
+                upstream: backup.base(),
+                custodied_key: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    let run_id = wait_for_usage(&engine, ("binding", "openai"), 10)
+        .record
+        .run_id
+        .as_str()
+        .to_string();
+    // Reroute: the call goes to the route's upstream, its own rest kept.
+    facade
+        .set_disposition(
+            &run_id,
+            DispositionVerb::Reroute(Some("openai/backup".to_string())),
+            "operator",
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    assert_eq!(backup.served().len(), 1);
+    assert!(backup.served()[0].request_line.starts_with("POST /v1/chat"));
+    // An unknown route is refused at set time.
+    assert!(facade
+        .set_disposition(
+            &run_id,
+            DispositionVerb::Reroute(Some("openai/nope".into())),
+            "operator"
+        )
+        .is_err());
+    facade
+        .set_disposition(&run_id, DispositionVerb::Reroute(None), "operator")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let before = upstream.served().len();
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    assert_eq!(
+        upstream.served().len(),
+        before + 1,
+        "back on its own upstream"
+    );
+    // A full hold queue: one parked, the next refused retryably.
+    facade
+        .set_disposition(&run_id, DispositionVerb::Hold, "operator")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let parked = std::thread::spawn(move || post(port, "/openai/chat", &[]));
+    std::thread::sleep(Duration::from_millis(300));
+    let full = post(port, "/openai/chat", &[]);
+    assert_eq!(full.status, 503, "{}", full.body);
+    assert_eq!(full.error_type(), "hekma_hold_full");
+    assert_eq!(full.header("x-should-retry"), Some("true"));
+    // Reject wins over the hold: the parked call and new calls get the
+    // non-retryable 402; a safe method still passes.
+    facade
+        .set_disposition(&run_id, DispositionVerb::Reject, "operator")
+        .unwrap();
+    let rejected = parked.join().unwrap();
+    assert_eq!(rejected.status, 402, "{}", rejected.body);
+    assert_eq!(rejected.error_type(), "hekma_run_reject");
+    assert_eq!(rejected.header("x-should-retry"), Some("false"));
+    let fresh = post(port, "/openai/chat", &[]);
+    assert_eq!(fresh.error_type(), "hekma_run_reject");
+    assert_eq!(
+        send(port, "GET /openai/models HTTP/1.1", &[], None).status,
+        200
+    );
+    let dispositions = call_dispositions(&engine, &run_id, 7);
+    assert!(
+        dispositions.contains(&("reject".to_string(), Some("rejected".to_string()))),
+        "{dispositions:?}"
+    );
+    assert!(
+        dispositions.contains(&("hold".to_string(), None)),
+        "the hold-full refusal"
+    );
+    assert!(dispositions.iter().any(|(d, _)| d == "reroute"));
+}
+
+#[test]
+fn disposition_verbs_need_a_wire_path_and_an_open_run() {
+    use hekma_engine::{DispositionVerb, RunError};
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    bind(&engine, "openai", "/openai", &upstream.base(), &[]);
+    let facade = engine.blocking();
+    // An observed Run (from telemetry) fails fast naming its depth.
+    let issued = facade
+        .issue_binding_credential("openai", hekma_engine::BindingCredentialClass::Announce)
+        .unwrap();
+    let hekma_engine::AnnounceCredentialState::Active(credential) = facade
+        .announce_credential(issued.token.expose_secret())
+        .unwrap()
+    else {
+        panic!("credential")
+    };
+    let outcome = facade
+        .ingest_telemetry(hekma_engine::TelemetryReport {
+            credential,
+            external_id: "tel".into(),
+            labels: Vec::new(),
+            points: vec![hekma_engine::TelemetryPoint {
+                token_type: hekma_engine::TelemetryTokenType::Input,
+                value: 1,
+                model: None,
+            }],
+        })
+        .unwrap();
+    let hekma_engine::TelemetryOutcome::Committed { run, .. } = outcome else {
+        panic!("{outcome:?}")
+    };
+    let refused = facade
+        .set_disposition(
+            run.record.run_id.as_str(),
+            DispositionVerb::Hold,
+            "operator",
+        )
+        .unwrap_err();
+    assert!(
+        matches!(refused, RunError::VerbUnavailable { .. }),
+        "{refused:?}"
+    );
+    assert!(refused.to_string().contains("observed"));
+    // An unknown Run, and an ended one.
+    assert!(matches!(
+        facade.set_disposition("run_NONE", DispositionVerb::Hold, "operator"),
+        Err(RunError::NotFound { .. })
+    ));
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    let wire = wait_for_usage(&engine, ("proxy", "unattributed"), 10);
+    facade.close_run(wire.record.run_id.as_str()).unwrap();
+    assert!(matches!(
+        facade.set_disposition(
+            wire.record.run_id.as_str(),
+            DispositionVerb::Reject,
+            "operator"
+        ),
+        Err(RunError::RunEnded { .. })
+    ));
+}

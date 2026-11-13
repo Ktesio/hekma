@@ -92,7 +92,10 @@ fn check_route_key(
     }
     let mut custody = None;
     for run in store.run_chain(&record.run_id)? {
-        if let Some(row) = store.run_custody(&run.run_id)?.filter(|row| row.state == "on") {
+        if let Some(row) = store
+            .run_custody(&run.run_id)?
+            .filter(|row| row.state == "on")
+        {
             custody = row.origin;
             break;
         }
@@ -138,18 +141,23 @@ pub(crate) fn apply(
             store.put_disposition(run_id, "hold", None, set_by, at)?;
             (!has("hold"), "hold".to_string())
         }
-        DispositionVerb::Release => (store.delete_disposition(run_id, "hold")?, "release".to_string()),
+        DispositionVerb::Release => (
+            store.delete_disposition(run_id, "hold")?,
+            "release".to_string(),
+        ),
         DispositionVerb::Reject => {
             store.put_disposition(run_id, "reject", None, set_by, at)?;
             (!has("reject"), "reject".to_string())
         }
         DispositionVerb::Reroute(Some(route)) => {
-            let target = store.reroute_target(route)?.ok_or_else(|| RunError::Invalid {
-                field: "route".to_string(),
-                reason: format!(
+            let target = store
+                .reroute_target(route)?
+                .ok_or_else(|| RunError::Invalid {
+                    field: "route".to_string(),
+                    reason: format!(
                     "no route `{route}`: name one as <binding>/<route> (`hekma binding route add`)"
                 ),
-            })?;
+                })?;
             check_route_key(store, &record, &target)?;
             let same = before
                 .iter()
@@ -192,7 +200,12 @@ pub(crate) fn apply(
         }
         current.updated_at = at.to_string();
         store.save_run(&current)?;
-        ops::note_disposition(store, &mut changes, &current, format!("{cause} by {set_by}"))?;
+        ops::note_disposition(
+            store,
+            &mut changes,
+            &current,
+            format!("{cause} by {set_by}"),
+        )?;
     }
     let reasons = store
         .run_dispositions(run_id)?

@@ -31,8 +31,8 @@ use super::usage::RunId;
 use crate::ports::StoreError;
 
 pub mod announce;
-pub mod dispositions;
 pub mod bindings;
+pub mod dispositions;
 pub(crate) mod keys;
 pub(crate) mod labels;
 pub(crate) mod lease;
@@ -599,6 +599,24 @@ pub struct RunView {
     /// Story 23-2: its last identified call or heartbeat (RFC 3339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_at: Option<String>,
+    /// Story 23-4: its wire disposition reasons (`hold`, `reject`,
+    /// `reroute <binding>/<route>`); empty when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispositions: Vec<String>,
+    /// Story 23-4: how many of its calls the metering proxy holds now.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub held_calls: u64,
+    /// Story 23-4: when its oldest held call started (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_held_at: Option<String>,
+    /// Story 23-4: how its most recent held call ended without a release
+    /// (`disconnect`, `shutdown`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hold_end: Option<String>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Where a child Run is opened.

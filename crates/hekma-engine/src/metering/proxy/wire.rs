@@ -59,12 +59,18 @@ pub(crate) enum WireError {
     LedgerUnavailable,
     RunUnavailable,
     UpstreamError,
+    /// Story 23-4: an Operator rejected the Run's calls.
+    RunReject,
+    /// Story 23-4: the Run's hold queue is full.
+    HoldFull,
+    /// Story 23-4: the host stopped while the call was held.
+    HoldInterrupted,
 }
 
 impl WireError {
     /// Every row (the table tests walk it).
     #[cfg(test)]
-    pub(crate) const ALL: [WireError; 15] = [
+    pub(crate) const ALL: [WireError; 18] = [
         WireError::CredentialInUrl,
         WireError::CustodyUnavailable,
         WireError::BadTarget,
@@ -80,6 +86,9 @@ impl WireError {
         WireError::LedgerUnavailable,
         WireError::RunUnavailable,
         WireError::UpstreamError,
+        WireError::RunReject,
+        WireError::HoldFull,
+        WireError::HoldInterrupted,
     ];
 
     /// (status, `error.type`, `error.code`, message, retryable). `None`
@@ -197,6 +206,28 @@ impl WireError {
                 "upstream_error",
                 "The upstream request failed.",
                 None,
+            ),
+            WireError::RunReject => (
+                402,
+                "hekma_run_reject",
+                "run_reject",
+                "This Run's model calls are rejected by its operator. Do not retry.",
+                Some(false),
+            ),
+            WireError::HoldFull => (
+                503,
+                "hekma_hold_full",
+                "hold_full",
+                "This Run's calls are held and its hold queue is full. Retry shortly.",
+                Some(true),
+            ),
+            WireError::HoldInterrupted => (
+                503,
+                "hekma_hold_interrupted",
+                "hold_interrupted",
+                "This call was held when the metering proxy stopped. Retry it; it will be held \
+                 again.",
+                Some(true),
             ),
         }
     }
