@@ -397,6 +397,12 @@ async fn accept_loop(
         }
     };
     drop(listener);
+    // Story 23-4: stopping from now on — a parked call answers the
+    // retryable `hekma_hold_interrupted` within its re-check tick instead
+    // of waiting out the grace to be aborted unanswered.
+    shared
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
     // In-flight calls finish within the grace; the rest are aborted (their
     // drop guards record `shutdown`).
     let deadline = tokio::time::Instant::now() + grace;

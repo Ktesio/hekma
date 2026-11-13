@@ -2987,3 +2987,59 @@ fn disposition_verbs_need_a_wire_path_and_an_open_run() {
         Err(RunError::RunEnded { .. })
     ));
 }
+
+/// Story 23-4 (R1.7): a call parked under a Run Key that is revoked
+/// before the release is refused with the revoked-key 401, never
+/// forwarded; a graceful stop answers a parked call with the retryable
+/// interruption.
+#[test]
+fn a_parked_call_is_re_validated_at_release_and_a_stop_interrupts_it() {
+    use hekma_engine::DispositionVerb;
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    bind(&engine, "openai", "/openai", &upstream.base(), &[]);
+    let first = post(port, "/openai/chat", &[("x-hekma-announce", "job")]);
+    let key = first.header("x-hekma-run-key").unwrap().to_string();
+    let run_id = wait_for_usage(&engine, ("binding:openai", "job"), 10)
+        .record
+        .run_id
+        .as_str()
+        .to_string();
+    let facade = engine.blocking();
+    facade
+        .set_disposition(&run_id, DispositionVerb::Hold, "operator")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let served = upstream.served().len();
+    let presented = key.clone();
+    let parked =
+        std::thread::spawn(move || post(port, "/openai/chat", &[("x-hekma-run-key", &presented)]));
+    std::thread::sleep(Duration::from_millis(400));
+    facade.revoke_run_keys(&run_id, true).unwrap();
+    facade
+        .set_disposition(&run_id, DispositionVerb::Release, "operator")
+        .unwrap();
+    let answer = parked.join().unwrap();
+    assert_eq!(answer.status, 401, "{}", answer.body);
+    assert_eq!(answer.error_type(), "hekma_credential_revoked");
+    assert_eq!(upstream.served().len(), served, "never forwarded");
+    // A graceful stop with a call parked: the retryable interruption.
+    facade
+        .set_disposition(&run_id, DispositionVerb::Hold, "operator")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    // The announce names the held Run (a bare call would go to the
+    // unattributed Run).
+    let parked =
+        std::thread::spawn(move || post(port, "/openai/chat", &[("x-hekma-announce", "job")]));
+    std::thread::sleep(Duration::from_millis(400));
+    drop(facade);
+    engine
+        .blocking()
+        .stop_metering_proxy(Duration::from_secs(2));
+    let interrupted = parked.join().unwrap();
+    assert_eq!(interrupted.status, 503, "{}", interrupted.body);
+    assert_eq!(interrupted.error_type(), "hekma_hold_interrupted");
+    assert_eq!(interrupted.header("x-should-retry"), Some("true"));
+}
