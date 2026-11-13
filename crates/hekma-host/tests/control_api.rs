@@ -267,6 +267,12 @@ fn every_route(addr: &str) -> Vec<(&'static str, String)> {
         ("POST", format!("http://{addr}/v0/runs/close")),
         ("PATCH", format!("http://{addr}/v0/runs/labels")),
         ("POST", format!("http://{addr}/v0/runs/limits")),
+        // The per-call read surface (the Operator family's newest rows).
+        ("GET", format!("http://{addr}/v0/calls")),
+        (
+            "GET",
+            format!("http://{addr}/v0/calls/call_01JZ6Q9G3S8V2X7K4M1N5P0R2T"),
+        ),
     ]
 }
 
@@ -394,7 +400,10 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
         // The Run listing (story 21-5) is identity-shaped only on its GET —
         // an empty state directory is a valid EMPTY listing. The POST
         // (open) keeps its exactly-one-parent 400 below.
-        || (method == "GET" && url.ends_with("/v0/runs"));
+        || (method == "GET" && url.ends_with("/v0/runs"))
+        // The calls listing (story 19-4): no calls recorded is a valid EMPTY
+        // listing too (the by-id read keeps its 404).
+        || (method == "GET" && url.ends_with("/v0/calls"));
         let register = method == "POST" && url.ends_with("/v0/instances");
         // The ack POST reached its handler but this loop's register-shaped
         // body carries no `seq` — the Json extractor's 422 is the
@@ -1949,42 +1958,47 @@ fn the_api_is_off_by_default_and_the_flag_pair_is_validated() {
         "no operator listener exists by default:\n{text}"
     );
     // The notice SEQUENCE, pinned exactly (review item 27's discipline):
-    // started, the local endpoint, signal, the API stop, the drain's
-    // zero-agent outcome, complete — in order, and NOTHING else.
+    // started, the shared metering proxy's address, the local endpoint,
+    // signal, the API stop, the drain's zero-agent outcome, complete — in
+    // order, and NOTHING else.
     let notices: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(
         notices.len(),
-        6,
-        "a listener-less serve emits exactly six notices:\n{text}"
+        7,
+        "a listener-less serve emits exactly seven notices:\n{text}"
     );
     assert!(
         notices[0].starts_with("[hekma] host started; state root "),
         "the first notice is the started notice:\n{text}"
     );
     assert!(
-        notices[1].starts_with(&format!(
+        notices[1].starts_with("[hekma] the metering proxy is listening on http://127.0.0.1:"),
+        "the second notice names the shared metering proxy on loopback:\n{text}"
+    );
+    assert!(
+        notices[2].starts_with(&format!(
             "[hekma] local control endpoint on {} (loopback, for the hekma CLI;",
             discovery.addr
         )),
-        "the second notice names the local endpoint:\n{text}"
-    );
-    assert_eq!(
-        notices[2],
-        "[hekma] SIGTEST received; stopping running and paused agents (graceful window 1s) ...",
-        "the third notice is the signal notice, verbatim:\n{text}"
+        "the third notice names the local endpoint:\n{text}"
     );
     assert_eq!(
         notices[3],
+        "[hekma] SIGTEST received; stopping running and paused agents (graceful window 1s) ...",
+        "the fourth notice is the signal notice, verbatim:\n{text}"
+    );
+    assert_eq!(
+        notices[4],
         "[hekma] control api stopped; no requests are accepted for the rest of the shutdown",
-        "the fourth notice is the API stop:\n{text}"
+        "the fifth notice is the API stop:\n{text}"
     );
     assert_eq!(
-        notices[4], "[hekma] no running or paused agents; nothing to stop",
-        "the fifth notice is the drain's zero-agent outcome:\n{text}"
+        notices[5], "[hekma] no running or paused agents; nothing to stop",
+        "the sixth notice is the drain's zero-agent outcome:\n{text}"
     );
     assert_eq!(
-        notices[5], "[hekma] shutdown complete (SIGTEST)",
-        "the sixth notice is the completion notice, verbatim:\n{text}"
+        notices[6], "[hekma] shutdown complete (SIGTEST)",
+        "the seventh notice is the completion notice, verbatim:\n{text}"
     );
 
     // --listen without --bearer-secret: a typed InvalidOptions (usage class).
@@ -4966,4 +4980,656 @@ fn read_sse_frame<R: std::io::BufRead>(reader: &mut R) -> (u64, serde_json::Valu
             // A frame terminator.
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Story 23-1: the /v0/bindings routes and /v0/proxy — CRUD, routes, the
+// one-time credentials, the listing's keyset page, and the typed codes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_binding_routes_serve_crud_credentials_and_typed_codes() {
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
+    let client = client();
+    let base = format!("http://{}/v0/bindings", server.addr);
+
+    // The proxy runs and says where.
+    let mut response = get_ok(&client, &server.addr, "/v0/proxy");
+    let proxy = json_body(&mut response);
+    assert_eq!(proxy["running"], true);
+    let port = proxy["port"].as_u64().unwrap();
+    assert_eq!(proxy["url"], format!("http://127.0.0.1:{port}"));
+    assert!(proxy.get("error").is_none());
+
+    // Create: 201 + Location + the binding.
+    for (name, prefix) in [("alpha", "/alpha"), ("beta", "/beta"), ("gamma", "/gamma")] {
+        let mut response = call(
+            &client,
+            "POST",
+            &base,
+            Some(serde_json::json!({
+                "name": name,
+                "prefix": prefix,
+                "upstream": "https://api.example.com/v1",
+                "labels": [["team", "core"]],
+            })),
+        );
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers()["location"].to_str().unwrap(),
+            format!("/v0/bindings/{name}")
+        );
+        assert_eq!(json_body(&mut response)["binding"]["prefix"], prefix);
+    }
+    // Typed refusals carry their codes.
+    for (body, status, code) in [
+        (
+            serde_json::json!({"name": "alpha", "prefix": "/x", "upstream": "https://e.com"}),
+            StatusCode::CONFLICT,
+            "binding-exists",
+        ),
+        (
+            serde_json::json!({"name": "dup", "prefix": "/alpha", "upstream": "https://e.com"}),
+            StatusCode::CONFLICT,
+            "binding-prefix-taken",
+        ),
+        (
+            serde_json::json!({"name": "bad", "prefix": "/_hekma", "upstream": "https://e.com"}),
+            StatusCode::BAD_REQUEST,
+            "binding-invalid",
+        ),
+    ] {
+        let mut response = call(&client, "POST", &base, Some(body));
+        assert_eq!(response.status(), status, "{code}");
+        assert_eq!(json_body(&mut response)["error"]["code"], code);
+    }
+    let mut response = call(&client, "POST", &base, Some(serde_json::json!({"oops": 1})));
+    assert!(response.status().is_client_error());
+    let _ = json_body(&mut response);
+
+    // The keyset listing: a page of two, then the rest after its cursor.
+    let mut response = get_ok(&client, &server.addr, "/v0/bindings?limit=2");
+    let page = json_body(&mut response);
+    assert_eq!(page["bindings"].as_array().unwrap().len(), 2);
+    assert_eq!(page["next_after"], "beta");
+    let mut response = get_ok(&client, &server.addr, "/v0/bindings?after=beta&limit=x");
+    let rest = json_body(&mut response);
+    assert_eq!(rest["bindings"][0]["name"], "gamma");
+
+    // Show, patch (labels replaced; custodied key set then cleared), 404s.
+    let mut response = get_ok(&client, &server.addr, "/v0/bindings/alpha");
+    assert_eq!(json_body(&mut response)["binding"]["name"], "alpha");
+    let mut response = client
+        .get(format!("{base}/ghost"))
+        .header("Authorization", format!("Bearer {BEARER_VALUE}"))
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "binding-not-found"
+    );
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/alpha"),
+        Some(serde_json::json!({"labels": [], "custodied_key": "secret:KEY"})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let patched = json_body(&mut response);
+    assert_eq!(patched["binding"]["custodied_key"], "secret:KEY");
+    assert_eq!(patched["binding"]["labels"].as_array().unwrap().len(), 0);
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/alpha"),
+        Some(serde_json::json!({"custodied_key": null})),
+    );
+    assert!(json_body(&mut response)["binding"]
+        .get("custodied_key")
+        .is_none());
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/ghost"),
+        Some(serde_json::json!({"prefix": "/g"})),
+    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let _ = json_body(&mut response);
+
+    // Routes: put, remove, and a missing route.
+    let mut response = call(
+        &client,
+        "PUT",
+        &format!("{base}/alpha/routes/backup"),
+        Some(serde_json::json!({"name": "backup", "upstream": "https://b.example.com"})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(&mut response)["binding"]["routes"][0]["name"],
+        "backup"
+    );
+    let mut response = call(
+        &client,
+        "DELETE",
+        &format!("{base}/alpha/routes/backup"),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(&mut response)["binding"]["routes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    let mut response = call(
+        &client,
+        "DELETE",
+        &format!("{base}/alpha/routes/backup"),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "binding-route-not-found"
+    );
+
+    // Credentials: issued once, listed without values, revoked per class.
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{base}/alpha/credentials"),
+        Some(serde_json::json!({"class": "proxy-access"})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let issued = json_body(&mut response);
+    let token = issued["token"].as_str().unwrap().to_string();
+    assert!(token.starts_with("hk_pxy_"));
+    assert_eq!(issued["class"], "proxy-access");
+    assert!(!issued["note"].as_str().unwrap().contains(&token));
+    let mut response = get_ok(&client, &server.addr, "/v0/bindings/alpha/credentials");
+    let listing = json_body(&mut response);
+    assert!(
+        !listing.to_string().contains(&token),
+        "a listing carries the token"
+    );
+    assert_eq!(listing["credentials"][0]["state"], "active");
+    for (body, code) in [
+        (Some(serde_json::json!({"class": "admin"})), "invalid"),
+        (None, "invalid"),
+    ] {
+        let response = call(&client, "POST", &format!("{base}/alpha/credentials"), body);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{code}");
+    }
+    let response = call(
+        &client,
+        "POST",
+        &format!("{base}/alpha/credentials/revoke"),
+        Some(serde_json::json!({"class": "proxy-access"})),
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let mut response = get_ok(&client, &server.addr, "/v0/bindings/alpha/credentials");
+    assert_eq!(
+        json_body(&mut response)["credentials"][0]["state"],
+        "revoked"
+    );
+    let response = call(
+        &client,
+        "POST",
+        &format!("{base}/alpha/credentials/revoke"),
+        Some(serde_json::json!({"class": "nope"})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Delete: 204, then 404.
+    let response = call(&client, "DELETE", &format!("{base}/gamma"), None);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let mut response = call(&client, "DELETE", &format!("{base}/gamma"), None);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let _ = json_body(&mut response);
+
+    // The token never reached the state directory's files.
+    let mut stack = vec![state.path().to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                assert!(
+                    !bytes.windows(token.len()).any(|w| w == token.as_bytes()),
+                    "{} carries the token",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The per-call read surface over the calls store: the listing, the by-id
+// record, every typed error, and the authority matrix's calls cells.
+// ---------------------------------------------------------------------------
+
+/// Seed call records into the state directory's calls segment (direct SQL
+/// through the same file the host's proxy owns — WAL allows the concurrent
+/// write). Each row is (run, outcome, status, status class, model); the
+/// ids are ULIDs at a controlled time so ordering and windows are
+/// deterministic.
+/// A seeded call row: (call id, run id, input tokens, outcome, token id).
+type SeedCall<'a> = (&'a str, &'a str, Option<i64>, &'a str, Option<&'a str>);
+
+fn seed_call_records(base: &Path, rows: &[SeedCall<'_>]) {
+    let calls_dir = base.join("calls");
+    std::fs::create_dir_all(&calls_dir).unwrap();
+    // A fresh segment beside whatever the host's engine owns: the reader
+    // merges by name order and today's (empty) segment reads clean.
+    let segment = calls_dir.join("2026-01-02.db");
+    let conn = rusqlite::Connection::open(&segment).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS calls (
+             call_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, token_id TEXT,
+             control_depth TEXT NOT NULL, binding TEXT, disposition TEXT NOT NULL,
+             hold_end TEXT, outcome TEXT NOT NULL, status INTEGER,
+             status_class TEXT NOT NULL, model TEXT, input_tokens INTEGER,
+             output_tokens INTEGER, cached_tokens INTEGER, started_at TEXT NOT NULL,
+             ended_at TEXT NOT NULL, latency_us INTEGER NOT NULL, upstream_us INTEGER);
+         CREATE INDEX IF NOT EXISTS idx_calls_run_call ON calls(run_id, call_id);
+         CREATE INDEX IF NOT EXISTS idx_calls_problem ON calls(call_id)
+             WHERE disposition <> 'pass' OR outcome <> 'completed'
+             OR status_class NOT IN ('2xx','3xx');
+         PRAGMA user_version = 2;",
+    )
+    .unwrap();
+    // 2026-01-02T00:00:00Z in Unix milliseconds; one row per second after
+    // it, so the ids and the stored starts agree.
+    const BASE_MS: u64 = 1_767_312_000_000;
+    for (index, (run, outcome, status, class, model)) in rows.iter().enumerate() {
+        let millis = BASE_MS + 1000 + 1000 * index as u64;
+        let started = format!("2026-01-02T00:00:{:02}.000000Z", index + 1);
+        conn.execute(
+            "INSERT OR IGNORE INTO calls VALUES (?1, ?2, ?3, 'wire', NULL, ?4, NULL, ?5, ?6, ?7, \
+             ?8, 10, 5, 2, ?9, ?9, 1000, 900)",
+            rusqlite::params![
+                format!("call_{}", ulid_at(millis, index as u8)),
+                run,
+                if *outcome == "refused" {
+                    Some("abcdef012345".to_string())
+                } else {
+                    None
+                },
+                if *outcome == "refused" {
+                    "block"
+                } else {
+                    "pass"
+                },
+                outcome,
+                status,
+                class,
+                model,
+                started,
+            ],
+        )
+        .unwrap();
+    }
+}
+
+/// A ULID at `unix_millis` whose random half varies by `nonce` (the last
+/// character carries its low bits) — deterministic, order-preserving ids.
+fn ulid_at(unix_millis: u64, nonce: u8) -> String {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut value: u128 = u128::from(unix_millis & ((1 << 48) - 1)) << 80;
+    value |= u128::from(nonce as u64) << 40;
+    let chars: Vec<char> = (0..26)
+        .rev()
+        .map(|group| ALPHABET[((value >> (5 * group)) & 0x1F) as usize] as char)
+        .collect();
+    chars.into_iter().collect()
+}
+
+#[test]
+fn the_calls_routes_read_records_page_and_refuse_every_malformed_value() {
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle.clone());
+    let client = client();
+    seed_call_records(
+        state.path(),
+        &[
+            (
+                "run_01JZ6Q9G3S8V2X7K4M1N5P0R2T",
+                "completed",
+                Some(200),
+                "2xx",
+                Some("gpt-demo"),
+            ),
+            (
+                "run_01JZ6Q9G3S8V2X7K4M1N5P0R2T",
+                "refused",
+                Some(429),
+                "refused",
+                None,
+            ),
+            (
+                "run_01JZ6Q9G3S8V2X7K4M1N5P0R2V",
+                "upstream-error",
+                None,
+                "transport-error",
+                Some("gpt-demo"),
+            ),
+            (
+                "run_01JZ6Q9G3S8V2X7K4M1N5P0R2V",
+                "completed",
+                Some(200),
+                "2xx",
+                Some("gpt-demo"),
+            ),
+        ],
+    );
+
+    // The unscoped listing: newest first, exactly the documented fields,
+    // the echoed filters, no cursor, nothing skipped.
+    let mut response = get_ok(&client, &server.addr, "/v0/calls");
+    assert_eq!(response.status(), StatusCode::OK);
+    let document = json_body(&mut response);
+    assert_eq!(document["schema_version"], 1);
+    assert_eq!(document["filters"]["view"], "all");
+    assert_eq!(document["filters"]["limit"], 50);
+    let items = document["items"].as_array().unwrap();
+    assert_eq!(items.len(), 4);
+    let first = &items[0];
+    assert!(first["call_id"].as_str().unwrap().starts_with("call_"));
+    assert_eq!(first["run_id"], "run_01JZ6Q9G3S8V2X7K4M1N5P0R2V");
+    // The refused row (index 1) presented a Run Key: the 12-hex label reads
+    // back; the others are null (never a value).
+    assert_eq!(items[2]["token_id"], "abcdef012345");
+    assert_eq!(first["token_id"], serde_json::Value::Null);
+    assert_eq!(first["hold_end"], serde_json::Value::Null);
+    assert!(document["next_cursor"].is_null());
+    assert_eq!(document["skipped_segments"], 0);
+
+    // The Run filter never expands a subtree; the problems view drops the
+    // clean passes.
+    let mut response = get_ok(
+        &client,
+        &server.addr,
+        "/v0/calls?run=run_01JZ6Q9G3S8V2X7K4M1N5P0R2V",
+    );
+    let tenant = json_body(&mut response);
+    assert_eq!(tenant["items"].as_array().unwrap().len(), 2);
+    let mut response = get_ok(&client, &server.addr, "/v0/calls?view=problems");
+    let problems = json_body(&mut response);
+    assert_eq!(problems["items"].as_array().unwrap().len(), 2);
+    assert_eq!(problems["filters"]["view"], "problems");
+
+    // limit=2 pages disjointly; 0 serves the maximum quietly; an absent
+    // limit is 50; a page-sized read's cursor continues.
+    let mut response = get_ok(&client, &server.addr, "/v0/calls?limit=2");
+    let page = json_body(&mut response);
+    assert_eq!(page["items"].as_array().unwrap().len(), 2);
+    let cursor = page["next_cursor"].as_str().unwrap().to_string();
+    let mut response = get_ok(
+        &client,
+        &server.addr,
+        &format!("/v0/calls?limit=2&cursor={}", percent_encode(&cursor)),
+    );
+    let next = json_body(&mut response);
+    assert_eq!(next["items"].as_array().unwrap().len(), 2);
+    assert!(next["next_cursor"].is_null(), "the read is exhausted");
+    for (left, right) in page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(next["items"].as_array().unwrap().iter())
+    {
+        assert!(left["call_id"].as_str().unwrap() > right["call_id"].as_str().unwrap());
+    }
+    let mut response = get_ok(&client, &server.addr, "/v0/calls?limit=0");
+    assert_eq!(
+        json_body(&mut response)["items"].as_array().unwrap().len(),
+        4
+    );
+
+    // The window is half-open on the call start.
+    let mut response = get_ok(
+        &client,
+        &server.addr,
+        "/v0/calls?from=2026-01-02T00:00:01Z&to=2026-01-02T00:00:03Z",
+    );
+    let windowed = json_body(&mut response);
+    assert_eq!(windowed["items"].as_array().unwrap().len(), 2);
+    assert_eq!(windowed["filters"]["from"], "2026-01-02T00:00:01Z");
+
+    // The by-id record.
+    let newest = items[0]["call_id"].as_str().unwrap().to_string();
+    let mut response = get_ok(&client, &server.addr, &format!("/v0/calls/{newest}"));
+    assert_eq!(response.status(), StatusCode::OK);
+    let record = json_body(&mut response);
+    assert_eq!(record["schema_version"], 1);
+    assert_eq!(record["call"]["call_id"], newest.as_str());
+    assert_eq!(record["call"]["run_id"], "run_01JZ6Q9G3S8V2X7K4M1N5P0R2V");
+
+    // Every typed refusal, each in the versioned envelope with its code.
+    let refusal = |path: &str, status: StatusCode, code: &str| {
+        let mut response = get_ok(&client, &server.addr, path);
+        assert_eq!(response.status(), status, "{path}");
+        let body = json_body(&mut response);
+        assert_eq!(body["error"]["code"], code, "{path}");
+    };
+    // A cursor that is not the codec's, a v2: prefix, and a RUN cursor.
+    refusal(
+        "/v0/calls?cursor=nonsense",
+        StatusCode::BAD_REQUEST,
+        "invalid-cursor",
+    );
+    refusal(
+        &format!(
+            "/v0/calls?cursor={}",
+            percent_encode(&base64ish_cursor("v2:run_x"))
+        ),
+        StatusCode::BAD_REQUEST,
+        "invalid-cursor",
+    );
+    refusal(
+        &format!(
+            "/v0/calls?cursor={}",
+            percent_encode(&base64ish_cursor("v1:run_01JZ6Q9G3S8V2X7K4M1N5P0R2T"))
+        ),
+        StatusCode::BAD_REQUEST,
+        "invalid-cursor",
+    );
+    // A calls cursor on the RUN listing refuses too (the cross-kind hole,
+    // both directions).
+    refusal(
+        &format!(
+            "/v0/runs?cursor={}",
+            percent_encode(&base64ish_cursor("v1:call_01JZ6Q9G3S8V2X7K4M1N5P0R2T"))
+        ),
+        StatusCode::BAD_REQUEST,
+        "invalid-cursor",
+    );
+    refusal(
+        "/v0/calls?run=not-a-run",
+        StatusCode::BAD_REQUEST,
+        "invalid-run",
+    );
+    refusal(
+        "/v0/calls?from=yesterday",
+        StatusCode::BAD_REQUEST,
+        "invalid-time",
+    );
+    refusal(
+        "/v0/calls?from=2026-01-03T00:00:00Z&to=2026-01-02T00:00:00Z",
+        StatusCode::BAD_REQUEST,
+        "invalid-time",
+    );
+    refusal(
+        "/v0/calls?view=everything",
+        StatusCode::BAD_REQUEST,
+        "invalid-view",
+    );
+    refusal(
+        "/v0/calls?limit=five",
+        StatusCode::BAD_REQUEST,
+        "invalid-limit",
+    );
+    refusal(
+        "/v0/calls?outcome=superceded",
+        StatusCode::BAD_REQUEST,
+        "invalid-filter",
+    );
+    refusal(
+        "/v0/calls/not-a-call-id",
+        StatusCode::BAD_REQUEST,
+        "invalid-call-id",
+    );
+    refusal(
+        "/v0/calls/call_01JZ6Q9G3S8V2X7K4M1N5P0R2T",
+        StatusCode::NOT_FOUND,
+        "call-not-found",
+    );
+
+    server.stop().unwrap();
+}
+
+/// A base64url-encoded cursor body over `inner` (the codec's exact form:
+/// unpadded URL-safe base64).
+fn base64ish_cursor(inner: &str) -> String {
+    let mut out = String::new();
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    for chunk in inner.as_bytes().chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let word = (b0 << 16) | (b1 << 8) | b2;
+        let quad = [
+            ALPHABET[(word >> 18) as usize & 0x3f],
+            ALPHABET[(word >> 12) as usize & 0x3f],
+            ALPHABET[(word >> 6) as usize & 0x3f],
+            ALPHABET[word as usize & 0x3f],
+        ];
+        match chunk.len() {
+            1 => out.push_str(std::str::from_utf8(&quad[..2]).unwrap()),
+            2 => out.push_str(std::str::from_utf8(&quad[..3]).unwrap()),
+            _ => out.push_str(std::str::from_utf8(&quad).unwrap()),
+        }
+    }
+    out
+}
+
+#[test]
+fn the_calls_routes_refuse_every_credential_class_but_the_operator_bearer() {
+    // Seed an open root Run BEFORE the host takes the state directory, so
+    // the API can open a real child under it and mint real credentials.
+    let state = tempfile::tempdir().unwrap();
+    drop(hekma_engine::Engine::open(Some(state.path().to_path_buf())).unwrap());
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+             process_owner, created_at, updated_at) \
+             VALUES ('run_ROOT', 'announced', 0, 'active', '', 0, 't', 't');",
+        )
+        .unwrap();
+    }
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle.clone());
+    let client = client();
+
+    // A real child Run of the seeded root: its Run Key and refresh
+    // credential, through the API.
+    let mut response = client
+        .post(format!("http://{}/v0/runs", server.addr))
+        .header("Authorization", format!("Bearer {BEARER_VALUE}"))
+        .send_json(serde_json::json!({"parent_run_id": "run_ROOT"}))
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let opened = json_body(&mut response);
+    let child = opened["run"]["run_id"].as_str().unwrap().to_string();
+    let run_key = opened["credentials"]["run_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let refresh = opened["credentials"]["refresh_credential"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // One call record attributed to that very child, and one to its
+    // parent.
+    seed_call_records(
+        state.path(),
+        &[
+            ("run_ROOT", "completed", Some(200), "2xx", Some("gpt-demo")),
+            (
+                child.as_str(),
+                "completed",
+                Some(200),
+                "2xx",
+                Some("gpt-demo"),
+            ),
+        ],
+    );
+
+    // The announce and proxy-access classes are pinned by the auth
+    // layer's own matrix test (their cells are refused on the Operator
+    // family, which the calls routes belong to): binding credentials do
+    // not resolve anywhere in this release, so an HTTP proof would need a
+    // resolver seam the release does not carry.
+
+    // The matrix's calls cells: the Run Key — INCLUDING the key of the very
+    // Run whose calls are asked for — and the refresh credential are all
+    // refused; no credential is a 401; the operator bearer reads
+    // everything. The by-id path uses a REAL record from the listing.
+    let mut response = get_ok(&client, &server.addr, &format!("/v0/calls?run={child}"));
+    let listed = json_body(&mut response);
+    let child_call = listed["items"][0]["call_id"].as_str().unwrap().to_string();
+    let calls_paths = [
+        "/v0/calls".to_string(),
+        format!("/v0/calls?run={child}"),
+        format!("/v0/calls/{child_call}"),
+    ];
+    for presented in [run_key.as_str(), refresh.as_str()] {
+        for path in &calls_paths {
+            let response = client
+                .get(format!("http://{}{}", server.addr, path))
+                .header("Authorization", format!("Bearer {presented}"))
+                .call()
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{path} with {presented}"
+            );
+            let mut response = response;
+            let body = json_body(&mut response);
+            assert_eq!(body["error"]["code"], "forbidden");
+            assert!(!body.to_string().contains(presented));
+        }
+    }
+    // An unknown Run Key shape is a 401, never a 403 oracle.
+    let unknown_key = format!("hk_run_{}", "9".repeat(52));
+    let response = client
+        .get(format!("http://{}/v0/calls", server.addr))
+        .header("Authorization", format!("Bearer {unknown_key}"))
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // No credential at all: 401.
+    let response = client
+        .get(format!("http://{}/v0/calls", server.addr))
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // The operator bearer reads the child's calls and every path above.
+    for path in &calls_paths {
+        let mut response = get_ok(&client, &server.addr, path);
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let _ = json_body(&mut response);
+    }
+
+    server.stop().unwrap();
 }

@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::policy::PolicyResolution;
-use super::{Label, RunRecord, RunUsage};
+use super::{Label, RunId, RunRecord, RunUsage};
 use crate::domain::budget::{BreachAction, BreachScope};
 use crate::domain::cost::EstimateLabel;
 use crate::domain::event::BreachDimension;
@@ -35,8 +35,6 @@ use crate::ports::PAGE_MAX;
 use super::policy::RunPolicy;
 #[cfg(test)]
 use crate::domain::cost::Micros;
-#[cfg(test)]
-use crate::domain::usage::RunId;
 
 /// How long a listing still shows an ended Run (read-side; PRD FR-49's
 /// assumed default until compaction lands with its knob).
@@ -125,12 +123,29 @@ impl ListRunsQuery {
     /// The keyset bound this page resumes after (the decoded cursor), or
     /// `None` for the first page. A cursor that is not the codec's form
     /// (a bad base64url body, a foreign version prefix, an empty id) is a
-    /// typed refusal — never a silently ignored key.
+    /// typed refusal — never a silently ignored key. So is a cursor whose
+    /// id is a CALL id (the calls listing's kind): the two listings share
+    /// one codec, so each refuses the other's cursors and a calls cursor
+    /// can never silently page the Run listing.
     pub fn after_key(&self) -> Result<Option<String>, super::RunError> {
         self.after
             .as_deref()
             .map(decode_cursor)
             .transpose()
+            .and_then(|decoded| match decoded {
+                Some((run_id, raw)) => {
+                    if crate::domain::calls::is_call_id(&run_id) {
+                        Err(super::RunError::InvalidCursor {
+                            detail: "the cursor names an id of another kind — it is not one this \
+                                     listing printed (start again from the first page)"
+                                .to_string(),
+                        })
+                    } else {
+                        Ok(Some((run_id, raw)))
+                    }
+                }
+                None => Ok(None),
+            })
             .map(|option| option.map(|(run_id, _raw)| run_id))
     }
 }
@@ -196,6 +211,16 @@ pub struct RunSummary {
     /// compact table).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub kept_on_pause: bool,
+    /// Story 23-1: a wire Run's `(namespace, external id)` identity — the
+    /// unattributed Run, a binding's Run, a split Run, a hint child. What
+    /// the listing renders as `unattributed`, `binding <name>` or the
+    /// external id; absent on instance-attached Runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<(String, String)>,
+    /// Story 23-1: this Run's agent started before the shared metering
+    /// proxy (the legacy root route serves it until it ends).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub before_shared_proxy: bool,
 }
 
 /// The headroom block a listing row carries: [`BudgetView`]'s stable field
@@ -475,7 +500,8 @@ pub(crate) fn headroom(
 /// Assemble one row's summary from its stored facts (the store layer's
 /// per-row point reads in one place): the record, labels, subtree usage,
 /// the instance cumulative usage on process-owning rows, the latches, the
-/// stored resolution's headroom, and the kept-on-pause marker.
+/// stored resolution's headroom, the kept-on-pause marker, and a wire Run's
+/// identity.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn summarize(
     record: RunRecord,
@@ -485,6 +511,8 @@ pub(crate) fn summarize(
     latches: Vec<LatchedBreach>,
     resolution: Option<&PolicyResolution>,
     kept_on_pause: bool,
+    identity: Option<(String, String)>,
+    before_shared_proxy: bool,
 ) -> RunSummary {
     RunSummary {
         budget: resolution
@@ -495,6 +523,8 @@ pub(crate) fn summarize(
         cumulative_usage: instance_cumulative,
         latched: latches,
         kept_on_pause,
+        identity,
+        before_shared_proxy,
     }
 }
 
@@ -524,6 +554,7 @@ pub(crate) fn latched_breaches(
 pub(crate) fn assemble<S: crate::ports::RunRecords + crate::ports::RunStore + ?Sized>(
     store: &S,
     records: Vec<RunRecord>,
+    legacy: Option<RunId>,
 ) -> Result<Vec<RunSummary>, crate::ports::StoreError> {
     let usage_of = |rollup: crate::ports::Rollup| RunUsage {
         input_tokens: rollup.totals.input_tokens,
@@ -554,12 +585,22 @@ pub(crate) fn assemble<S: crate::ports::RunRecords + crate::ports::RunStore + ?S
                     .transpose()?;
                 (subtree, cumulative)
             }
-            None => (RunUsage::default(), None),
+            // A wire Run (a binding's Run, a split, a hint child, the
+            // unattributed Run) has no instance: its subtree rollup is
+            // keyed by run id alone (story 23-1's re-key) and it has no
+            // cumulative scope.
+            None => (usage_of(store.run_rollup_by_id(&run_id)?), None),
         };
         let kept_on_pause = match instance.as_deref() {
             Some(name) => store.breach_default_kept(name)?,
             None => false,
         };
+        // A wire Run's identity (story 23-1): what the listing renders as
+        // `unattributed`, `binding <name>` or the external id.
+        let identity = store.run_identity(&run_id)?;
+        // The migration marker (story 23-1): the one pre-proxy Run the
+        // legacy root route serves.
+        let before_shared_proxy = legacy.as_ref().is_some_and(|legacy| legacy == &run_id);
         items.push(summarize(
             record,
             labels,
@@ -568,6 +609,8 @@ pub(crate) fn assemble<S: crate::ports::RunRecords + crate::ports::RunStore + ?S
             latches,
             resolution.as_ref(),
             kept_on_pause,
+            identity,
+            before_shared_proxy,
         ));
     }
     Ok(items)
@@ -833,6 +876,30 @@ mod tests {
     }
 
     #[test]
+    fn a_calls_cursor_never_pages_the_run_listing() {
+        // The two listings share one codec, so the Run listing refuses a
+        // cursor whose id is a call id — the cross-kind hole closed in both
+        // directions.
+        let call_id = format!("call_{}", crate::domain::mint_ulid());
+        let query = ListRunsQuery {
+            after: Some(encode_cursor(&call_id)),
+            ..ListRunsQuery::exceptions()
+        };
+        let err = query.after_key().unwrap_err();
+        assert_eq!(err.code(), "invalid-cursor");
+        assert!(err.to_string().contains("another kind"), "{err}");
+        // A legacy run id still passes (only the call-id shape refuses).
+        let legacy = ListRunsQuery {
+            after: Some(encode_cursor("run-1730000000000000000-7")),
+            ..ListRunsQuery::exceptions()
+        };
+        assert_eq!(
+            legacy.after_key().unwrap().as_deref(),
+            Some("run-1730000000000000000-7")
+        );
+    }
+
+    #[test]
     fn headroom_computes_against_the_resolved_limits_with_sources() {
         use crate::domain::cost::Rate;
         let resolution = crate::domain::runs::policy::resolve(&{
@@ -984,6 +1051,8 @@ mod tests {
             latched_breaches(&latches),
             Some(&resolution),
             true,
+            None,
+            false,
         );
         assert_eq!(summary.latched.len(), 2);
         // Sorted by (dimension, scope): dollars sorts before tokens.

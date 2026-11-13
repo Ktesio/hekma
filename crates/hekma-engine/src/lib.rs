@@ -152,9 +152,19 @@ pub use domain::{
     ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument, RunSummary,
     ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
 };
+// The per-call read surface over the calls store: the query, the record,
+// the listing and its document, the forward-compatible enums, the cursor
+// wrappers, the error surface, and the helpers the surfaces share.
+pub use domain::calls::{
+    decode_call_cursor, encode_call_cursor, expose_model, is_call_id, is_run_id, CallDisposition,
+    CallError, CallFilters, CallListing, CallListingDocument, CallOutcome, CallRecord, CallView,
+    CallsQuery, StatusClass, CALLS_DEFAULT_LIMIT, CALLS_LISTING_SCHEMA_VERSION, CALLS_MAX_LIMIT,
+    CALLS_SCAN_BUDGET, MAX_MODEL_CHARS, MODEL_REDACTED,
+};
 // The RFC 3339 formatters behind the window arithmetic (story 21-5: the
-// bench seeds ended rows at fixed distances from now).
-pub use crate::time::{format_rfc3339, now_unix_secs};
+// bench seeds ended rows at fixed distances from now). The parser and the
+// microsecond formatter serve the per-call read surface's time window.
+pub use crate::time::{format_rfc3339, format_rfc3339_micros, now_unix_secs, parse_rfc3339};
 // Story 21-3: Policies — the request and outcome of a Policy change, the
 // stored Policy, its limits and events, and the resolution a Run carries.
 pub use domain::{
@@ -182,9 +192,12 @@ pub use domain::{
     BindingOutcome, BindingPatch, BindingRoute, BindingSpec, IssuedBindingCredential, RouteSpec,
     BINDING_EVENT_SCHEMA_VERSION, MAX_BINDINGS, MAX_BINDING_ROUTES,
 };
+// Story 23-1: the shared Metering Proxy's options and address (the type of
+// `EngineOptions::metering_proxy` and `Engine::metering_proxy`).
 /// Story 22-1: the reserved credential config keys and the variable every
 /// supervised agent receives its Run Key in.
 pub use domain::{RUN_KEY_ENV, RUN_KEY_KEY, RUN_KEY_MARKER_PREFIX, RUN_REFRESH_KEY_KEY};
+pub use metering::proxy::{MeteringProxyOptions, ProxyInfo, ProxyStartError};
 // The shutdown drain's public surface (issue #328 item 3): the planner, the
 // per-instance outcome vocabulary, and (via `Engine::shutdown` / its
 // `blocking()` twin) the drain itself.

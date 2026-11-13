@@ -166,7 +166,7 @@ windows = "best-effort"
 A viable Metering Source. `source` is one of:
 
 - `"self-reported"` — the agent emits its own usage accounting (`KTESIO_USAGE {json}` sentinel lines on stdout).
-- `"engine-observed"` — the engine meters the agent's model traffic through a per-instance loopback proxy. The operator points the agent's OpenAI-compatible `base_url` at the engine (via the config mapping below) and sets `metering.upstream_base_url` to the real provider endpoint.
+- `"engine-observed"` — the engine meters the agent's model traffic through the host's shared loopback [metering proxy](metering-proxy.md). The engine injects `metering.base_url`, which the config mapping below points at the agent's OpenAI-compatible base URL (for example `OPENAI_BASE_URL`), and the operator sets `metering.upstream_base_url` to the real provider endpoint. The injected value carries a path, `<proxy url>/_hekma/runs/<run id>`: an agent that appends its request paths to its base URL works unchanged, and one that keeps only the base URL's host gets `404 hekma_no_route`.
 
 ```toml
 [metering]

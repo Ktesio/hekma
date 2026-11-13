@@ -118,6 +118,7 @@ surface `hekma` uses. The capabilities you will reach for first:
 | `budget_breach_events` / `transition_events` / `read_agent_log` | Query the durable records directly (a `subscribe` sees only later commits; the query APIs reach the past). |
 | `open_child_run` / `close_run` / `run` | Open a child Run under a supervised Run for one unit of your own work (`ChildRunRequest`: parent, caller labels, per-run ceilings, an external id for idempotent retries), close it, and read any Run (`RunView`: depth, status, Anomalies, labels, limits, subtree usage). Refusals are a typed `RunError` with a stable `code()`. See [Runs](runs.md). |
 | `label_run` / `select_runs` / `instance_run` | Bind and unbind labels on one Run as the Operator (`LabelChange`: `set` and `remove`, plus a dry run), returning a `LabelOutcome` (the labels after and before, and whether they changed); resolve a `Selector` (`key=value,…`) to the open Runs carrying every term (at most `MAX_SELECTED_RUNS`, else `RunError::TooManyRuns`); and read the open Run of an agent. Each bound `Label` carries its `origin` (`config` or `label-verb`). See [Runs](runs.md#bound-labels). |
+| `list_calls` / `call` | Read the [metering proxy's](metering-proxy.md#reading-the-records) per-call records: a `CallsQuery` (filters, the `problems` view, a cursor and a limit) answers a `CallListing`, and `call(call_id)` one `CallRecord`. Refusals are a typed `CallError` with a stable `code()`. Both take no engine lock and work on a read-only engine; `Blocking` has both. |
 | `send_input` / `attach_memory` / `detach_memory` | Interaction and memory wiring, where the adapter declares support. For an `acp` instance `send_input` dispatches one ACP `session/prompt` turn and returns immediately (the turn streams asynchronously); a second prompt while a turn is in flight is refused with `EngineError::AcpTurnInFlight`. |
 
 Every method returns a typed `Result` — the engine reports partial failures
@@ -146,9 +147,10 @@ A host that starts agents detached owes its operators the same honesty: keep
 the enforcement window visible wherever the option is offered, and remember
 that a detached instance's usage ledger only advances while some engine holds
 it. `start_detached` is refused outright (`EngineError::DetachRefused`) for
-engine-observed instances, because their loopback metering listener lives
-inside the starting engine and would strand the agent's `base_url` on a dead
-port — start those without detaching.
+engine-observed instances, because the metering proxy their `base_url` points
+at lives inside the starting engine and would leave it on a dead port — start
+those without detaching. An embedder runs the proxy on an ephemeral port by
+default; see [The metering proxy](metering-proxy.md).
 
 ## The event bus
 

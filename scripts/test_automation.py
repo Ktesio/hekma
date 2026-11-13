@@ -1209,6 +1209,54 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertNotIn("|| true", ps_block)
         self.assertNotIn("exit 0", ps_block)
         self.assertNotIn("--baseline", ps_block, "the ps run does not ratchet")
+        # Story 23-1: the metering proxy scenario is its own blocking step
+        # too, after the ps run, pinned the same way.
+        self.assertIn("- name: Run the metering proxy scenario", perf_job)
+        proxy_step = perf_job.index("- name: Run the metering proxy scenario")
+        self.assertGreater(proxy_step, ps_step, "the proxy run follows the ps run")
+        proxy_text = perf_job[perf_job.index("run: |", proxy_step) :]
+        next_proxy_step = _re.search(r"\n      - name:", proxy_text[1:])
+        proxy_block = (
+            proxy_text[: 1 + next_proxy_step.start()] if next_proxy_step else proxy_text
+        )
+        proxy_last_line = next(
+            line for line in reversed(proxy_block.splitlines()) if line.strip()
+        )
+        self.assertEqual(
+            proxy_last_line.strip(),
+            "target/release/examples/perf-budgets --proxy",
+        )
+        self.assertIn("set -euo pipefail", proxy_block)
+        self.assertNotIn("|| true", proxy_block)
+        self.assertNotIn("--baseline", proxy_block)
+        self.assertIn(
+            "PERF_BUDGETS_REPORT_PATH: perf-budgets-proxy-report.json",
+            perf_job[proxy_step : perf_job.index("- name: Upload the measured report", proxy_step)],
+        )
+        # Story 19-4: the per-call records listing scenario, after the proxy
+        # run, pinned the same way.
+        calls_step = perf_job.index("- name: Run the per-call records listing scenario")
+        self.assertGreater(calls_step, proxy_step, "the calls run follows the proxy run")
+        calls_text = perf_job[perf_job.index("run: |", calls_step) :]
+        next_calls_step = _re.search(r"\n      - name:", calls_text[1:])
+        calls_block = (
+            calls_text[: 1 + next_calls_step.start()] if next_calls_step else calls_text
+        )
+        calls_last_line = next(
+            line for line in reversed(calls_block.splitlines()) if line.strip()
+        )
+        self.assertEqual(
+            calls_last_line.strip(),
+            "target/release/examples/perf-budgets --calls-seed 100000",
+        )
+        self.assertIn("set -euo pipefail", calls_block)
+        self.assertNotIn("|| true", calls_block)
+        self.assertNotIn("--baseline", calls_block)
+        self.assertIn(
+            "PERF_BUDGETS_REPORT_PATH: perf-budgets-calls-report.json",
+            perf_job[calls_step : perf_job.index("- name: Upload the measured report", calls_step)],
+        )
+        self.assertIn("perf-budgets-calls-report.json", perf_job)
         ps_upload = perf_job.index("- name: Upload the measured report", ps_step)
         self.assertIn(
             "PERF_BUDGETS_REPORT_PATH: perf-budgets-ps-report.json",

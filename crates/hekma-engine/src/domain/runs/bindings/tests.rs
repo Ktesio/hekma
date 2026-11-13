@@ -371,3 +371,21 @@ fn limits_bound_bindings_and_routes() {
         Err(BindingError::TooMany { .. })
     ));
 }
+
+#[test]
+fn a_patch_tells_an_absent_custodied_key_from_a_null_one() {
+    let absent: BindingPatch = serde_json::from_str(r#"{"prefix":"/x"}"#).unwrap();
+    assert_eq!(
+        absent.custodied_key, None,
+        "absent leaves the key unchanged"
+    );
+    let null: BindingPatch = serde_json::from_str(r#"{"custodied_key":null}"#).unwrap();
+    assert_eq!(null.custodied_key, Some(None), "null clears the key");
+    let set: BindingPatch =
+        serde_json::from_str(r#"{"custodied_key":"secret:OPENAI_KEY"}"#).unwrap();
+    assert_eq!(
+        set.custodied_key,
+        Some(Some("secret:OPENAI_KEY".to_string())),
+        "a value sets it"
+    );
+}

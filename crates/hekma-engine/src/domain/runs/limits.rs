@@ -31,22 +31,18 @@ use crate::domain::cost::Micros;
 use crate::domain::governance::{self, GovernanceDecision, LatchKey, LevelArms, LevelTotals};
 use crate::domain::name::InstanceName;
 use crate::domain::pipeline::{self, CommittedBreach, EvalInput};
-use crate::metering::WireFence;
 use crate::ports::{PolicyRecords, RunRecords, RunStore};
 use crate::time::now_rfc3339;
 
 /// The live per-instance context the re-arm pass's money half needs (built
 /// by the caller — engine or supervisor — which holds the locks): the
-/// instance's metering wire fence, its metering source for the breach
+/// instance's metering source for the breach
 /// records, and its fresh explicit inputs. Whether the engine supervises
 /// the instance is the CALLER's own fact when it applies the returned
 /// process actions (D2) — an unsupervised instance's breaches still
 /// record and latch here.
 #[derive(Clone, Default)]
 pub(crate) struct InstanceContext {
-    /// The instance's live wire fence (an engine-observed instance's
-    /// listener fence; `None` when it has no listener).
-    pub fence: Option<WireFence>,
     /// The instance's metering source (the breach records name it).
     pub metering_source: String,
     /// Whether THIS engine supervises the instance right now: only a
@@ -176,14 +172,8 @@ pub(crate) fn re_arm(
                 // Per-reason fence clear: only the raised reasons clear; the
                 // fence stays up while any other latched `block` reason
                 // holds (amendment 2).
-                if action == BreachAction::Block {
-                    if !report.fence_cleared.contains(&key) {
-                        report.fence_cleared.push(key);
-                    }
-                    if let Some(fence) = &context.fence {
-                        let fence = fence.clone();
-                        ctx.after_commit(move || fence.clear(key));
-                    }
+                if action == BreachAction::Block && !report.fence_cleared.contains(&key) {
+                    report.fence_cleared.push(key);
                 }
             } else {
                 any_latch_left = true;
@@ -271,7 +261,6 @@ pub(crate) fn re_arm(
             cost_cap: owner_arms.dollars,
             cost_action: owner_arms.effective_action,
             supervised: true,
-            fence: context.fence.clone(),
             runs: None,
             #[cfg(test)]
             totals_fault: false,

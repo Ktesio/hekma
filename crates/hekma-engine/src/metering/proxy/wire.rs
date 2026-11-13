@@ -303,3 +303,51 @@ pub(crate) fn labels_header_value(labels: &[(String, String)]) -> Option<HeaderV
     items.sort();
     HeaderValue::from_str(&items.join(",")).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_refusal_row_is_well_formed_and_unique() {
+        let mut codes = std::collections::HashSet::new();
+        for error in WireError::ALL {
+            let (status, error_type, code, message, retry) = error.row();
+            assert!(codes.insert(code), "{code} appears twice");
+            assert_eq!(error_type, format!("hekma_{code}"), "{error:?}");
+            assert!((400..600).contains(&status), "{error:?}");
+            // Only a 503 asks for a retry; the upstream's 502 leaves the
+            // SDK's own default.
+            assert_eq!(retry == Some(true), status == 503, "{error:?}");
+            assert_eq!(retry.is_none(), error == WireError::UpstreamError);
+            assert!(
+                !message.contains('"') && !message.contains('\\'),
+                "{error:?}"
+            );
+
+            let body: serde_json::Value = serde_json::from_str(&error.body()).unwrap();
+            assert_eq!(body["type"], "error");
+            assert_eq!(body["error"]["type"], error_type);
+            assert_eq!(body["error"]["code"], code);
+            assert_eq!(body["error"]["message"], message);
+            assert!(body["error"]["param"].is_null());
+            assert_eq!(body["error"]["proxy_wire"], PROXY_WIRE_VERSION);
+
+            let response = error.response();
+            assert_eq!(response.status().as_u16(), status);
+            let headers = response.headers();
+            assert_eq!(headers[hyper::header::CONTENT_TYPE], "application/json");
+            let should_retry = headers.get("x-should-retry").map(|v| v.to_str().unwrap());
+            assert_eq!(
+                should_retry,
+                retry.map(|r| if r { "true" } else { "false" })
+            );
+            assert_eq!(
+                headers.contains_key(hyper::header::RETRY_AFTER),
+                retry == Some(true),
+                "{error:?}"
+            );
+        }
+        assert_eq!(codes.len(), WireError::ALL.len());
+    }
+}

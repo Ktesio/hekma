@@ -10,11 +10,11 @@
 //! * [`evaluate`] — read the just-committed totals from the rollups and the
 //!   Run's latches, run the pure [`governance::decide`], and for each
 //!   decision write the breach row, the latch row and the breach outbox row.
-//!   A `block` decision registers a post-commit hook that raises the
-//!   instance's wire fence before the caller is acked (the writer sets the
-//!   flag, AD-7's "`block` before the shared proxy").
+//!   A `block` decision's latch republishes the Run's snapshot entry, whose
+//!   disposition the shared proxy reads before the caller is acked (AD-7's
+//!   "`block` before the shared proxy", story 23-1).
 //!
-//! The evaluator's inputs (resolved budget, Rate, cap, actions, the fence)
+//! The evaluator's inputs (resolved budget, Rate, cap, actions)
 //! travel in the job (D2: the writer reads no engine state). The caller gets
 //! the committed events back in commit order and executes pause / stop through
 //! the normal lifecycle before releasing its locks.
@@ -31,7 +31,6 @@ use super::outbox::OUTBOX_MAX_BYTES;
 use super::runs::RunLimits;
 use super::runs::{self, ops::CommittedRunEvent, ops::RunChanges, snapshot::SnapshotPublisher};
 use super::usage::{RecordOutcome, RunId, UsageEvent, UsageUpdateEvent};
-use crate::metering::WireFence;
 use crate::ports::{OutboxAppend, Rollup, RunRecords, RunStore, StoreError};
 use crate::store::WriterCtx;
 use crate::time::now_rfc3339;
@@ -54,8 +53,6 @@ pub(crate) struct EvalInput {
     /// instance commits its usage but fires nothing (the pre-21-1
     /// `apply_breach` declined the same way).
     pub supervised: bool,
-    /// The instance's wire fence, when it has a metering listener.
-    pub fence: Option<WireFence>,
     /// The Run snapshot publisher (story 21-2): a breach raises its Run's
     /// `breach` Anomaly, which republishes the Run. `None` only in writer
     /// tests that build an input by hand.
@@ -216,11 +213,6 @@ pub(crate) fn evaluate(
             store.latch(&level.run_id, key, decision.action, &event.at)?;
             let outbox =
                 store.append_outbox(&EngineEvent::BudgetBreach(event.clone()), OUTBOX_MAX_BYTES)?;
-            if level.acts && decision.action == BreachAction::Block {
-                if let Some(fence) = input.fence.clone() {
-                    ctx.after_commit(move || fence.raise(key));
-                }
-            }
             evaluation.breaches.push(CommittedBreach {
                 event,
                 decision,
@@ -634,7 +626,7 @@ pub(crate) struct EvaluationInbox {
 #[derive(Debug)]
 pub(crate) enum InboxItem {
     /// A committed proxied close's usage and evaluation.
-    Proxied(ProxiedCommit),
+    Proxied(Box<ProxiedCommit>),
     /// Run events a proxy job committed (a wire Run's `created`).
     RunEvents(Vec<runs::ops::CommittedRunEvent>),
 }
@@ -653,7 +645,7 @@ impl EvaluationInbox {
     /// Push one committed evaluation (a post-commit hook).
     pub(crate) fn push(&self, commit: ProxiedCommit) {
         let tx = self.tx.lock().unwrap_or_else(|p| p.into_inner());
-        let _ = tx.send(InboxItem::Proxied(commit));
+        let _ = tx.send(InboxItem::Proxied(Box::new(commit)));
     }
 
     /// Push the Run events a proxy job committed.
@@ -715,8 +707,11 @@ fn proxied_row_rate(
 /// over the Run's ancestor chain, all in this job's SAVEPOINT. The
 /// evaluator's inputs come from state the writer owns (D2): the process-
 /// owning ancestor's stored resolution for the process level, each level's
-/// own stored resolution for its own. A replayed close (the record already
-/// exists) changes nothing. The post-commit hooks republish the changed
+/// own stored resolution for its own. A replayed close changes nothing: the
+/// usage row's (run, call id) key dedups it. An existing calls-store record
+/// alone does not prove the usage landed, because the calls store is its
+/// own file and a commit is atomic per file, so the job goes on to the
+/// usage row either way. The post-commit hooks republish the changed
 /// entries (the `block` reasons ride them) and push the committed
 /// evaluation into the Supervisor's inbox.
 pub(crate) fn commit_proxied_call(
@@ -727,18 +722,21 @@ pub(crate) fn commit_proxied_call(
 ) -> Result<(), StoreError> {
     use crate::ports::PolicyRecords as _;
     let store = ctx.store();
-    if !store.insert_call_record(&close.record)? {
-        return Ok(());
-    }
+    store.insert_call_record(&close.record)?;
     let Some(usage) = close.usage else {
         return Ok(());
     };
     let run_id = close.record.run_id.clone();
     let chain = store.run_chain(&run_id)?;
     let Some(record) = chain.first().cloned() else {
-        // A Run with no row cannot carry usage (its identity was never
-        // created): the record stands, nothing is metered.
-        return Ok(());
+        // The Run's row is not committed yet (a call on a pending Run route
+        // that beat its launch job): fail the job so the record pump
+        // re-queues it — the record and the usage commit together, later.
+        return Err(StoreError::Backend(format!(
+            "the Run {} of call {} is not recorded yet",
+            run_id.as_str(),
+            close.record.call_id
+        )));
     };
     let instance = record
         .instance
@@ -798,7 +796,6 @@ pub(crate) fn commit_proxied_call(
         cost_cap,
         cost_action: action,
         supervised: true,
-        fence: None,
         runs: Some(Arc::clone(runs)),
         #[cfg(test)]
         totals_fault: false,

@@ -208,15 +208,10 @@ impl BindingTable {
             .find_map(|entry| entry.strip(path).map(|rest| (entry, rest)))
     }
 
-    /// The binding named `name`.
+    /// The binding named `name` (the tests' lookup).
+    #[cfg(test)]
     pub(crate) fn by_name(&self, name: &str) -> Option<&Arc<BindingEntry>> {
         self.entries.iter().find(|entry| entry.name == name)
-    }
-
-    /// Every binding.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn entries(&self) -> &[Arc<BindingEntry>] {
-        &self.entries
     }
 }
 
@@ -284,6 +279,11 @@ pub(crate) struct RunSnapshot {
     /// Story 23-1: the one adopted pre-proxy observed Run that receives
     /// calls matching no binding and no Run route (the legacy root route).
     pub legacy_root: Option<RunId>,
+    /// Story 23-1: Run routes published before their Run's launch job
+    /// commits (the agent may call as soon as it is spawned): the upstream
+    /// and the Run-start `block` reasons, until the Run's own entry carries
+    /// them.
+    pub pending_routes: HashMap<RunId, (Arc<str>, u8)>,
 }
 
 // The data path's reads: the Metering Proxy consumes them once it reads the
@@ -338,11 +338,33 @@ impl RunSnapshot {
     /// latched reasons of any action (story 23-1).
     pub(crate) fn disposition_over(&self, run_id: &RunId) -> Disposition {
         let mut over = Disposition::default();
-        for entry in self.chain(run_id) {
+        let chain = self.chain(run_id);
+        for entry in &chain {
             over.breach_block |= entry.disposition.breach_block;
             over.breach_latched |= entry.disposition.breach_latched;
+            if let Some((_, bits)) = self.pending_routes.get(&entry.record.run_id) {
+                over.breach_block |= bits;
+            }
+        }
+        if chain.is_empty() {
+            if let Some((_, bits)) = self.pending_routes.get(run_id) {
+                over.breach_block |= bits;
+            }
         }
         over
+    }
+
+    /// The upstream a Run route forwards to: the first recorded upstream up
+    /// the Run's chain, else its pending route's (story 23-1).
+    pub(crate) fn route_upstream(&self, run_id: &RunId) -> Option<Arc<str>> {
+        self.chain(run_id)
+            .iter()
+            .find_map(|entry| entry.upstream.clone())
+            .or_else(|| {
+                self.pending_routes
+                    .get(run_id)
+                    .map(|(up, _)| Arc::clone(up))
+            })
     }
 
     /// The next snapshot with `changes` applied: an ended entry leaves the
@@ -503,6 +525,25 @@ impl SnapshotPublisher {
         *guard = Arc::new(next);
     }
 
+    /// Publish (or retire) a pending Run route (story 23-1).
+    pub(crate) fn publish_pending_route(&self, run: RunId, route: Option<(Arc<str>, u8)>) {
+        let mut guard = match self.current.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut next = (**guard).clone();
+        next.generation = next.generation.wrapping_add(1);
+        match route {
+            Some(route) => {
+                next.pending_routes.insert(run, route);
+            }
+            None => {
+                next.pending_routes.remove(&run);
+            }
+        }
+        *guard = Arc::new(next);
+    }
+
     /// Set (or clear) the legacy root route (story 23-1: the supervisor
     /// decides it once at open).
     pub(crate) fn publish_legacy_root(&self, run: Option<RunId>) {
@@ -516,6 +557,60 @@ impl SnapshotPublisher {
         let mut next = (**guard).clone();
         next.generation = next.generation.wrapping_add(1);
         next.legacy_root = run.filter(|id| next.runs.contains_key(id));
+        *guard = Arc::new(next);
+    }
+
+    /// Replace the whole Run and key state from a fresh read (story 23-1:
+    /// the foreign-commit reload). Unlike [`Self::publish_changes`], Runs the
+    /// fresh read does not hold LEAVE the snapshot (a foreign engine ended
+    /// them), the key index is rebuilt from the active keys, and the
+    /// recently-revoked set merges the fresh read's revocations with the ones
+    /// already held (both are bounded and age out together). Pending routes
+    /// and the legacy root survive (this engine's own in-memory decisions).
+    pub(crate) fn publish_reload(&self, entries: Vec<RunEntry>, keys: Vec<KeyChange>) {
+        let mut guard = match self.current.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut next = (**guard).clone();
+        next.generation = next.generation.wrapping_add(1);
+        next.runs.clear();
+        next.owners.clear();
+        next.identities.clear();
+        next.keys.clear();
+        for entry in &entries {
+            let id = entry.record.run_id.clone();
+            if let Some(instance) = entry
+                .record
+                .process_owner
+                .then(|| entry.record.instance.clone())
+                .flatten()
+            {
+                next.owners.insert(instance, id.clone());
+            }
+            if let Some(identity) = &entry.identity {
+                next.identities.insert(identity.clone(), id.clone());
+            }
+            next.runs.insert(id, Arc::new(entry.clone()));
+        }
+        if let Some(root) = next.legacy_root.clone() {
+            if !next.runs.contains_key(&root) {
+                next.legacy_root = None;
+            }
+        }
+        let now = std::time::Instant::now();
+        let mut revoked = (*next.revoked).clone();
+        for change in keys {
+            match change {
+                KeyChange::Add(hash, entry) => {
+                    next.keys.insert(hash, Arc::new(entry));
+                }
+                KeyChange::Remove(hash) | KeyChange::Revoked(hash) => {
+                    revoked.insert(hash, now);
+                }
+            }
+        }
+        next.revoked = Arc::new(revoked);
         *guard = Arc::new(next);
     }
 }
@@ -602,5 +697,40 @@ mod tests {
                 .as_str(),
             "new"
         );
+    }
+
+    fn hash(n: u32) -> TokenHash {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        TokenHash::from_bytes(bytes)
+    }
+
+    #[test]
+    fn a_revoked_key_is_told_apart_for_24_hours_then_forgotten() {
+        let start = std::time::Instant::now();
+        let mut set = RevokedSet::default();
+        set.insert(hash(1), start);
+        set.insert(hash(1), start); // a repeat is one entry, not two
+        assert_eq!(set.len(), 1);
+        let day = std::time::Duration::from_secs(RECENTLY_REVOKED_SECS);
+        set.insert(hash(2), start + day);
+        assert!(set.contains(&hash(1)), "exactly 24 hours is still recent");
+        set.insert(hash(3), start + day + std::time::Duration::from_secs(1));
+        assert!(!set.contains(&hash(1)), "past 24 hours it is unknown again");
+        assert!(set.contains(&hash(2)) && set.contains(&hash(3)));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn the_revoked_set_keeps_at_most_its_bound_oldest_out() {
+        let now = std::time::Instant::now();
+        let mut set = RevokedSet::default();
+        let max = u32::try_from(RECENTLY_REVOKED_MAX).unwrap();
+        for n in 0..=max {
+            set.insert(hash(n), now);
+        }
+        assert_eq!(set.len(), RECENTLY_REVOKED_MAX);
+        assert!(!set.contains(&hash(0)), "the oldest is evicted first");
+        assert!(set.contains(&hash(1)) && set.contains(&hash(max)));
     }
 }

@@ -150,6 +150,8 @@ impl MeteringProxy {
             diagnostics: Arc::clone(&deps.diagnostics),
             #[cfg(test)]
             fail_closes: Arc::default(),
+            #[cfg(test)]
+            prerecord_closes: Arc::default(),
         });
         let kib = (options.max_buffered_bytes / 1024).clamp(1, u64::from(u32::MAX >> 3));
         let shared = Arc::new(forward::ProxyShared {
@@ -190,7 +192,7 @@ impl MeteringProxy {
         &self.info
     }
 
-    /// The shared call state (tests read its counters and seams).
+    /// The shared call state (the seam tests drive its test hooks).
     #[cfg(test)]
     pub(crate) fn shared(&self) -> &Arc<forward::ProxyShared> {
         &self.shared

@@ -358,6 +358,58 @@ Invocation: `cargo run -p hekma-engine --example perf-budgets -- --ps-seed
 the serve scenario). `PERF_BUDGETS_PS_ITERATIONS` (default 40) bounds the
 measurement iterations.
 
+### The metering proxy scenario (`--proxy`)
+
+The shared metering proxy may add at most **10 ms at p99** to a model call
+(NFR-4). `--proxy` runs on its own (it refuses the other flags): it opens
+an engine with its proxy, creates one endpoint binding to a loopback
+upstream fake that answers a 1 KiB completion with usage, and seeds 1 000
+open Runs beneath it (900 split Runs by hint, 100 keyed child Runs). Then
+64 clients make `PERF_BUDGETS_PROXY_CALLS` calls (default 10 000) straight
+to the upstream, and the same number through the proxy, a third each on
+the binding's Run, a split Run and a keyed Run. The gate is the proxied
+p99 minus the direct p99; in CI mode a miss is measured once more before
+the gate reads it. The `proxy` report block carries both sides' p50 and
+p99 and the added figures. The `perf-budgets` job runs `perf-budgets
+--proxy` as its own blocking step, and its report,
+`perf-budgets-proxy-report.json`, rides the job's artifact.
+
+Responses through the proxy are buffered whole, so the added latency of a
+large or streamed response grows with its size; the scenario measures the
+proxy, not the provider.
+
+| Date | Platform | calls / clients / open Runs | direct p50/p99 (ms) | proxied p50/p99 (ms) | added p50/p99 (ms) | Verdict |
+|---|---|---|---|---|---|---|
+| 2026-11-13 | macOS arm64 (this development machine), release | 10 000 / 64 / 1 000 | 3.43 / 6.95 | 6.77 / 9.37 | 3.33 / 2.42 | PASS (budget 10) |
+
+Invocation: `cargo run --release -p hekma-engine --example perf-budgets --
+--proxy` (exit 0 green, 1 red, 2 usage or scenario error).
+
+### The per-call records listing scenario (`--calls-seed <N>`)
+
+Reading the metering proxy's per-call records must stay under **1 s at
+p99** however many there are. `--calls-seed <N>` runs on its own (it
+refuses the other flags): it opens an engine so the calls store is created
+with its current schema and indexes, then seeds N records straight into two
+calls segments (the older half in a segment named for an earlier date, so
+every read merges across files), 1% of them on one measured Run and 2% of
+them problem calls. A read-only engine then times
+`PERF_BUDGETS_CALLS_ITERATIONS` (default 40) reads each of the unscoped
+first page, the measured Run's first page, the problems first page and the
+by-id probe; each is gated at p99 < 1 s. One sparse filter that matches
+nothing, and so runs the scan budget out, is reported but not gated. The
+`calls_listing` report block carries every p99. The `perf-budgets` job runs
+`perf-budgets --calls-seed 100000` as its own blocking step, and its
+report, `perf-budgets-calls-report.json`, rides the job's artifact.
+
+| Date | Platform | Records / segments | unscoped / Run / problems / by id p99 (ms) | sparse filter p99 (ms) | Verdict |
+|---|---|---|---|---|---|
+| 2026-11-13 | macOS arm64 (this development machine), release | 100 000 / 2 | 1.12 / 1.05 / 1.05 / 0.82 | 81.6 | PASS (budget 1000) |
+| 2026-11-13 | macOS arm64 (this development machine), release | 1 000 000 / 2 | 1.94 / 1.08 / 1.21 / 1.03 | not gated | PASS (budget 1000) |
+
+Invocation: `cargo run --release -p hekma-engine --example perf-budgets --
+--calls-seed 100000` (exit 0 green, 1 red, 2 usage or scenario error).
+
 ## Cross-platform testing (3-OS matrix)
 
 The per-OS process-control code lives only under `crates/hekma-engine/src/backends/{unix,windows}` (the sole place OS-conditional compilation is allowed). This code cannot be verified on a single operating system — the Windows Job-Object backend does not even compile on Linux. The CI `test` job therefore runs on a matrix of `ubuntu-latest`, `macos-latest`, and `windows-latest`:

@@ -1329,7 +1329,7 @@ fn the_view_sql_matches_the_specification_predicates_row_by_row() {
 fn the_v17_step_adds_the_tokens_table_and_its_three_indexes() {
     // Story 22-1: `tokens` with its CHECKs and the three indexes.
     let (_tmp, store) = store();
-    assert!(SCHEMA_VERSION >= 17, "tokens is the v17 step");
+    const { assert!(SCHEMA_VERSION >= 17, "tokens is the v17 step") };
     for (kind, name) in [
         ("table", "tokens"),
         ("index", "idx_tokens_run"),

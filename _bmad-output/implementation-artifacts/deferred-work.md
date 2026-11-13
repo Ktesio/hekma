@@ -303,6 +303,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `sprint-change-proposal-2026-10-23-adoptability.md` §4.6 (full otel SDK / gRPC transport)
   summary: AD-21 option (b) — the opentelemetry + opentelemetry-otlp crate family — stays rejected for v1 and recorded as the standing alternative behind the hand-rolled OTLP/HTTP+JSON exporter.
   evidence: AD-21's alternatives paragraph (ARCHITECTURE-SPINE.md). Trigger: a real traces consumer (post-19.4) or a vendor must-have the hand-rolled path cannot meet.
+  19-4 (2026-11-13): kept deferred. The per-call records now exist and are readable (`hekma calls`, `GET /v0/calls`), but no traces consumer or vendor must-have has appeared; the trigger stands.
 - source_spec: `sprint-change-proposal-2026-10-23-adoptability.md` §4.6 (Prometheus native scrape endpoint)
   summary: A `/metrics` pull reader on the Control API is deferred; the OTel-Collector bridge covers the Prometheus need (option (c), rejected by Islam 2026-10-23, kept reachable).
   evidence: AD-21 alternatives paragraph. Trigger: a pull-model minority asks after the collector bridge is documented.
@@ -426,6 +427,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-21-1-the-store-writer-and-run-scale-storage.md` (AD-27 scope)
   summary: Ended-Run compaction (a compacted-Run rollup, then deleting `runs` detail rows), the calls store and the published snapshot are not in this story: they need the `runs` table (21.2), the shared proxy (23.1) and the snapshot publisher (21.2).
   evidence: readiness resolution 2026-10-30 names 21.2 for the snapshot publisher and 23.1 for the calls store; `usage_rollup_run` is keyed by (instance, run id) until `runs` exists. Trigger: story 21.2 (re-key the per-Run rollup by run and add the compaction window), 23.1 (calls store).
+  19-4 (2026-11-13): the calls store's read half is resolved (the read port, `Engine::list_calls`/`call`, `/v0/calls`, `hekma calls`). Rotation and retention stay with story 24.4.
   partly resolved by story 21-2 (2026-11-02): the snapshot publisher ships; `usage_rollup_run` stays keyed (instance, run) and becomes a subtree total (each ancestor under its own instance). Still open: ended-Run compaction and the retention window. New trigger: story 21.5 (`hekma ps --all` and the retention window it lists against).
   resolved-in-part by story 21-5 (2026-11-12): the window's default and its READ-side meaning land (`ENDED_RUN_RETENTION_DAYS = 7` bounds both `hekma ps` views; docs/runs.md). The configurable knob and compaction (deleting detail rows into compacted rollups) stay with 24.4 — one mechanism, one owner; a knob with no enforcement behind it would hide rows without removing them. New trigger: story 24.4.
 - source_spec: `spec-21-1-the-store-writer-and-run-scale-storage.md` (AI-55 adversarial review, finding 7)
@@ -633,3 +635,72 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: The `hk_run_`/`hk_ref_`/`hk_ann_` prefixes are distinctive enough for secret scanners, but they are not registered with GitHub secret scanning (a follow-up outside the code).
   evidence: `docs/run-keys.md` (The format). Trigger: the first public release carrying Run Keys.
 
+
+## From spec-23-1 (the shared Metering Proxy) — build, 2026-11-13
+
+- source_spec: `spec-23-1-shared-metering-proxy.md` (Design Notes: Streaming, back-pressure and timeouts)
+  summary: Responses through the proxy are buffered whole, so a streamed completion's first token reaches the client only when the whole response has (time to first token equals the full response time).
+  evidence: `metering/proxy/forward.rs` (the `Limited` body collect before relay); docs/metering-proxy.md and docs/testing.md say so. Trigger: wire hold mid-stream (story 23.4) or a time-to-first-token report from a user.
+
+- source_spec: `spec-23-1-shared-metering-proxy.md` (Design Notes: Hints)
+  summary: A hint's `x-hekma-labels` apply only when it creates the Run; later different labels on the same hint are ignored. Caller label updates come with announce.
+  evidence: `domain/runs/wire.rs` (`ensure_wire_run` takes the labels on creation only). Trigger: story 23.2 (announce and Caller label updates).
+
+- source_spec: `spec-23-1-shared-metering-proxy.md` (Design Notes: Bind and auth posture)
+  summary: The proxy binds `127.0.0.1` only; IPv6 loopback (`::1`) is not served.
+  evidence: `metering/proxy/mod.rs` (the loopback check refuses any other address). Trigger: a user report that needs `::1`.
+
+- source_spec: `spec-23-1-shared-metering-proxy.md` (Design Notes: Pricing wire Runs)
+  summary: Cumulative ceilings bind an Agent Instance, which a wire Run lacks, so a Policy cumulative ceiling matching a binding's Runs is "not applicable" and never fires; only per-run ceilings and those of the Runs above apply.
+  evidence: `domain/runs/policy.rs` (cumulative scope keyed by instance). Trigger: a Host asking for a binding-level all-time ceiling.
+
+- source_spec: `spec-23-1-shared-metering-proxy.md` (Design Notes: Identification)
+  summary: The recently-revoked set (Run Keys revoked in the last 24 hours, told apart from unknown ones) is bounded at 100 000 hashes, oldest out; past that an older revoked key answers "unknown".
+  evidence: `domain/runs/snapshot.rs` (`RevokedSet`, `RECENTLY_REVOKED_MAX`), pinned by `the_revoked_set_keeps_at_most_its_bound_oldest_out`. Trigger: story 24.4 (snapshot scale).
+
+- source_spec: `spec-23-1-shared-metering-proxy.md` (build: the owner's question in the ledger)
+  summary: `hekma agent start --detach` still refuses an `engine-observed` agent (exit 5), though under a Service Host the proxy's sticky port means a later host serves the agent's base URL again. Lifting the refusal changes a frozen exit-code contract and the `start --help` text.
+  evidence: `domain/supervisor/spawn.rs` (`DetachRefused`), `crates/hekma/tests/agent_cli.rs` (`start_detach_of_an_engine_observed_instance_is_refused_with_exit_code_5`). Trigger: the owner's ruling (decisions ledger, item 9).
+
+- source_spec: `spec-23-1-shared-metering-proxy.md` (Deferrals: existing entries this story closes)
+  summary: The earlier entries naming story 23.1, as this build leaves them.
+  evidence: the spec's Deferrals list and the build's tests.
+  resolved: story 23-1 (2026-11-13, ktesio/23-1-shared-proxy):
+  - 21-1 instance-less dedup: a usage row on a Run with no Agent Instance must carry a call id (`store/run_store_sqlite.rs`), and proxied rows key on (run, call id).
+  - 21-1 calls store: created (`<state dir>/calls/`), with rotation left to 24.4.
+  - 21-2 child usage before 23.1: attributed calls commit through the pipeline job.
+  - 21-3 wire enforcement through the proxy: done for `warn` and `block` (`block` at any depth with a wire path); `pause`/`stop` below supervised stay with 23.4.
+  - 21-5 wire usage on the listing: the Run rollup is keyed by run id; `run show` reads it too (a bug fixed in this build).
+  - 22-1's proxy halves of R1.6/R1.8/R1.12, and announce-credential issuance: done.
+  - 22-1 cross-engine revocation: picked up within 1 s by the foreign-commit reload; the O(changed) refinement stays with 24.4.
+  The 19-2 fenced-marker entry stays with 23.4, and the 21-9 Caller upsert's first caller with 23.2.
+
+## From spec-19-4 (per-call records for Hosts) — build, 2026-11-13
+
+- source_spec: `spec-19-4-per-call-records-for-hosts.md` (Design Notes: No subscription, on purpose)
+  summary: No live tail of per-call records; a Host follows calls through the committed usage event (it carries the call id) and polls `view=problems` or `disposition=block` for refusals.
+  evidence: `store/calls_read.rs` reads pages only; no event or SSE frame was added. Trigger: a Host asking to follow calls without polling (it also decides an insertion sequence that survives segment rotation).
+
+- source_spec: `spec-19-4-per-call-records-for-hosts.md` (Design Notes: Deferred-work decisions)
+  summary: No Selector or subtree filter over calls: `run=` lists one Run's own calls, never its children's.
+  evidence: the records carry a run id but no Run chain or labels. Trigger: a Host asking for fleet-wide or parent-rollup call views (needs a label or chain join, a calls-store step).
+
+- source_spec: `spec-19-4-per-call-records-for-hosts.md` (Design Notes: Deferred-work decisions)
+  summary: Calls still in flight (`open_calls`) are not listed.
+  evidence: the reader reads closed records only. Trigger: story 23.4's held-call surface.
+
+- source_spec: `spec-19-4-per-call-records-for-hosts.md` (Ask First O1)
+  summary: Reading calls is Operator-only; there is no tenant-scoped read credential.
+  evidence: the calls routes sit in the Operator family (`hekma-host` auth table). Trigger: the owner's ruling on O1, or a multi-tenant Host asking for scoped reads.
+
+- source_spec: `spec-19-4-per-call-records-for-hosts.md` (Design Notes: Deferred-work decisions)
+  summary: The model text is masked on read (a credential-shaped value reads as `[redacted]`), not on write; the stored value can still hold it.
+  evidence: `domain/calls.rs` `expose_model`; the writer's `record_model` checks only length and visible ASCII. Trigger: the next change to what the proxy writes (mask in `record_model` too).
+
+- source_spec: `spec-20-1-otlp-telemetry-export.md`, re-pointed by spec-19-4
+  summary: `gen_ai.client.operation_duration` still has no producer: the OTLP exporter reads the event bus, and per-call records are not events.
+  evidence: the per-call timings now exist in the calls store (`latency_us`, `upstream_us`). Trigger: a Host or Operator asking for latency histograms in OTLP (the producer is then a calls-store read in the exporter or a per-call event).
+
+- source_spec: `spec-19-4-per-call-records-for-hosts.md` (build)
+  summary: `perf-budgets --calls-seed` runs standalone with absolute gates (like `--proxy`), not as a block of the default report with the baseline ratchet.
+  evidence: `examples/perf-budgets.rs`; the canonical baseline carries no calls metric. Trigger: a regression the absolute gate misses, or the next baseline re-seed (fold the four p99 figures into the ratchet then).

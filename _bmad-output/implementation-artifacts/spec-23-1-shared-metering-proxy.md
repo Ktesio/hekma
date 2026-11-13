@@ -235,3 +235,30 @@ Each is a public-contract or scope choice; the recommendation is the spec's curr
 - 2026-11-12 — spec written from Story 23.1 and its readiness bullets, the Epic 23 seams (23.2–23.4), 19.4, 22.2, 22.5 and 24.1–24.4, AD-26/AD-7/AD-25/AD-27/AD-20/AD-22/AD-21, FR-51/FR-43/FR-49/FR-53/FR-21/FR-60, NFR-4/NFR-6/NFR-9 and PRD §6/§7, the key-custody security review (draft for ruling; R1.6/R1.8/R1.12 proxy halves, R2.5/R2.6/R2.10 per its 23.1 note), the 22-1 spec (approved, not built), the 19-2/21-3/21-5 specs, 21-6's in-build spec (no schema step, vectors 1.4.0), and the deferred-work entries naming this story. Status draft; awaiting the orchestrator's review and Islam's rulings on O1–O6.
 - 2026-11-12 — orchestrator review: approved for build. The orchestrator-level Ask First items are accepted as recommended. O1–O6 are Islam's rulings, still pending: the build proceeds on the recommended options (O1 `hk_pxy_` yes; O2 issue per-binding credentials now per D3; O3 outbound identity headers on by default, with a release-note line naming the change; O4 per-call records stay unacknowledged per AD-26; O5 the Run route path as unauthenticated attribution until custody; O6 refuse unknown and revoked Run Keys now), and the PR stays unmerged until he rules. Build after 22-1 lands on its branch; ride 22-1's code for the launch generation.
 
+- 2026-11-13 — build (orchestrator), deviations and findings:
+  - **Governance vectors stay 1.4.0**, not the next minor. 1.3.0 (21-3) and 1.4.0 (21-6) are both unreleased, and 22-1 already appended its Caller-layer cases to 1.4.0 rather than bumping. So the four `policy-wire-*` cases append to 1.4.0 too (73 cases), and one unreleased version reaches Hosts.
+  - **Typed binding refusals:** `Registry::run_binding` stringified every binding refusal across the writer, so a duplicate prefix gave 500 and exit 1. Fixed: the job still rolls back, and the typed refusal travels out beside it. `BindingError::code()` gives `error.code`, and the CLI maps those codes to exit 3 and exit 2. This is a contract addition, flagged for Islam.
+  - **`hekma ps`:** the before-the-shared-proxy note now rides the adopted agent's own row (it only rode instanceless Runs before).
+  - **The two per-instance-listener tests are rewritten for the shared proxy**, not retired.
+  - **The test suites, and the bugs they found:**
+    - The spec's Verification suites, which were missing:
+      - an identification table;
+      - end-to-end proxy tests against a recording upstream;
+      - failure seams;
+      - crash closing of open calls;
+      - the legacy root route;
+      - binding lifecycle, host route and CLI tests.
+    - Changed-line coverage rose from 77.40%.
+    - Bugs found and fixed:
+      - (1) `--clear-custodied-key` was a no-op, because plain serde reads `null` as "unchanged";
+      - (2) `GET /v0/bindings/{name}` not-found had no `error.code`;
+      - (3) `RunView.usage` (`hekma run show`, `GET /v0/runs/{id}`) read zero for every Run without an Agent Instance, though v18 keys the Run rollup by run id alone.
+    - The `ensure_delay` seam is documented as what it actually proves: the writer's ack bound covers a job being taken, so the refused call is a creation queued behind a slow one.
+- 2026-11-13 — AI-55 review round 1 (independent adversarial pass: spec and diff only, no cargo). Seven findings; all seven verified real and fixed, each with a test that fails on the unfixed code (mutation-checked):
+  - **High (money):** a response the buffered-byte budget could not hold was answered `503` with its usage dropped, though the provider had billed the call (N6: never a forwarded unrecorded call). A response is now never refused for the budget: it is buffered up to the body cap, recorded with its usage and relayed, and a diagnostic (once a minute) counts the overshoot.
+  - **Medium (bounds):** the budget was taken only after a body was fully buffered, so peak memory was concurrency × 64 MiB, not the 512 MiB budget N4 relies on. Both bodies are now collected frame by frame, taking the budget as the bytes arrive; a request the budget cannot hold is refused at the frame that overflows it, before any dial. The attacker in N4 sends requests, so the bound holds for them; responses come from the configured upstream.
+  - **Medium (AI-18):** the capped-hint diagnostic the AC and docs promise did not exist (a counter nothing read). It is now said once a minute, with the running count.
+  - **Medium:** a failed `engine-observed` start never retired its pending Run route, which kept forwarding unmeterable calls and leaked one entry per failed start. A drop guard now retires it on every return.
+  - **Low (money):** a close whose calls-store record survived a state.db rollback (a commit is atomic per file) short-circuited on the replayed record and dropped its usage. The job now goes on to the usage row, whose (run, call id) key dedups a true replay.
+  - **Low:** `ensure`'s early return left the identity's pending-creation gate in the map; a drop guard now releases it on every return.
+  - **Low (12-4 loud skip):** a close the writer channel refused was counted as skipped without a diagnostic; it now says so.

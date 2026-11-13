@@ -57,6 +57,27 @@ pub(crate) const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// so a degraded mint is still unique within the process (see [`RunId::mint`]).
 static RUN_NONCE: AtomicU64 = AtomicU64::new(0);
 
+/// A fresh ULID (26 Crockford characters): 48 bits of wall-clock
+/// milliseconds (a clock before the epoch clamps to 0), then 80 bits from the
+/// OS CSPRNG. If the OS source fails (it does not on supported platforms),
+/// the random half falls back to the clock's nanoseconds plus the
+/// process-global [`RUN_NONCE`], so the id is still unique per process,
+/// never a panic: this is an id, not a secret. Shared by [`RunId::mint`] and
+/// the metering proxy's call ids, so the engine keeps one counter.
+pub(crate) fn mint_ulid() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let millis = (now.as_millis() as u64) & ((1 << 48) - 1);
+    let mut random = [0u8; 10];
+    if getrandom::getrandom(&mut random).is_err() {
+        let nonce = RUN_NONCE.fetch_add(1, Ordering::Relaxed);
+        random[..4].copy_from_slice(&now.subsec_nanos().to_be_bytes());
+        random[4..].copy_from_slice(&nonce.to_be_bytes()[2..]);
+    }
+    encode_ulid(millis, &random)
+}
+
 impl RunId {
     /// Mint a fresh Run id: `run_` + ULID (story 21-2, AD-25).
     ///
@@ -67,17 +88,7 @@ impl RunId {
     /// counter — still unique per process, never a panic: this is an id, not
     /// a secret.
     pub fn mint() -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        let millis = (now.as_millis() as u64) & ((1 << 48) - 1);
-        let mut random = [0u8; 10];
-        if getrandom::getrandom(&mut random).is_err() {
-            let nonce = RUN_NONCE.fetch_add(1, Ordering::Relaxed);
-            random[..4].copy_from_slice(&now.subsec_nanos().to_be_bytes());
-            random[4..].copy_from_slice(&nonce.to_be_bytes()[2..]);
-        }
-        Self(format!("run_{}", encode_ulid(millis, &random)))
+        Self(format!("run_{}", mint_ulid()))
     }
 
     /// Reconstruct a [`RunId`] from its stored wire string (a DB read / a
@@ -112,6 +123,15 @@ fn encode_ulid(millis: u64, random: &[u8; 10]) -> String {
         .rev()
         .map(|group| CROCKFORD[((value >> (5 * group)) & 0x1F) as usize] as char)
         .collect()
+}
+
+/// The lexicographically smallest ULID whose embedded time is `unix_millis`
+/// (the random half all zero). A call-id window bound: because a call id is
+/// `call_` + a ULID and the Crockford rendering of a fixed length is
+/// order-preserving, `call_id >= "call_" + ulid_floor(t)` holds exactly when
+/// the call's embedded time is `t` or later.
+pub(crate) fn ulid_floor(unix_millis: u64) -> String {
+    encode_ulid(unix_millis, &[0u8; 10])
 }
 
 impl std::fmt::Display for RunId {

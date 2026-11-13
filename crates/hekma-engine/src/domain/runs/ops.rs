@@ -430,6 +430,10 @@ pub(crate) struct SupervisedRun {
     /// Run); a fresh Run with `None` resolves with no explicit instance
     /// limits.
     pub inputs: Option<super::policy::ResolveInputs>,
+    /// Story 23-1: the instance's resolved upstream base URL, recorded on
+    /// the Run (the shared proxy's Run route forwards there); `None` keeps
+    /// what is recorded (an adoption) or records none (self-reported).
+    pub upstream: Option<String>,
 }
 
 /// A supervised launch's credentials (story 22-1), value-free: the Run Key
@@ -629,6 +633,14 @@ pub(crate) fn ensure_supervised<S: RunRecords + ?Sized>(
                 run.inputs.clone(),
                 at,
             )?);
+        }
+    }
+    // Story 23-1: the instance's upstream rides the Run (the shared proxy's
+    // Run route forwards there); the freshest entry publishes last.
+    if let Some(upstream) = &run.upstream {
+        store.set_run_upstream(&run.run_id, Some(upstream))?;
+        if let Some(entry) = refreshed_entry(store, &run.run_id)? {
+            changes.entries.push(entry);
         }
     }
     Ok(changes)
@@ -1192,24 +1204,16 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
         .ok_or_else(|| RunError::NotFound {
             run_id: run_id.as_str().to_string(),
         })?;
-    let usage = match &record.instance {
-        Some(instance) => {
-            let name = InstanceName::new(instance).map_err(|e| {
-                RunError::Store(StoreError::CorruptRow {
-                    name: instance.clone(),
-                    detail: e.to_string(),
-                })
-            })?;
-            let rollup = store.run_rollup(&name, run_id)?;
-            RunUsage {
-                input_tokens: rollup.totals.input_tokens,
-                output_tokens: rollup.totals.output_tokens,
-                cached_tokens: rollup.totals.cached_tokens,
-                cost_micros: rollup.cost,
-                estimate: EstimateLabel::Estimated,
-            }
-        }
-        None => RunUsage::default(),
+    // Story 23-1 (v18): the Run rollup is keyed by the run id alone, so a
+    // Run without an Agent Instance (a wire Run of the shared proxy) shows
+    // its usage too — it used to read as zero.
+    let rollup = store.run_rollup_by_id(run_id)?;
+    let usage = RunUsage {
+        input_tokens: rollup.totals.input_tokens,
+        output_tokens: rollup.totals.output_tokens,
+        cached_tokens: rollup.totals.cached_tokens,
+        cost_micros: rollup.cost,
+        estimate: EstimateLabel::Estimated,
     };
     Ok(RunView {
         labels: store.run_labels(run_id)?,

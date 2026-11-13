@@ -692,6 +692,41 @@ jobs:
             exit 1
           }
           target/release/examples/perf-budgets --ps-seed 10000
+      - name: Run the metering proxy scenario (story 23-1; regressions fail this job)
+        # The FOURTH explicit run (story 23-1): 64 clients make 10 000 calls
+        # through the shared metering proxy, over 1 000 open Runs (split and
+        # keyed), and the same calls straight to the upstream fake; the gate
+        # is the proxy's ADDED p99 <= 10 ms (NFR-4), with the CI once-retry.
+        # Standalone (no --baseline): the canonical baseline carries no
+        # proxy metric. Same contract as the steps above.
+        timeout-minutes: 10
+        env:
+          PERF_BUDGETS_REPORT_PATH: perf-budgets-proxy-report.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/release/examples/perf-budgets || {
+            echo "::error::perf-budgets binary not found at target/release/examples/perf-budgets — the build step above failed or the output path moved."
+            exit 1
+          }
+          target/release/examples/perf-budgets --proxy
+      - name: Run the per-call records listing scenario (story 19-4; regressions fail this job)
+        # The FIFTH explicit run (story 19-4): 100 000 per-call records seeded
+        # into two calls segments; the unscoped, Run-scoped and problems
+        # first pages and the by-id probe each gate at p99 < 1 s. Standalone
+        # (no --baseline), like the proxy run. Same contract as the steps
+        # above.
+        timeout-minutes: 10
+        env:
+          PERF_BUDGETS_REPORT_PATH: perf-budgets-calls-report.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/release/examples/perf-budgets || {
+            echo "::error::perf-budgets binary not found at target/release/examples/perf-budgets — the build step above failed or the output path moved."
+            exit 1
+          }
+          target/release/examples/perf-budgets --calls-seed 100000
       - name: Upload the measured report (artifact)
         # The measured record of record also lives in this job's log; the
         # artifact makes it downloadable for trend inspection. `if: always()`
@@ -707,6 +742,8 @@ jobs:
             perf-budgets-report.json
             perf-budgets-serve-report.json
             perf-budgets-ps-report.json
+            perf-budgets-proxy-report.json
+            perf-budgets-calls-report.json
           if-no-files-found: warn
 
   agents-in-ci:

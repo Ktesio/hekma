@@ -2027,32 +2027,43 @@ fn observed_call_with_retry(
     }
 }
 
-/// Make ONE minimal OpenAI-compatible completion POST to `<base_url>/v1/chat/completions`
-/// (story 3-4 engine-observed mode). Pure `std` HTTP/1.1 over a raw `TcpStream` — NO
-/// dependency, NO OS-cfg. Sends a tiny JSON body, reads (and discards) the response.
-/// Best-effort: any error is returned to the caller which skips it (the test asserts
-/// on committed ledger rows, not on this call succeeding byte-for-byte). The `base_url`
-/// is `http://127.0.0.1:<port>` (the engine's loopback listener); we parse the
-/// host:port out of it, connect, and speak the minimal HTTP/1.1 a proxy relays.
-#[cfg(not(tarpaulin_include))]
-fn post_completion(base_url: &str, auth: Option<&str>) -> std::io::Result<()> {
-    use std::io::Read;
-    use std::net::TcpStream;
-
-    // Parse `http://<host>:<port>` → the `host:port` authority (v1 the injected URL
-    // is always http loopback with an explicit port). Strip the scheme + any path.
-    let authority = base_url
-        .strip_prefix("http://")
-        .unwrap_or(base_url)
-        .split('/')
-        .next()
-        .unwrap_or("");
+/// Split an injected `base_url` into its `(authority, path)` halves
+/// (story 23-1: the injected URL carries a Run-route path —
+/// `http://127.0.0.1:<port>/_hekma/runs/<run id>` — and a CONFORMING agent
+/// appends its endpoint paths to the WHOLE base URL, keeping the route
+/// prefix. An agent that builds URLs from the origin alone would drop the
+/// route and get `404 hekma_no_route` loudly; this fake pins the
+/// concatenating behaviour the docs require).
+fn split_base_url(base_url: &str) -> std::io::Result<(String, String)> {
+    let rest = base_url.strip_prefix("http://").unwrap_or(base_url);
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (rest, String::new()),
+    };
+    let path = path.trim_end_matches('/').to_string();
     if authority.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "empty authority",
         ));
     }
+    Ok((authority.to_string(), path))
+}
+
+/// Make ONE minimal OpenAI-compatible completion POST to `<base_url>/v1/chat/completions`
+/// (story 3-4 engine-observed mode). Pure `std` HTTP/1.1 over a raw `TcpStream` — NO
+/// dependency, NO OS-cfg. Sends a tiny JSON body, reads (and discards) the response.
+/// Best-effort: any error is returned to the caller which skips it (the test asserts
+/// on committed ledger rows, not on this call succeeding byte-for-byte). The `base_url`
+/// is the engine-injected URL (the shared metering proxy's address, its Run-route
+/// path included); we parse the authority and the path out of it, connect, and
+/// speak the minimal HTTP/1.1 a proxy relays.
+#[cfg(not(tarpaulin_include))]
+fn post_completion(base_url: &str, auth: Option<&str>) -> std::io::Result<()> {
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    let (authority, path) = split_base_url(base_url)?;
 
     let body = br#"{"model":"gpt-observed","messages":[{"role":"user","content":"hi"}]}"#;
     // An optional `Authorization: Bearer <key>` header (the no-leak sentinel): the
@@ -2062,11 +2073,12 @@ fn post_completion(base_url: &str, auth: Option<&str>) -> std::io::Result<()> {
         Some(key) => format!("Authorization: Bearer {key}\r\n"),
         None => String::new(),
     };
-    // A minimal, correct HTTP/1.1 request: the path the OpenAI client uses, Host, a
-    // JSON content-type, an explicit content-length, and Connection: close so the
-    // upstream/proxy closes the socket after one response (simplest read loop).
+    // A minimal, correct HTTP/1.1 request: the base URL's path + the endpoint
+    // the OpenAI client uses, Host, a JSON content-type, an explicit
+    // content-length, and Connection: close so the upstream/proxy closes the
+    // socket after one response (simplest read loop).
     let request = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\n\
+        "POST {path}/v1/chat/completions HTTP/1.1\r\n\
          Host: {authority}\r\n\
          {auth_header}\
          Content-Type: application/json\r\n\
@@ -2098,19 +2110,8 @@ fn post_streaming_completion(base_url: &str, auth: Option<&str>) -> std::io::Res
     use std::io::Read;
     use std::net::TcpStream;
 
-    // The same authority parse the sibling uses (`http://<host>:<port>` → authority).
-    let authority = base_url
-        .strip_prefix("http://")
-        .unwrap_or(base_url)
-        .split('/')
-        .next()
-        .unwrap_or("");
-    if authority.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "empty authority",
-        ));
-    }
+    // The same authority + path parse the sibling uses (the Run route stays).
+    let (authority, path) = split_base_url(base_url)?;
 
     // The streaming request shape: `"stream": true`, NO stream_options (the
     // engine's injection is what adds it).
@@ -2121,7 +2122,7 @@ fn post_streaming_completion(base_url: &str, auth: Option<&str>) -> std::io::Res
         None => String::new(),
     };
     let request = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\n\
+        "POST {path}/v1/chat/completions HTTP/1.1\r\n\
          Host: {authority}\r\n\
          {auth_header}\
          Content-Type: application/json\r\n\
@@ -2239,5 +2240,34 @@ mod observed_retry_tests {
             super::OBSERVED_RETRY_ATTEMPTS,
             "bounded: never more than the configured attempt count"
         );
+    }
+}
+
+#[cfg(test)]
+mod base_url_tests {
+    use super::split_base_url;
+
+    #[test]
+    fn a_run_route_base_url_keeps_its_path_for_appending() {
+        assert_eq!(
+            split_base_url("http://127.0.0.1:8400/_hekma/runs/run_X").unwrap(),
+            (
+                "127.0.0.1:8400".to_string(),
+                "/_hekma/runs/run_X".to_string()
+            )
+        );
+        // A trailing slash is trimmed, so appending never doubles it.
+        assert_eq!(
+            split_base_url("http://127.0.0.1:8400/_hekma/runs/run_X/")
+                .unwrap()
+                .1,
+            "/_hekma/runs/run_X"
+        );
+        // An origin alone has an empty path.
+        assert_eq!(
+            split_base_url("http://127.0.0.1:8400").unwrap(),
+            ("127.0.0.1:8400".to_string(), String::new())
+        );
+        assert!(split_base_url("http:///nothing").is_err());
     }
 }

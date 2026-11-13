@@ -11,7 +11,7 @@
 
 mod budget;
 mod bus;
-pub(crate) mod calls;
+pub mod calls;
 pub(crate) mod config;
 mod cost;
 pub(crate) mod credential;
@@ -51,6 +51,9 @@ mod secret;
 mod supervisor;
 mod transition;
 mod usage;
+pub(crate) use usage::mint_ulid;
+pub(crate) use usage::ulid_floor;
+pub(crate) use usage::CROCKFORD;
 
 pub use budget::{
     BreachAction, BreachDecision, BreachScope, BudgetEvaluator, ParseBreachActionError, TokenBudget,

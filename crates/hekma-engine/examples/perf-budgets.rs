@@ -2150,6 +2150,14 @@ struct CliArgs {
     /// the listing's first page + counts — adding the `ps_listing` report
     /// block + its gate (bound only on ps runs).
     ps_seed: Option<u64>,
+    /// Story 23-1: run ONLY the shared Metering Proxy scenario (added
+    /// latency through the proxy against the same upstream called
+    /// directly) and its absolute gate; refused beside the other flags.
+    proxy: bool,
+    /// Story 19-4: run ONLY the per-call records listing scenario over N
+    /// seeded records and its absolute gates; refused beside the other
+    /// flags.
+    calls_seed: Option<u64>,
     help: bool,
 }
 
@@ -2181,6 +2189,18 @@ fn usage_text() -> String {
          \x20                          budgets through the serve gates (their own names;\n\
          \x20                          bound only on serve runs; not ratcheted until a\n\
          \x20                          serve-carrying baseline is seeded per docs/testing.md).\n\
+         \x20 --proxy                story 23-1: run ONLY the shared metering proxy\n\
+         \x20                          scenario: 64 clients make PERF_BUDGETS_PROXY_CALLS\n\
+         \x20                          (default 10000) calls through the proxy, over 1000\n\
+         \x20                          open Runs, and the same calls straight to the upstream;\n\
+         \x20                          gates the proxy's added p99 at 10 ms (CI retries once).\n\
+         \x20                          Refused beside the other flags.\n\
+         \x20 --calls-seed <N>       story 19-4: run ONLY the per-call records listing\n\
+         \x20                          scenario: seed N records into two calls segments, then\n\
+         \x20                          time the unscoped, Run-scoped and problems first pages\n\
+         \x20                          and the by-id probe (PERF_BUDGETS_CALLS_ITERATIONS,\n\
+         \x20                          default 40); gates each p99 under 1 s. Refused beside\n\
+         \x20                          the other flags.\n\
          \x20 --help | -h             this text.\n\
          \n\
          \x20 No flags: the absolute budgets gate exactly as before and the report is\n\
@@ -2223,9 +2243,21 @@ fn parse_cli_args(argv: &[String]) -> Result<CliArgs, String> {
             return Err(format!(
                 "unknown argument {raw:?} \
                  (supported: --baseline <file>, --write-baseline <file>, --serve-shape, \
-                 --ps-seed <N>, --help)"
+                 --ps-seed <N>, --proxy, --calls-seed <N>, --help)"
             ));
         };
+        if flag == "--proxy" {
+            // Story 23-1: a BOOLEAN flag, like --serve-shape.
+            if let Some(value) = inline_value {
+                return Err(format!("--proxy takes no value (got --proxy={value:?})"));
+            }
+            if parsed.proxy {
+                return Err("--proxy given more than once".to_string());
+            }
+            parsed.proxy = true;
+            index += 1;
+            continue;
+        }
         if flag == "--serve-shape" {
             // Story 17-1: a BOOLEAN flag — the `=`-carrying form is invalid
             // usage outright (the spec's `--serve-shape=bogus` row: a named
@@ -2240,6 +2272,30 @@ fn parse_cli_args(argv: &[String]) -> Result<CliArgs, String> {
                 return Err("--serve-shape given more than once".to_string());
             }
             parsed.serve_shape = true;
+            index += 1;
+            continue;
+        }
+        if flag == "--calls-seed" {
+            // Story 19-4: a count, like --ps-seed.
+            let value = match inline_value {
+                Some(value) => value,
+                None => {
+                    index += 1;
+                    argv.get(index).cloned().ok_or_else(|| {
+                        "--calls-seed requires a count (usage: --calls-seed <N>)".to_string()
+                    })?
+                }
+            };
+            let count: u64 = value.parse().map_err(|_| {
+                format!("--calls-seed requires a whole number of records (got {value:?})")
+            })?;
+            if count == 0 {
+                return Err("--calls-seed requires a count of at least 1".to_string());
+            }
+            if parsed.calls_seed.is_some() {
+                return Err("--calls-seed given more than once".to_string());
+            }
+            parsed.calls_seed = Some(count);
             index += 1;
             continue;
         }
@@ -2270,7 +2326,7 @@ fn parse_cli_args(argv: &[String]) -> Result<CliArgs, String> {
             return Err(format!(
                 "unknown argument {raw:?} \
                  (supported: --baseline <file>, --write-baseline <file>, --serve-shape, \
-                 --ps-seed <N>, --help)"
+                 --ps-seed <N>, --proxy, --calls-seed <N>, --help)"
             ));
         }
         let value = match inline_value {
@@ -3012,6 +3068,495 @@ fn baseline_write_refusal(
 // The harness
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Story 23-1: the shared Metering Proxy's added latency (--proxy)
+// ---------------------------------------------------------------------------
+
+/// Concurrent clients in the proxy scenario.
+const PROXY_CLIENTS: usize = 64;
+/// Calls per measurement (all clients together), unless overridden.
+const PROXY_DEFAULT_CALLS: u64 = 10_000;
+/// Open Runs in the snapshot while measuring: split Runs and keyed child
+/// Runs beneath one binding.
+const PROXY_OPEN_RUNS: usize = 1_000;
+/// Keyed child Runs among them (the rest are split Runs).
+const PROXY_KEYED_RUNS: usize = 100;
+/// NFR-4: the proxy adds at most this much p99 latency.
+const PROXY_ADDED_P99_BUDGET_MS: f64 = 10.0;
+
+/// A 1 KiB non-streaming completion with usage.
+fn proxy_completion() -> String {
+    let filler = "x".repeat(800);
+    format!(
+        r#"{{"id":"cmpl","object":"chat.completion","model":"gpt-bench","choices":[{{"index":0,"message":{{"role":"assistant","content":"{filler}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}}}"#
+    )
+}
+
+/// A loopback upstream answering every request with [`proxy_completion`].
+fn proxy_upstream() -> u16 {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind the upstream");
+    let port = listener.local_addr().expect("upstream addr").port();
+    let body = proxy_completion();
+    let reply = Arc::new(format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+         connection: close\r\n\r\n{body}",
+        body.len()
+    ));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let reply = Arc::clone(&reply);
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read the head and its content-length body.
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                    }
+                    if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buffer.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let _ = stream.write_all(reply.as_bytes());
+            });
+        }
+    });
+    port
+}
+
+/// One call: a small chat body to `path` on `port`; the latency in ms.
+fn proxy_call(port: u16, path: &str, extra_headers: &str) -> Result<f64, String> {
+    use std::io::{Read, Write};
+    const BODY: &str = r#"{"model":"gpt-bench","messages":[{"role":"user","content":"hi"}]}"#;
+    let started = Instant::now();
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+        .map_err(|err| format!("connect {port}: {err}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n{extra_headers}\
+         content-type: application/json\r\ncontent-length: {}\r\n\r\n{BODY}",
+        BODY.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("write: {err}"))?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|err| format!("read: {err}"))?;
+    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+    if !raw.starts_with(b"HTTP/1.1 200") {
+        let head = String::from_utf8_lossy(&raw[..raw.len().min(200)]).into_owned();
+        return Err(format!("{path}: {head}"));
+    }
+    Ok(elapsed)
+}
+
+/// Run `calls` calls over [`PROXY_CLIENTS`] threads; `target(i)` names the
+/// `i`-th call's (port, path, headers). Sorted latency samples.
+fn proxy_measure(
+    calls: usize,
+    target: Arc<dyn Fn(usize) -> (u16, String, String) + Send + Sync>,
+) -> Result<Vec<f64>, String> {
+    let next = Arc::new(AtomicU64::new(0));
+    let workers: Vec<_> = (0..PROXY_CLIENTS)
+        .map(|_| {
+            let next = Arc::clone(&next);
+            let target = Arc::clone(&target);
+            std::thread::spawn(move || -> Result<Vec<f64>, String> {
+                let mut samples = Vec::new();
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed) as usize;
+                    if index >= calls {
+                        return Ok(samples);
+                    }
+                    let (port, path, headers) = target(index);
+                    samples.push(proxy_call(port, &path, &headers)?);
+                }
+            })
+        })
+        .collect();
+    let mut all = Vec::with_capacity(calls);
+    for worker in workers {
+        all.extend(
+            worker
+                .join()
+                .map_err(|_| "a client thread panicked".to_string())??,
+        );
+    }
+    all.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(all)
+}
+
+/// One proxy measurement: direct and proxied samples' p50/p99 and the
+/// added p50/p99.
+struct ProxyFigures {
+    direct_p50: f64,
+    direct_p99: f64,
+    proxy_p50: f64,
+    proxy_p99: f64,
+}
+
+impl ProxyFigures {
+    fn added_p50(&self) -> f64 {
+        (self.proxy_p50 - self.direct_p50).max(0.0)
+    }
+    fn added_p99(&self) -> f64 {
+        (self.proxy_p99 - self.direct_p99).max(0.0)
+    }
+}
+
+/// Run the proxy scenario: open an engine with its proxy, seed the open
+/// Runs, measure direct and proxied calls, gate, print the report. The
+/// exit code: 0 passed, 1 the gate failed, 2 the scenario could not run.
+fn run_proxy_scenario(ci: bool) -> i32 {
+    match proxy_scenario(ci) {
+        Ok(passed) => i32::from(!passed),
+        Err(reason) => {
+            note(&format!(
+                "the proxy scenario could not run: {reason} — exiting 2"
+            ));
+            2
+        }
+    }
+}
+
+fn proxy_scenario(ci: bool) -> Result<bool, String> {
+    let calls = env_u64("PERF_BUDGETS_PROXY_CALLS", PROXY_DEFAULT_CALLS).max(1) as usize;
+    let state = tempfile::TempDir::new().map_err(|err| err.to_string())?;
+    let engine = hekma_engine::Engine::open(Some(state.path().to_path_buf()))
+        .map_err(|err| format!("open the engine: {err}"))?;
+    let proxy_port = engine
+        .metering_proxy()
+        .ok_or("the metering proxy did not start")?
+        .port;
+    let upstream = proxy_upstream();
+    let facade = engine.blocking();
+    facade
+        .create_binding(hekma_engine::BindingSpec {
+            name: "bench".into(),
+            prefix: "/bench".into(),
+            upstream: format!("http://127.0.0.1:{upstream}/v1"),
+            labels: vec![("team".into(), "bench".into())],
+            custodied_key: None,
+        })
+        .map_err(|err| format!("create the binding: {err}"))?;
+    // The binding's own Run first (read while it is the only Run), then
+    // the split Runs by hint, then the keyed child Runs beneath it.
+    proxy_call(proxy_port, "/bench/chat", "")?;
+    let binding_run = facade
+        .list_runs(hekma_engine::ListRunsQuery {
+            view: hekma_engine::ListingView::All,
+            limit: 0,
+            ..hekma_engine::ListRunsQuery::default()
+        })
+        .map_err(|err| err.to_string())?
+        .items
+        .into_iter()
+        .find(|run| {
+            run.identity
+                .as_ref()
+                .is_some_and(|(ns, id)| ns == "binding" && id == "bench")
+        })
+        .ok_or("the binding's Run was not listed")?
+        .record
+        .run_id;
+    let splits = PROXY_OPEN_RUNS - PROXY_KEYED_RUNS;
+    for n in 0..splits {
+        proxy_call(
+            proxy_port,
+            "/bench/chat",
+            &format!("x-hekma-run: split-{n}\r\n"),
+        )?;
+    }
+    let mut keys = Vec::with_capacity(PROXY_KEYED_RUNS);
+    for _ in 0..PROXY_KEYED_RUNS {
+        let mut request =
+            hekma_engine::ChildRunRequest::under(hekma_engine::RunParent::Run(binding_run.clone()));
+        request.issue_credentials = true;
+        let opened = facade
+            .open_child_run_as(hekma_engine::RunActor::Operator, request)
+            .map_err(|err| format!("open a keyed child Run: {err}"))?;
+        let credentials = opened.credentials.ok_or("no credentials issued")?;
+        keys.push(credentials.run_key().expose_secret().to_string());
+    }
+    let keys = Arc::new(keys);
+    note(&format!(
+        "proxy run (story 23-1): {PROXY_OPEN_RUNS} open Runs ({splits} split, {PROXY_KEYED_RUNS} \
+         keyed); measuring {calls} calls over {PROXY_CLIENTS} clients, direct then proxied"
+    ));
+
+    let measure = || -> Result<ProxyFigures, String> {
+        let direct = proxy_measure(
+            calls,
+            Arc::new(move |_| (upstream, "/v1/chat".to_string(), String::new())),
+        )?;
+        let keys = Arc::clone(&keys);
+        let proxied = proxy_measure(
+            calls,
+            Arc::new(move |index| {
+                // A third each: the binding's Run, a split Run, a keyed Run.
+                let headers = match index % 3 {
+                    0 => String::new(),
+                    1 => format!("x-hekma-run: split-{}\r\n", index % splits),
+                    _ => format!("x-hekma-run-key: {}\r\n", keys[index % keys.len()]),
+                };
+                (proxy_port, "/bench/chat".to_string(), headers)
+            }),
+        )?;
+        Ok(ProxyFigures {
+            direct_p50: percentile(&direct, 50.0),
+            direct_p99: percentile(&direct, 99.0),
+            proxy_p50: percentile(&proxied, 50.0),
+            proxy_p99: percentile(&proxied, 99.0),
+        })
+    };
+    let mut figures = measure()?;
+    let mut retried = false;
+    if ci && figures.added_p99() > PROXY_ADDED_P99_BUDGET_MS {
+        // The CI once-retry (the 21-5 pattern): a noisy shared runner gets
+        // one more measurement before the gate is read.
+        note("the proxy's added p99 is over budget; measuring once more (CI retry)");
+        figures = measure()?;
+        retried = true;
+    }
+    let passed = figures.added_p99() <= PROXY_ADDED_P99_BUDGET_MS;
+    let report = serde_json::json!({
+        "proxy": {
+            "clients": PROXY_CLIENTS,
+            "calls": calls,
+            "open_runs": PROXY_OPEN_RUNS,
+            "direct_p50_ms": figures.direct_p50,
+            "direct_p99_ms": figures.direct_p99,
+            "proxy_p50_ms": figures.proxy_p50,
+            "proxy_p99_ms": figures.proxy_p99,
+            "added_p50_ms": figures.added_p50(),
+            "added_p99_ms": figures.added_p99(),
+            "budget_added_p99_ms": PROXY_ADDED_P99_BUDGET_MS,
+            "retried": retried,
+            "passed": passed,
+        }
+    });
+    let text = serde_json::to_string_pretty(&report).map_err(|err| err.to_string())?;
+    println!("{text}");
+    if let Ok(path) = std::env::var("PERF_BUDGETS_REPORT_PATH") {
+        std::fs::write(&path, &text).map_err(|err| format!("write {path}: {err}"))?;
+    }
+    note(&format!(
+        "proxy added latency: p50 {:.3} ms, p99 {:.3} ms (budget {PROXY_ADDED_P99_BUDGET_MS} ms) — {}",
+        figures.added_p50(),
+        figures.added_p99(),
+        if passed { "PASS" } else { "FAIL" }
+    ));
+    drop(engine);
+    Ok(passed)
+}
+
+// ---- Story 19-4: the per-call records listing scenario. ----
+
+/// The listing gate: each measured read's p99 strictly under one second.
+const CALLS_P99_BUDGET_MS: f64 = 1000.0;
+/// Iterations per measured read (`PERF_BUDGETS_CALLS_ITERATIONS`).
+const CALLS_DEFAULT_ITERATIONS: u64 = 40;
+/// The seed's distinct Runs; the measured Run holds 1% of the records.
+const CALLS_SEED_RUNS: u64 = 1_000;
+
+/// A Crockford ULID body at `unix_millis` with `nonce` in its random half:
+/// deterministic, order-preserving ids.
+fn bench_ulid(unix_millis: u64, nonce: u64) -> String {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut value: u128 = u128::from(unix_millis & ((1 << 48) - 1)) << 80;
+    value |= u128::from(nonce);
+    (0..26)
+        .rev()
+        .map(|group| ALPHABET[((value >> (5 * group)) & 0x1F) as usize] as char)
+        .collect()
+}
+
+/// One seeded record's shape: (run index, a problem call). 1% go to the
+/// measured Run (index 0), the rest spread over the others; 2% are
+/// problems.
+fn calls_seed_shape(i: u64) -> (u64, bool) {
+    let run = if i.is_multiple_of(100) {
+        0
+    } else {
+        1 + i % (CALLS_SEED_RUNS - 1)
+    };
+    (run, i % 50 == 7)
+}
+
+fn run_calls_scenario(seed: u64) -> i32 {
+    match calls_scenario(seed) {
+        Ok(passed) => i32::from(!passed),
+        Err(reason) => {
+            note(&format!(
+                "the calls scenario could not run: {reason} — exiting 2"
+            ));
+            2
+        }
+    }
+}
+
+/// Fill one segment with records `range` (one transaction).
+fn seed_calls_segment(
+    path: &std::path::Path,
+    range: std::ops::Range<u64>,
+    base_ms: u64,
+) -> Result<(), String> {
+    let mut conn = rusqlite::Connection::open(path).map_err(|err| err.to_string())?;
+    let tx = conn.transaction().map_err(|err| err.to_string())?;
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO calls VALUES (?1, ?2, NULL, 'wire', 'bench', ?3, NULL, ?4, ?5, ?6, \
+                 'gpt-demo', 10, 5, 0, ?7, ?7, 1000, 900)",
+            )
+            .map_err(|err| err.to_string())?;
+        for i in range {
+            let (run, problem) = calls_seed_shape(i);
+            let millis = base_ms + i;
+            let (disposition, outcome, status, class) = if problem {
+                ("block", "refused", 402, "refused")
+            } else {
+                ("pass", "completed", 200, "2xx")
+            };
+            let started_at =
+                hekma_engine::format_rfc3339_micros(millis / 1000, ((millis % 1000) * 1000) as u32);
+            insert
+                .execute(rusqlite::params![
+                    format!("call_{}", bench_ulid(millis, i)),
+                    format!("run_{}", bench_ulid(1_700_000_000_000, run)),
+                    disposition,
+                    outcome,
+                    status,
+                    class,
+                    started_at,
+                ])
+                .map_err(|err| err.to_string())?;
+        }
+    }
+    tx.commit().map_err(|err| err.to_string())
+}
+
+fn calls_scenario(seed: u64) -> Result<bool, String> {
+    let iterations = env_u64("PERF_BUDGETS_CALLS_ITERATIONS", CALLS_DEFAULT_ITERATIONS).max(1);
+    let state = tempfile::TempDir::new().map_err(|err| err.to_string())?;
+    // The proxy-owning open creates today's segment at the current calls
+    // schema (the real DDL and indexes); the bench then fills it.
+    drop(
+        hekma_engine::Engine::open(Some(state.path().to_path_buf()))
+            .map_err(|err| format!("open the engine: {err}"))?,
+    );
+    let calls_dir = state.path().join("calls");
+    let head = std::fs::read_dir(&calls_dir)
+        .map_err(|err| err.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "db"))
+        .ok_or("the engine created no calls segment")?;
+    // Two segments: the older half in a copy named for an earlier date, so
+    // every read merges across the boundary.
+    let older = calls_dir.join("2000-01-01.db");
+    std::fs::copy(&head, &older).map_err(|err| err.to_string())?;
+    let base_ms: u64 = 1_750_000_000_000;
+    let started = std::time::Instant::now();
+    seed_calls_segment(&older, 0..seed / 2, base_ms)?;
+    seed_calls_segment(&head, seed / 2..seed, base_ms)?;
+    note(&format!(
+        "calls run (story 19-4): seeded {seed} records into 2 segments in {:.1} s; measuring \
+         {iterations} iterations per read",
+        started.elapsed().as_secs_f64()
+    ));
+    let engine = hekma_engine::Engine::open_read_only(Some(state.path().to_path_buf()))
+        .map_err(|err| format!("open read-only: {err}"))?;
+    let facade = engine.blocking();
+    let probe_id = format!("call_{}", bench_ulid(base_ms + 1, 1));
+    let measured_run = format!("run_{}", bench_ulid(1_700_000_000_000, 0));
+    let time = |read: &dyn Fn() -> Result<(), String>| -> Result<f64, String> {
+        let mut samples = Vec::with_capacity(iterations as usize);
+        for _ in 0..iterations {
+            let at = std::time::Instant::now();
+            read()?;
+            samples.push(at.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        Ok(percentile(&samples, 99.0))
+    };
+    let page = |query: hekma_engine::CallsQuery| -> Result<(), String> {
+        facade
+            .list_calls(query)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    };
+    let unscoped = time(&|| page(hekma_engine::CallsQuery::all()))?;
+    let run_scoped = time(&|| {
+        page(hekma_engine::CallsQuery {
+            run: Some(measured_run.clone()),
+            ..hekma_engine::CallsQuery::all()
+        })
+    })?;
+    let problems = time(&|| {
+        page(hekma_engine::CallsQuery {
+            view: hekma_engine::CallView::Problems,
+            ..hekma_engine::CallsQuery::all()
+        })
+    })?;
+    let by_id = time(&|| {
+        facade
+            .call(&probe_id)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    })?;
+    // A sparse filter that matches nothing exhausts the scan budget
+    // (reported, not gated).
+    let sparse = time(&|| {
+        page(hekma_engine::CallsQuery {
+            model: Some("no-such-model".into()),
+            ..hekma_engine::CallsQuery::all()
+        })
+    })?;
+    let passed = [unscoped, run_scoped, problems, by_id]
+        .iter()
+        .all(|p99| *p99 < CALLS_P99_BUDGET_MS);
+    let report = serde_json::json!({
+        "calls_listing": {
+            "seed": seed,
+            "segments": 2,
+            "iterations": iterations,
+            "unscoped_first_page_p99_ms": unscoped,
+            "run_scoped_first_page_p99_ms": run_scoped,
+            "problems_first_page_p99_ms": problems,
+            "by_id_p99_ms": by_id,
+            "sparse_scan_budget_p99_ms": sparse,
+            "budget_p99_ms": CALLS_P99_BUDGET_MS,
+            "passed": passed,
+        }
+    });
+    let text = serde_json::to_string_pretty(&report).map_err(|err| err.to_string())?;
+    println!("{text}");
+    if let Ok(path) = std::env::var("PERF_BUDGETS_REPORT_PATH") {
+        std::fs::write(&path, &text).map_err(|err| format!("write {path}: {err}"))?;
+    }
+    note(&format!(
+        "calls listing p99: unscoped {unscoped:.2} ms, Run-scoped {run_scoped:.2} ms, problems \
+         {problems:.2} ms, by id {by_id:.2} ms (budget < {CALLS_P99_BUDGET_MS} ms) — {}",
+        if passed { "PASS" } else { "FAIL" }
+    ));
+    Ok(passed)
+}
+
 fn main() {
     // Story 15-5: the flag surface (--baseline / --write-baseline). Parsed
     // FIRST so a usage error cannot waste a minute of measurement; invalid
@@ -3029,6 +3574,29 @@ fn main() {
         return;
     }
     let config = HarnessConfig::from_env();
+    if let Some(seed) = cli.calls_seed {
+        if cli.baseline.is_some()
+            || cli.write_baseline.is_some()
+            || cli.serve_shape
+            || cli.ps_seed.is_some()
+            || cli.proxy
+        {
+            note("--calls-seed runs on its own: drop the other flags — exiting 2");
+            std::process::exit(2);
+        }
+        std::process::exit(run_calls_scenario(seed));
+    }
+    if cli.proxy {
+        if cli.baseline.is_some()
+            || cli.write_baseline.is_some()
+            || cli.serve_shape
+            || cli.ps_seed.is_some()
+        {
+            note("--proxy runs on its own: drop the other flags — exiting 2");
+            std::process::exit(2);
+        }
+        std::process::exit(run_proxy_scenario(config.ci));
+    }
     // The baseline loads (and validates) BEFORE anything is spawned, for the
     // same fail-fast reason — a missing/corrupt/schema-mismatched baseline
     // is a loud named error + exit 2, never a silent no-trend run. Review
@@ -5211,6 +5779,8 @@ mod tests {
                 write_baseline: Some("w.json".into()),
                 serve_shape: false,
                 ps_seed: None,
+                proxy: false,
+                calls_seed: None,
                 help: false,
             }
         );
@@ -5225,6 +5795,8 @@ mod tests {
                 write_baseline: Some("w.json".into()),
                 serve_shape: false,
                 ps_seed: None,
+                proxy: false,
+                calls_seed: None,
                 help: false,
             }
         );
@@ -5241,6 +5813,8 @@ mod tests {
                 write_baseline: None,
                 serve_shape: false,
                 ps_seed: None,
+                proxy: false,
+                calls_seed: None,
                 help: false,
             }
         );
@@ -5773,6 +6347,68 @@ mod tests {
         assert_eq!(outcome.page_p(0.95), 12.0);
         assert_eq!(outcome.page_p(0.50), 6.0);
         assert_eq!(outcome.open_p(0.99), 1.0, "constant samples rank constant");
+    }
+
+    #[test]
+    fn the_calls_seed_flag_parses_and_refuses_bad_usage() {
+        let parse =
+            |args: &[&str]| parse_cli_args(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            parse(&["--calls-seed", "100000"]).unwrap().calls_seed,
+            Some(100_000)
+        );
+        assert_eq!(parse(&["--calls-seed=7"]).unwrap().calls_seed, Some(7));
+        assert_eq!(parse(&[]).unwrap().calls_seed, None);
+        assert!(parse(&["--calls-seed", "0"])
+            .unwrap_err()
+            .contains("at least 1"));
+        assert!(parse(&["--calls-seed", "x"])
+            .unwrap_err()
+            .contains("whole number"));
+        assert!(parse(&["--calls-seed"])
+            .unwrap_err()
+            .contains("requires a count"));
+        assert!(parse(&["--calls-seed", "1", "--calls-seed", "2"])
+            .unwrap_err()
+            .contains("more than once"));
+        assert!(usage_text().contains("--calls-seed"));
+    }
+
+    #[test]
+    fn the_calls_seed_mix_is_one_percent_measured_and_two_percent_problems() {
+        let shapes: Vec<_> = (0..10_000).map(calls_seed_shape).collect();
+        assert_eq!(shapes.iter().filter(|(run, _)| *run == 0).count(), 100);
+        assert_eq!(shapes.iter().filter(|(_, problem)| *problem).count(), 200);
+        assert!(shapes.iter().all(|(run, _)| *run < CALLS_SEED_RUNS));
+        // Ids sort by time: a later millisecond is a later id.
+        assert!(bench_ulid(1_000, 5) < bench_ulid(1_001, 0));
+    }
+
+    #[test]
+    fn the_proxy_flag_parses_and_refuses_a_value_or_a_repeat() {
+        let parse =
+            |args: &[&str]| parse_cli_args(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        assert!(parse(&["--proxy"]).unwrap().proxy);
+        assert!(!parse(&[]).unwrap().proxy);
+        assert!(parse(&["--proxy=yes"])
+            .unwrap_err()
+            .contains("takes no value"));
+        assert!(parse(&["--proxy", "--proxy"])
+            .unwrap_err()
+            .contains("more than once"));
+        assert!(usage_text().contains("--proxy"));
+    }
+
+    #[test]
+    fn proxy_figures_subtract_the_direct_baseline_and_never_go_negative() {
+        let figures = ProxyFigures {
+            direct_p50: 1.0,
+            direct_p99: 4.0,
+            proxy_p50: 1.5,
+            proxy_p99: 3.0,
+        };
+        assert!((figures.added_p50() - 0.5).abs() < f64::EPSILON);
+        assert_eq!(figures.added_p99(), 0.0);
     }
 
     #[test]

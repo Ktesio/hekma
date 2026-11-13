@@ -81,8 +81,22 @@ pub struct BindingPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<Vec<(String, String)>>,
     /// `Some(None)` clears the reference.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // `null` must mean "clear", which plain serde reads as "unchanged".
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_or_null"
+    )]
     pub custodied_key: Option<Option<String>>,
+}
+
+/// A present field, `null` included, is `Some`: absent is `None`
+/// (unchanged), `null` is `Some(None)` (clear), a value is `Some(Some(v))`.
+fn present_or_null<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// A route to put on a binding.
@@ -246,6 +260,24 @@ pub enum BindingError {
     /// The store refused or failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+impl BindingError {
+    /// A stable machine code for wire surfaces (`error.code` on the
+    /// Control API; the CLI maps it onto its exit classes).
+    pub fn code(&self) -> &'static str {
+        match self {
+            BindingError::Invalid { .. } => "binding-invalid",
+            BindingError::NotFound { .. } => "binding-not-found",
+            BindingError::Exists { .. } => "binding-exists",
+            BindingError::PrefixTaken { .. } => "binding-prefix-taken",
+            BindingError::TooMany { .. } => "binding-limit",
+            BindingError::RouteNotFound { .. } => "binding-route-not-found",
+            BindingError::LegacyRoute { .. } => "binding-legacy-route",
+            BindingError::Credential(_) => "binding-credential",
+            BindingError::Store(_) => "binding-store",
+        }
+    }
 }
 
 /// Validate a binding name (the agent-name charset).

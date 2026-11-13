@@ -144,6 +144,8 @@ KT_COMMANDS = {
     "label",
     "policy",
     "budget",
+    "binding",
+    "calls",
     "ps",
     "serve",
 }
@@ -157,6 +159,12 @@ BUDGET_COMMANDS = {"show", "set"}
 # `hekma policy` owns its own subcommand tree (crates/hekma/src/lib.rs
 # `PolicyCommands`).
 POLICY_COMMANDS = {"list", "show", "create", "change", "delete"}
+# `hekma binding` owns its own subcommand tree (crates/hekma/src/lib.rs
+# `BindingCommands`).
+BINDING_COMMANDS = {"list", "show", "create", "set", "delete", "route", "credential"}
+# `hekma calls` owns its own subcommand tree (crates/hekma/src/lib.rs
+# `CallsCommands`).
+CALLS_COMMANDS = {"list", "show"}
 # `hekma agent` owns its own subcommand tree (crates/hekma/src/lib.rs `AgentCommands`).
 # Model it the same way as the top level — an allowlist per nesting level — so the
 # agent-runner surface validates without a blanket bypass.
@@ -363,6 +371,20 @@ def validate_command_examples(
                 errors.append(
                     f"{rel_path}: shell fence #{fence_index}, line {line_number}: unknown "
                     f"`kt policy` subcommand `{found[1]}`"
+                )
+        if command == "binding":
+            found = first_non_flag(tokens[command_index + 2 :])
+            if found is not None and found[1] not in BINDING_COMMANDS:
+                errors.append(
+                    f"{rel_path}: shell fence #{fence_index}, line {line_number}: unknown "
+                    f"`kt binding` subcommand `{found[1]}`"
+                )
+        if command == "calls":
+            found = first_non_flag(tokens[command_index + 2 :])
+            if found is not None and found[1] not in CALLS_COMMANDS:
+                errors.append(
+                    f"{rel_path}: shell fence #{fence_index}, line {line_number}: unknown "
+                    f"`kt calls` subcommand `{found[1]}`"
                 )
 
 
