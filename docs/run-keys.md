@@ -118,11 +118,9 @@ hekma agent config set my-agent provider.api_key secret:OPENAI_KEY
 
 Custody is then on by default. The adapter must map `provider.api_key` to an environment variable (an `env` target in its manifest); a `flag` or `file` target is refused, because it would put the key on the command line or in the Agent Home.
 
-| Key | Values | What it does |
-|---|---|---|
-| `provider.api_key` | `secret:NAME` only | The provider key Hekma holds. Any other value is refused. |
-| `provider.custody` | `on` (default), `off` | `off` delivers the real key to the agent as before, while Hekma still holds the reference. |
-| `provider.isolate_home` | `off` (default), `on` | Points the agent's home-directory variables at a directory inside its Agent Home (see the limits below). |
+- **`provider.api_key`**, `secret:NAME` only: the provider key Hekma holds. Any other value is refused.
+- **`provider.custody`**, `on` (the default) or `off`: `off` delivers the real key to the agent as before, while Hekma still holds the reference.
+- **`provider.isolate_home`**, `off` (the default) or `on`: points the agent's home-directory variables at a directory inside its Agent Home (see the limits below).
 
 At start, under custody, Hekma:
 
