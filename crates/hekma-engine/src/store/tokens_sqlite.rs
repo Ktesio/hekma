@@ -250,15 +250,17 @@ pub(super) fn run_tokens(conn: &Connection, run_id: &RunId) -> Result<Vec<TokenR
     )
 }
 
-pub(super) fn active_issued_under(
+/// Every token in `state` whose `issued_by` chain starts at one of `roots`.
+pub(super) fn issued_under(
     conn: &Connection,
     roots: &[TokenHash],
+    state: TokenState,
 ) -> Result<Vec<TokenRow>, StoreError> {
     let mut found: Vec<TokenRow> = Vec::new();
     for root in roots {
         // The walk visits every descendant whatever its state (a revoked
         // child key may still have live grandchildren), and returns the
-        // active ones. `UNION` (not `UNION ALL`) ends any cycle.
+        // ones in `state`. `UNION` (not `UNION ALL`) ends any cycle.
         let rows = collect(
             conn,
             &format!(
@@ -268,10 +270,10 @@ pub(super) fn active_issued_under(
                      SELECT t.token_hash FROM tokens t JOIN under u ON t.issued_by_hash = u.hash\
                  ) \
                  SELECT {TOKEN_COLUMNS} FROM tokens \
-                 WHERE token_hash IN (SELECT hash FROM under) AND state = 'active' \
+                 WHERE token_hash IN (SELECT hash FROM under) AND state = ?2 \
                  ORDER BY issued_at, rowid"
             ),
-            [&root.as_bytes()[..]],
+            rusqlite::params![&root.as_bytes()[..], state.as_str()],
         )?;
         for row in rows {
             if !found.iter().any(|seen| seen.hash.ct_eq(&row.hash)) {

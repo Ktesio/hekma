@@ -1258,3 +1258,251 @@ fn a_callers_open_time_ceilings_land_in_the_caller_layer_and_only_tighten() {
         Some(700)
     );
 }
+
+impl World {
+    /// The stored row of a presented token.
+    fn token_row(&self, presented: &crate::domain::SecretString) -> crate::ports::TokenRow {
+        let hash = hash_presented(presented);
+        self.registry
+            .store
+            .snapshot(|store| store.token(&hash))
+            .unwrap()
+            .expect("a row")
+    }
+
+    /// Trade `presented` at the job level.
+    fn refresh(
+        &self,
+        presented: &crate::domain::SecretString,
+    ) -> Result<crate::domain::IssuedCredentials, RunError> {
+        self.supervisor
+            .refresh_credentials(&self.registry, presented)
+    }
+}
+
+/// One supervised launch whose Adapter maps a refresh variable: the Run
+/// kept, and its Run Key and refresh credential committed with the record's
+/// generation. Returns (run key, refresh credential).
+fn launch_pair(w: &World, run: &RunId) -> (crate::domain::MintedToken, crate::domain::MintedToken) {
+    let key = mint(TokenClass::RunKey).unwrap();
+    let refresh = mint(TokenClass::Refresh).unwrap();
+    let (key_stub, refresh_stub) = (key.stub(), refresh.stub());
+    let publisher = std::sync::Arc::clone(w.registry.run_publisher());
+    let r = run.clone();
+    w.registry
+        .writer
+        .call(move |ctx| {
+            use crate::ports::RunStore as _;
+            let generation = ctx
+                .store()
+                .bump_launch_generation(&InstanceName::new(INSTANCE).unwrap())?;
+            let changes = ops::issue_launch(
+                ctx.store(),
+                &r,
+                generation,
+                LaunchCredentials {
+                    key: key_stub,
+                    refresh: Some(refresh_stub),
+                },
+                "t",
+            )?;
+            ops::commit(ctx, &publisher, changes)
+        })
+        .unwrap();
+    (key, refresh)
+}
+
+/// Review 2, L1: a Caller's open re-reads its key in the job on EVERY path.
+/// A key revoked in flight is refused even when the parent it names does
+/// not resolve — and so before a retried external id could answer with
+/// the existing Run.
+#[test]
+fn a_callers_open_rechecks_its_key_even_when_the_parent_does_not_resolve() {
+    let w = world();
+    let (child, credentials) = w.operator_child();
+    let stale = w.caller(credentials.run_key());
+    let with_id = |parent: RunParent| {
+        let mut request = ChildRunRequest::under(parent);
+        request.external_id = Some("job-retry".to_string());
+        request
+    };
+    let opened = w
+        .supervisor
+        .open_child_run_as(
+            &w.registry,
+            stale.clone(),
+            with_id(RunParent::Run(child.clone())),
+        )
+        .unwrap();
+    // While the key is live, a retry naming an instance with no open Run
+    // still finds the Run its own binding holds.
+    let retried = w
+        .supervisor
+        .open_child_run_as(
+            &w.registry,
+            stale.clone(),
+            with_id(RunParent::Instance("nope".to_string())),
+        )
+        .unwrap();
+    assert_eq!(retried.view.record.run_id, opened.view.record.run_id);
+    // The key is revoked between authentication and the job.
+    w.supervisor
+        .revoke_run_keys(&w.registry, &child, false)
+        .unwrap();
+    let runs = w.registry.open_runs().unwrap().len();
+    let events = w.credential_events().len();
+    for parent in [
+        RunParent::Instance("nope".to_string()),
+        RunParent::Instance("not a valid name!".to_string()),
+        RunParent::Run(RunId::from_wire("run_missing")),
+        RunParent::Run(child.clone()),
+    ] {
+        let err = w
+            .supervisor
+            .open_child_run_as(&w.registry, stale.clone(), with_id(parent.clone()))
+            .unwrap_err();
+        assert_eq!(err.code(), "credential-revoked", "{parent:?}");
+    }
+    assert_eq!(w.registry.open_runs().unwrap().len(), runs);
+    assert_eq!(w.credential_events().len(), events);
+}
+
+/// Review 2, L2: a used refresh credential's reuse revokes only its own
+/// launch generation. A credential of an exited launch that somehow stayed
+/// `retired` (its exit's revocation is the first line, the next launch's
+/// the second) raises the Anomaly but never revokes the live launch's key.
+#[test]
+fn a_stale_refresh_credential_of_an_exited_launch_never_revokes_the_live_launch() {
+    let w = world();
+    let run = w.root.clone();
+    let (_, first_refresh) = launch_pair(&w, &run);
+    w.refresh(first_refresh.secret()).unwrap();
+    let (live_key, live_refresh) = launch_pair(&w, &run);
+    // Both lines of defence took the used credential out; put it back to
+    // `retired` to prove the third.
+    let literal: String = hash_presented(first_refresh.secret())
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect();
+    w.registry
+        .writer
+        .call(move |ctx| {
+            ctx.store().execute_batch_for_test(&format!(
+                "UPDATE tokens SET state = 'retired' WHERE token_hash = X'{literal}'"
+            ));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(w.token_state(first_refresh.secret()), TokenState::Retired);
+    let err = w.refresh(first_refresh.secret()).unwrap_err();
+    assert_eq!(err.code(), "credential-revoked");
+    assert!(w.run(&run).anomalies.contains(&Anomaly::CredentialReuse));
+    assert!(
+        w.authenticate(live_key.secret()).is_some(),
+        "the live launch keeps its key"
+    );
+    assert_eq!(w.token_state(live_refresh.secret()), TokenState::Active);
+    assert_eq!(w.token_state(first_refresh.secret()), TokenState::Revoked);
+}
+
+/// Review 1, L4 (the remainder): a used refresh credential leaves service
+/// with the credentials it belonged to — at its launch's exit, at a
+/// relaunch whose exit was never recorded, at its Run's end, under the
+/// Operator's cascade, and when it is seen in a URL (which is reuse, so the
+/// rotated pair goes too and the Anomaly is raised). Presented afterwards it
+/// is a plain refusal, never a reuse that revokes a live pair.
+#[test]
+fn a_used_refresh_credential_leaves_service_wherever_its_credentials_do() {
+    use crate::domain::LifecycleState;
+    let used = |w: &World, presented: &crate::domain::SecretString, cause: &str| {
+        let row = w.token_row(presented);
+        assert_eq!(row.state, TokenState::Revoked, "{cause}");
+        assert_eq!(row.revoke_cause.as_deref(), Some(cause));
+    };
+
+    // The launch's exit.
+    let w = world();
+    let run = w.root.clone();
+    let (_, refresh) = launch_pair(&w, &run);
+    w.refresh(refresh.secret()).unwrap();
+    transition(&w, LifecycleState::Failed, RunFate::Relaunching);
+    used(&w, refresh.secret(), "process-exited");
+    let (next, _) = launch_pair(&w, &run);
+    assert_eq!(
+        w.refresh(refresh.secret()).unwrap_err().code(),
+        "credential-revoked"
+    );
+    assert!(w.authenticate(next.secret()).is_some());
+    assert!(!w.run(&run).anomalies.contains(&Anomaly::CredentialReuse));
+
+    // A relaunch whose exit was never recorded.
+    let w = world();
+    let run = w.root.clone();
+    let (_, refresh) = launch_pair(&w, &run);
+    w.refresh(refresh.secret()).unwrap();
+    launch_pair(&w, &run);
+    used(&w, refresh.secret(), "process-exited");
+
+    // The Run's end.
+    let w = world();
+    let (child, first) = w.operator_child();
+    w.refresh(first.refresh_credential()).unwrap();
+    w.supervisor
+        .close_run_as(&w.registry, RunActor::Operator, &child)
+        .unwrap();
+    used(&w, first.refresh_credential(), "run-ended");
+
+    // The Operator's cascade reaches a descendant's used credential.
+    let w = world();
+    let (child, credentials) = w.operator_child();
+    let grandchild = w
+        .open(w.caller(credentials.run_key()), &child)
+        .unwrap()
+        .credentials
+        .unwrap();
+    let rotated = w.refresh(grandchild.refresh_credential()).unwrap();
+    w.supervisor
+        .revoke_run_keys(&w.registry, &child, true)
+        .unwrap();
+    used(&w, grandchild.refresh_credential(), "operator-cascade");
+    assert!(w.authenticate(rotated.run_key()).is_none());
+
+    // Seen in a URL.
+    let w = world();
+    let (child, first) = w.operator_child();
+    let rotated = w.refresh(first.refresh_credential()).unwrap();
+    let count = w
+        .supervisor
+        .revoke_exposed(
+            &w.registry,
+            &[crate::domain::SecretString::new(
+                first.refresh_credential().expose_secret(),
+            )],
+        )
+        .unwrap();
+    // Review 3, N3: a used refresh credential in a URL is reuse evidence,
+    // not a quiet revocation (which would let a thief who already rotated
+    // it disarm the detection with one unauthenticated request). Its
+    // launch's live pair goes, the reuse is recorded and the Anomaly raised.
+    assert_eq!(count, 3, "the used credential and the rotated pair");
+    used(&w, first.refresh_credential(), "exposed-in-url");
+    assert!(w.authenticate(rotated.run_key()).is_none());
+    assert_eq!(
+        w.token_state(rotated.refresh_credential()),
+        TokenState::Revoked
+    );
+    assert!(w.run(&child).anomalies.contains(&Anomaly::CredentialReuse));
+    let reuse: Vec<_> = w
+        .credential_events()
+        .into_iter()
+        .filter(|e| e.change == CredentialChange::ReuseDetected)
+        .collect();
+    assert_eq!(reuse.len(), 1);
+    assert_eq!(reuse[0].cause.as_deref(), Some("exposed-in-url"));
+    // Afterwards the value is out of service: presenting it changes nothing.
+    assert_eq!(
+        w.refresh(first.refresh_credential()).unwrap_err().code(),
+        "credential-revoked"
+    );
+}

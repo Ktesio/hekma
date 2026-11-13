@@ -466,6 +466,10 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// (the cascade walk: recursive over `issued_by_hash`), oldest first.
     fn active_issued_under(&self, roots: &[TokenHash]) -> Result<Vec<TokenRow>, StoreError>;
 
+    /// Every RETIRED token (a used refresh credential) on the same walk as
+    /// [`Self::active_issued_under`], oldest first.
+    fn retired_issued_under(&self, roots: &[TokenHash]) -> Result<Vec<TokenRow>, StoreError>;
+
     /// Every active Run Key and announce credential of a non-ended Run (the
     /// snapshot's key index at open).
     fn active_key_rows(&self) -> Result<Vec<TokenRow>, StoreError>;

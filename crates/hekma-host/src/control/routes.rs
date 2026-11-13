@@ -754,7 +754,8 @@ pub(crate) async fn run_open(
                 issue_credentials: request.issue_credentials.unwrap_or(true),
             },
         )
-        .await?;
+        .await
+        .map_err(|err| ApiError::for_authority(&authority, err))?;
     let location = format!("/v0/runs/{}", opened.view.record.run_id);
     let credentials = opened
         .credentials
@@ -803,7 +804,8 @@ pub(crate) async fn run_close(
     let view = state
         .engine
         .close_run_as(authority.actor()?, &run_id)
-        .await?;
+        .await
+        .map_err(|err| ApiError::for_authority(&authority, err))?;
     Ok(Json(dto::RunDocument {
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
         run: view,
@@ -817,10 +819,16 @@ pub(crate) async fn run_refresh(
     State(state): State<ApiState>,
     Extension(authority): Extension<super::auth::Authority>,
 ) -> ApiResult<Response> {
-    let super::auth::Authority::Refresh(presented) = authority else {
+    let super::auth::Authority::Refresh(presented) = &authority else {
         return Err(ApiError::forbidden());
     };
-    let issued = state.engine.refresh_credentials(&presented).await?;
+    // Never the Operator on this route (the matrix), so a store failure is
+    // always the fixed `store` body, never the backend's text.
+    let issued = state
+        .engine
+        .refresh_credentials(presented)
+        .await
+        .map_err(|err| ApiError::for_authority(&authority, err))?;
     let mut response = Json(dto::RefreshDocument {
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
         run_id: issued.run_id().clone(),
@@ -1329,7 +1337,8 @@ pub(crate) async fn run_limits_patch(
     let mut results = state
         .engine
         .set_run_limits_as(vec![run_id], change, authority.actor()?, request.dry_run)
-        .await?;
+        .await
+        .map_err(|err| ApiError::for_authority(&authority, err))?;
     let (_, outcome) = results.pop().ok_or_else(|| {
         ApiError::new(
             super::error::ApiErrorKind::Internal,
@@ -1338,7 +1347,7 @@ pub(crate) async fn run_limits_patch(
     })?;
     Ok(Json(dto::RunLimitsChangeDocument {
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
-        outcome: outcome?,
+        outcome: outcome.map_err(|err| ApiError::for_authority(&authority, err))?,
     }))
 }
 
