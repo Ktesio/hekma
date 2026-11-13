@@ -2444,8 +2444,11 @@ fn report(
     }
 }
 
-/// The usage rows a Run holds: `(input, output, cached, source, call id)`.
-fn usage_rows(state: &TempDir, run: &str) -> Vec<(i64, i64, Option<i64>, String, Option<String>)> {
+/// One stored usage row: `(input, output, cached, source, call id)`.
+type UsageRow = (i64, i64, Option<i64>, String, Option<String>);
+
+/// The usage rows a Run holds.
+fn usage_rows(state: &TempDir, run: &str) -> Vec<UsageRow> {
     let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
     let mut stmt = conn
         .prepare(
@@ -2566,7 +2569,6 @@ fn telemetry_creates_an_observed_run_and_commits_only_forward_differences() {
         .find(|r| r.record.run_id.as_str() == run_id)
         .unwrap();
     assert_eq!(listed.usage.input_tokens, 1700);
-    drop(facade);
     drop(engine);
     let rows = usage_rows(&state, &run_id);
     assert_eq!(rows.len(), 3, "{rows:?}");
