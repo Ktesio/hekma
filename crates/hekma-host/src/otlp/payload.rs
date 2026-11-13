@@ -217,8 +217,14 @@ impl MetricState {
                     .insert((instance, transition.new_state.as_str().to_string()), 1);
             }
             EngineEvent::BudgetBreach(breach) => {
+                // Story 23-1 (AD-21 interim): a wire Run's breach names no
+                // instance, and `otlp-metrics v1` has instance-level
+                // attributes only — skipped until v2.
+                let Some(instance) = breach.instance.clone() else {
+                    return;
+                };
                 let key = BreachKey {
-                    instance: breach.instance.clone(),
+                    instance: instance.clone(),
                     dimension: dimension_str(breach.dimension),
                     scope: scope_str(breach.scope),
                     action: action_str(breach.action),
@@ -246,7 +252,7 @@ impl MetricState {
                             .unwrap_or(EstimateLabel::Estimated.as_str());
                         let observed = micros.get().max(0) as f64 / MICROS_PER_DOLLAR_F64;
                         let key = CostKey {
-                            instance: breach.instance.clone(),
+                            instance,
                             estimate_state: label,
                         };
                         let entry = self.cost.entry(key).or_insert(0.0);
@@ -259,6 +265,12 @@ impl MetricState {
             }
             EngineEvent::UsageUpdate(update) => {
                 let event = &update.event;
+                // Story 23-1 (AD-21 interim): usage on a Run with no Agent
+                // Instance (a wire Run of the shared proxy) is skipped —
+                // `otlp-metrics v1` carries no run id or label before v2.
+                let Some(instance) = event.instance.clone() else {
+                    return;
+                };
                 let run = event.run_id.as_str().to_string();
                 // Stamp the run's recency FIRST (P5): the window keeps the
                 // most-recently-OBSERVED runs, so every usage event refreshes
@@ -266,7 +278,7 @@ impl MetricState {
                 let seq = self.next_run_seq;
                 self.next_run_seq = self.next_run_seq.saturating_add(1);
                 self.run_last_seen
-                    .insert((event.instance.clone(), run.clone()), seq);
+                    .insert((instance.clone(), run.clone()), seq);
                 for (token_type, value) in [
                     (TokenType::Input, Some(event.input_tokens)),
                     (TokenType::Output, Some(event.output_tokens)),
@@ -279,12 +291,12 @@ impl MetricState {
                 ] {
                     if let Some(tokens) = value {
                         self.token_usage
-                            .entry((event.instance.clone(), run.clone(), token_type))
+                            .entry((instance.clone(), run.clone(), token_type))
                             .or_default()
                             .observe(tokens as f64);
                     }
                 }
-                self.enforce_run_window(&event.instance);
+                self.enforce_run_window(&instance);
             }
             // Run events carry run ids and labels; `otlp-metrics v1` uses
             // instance-level attributes only (no run id on a metric), so
@@ -294,6 +306,12 @@ impl MetricState {
             // upgrade carry no instance or run id, so `otlp-metrics v1` has
             // no series for them (the AD-21 interim, as for Run events).
             EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => {}
+            // Story 22-1: credential events carry no counter before
+            // `otlp-metrics v2` (and never a token) — ignored.
+            EngineEvent::Credential(_) => {}
+            // Story 23-1: binding events carry no counter before
+            // `otlp-metrics v2` (the AD-21 interim) — ignored.
+            EngineEvent::Binding(_) => {}
         }
     }
 

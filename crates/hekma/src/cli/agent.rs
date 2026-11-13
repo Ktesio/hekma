@@ -1504,6 +1504,21 @@ pub fn start(name: &str, detach: bool) -> Result<(), Box<dyn std::error::Error>>
 const STOP_WINDOW_MIN_SECS: u64 = hekma_host::MIN_STOP_WINDOW_SECS;
 const STOP_WINDOW_MAX_SECS: u64 = hekma_host::MAX_STOP_WINDOW_SECS;
 
+/// `--timeout <secs>` as the Service Host serves it: within
+/// 1..=86400 s (a zero window would be an instant kill, a longer one a
+/// lifetime), a value outside served at the nearest bound — and said so
+/// (AI-18). Every stop path (an agent, a run id, a Selector) uses it.
+pub(crate) fn served_stop_window(secs: u64) -> u64 {
+    let served = secs.clamp(STOP_WINDOW_MIN_SECS, STOP_WINDOW_MAX_SECS);
+    if served != secs {
+        ui::note(format!(
+            "--timeout {secs} is served as a {served}s window (the stop window is bounded to \
+             {STOP_WINDOW_MIN_SECS}..={STOP_WINDOW_MAX_SECS} seconds)"
+        ));
+    }
+    served
+}
+
 /// `hekma agent stop <name> [--timeout <secs>]` — stop a running Agent Instance
 /// (AC3/AC4).
 ///
@@ -1513,19 +1528,7 @@ const STOP_WINDOW_MAX_SECS: u64 = hekma_host::MAX_STOP_WINDOW_SECS;
 /// stop on `stopped`, AC4) to stderr.
 pub fn stop(name: &str, timeout_secs: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
     validate_instance_name(name)?;
-    // The Service Host serves a stop window within 1..=86400 s (a zero
-    // window would be an instant kill, a longer one a lifetime): a value
-    // outside it is served at the nearest bound — and said so (AI-18).
-    let window = timeout_secs.map(|secs| {
-        let served = secs.clamp(STOP_WINDOW_MIN_SECS, STOP_WINDOW_MAX_SECS);
-        if served != secs {
-            ui::note(format!(
-                "--timeout {secs} is served as a {served}s window (the stop window is bounded \
-                 to {STOP_WINDOW_MIN_SECS}..={STOP_WINDOW_MAX_SECS} seconds)"
-            ));
-        }
-        served
-    });
+    let window = timeout_secs.map(served_stop_window);
     let body = window.map(|secs| json!({ "window_secs": secs }));
     let routed = route(
         "POST",
@@ -2096,7 +2099,7 @@ fn follow_exit_note(name: &str, state: LifecycleState) -> String {
 /// uses — no `Engine::pause` signature change). A read-back failure is swallowed:
 /// it must never turn a successful pause into a CLI error (the state already
 /// changed and the machine-readable qualifier is already in the event log).
-fn note_if_best_effort(name: &str, op: &str) {
+pub(crate) fn note_if_best_effort(name: &str, op: &str) {
     let Ok(engine) = open_read_only_engine() else {
         return;
     };
@@ -2822,7 +2825,8 @@ fn governance_vectors_summary(
         mut fence_cases,
         mut chain_cases,
         mut policy_cases,
-    ) = (0, 0, 0, 0, 0);
+        mut rearm_cases,
+    ) = (0, 0, 0, 0, 0, 0);
     for case in &document.cases {
         match case {
             hekma_engine::Case::Decision(_) => decision_cases += 1,
@@ -2830,11 +2834,12 @@ fn governance_vectors_summary(
             hekma_engine::Case::Fence(_) => fence_cases += 1,
             hekma_engine::Case::Chain(_) => chain_cases += 1,
             hekma_engine::Case::Policy(_) => policy_cases += 1,
+            hekma_engine::Case::Rearm(_) => rearm_cases += 1,
         }
     }
     Ok(format!(
         "{}\n  checksum  sha256:{checksum}\n  cases     {} ({} decision, {} derivation, {} fence, \
-         {} chain, {} policy)\n  \
+         {} chain, {} policy, {} rearm)\n  \
          artifact  {}\n  pin       vectors_version + sha256 — re-run every case against your \
          guard on any upgrade\n",
         ui::success_text(format!(
@@ -2847,6 +2852,7 @@ fn governance_vectors_summary(
         fence_cases,
         chain_cases,
         policy_cases,
+        rearm_cases,
         hekma_engine::GOVERNANCE_VECTORS_ARTIFACT_PATH,
     ))
 }
@@ -2990,10 +2996,35 @@ impl RoutedError {
 /// (the host had just exited) finds or starts the owner again and retries
 /// once — a refused connection never applied anything.
 pub(crate) fn route(method: &str, path: &str, body: Option<Value>) -> Result<Routed, RoutedError> {
+    route_with(method, path, body, None)
+}
+
+/// [`route`] with the call bounded overall by `bound` (story 21-6: a set
+/// act's bounded wait — past it the command reports that it lost patience
+/// and the acts may still be committing, never a hang).
+pub(crate) fn route_bounded(
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    bound: std::time::Duration,
+) -> Result<Routed, RoutedError> {
+    route_with(method, path, body, Some(bound))
+}
+
+fn route_with(
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    bound: Option<std::time::Duration>,
+) -> Result<Routed, RoutedError> {
     let root = state_root().map_err(RoutedError::Diagnostic)?;
     let mut retried = false;
     loop {
         let client = HostClient::connect(&root).map_err(RoutedError::Call)?;
+        let client = match bound {
+            Some(bound) => client.bounded(bound),
+            None => client,
+        };
         match client.call(method, path, body.as_ref()) {
             Ok(value) => {
                 return Ok(Routed {
@@ -3213,7 +3244,7 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
 /// (AC4) and the launch-failed diagnostic (AC2) get their own codes; the shared
 /// registry-shaped variants (NotFound / InvalidName / Store) reuse the existing
 /// agent diagnostics for a consistent surface.
-fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
+pub(crate) fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
     match err {
         EngineError::NotFound { name } => AgentNotFound {
             message: format!(
@@ -3241,6 +3272,16 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             message: format!(
                 "Agent Instance '{name}' failed to launch: {detail}. The instance is now in the \
                  'failed' state; fix the adapter's launch command and try starting it again."
+            ),
+        }
+        .into(),
+        // Story 22-1: no Run Key could be issued (the OS random source
+        // failed): nothing was spawned and nothing changed.
+        EngineError::CredentialUnavailable { name, .. } => AgentLaunchFailed {
+            message: format!(
+                "The operating system's random source failed, so no Run Key was issued and the \
+                 agent '{name}' was not started. Nothing changed; check the system's random \
+                 source and try again."
             ),
         }
         .into(),

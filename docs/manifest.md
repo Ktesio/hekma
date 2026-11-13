@@ -166,7 +166,7 @@ windows = "best-effort"
 A viable Metering Source. `source` is one of:
 
 - `"self-reported"` — the agent emits its own usage accounting (`KTESIO_USAGE {json}` sentinel lines on stdout).
-- `"engine-observed"` — the engine meters the agent's model traffic through a per-instance loopback proxy. The operator points the agent's OpenAI-compatible `base_url` at the engine (via the config mapping below) and sets `metering.upstream_base_url` to the real provider endpoint.
+- `"engine-observed"` — the engine meters the agent's model traffic through the host's shared loopback [metering proxy](metering-proxy.md). The engine injects `metering.base_url`, which the config mapping below points at the agent's OpenAI-compatible base URL (for example `OPENAI_BASE_URL`), and the operator sets `metering.upstream_base_url` to the real provider endpoint. The injected value carries a path, `<proxy url>/_hekma/runs/<run id>`: an agent that appends its request paths to its base URL works unchanged, and one that keeps only the base URL's host gets `404 hekma_no_route`.
 
 ```toml
 [metering]
@@ -229,6 +229,25 @@ Notes:
 - **`{env:VAR}` substitution honesty** (contract v1 rider): some agents substitute `{env:VAR}` placeholders in their own config and render an **unset variable as an empty string, silently**. An adapter to such an agent MUST map every substituted key through a delivery that guarantees the variable is set — or fail the render with a named reason — before the child launches. A silently-empty rendered config is a contract violation, not a quirk to tolerate.
 - **Self-updating agents** (contract v1): an adapter for an agent that downloads its own updates MUST map that agent's update-disable mechanism (env or config) so the pinned, supervised binary stays pinned. The adapter docs must additionally state whether the agent's config chain contains a higher-authority (managed/MDM) layer that can override supervisor-delivered values, so an operator on a managed machine can verify the pin survived.
 - **Isolation keys**: an adapter documents which environment levers give each Agent Instance its own data/config roots (for Hermes, `HERMES_HOME`; for XDG-based agents like opencode, `XDG_DATA_HOME` + `XDG_CONFIG_HOME`). Per-instance isolated roots inside each Agent Home are the RECOMMENDED normative posture (they make shared-root concurrency out of scope); where a lever is an undocumented agent interface, say so and re-validate it per pinned release. Per-OS support levels remain the declaration's own honesty job — an agent whose vendor recommends a compatibility layer on Windows is best declared `best-effort` there, but that cap is the adapter author's choice, not a contract mandate.
+
+#### Reserved credential keys
+
+Two reserved keys carry a supervised launch's credentials (see [Run Keys](run-keys.md)): `run.key` (the launch's Run Key) and `run.refresh_key` (a refresh credential). The engine delivers them; an operator never sets them.
+
+```toml
+# Also deliver the Run Key in the agent's own variable (it always gets HEKMA_RUN_KEY).
+[config."run.key"]
+env = "MY_AGENT_HEKMA_KEY"
+
+# Ask for a refresh credential too (none is issued unless this is mapped).
+[config."run.refresh_key"]
+env = "MY_AGENT_HEKMA_REFRESH"
+```
+
+- Every agent receives its Run Key in `HEKMA_RUN_KEY`, whatever the manifest maps.
+- Only an `env` target is accepted for either key. A `flag` or `file` target is refused at registration, naming the key: an argv is readable by other local users, and a file would put the credential in the Agent Home.
+- A refresh credential is issued to a supervised launch only when `run.refresh_key` is mapped to an `env` target.
+- No Adapter Contract change: these are ordinary `[config]` mappings of two reserved keys.
 
 ### `[readiness]` — the readiness probe (added at contract 1.1.0)
 

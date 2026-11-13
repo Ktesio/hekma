@@ -99,7 +99,16 @@ hekma agent config set my-agent cost.rate.output 15.00
 hekma agent config set my-agent budget.dollars.cumulative 10.00
 ```
 
-The Breach Action (`pause`, `stop`, `warn`, or `block`) fires the instant a ceiling is reached, on real usage from the Usage Ledger — `warn` records the breach event only and performs no lifecycle transition, and `block` (engine-observed instances only) leaves the agent running but refuses its further model calls at the metering listener ([the wire fence](hosting.md#the-wire-fence-block-refuses-further-model-calls)). A dollar cap set without a Rate is inert until a Rate exists.
+The Breach Action (`pause`, `stop`, `warn`, or `block`) fires the instant a ceiling is reached, on real usage from the Usage Ledger — `warn` records the breach event only and performs no lifecycle transition, and `block` (engine-observed instances only) leaves the agent running but refuses its further model calls at the metering proxy ([the wire fence](hosting.md#the-wire-fence-block-refuses-further-model-calls)). A dollar cap set without a Rate is inert until a Rate exists.
+
+These `budget.*` keys are the agent's limits: every Run it starts carries them. To change the limits of the Run that is running now — give it more room, or rein it in — use `hekma budget`:
+
+```bash
+hekma budget show my-agent
+hekma budget set my-agent --tokens-per-run 200000
+```
+
+A limit set with `hekma budget set` belongs to that Run: it ends with the Run, and the next `start` opens a new Run without it. For limits every future Run should carry, keep using the `budget.*` keys (or a [Policy](policies.md)).
 
 ## Inspect the fleet
 

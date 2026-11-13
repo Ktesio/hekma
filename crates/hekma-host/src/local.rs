@@ -48,6 +48,10 @@ pub struct Discovery {
     pub hekma_version: String,
     /// Whether the host was auto-started by a CLI command.
     pub autostarted: bool,
+    /// Story 23-1: where the shared Metering Proxy listens, when it is
+    /// running (additive; absent in older files and when it could not bind).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metering_proxy_url: Option<String>,
 }
 
 impl std::fmt::Debug for Discovery {
@@ -204,6 +208,7 @@ mod tests {
             token: "ab".repeat(32),
             hekma_version: "0.0.0-test".into(),
             autostarted: true,
+            metering_proxy_url: Some("http://127.0.0.1:8400".into()),
         }
     }
 

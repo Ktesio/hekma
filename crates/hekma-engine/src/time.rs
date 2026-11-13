@@ -33,6 +33,18 @@ pub fn now_rfc3339() -> String {
     format_rfc3339(now_unix_secs())
 }
 
+/// Current time as an RFC 3339 UTC string with microseconds, e.g.
+/// `2026-07-03T14:05:09.123456Z` (story 23-1: per-call records carry
+/// sub-second start and end times).
+pub fn now_rfc3339_micros() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let whole = format_rfc3339(now.as_secs());
+    let stem = whole.trim_end_matches('Z');
+    format!("{stem}.{:06}Z", now.subsec_micros())
+}
+
 /// Format a count of whole seconds since the Unix epoch as RFC 3339 UTC.
 ///
 /// Pure and total — separated from [`now_rfc3339`] so it can be unit-tested

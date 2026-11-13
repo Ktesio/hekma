@@ -140,6 +140,12 @@ pub use domain::{
     RunUsage, RunVerb, RunView, Selector, SelectorScope, VerbCell, HOST_IDENTITY_BINDING,
     MAX_RUN_NESTING, MAX_SELECTED_RUNS, RUN_EVENT_SCHEMA_VERSION, RUN_VERBS,
 };
+// Story 21-6: Selectors on every verb and `hekma budget` — the Run-grain
+// lifecycle verbs, Run-level limits as one actor, and the budget read.
+pub use domain::{
+    LimitActor, LimitsDirection, RunLifecycleVerb, RunLimitChange, RunLimitField, RunLimitsOutcome,
+    RunLimitsResults, RunLimitsView, RunVerbError,
+};
 // Story 21-5: the Run listing — `hekma ps` and `GET /v0/runs`'s read model.
 pub use domain::{
     decode_cursor, encode_cursor, ended_run_cutoff, LatchedBreach, ListRunsQuery, ListingCounts,
@@ -157,6 +163,31 @@ pub use domain::{
     ScentCheckMode, UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
 };
 pub use engine::{Blocking, DrainReport, Engine, EngineOptions, EventSubscription, InstanceStatus};
+// Story 22-1: Run Keys — the credential classes, the one-time issued pair,
+// the snapshot's match, the metadata listing and revocation report, the
+// credential event, and the actor a Caller acts as.
+/// Story 22-1: the URL scan the Control API and the metering listener use
+/// to refuse a credential in a path or query.
+pub use domain::credential::{percent_decode, scan_url, UrlScan};
+pub use domain::{
+    parse_presented, CredentialChange, CredentialError, CredentialEvent, CredentialMatch,
+    CredentialSummary, IssuedCredentials, MintedToken, OpenedRun, PresentedState, RevokeOutcome,
+    RevokedCredential, RunActor, SecretString, TokenClass, TokenHash, TokenState, ANNOUNCE_PREFIX,
+    CREDENTIAL_EVENT_SCHEMA_VERSION, MAX_CALLER_OPEN_CHILDREN, REFRESH_PREFIX, RUN_KEY_PREFIX,
+    TOKEN_BODY_LEN, TOKEN_ID_LEN,
+};
+// Story 23-1: the shared Metering Proxy's endpoint bindings.
+pub use domain::{
+    Binding, BindingChange, BindingCredential, BindingCredentialClass, BindingError, BindingEvent,
+    BindingOutcome, BindingPatch, BindingRoute, BindingSpec, IssuedBindingCredential, RouteSpec,
+    BINDING_EVENT_SCHEMA_VERSION, MAX_BINDINGS, MAX_BINDING_ROUTES,
+};
+// Story 23-1: the shared Metering Proxy's options and address (the type of
+// `EngineOptions::metering_proxy` and `Engine::metering_proxy`).
+/// Story 22-1: the reserved credential config keys and the variable every
+/// supervised agent receives its Run Key in.
+pub use domain::{RUN_KEY_ENV, RUN_KEY_KEY, RUN_KEY_MARKER_PREFIX, RUN_REFRESH_KEY_KEY};
+pub use metering::proxy::{MeteringProxyOptions, ProxyInfo, ProxyStartError};
 // The shutdown drain's public surface (issue #328 item 3): the planner, the
 // per-instance outcome vocabulary, and (via `Engine::shutdown` / its
 // `blocking()` twin) the drain itself.
@@ -168,11 +199,12 @@ pub use shutdown::{drain_plan, DrainOutcome, StopResult};
 // `proxy-wire v1` refusal constants join it.
 pub use domain::{
     canonical_json, checksum_file_content, decide, decide_chain, fence_code, fence_refusal,
-    generate, governance_vectors_checksum, run_derivation, Case, ChainCase, CoverTag, DecisionCase,
-    DerivationCase, DerivationSpec, DollarArm, FenceCase, FenceRefusal, GovernanceDecision,
-    GovernanceInput, GovernanceOutcome, LatchKey, Provenance, RowPricing, TokenArm,
-    VectorsDocument, ALL_COVERS, FENCE_ERROR_TYPE, FENCE_REASON_ORDER, FENCE_REFUSAL_STATUS,
-    GOVERNANCE_VECTORS_ARTIFACT_ID, GOVERNANCE_VECTORS_ARTIFACT_PATH,
+    generate, governance_vectors_checksum, re_armed_keys, rearm, run_derivation, Case, ChainCase,
+    CoverTag, DecisionCase, DerivationCase, DerivationSpec, DollarArm, FenceCase, FenceRefusal,
+    GovernanceDecision, GovernanceInput, GovernanceOutcome, LatchKey, LatchedReason, LevelArms,
+    LevelTotals, Provenance, RearmCase, RearmInput, RearmOutcome, RearmTrigger, RowPricing,
+    TokenArm, VectorsDocument, ALL_COVERS, FENCE_ERROR_TYPE, FENCE_REASON_ORDER,
+    FENCE_REFUSAL_STATUS, GOVERNANCE_VECTORS_ARTIFACT_ID, GOVERNANCE_VECTORS_ARTIFACT_PATH,
     GOVERNANCE_VECTORS_SCHEMA_VERSION, GOVERNANCE_VECTORS_VERSION, PROXY_WIRE_VERSION,
 };
 /// The governance conformance vectors artifact, embedded verbatim at build

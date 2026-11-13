@@ -585,6 +585,148 @@ const RUN_COLUMNS: &str = "r.run_id, r.control_depth, r.wire_path, r.status, r.a
 /// `FROM runs r LEFT JOIN agent_instances i` — the join every Run read uses.
 const RUN_FROM: &str = "FROM runs r LEFT JOIN agent_instances i ON i.id = r.instance_id";
 
+/// Decode one `run_labels` row (shared by the one-Run read and the Fleet's
+/// batched read, so both refuse a corrupt row with the same words).
+fn decode_label(
+    run_id: &str,
+    key: String,
+    value: String,
+    source: &str,
+    origin: Option<String>,
+) -> Result<Label, StoreError> {
+    let source = LabelSource::from_wire(source).ok_or_else(|| StoreError::CorruptRow {
+        name: "run_labels".to_string(),
+        detail: format!("Run `{run_id}` label `{key}` has an unknown source `{source}`"),
+    })?;
+    let origin =
+        match (source, origin) {
+            (LabelSource::Caller, _) => None,
+            // A bound row with no origin predates origins: configuration
+            // was the only bound source then.
+            (LabelSource::Bound, None) => Some(LabelOrigin::Config),
+            (LabelSource::Bound, Some(raw)) => Some(LabelOrigin::from_wire(&raw).ok_or_else(
+                || StoreError::CorruptRow {
+                    name: "run_labels".to_string(),
+                    detail: format!("Run `{run_id}` label `{key}` has an unknown origin `{raw}`"),
+                },
+            )?),
+        };
+    Ok(Label {
+        key,
+        value,
+        source,
+        origin,
+    })
+}
+
+/// The `run_limits` dimension of the Run-level Breach Action row (story
+/// 21-6): `limit_value` 1 = the action column is the Run's action, 0 = the
+/// Run sets no action of its own (the action column is a placeholder).
+/// When the row exists it decides the Run's action; a Run without it (a
+/// child opened by 21-2, which stores the action on every ceiling row)
+/// keeps the ceiling rows' action.
+const ACTION_DIMENSION: &str = "action";
+
+/// The scope column of the action row.
+const ACTION_SCOPE: &str = "run";
+
+/// The dimension prefix of the Caller layer's rows (story 21-6): a Caller's
+/// limits are their own rows (`caller.tokens` / `per-run`, …,
+/// `caller.action` / `run`) beside the Operator/Host rows on the same Run,
+/// so a Caller write never replaces — or re-labels — an Operator's limit,
+/// and the resolver applies the Caller's only where tighter. No schema
+/// step: the existing key `(run_id, dimension, scope)` holds both layers.
+const CALLER_PREFIX: &str = "caller.";
+
+/// The dimension a layer's row is stored under.
+fn slot_dimension(slot: crate::ports::LimitSlot, dimension: &str) -> String {
+    match slot {
+        crate::ports::LimitSlot::Run => dimension.to_string(),
+        crate::ports::LimitSlot::Caller => format!("{CALLER_PREFIX}{dimension}"),
+    }
+}
+
+/// Folds one layer of a Run's `run_limits` rows into its [`RunLimits`].
+#[derive(Default)]
+struct LayerFold {
+    limits: RunLimits,
+    /// The action carried on the ceiling rows (the 21-2 child-open shape).
+    ceiling_action: Option<BreachAction>,
+    /// The action row's verdict, when the layer has one.
+    action_row: Option<Option<BreachAction>>,
+}
+
+impl LayerFold {
+    fn finish(self) -> RunLimits {
+        let mut limits = self.limits;
+        limits.breach_action = match self.action_row {
+            Some(action) => action,
+            None => self.ceiling_action,
+        };
+        limits
+    }
+}
+
+/// Folds one Run's `run_limits` rows into its two layers (shared by the
+/// one-Run reads and the Fleet's batched read).
+#[derive(Default)]
+struct LimitsFold {
+    /// The Operator/Host layer.
+    run: LayerFold,
+    /// The Caller layer.
+    caller: LayerFold,
+}
+
+impl LimitsFold {
+    fn row(
+        &mut self,
+        run_id: &str,
+        dimension: &str,
+        scope: &str,
+        limit: i64,
+        action: &str,
+    ) -> Result<(), StoreError> {
+        let corrupt = |detail: String| StoreError::CorruptRow {
+            name: "run_limits".to_string(),
+            detail,
+        };
+        let parsed: BreachAction = action.parse().map_err(|_| {
+            corrupt(format!(
+                "Run `{run_id}` has an unknown Breach Action `{action}`"
+            ))
+        })?;
+        let (layer, dimension) = match dimension.strip_prefix(CALLER_PREFIX) {
+            Some(dimension) => (&mut self.caller, dimension),
+            None => (&mut self.run, dimension),
+        };
+        let value = limit.max(0);
+        match (dimension, scope) {
+            (ACTION_DIMENSION, _) => {
+                layer.action_row = Some((value != 0).then_some(parsed));
+                return Ok(());
+            }
+            ("tokens", "per-run") => layer.limits.token_per_run = Some(value as u64),
+            ("dollars", "per-run") => layer.limits.dollar_per_run_micros = Some(Micros(value)),
+            ("tokens", "cumulative") => layer.limits.token_cumulative = Some(value as u64),
+            ("dollars", "cumulative") => {
+                layer.limits.dollar_cumulative_micros = Some(Micros(value))
+            }
+            (other, scope) => {
+                return Err(corrupt(format!(
+                    "Run `{run_id}` has an unknown limit `{other}` / `{scope}`"
+                )))
+            }
+        }
+        layer.ceiling_action = Some(parsed);
+        Ok(())
+    }
+
+    /// The Operator/Host layer and the Caller layer.
+    fn finish(self) -> (RunLimits, RunLimits) {
+        (self.run.finish(), self.caller.finish())
+    }
+}
+
 fn read_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
     let run_id: String = row.get(0)?;
     let depth_raw: String = row.get(1)?;
@@ -629,6 +771,14 @@ impl SqliteStore {
     #[cfg(test)]
     pub(crate) fn execute_batch_for_test(&self, sql: &str) {
         self.conn().execute_batch(sql).expect("test fixture SQL");
+    }
+
+    /// Test-only: one text column of one row.
+    #[cfg(test)]
+    pub(crate) fn query_string_for_test(&self, sql: &str) -> String {
+        self.conn()
+            .query_row(sql, [], |row| row.get::<_, String>(0))
+            .expect("test fixture query")
     }
 
     /// Run `body` in a named SAVEPOINT of the open batch transaction: its
@@ -827,71 +977,154 @@ impl RunRecords for SqliteStore {
         let mut labels = Vec::new();
         for row in rows {
             let (key, value, source, origin) = row.map_err(backend)?;
-            let source = LabelSource::from_wire(&source).ok_or_else(|| StoreError::CorruptRow {
-                name: "run_labels".to_string(),
-                detail: format!("Run `{run_id}` label `{key}` has an unknown source `{source}`"),
-            })?;
-            let origin = match (source, origin) {
-                (LabelSource::Caller, _) => None,
-                // A bound row with no origin predates origins: configuration
-                // was the only bound source then.
-                (LabelSource::Bound, None) => Some(LabelOrigin::Config),
-                (LabelSource::Bound, Some(raw)) => Some(LabelOrigin::from_wire(&raw).ok_or_else(
-                    || StoreError::CorruptRow {
-                        name: "run_labels".to_string(),
-                        detail: format!(
-                            "Run `{run_id}` label `{key}` has an unknown origin `{raw}`"
-                        ),
-                    },
-                )?),
-            };
-            labels.push(Label {
-                key,
-                value,
-                source,
-                origin,
-            });
+            labels.push(decode_label(run_id.as_str(), key, value, &source, origin)?);
         }
         Ok(labels)
     }
 
     fn run_limits(&self, run_id: &RunId) -> Result<RunLimits, StoreError> {
-        let mut stmt = self
+        Ok(self.run_limit_layers(run_id)?.0)
+    }
+
+    fn run_caller_limits(&self, run_id: &RunId) -> Result<RunLimits, StoreError> {
+        Ok(self.run_limit_layers(run_id)?.1)
+    }
+
+    fn replace_run_limits(
+        &self,
+        run_id: &RunId,
+        slot: crate::ports::LimitSlot,
+        limits: &RunLimits,
+        source: &str,
+        at: &str,
+    ) -> Result<(), StoreError> {
+        let action = limits.action();
+        let clamp = |value: u64| value.min(i64::MAX as u64) as i64;
+        let wanted = [
+            ("tokens", "per-run", limits.token_per_run.map(clamp)),
+            (
+                "dollars",
+                "per-run",
+                limits.dollar_per_run_micros.map(|m| m.0.max(0)),
+            ),
+            ("tokens", "cumulative", limits.token_cumulative.map(clamp)),
+            (
+                "dollars",
+                "cumulative",
+                limits.dollar_cumulative_micros.map(|m| m.0.max(0)),
+            ),
+            (
+                ACTION_DIMENSION,
+                ACTION_SCOPE,
+                limits
+                    .is_set()
+                    .then_some(i64::from(limits.breach_action.is_some())),
+            ),
+        ];
+        // The oldest ceiling row of this layer as it stood BEFORE the write
+        // (its action, source and time): the 21-2 child-open shape's
+        // provenance for an action no action row recorded yet.
+        let prior_ceiling: Option<(String, String, String)> = self
             .conn()
-            .prepare(
-                "SELECT dimension, limit_value, action FROM run_limits \
-                 WHERE run_id = ?1 AND scope = 'per-run'",
+            .query_row(
+                "SELECT action, source, set_at FROM run_limits \
+                 WHERE run_id = ?1 AND scope <> ?2 AND dimension IN (?3, ?4) \
+                 ORDER BY set_at, dimension, scope LIMIT 1",
+                rusqlite::params![
+                    run_id.as_str(),
+                    ACTION_SCOPE,
+                    slot_dimension(slot, "tokens"),
+                    slot_dimension(slot, "dollars"),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
+            .optional()
             .map_err(backend)?;
-        let rows = stmt
-            .query_map([run_id.as_str()], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(backend)?;
-        let mut limits = RunLimits::default();
-        for row in rows {
-            let (dimension, limit, action) = row.map_err(backend)?;
-            let action: BreachAction = action.parse().map_err(|_| StoreError::CorruptRow {
-                name: "run_limits".to_string(),
-                detail: format!("Run `{run_id}` has an unknown Breach Action `{action}`"),
-            })?;
-            limits.breach_action = Some(action);
-            match dimension.as_str() {
-                "tokens" => limits.token_per_run = Some(limit.max(0) as u64),
-                "dollars" => limits.dollar_per_run_micros = Some(Micros(limit.max(0))),
-                other => {
-                    return Err(StoreError::CorruptRow {
-                        name: "run_limits".to_string(),
-                        detail: format!("Run `{run_id}` has an unknown dimension `{other}`"),
-                    })
+        for (dimension, scope, value) in wanted {
+            let dimension = slot_dimension(slot, dimension);
+            let existing: Option<(i64, String)> = self
+                .conn()
+                .query_row(
+                    "SELECT limit_value, action FROM run_limits \
+                     WHERE run_id = ?1 AND dimension = ?2 AND scope = ?3",
+                    rusqlite::params![run_id.as_str(), dimension, scope],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(backend)?;
+            match (value, existing) {
+                (None, None) => {}
+                (None, Some(_)) => {
+                    self.conn()
+                        .execute(
+                            "DELETE FROM run_limits \
+                             WHERE run_id = ?1 AND dimension = ?2 AND scope = ?3",
+                            rusqlite::params![run_id.as_str(), dimension, scope],
+                        )
+                        .map_err(backend)?;
+                }
+                // Provenance: a row whose value holds keeps who set it and
+                // when. The action column a ceiling row carries (the 21-2
+                // shape's fallback) follows the layer's action in place;
+                // the action row's own value is its action, so a change of
+                // action is a change of that row.
+                (Some(value), Some((stored, stored_action)))
+                    if stored == value
+                        && (scope != ACTION_SCOPE || stored_action == action.as_str()) =>
+                {
+                    if stored_action != action.as_str() {
+                        self.conn()
+                            .execute(
+                                "UPDATE run_limits SET action = ?4 \
+                                 WHERE run_id = ?1 AND dimension = ?2 AND scope = ?3",
+                                rusqlite::params![
+                                    run_id.as_str(),
+                                    dimension,
+                                    scope,
+                                    action.as_str()
+                                ],
+                            )
+                            .map_err(backend)?;
+                    }
+                }
+                (Some(value), existing) => {
+                    // Story 22-1 (the 21-6 review's N4): the FIRST action row
+                    // of a layer written in the 21-2 child-open shape (the
+                    // action carried on its ceiling rows, no action row)
+                    // keeps the provenance of those rows when the action is
+                    // unchanged — the next writer of some other limit did
+                    // not set it.
+                    let inherited = (scope == ACTION_SCOPE && existing.is_none())
+                        .then_some(())
+                        .and(prior_ceiling.as_ref())
+                        .filter(|(stored_action, _, _)| stored_action == action.as_str())
+                        .map(|(_, source, at)| (source.clone(), at.clone()));
+                    let (row_source, row_at) = match &inherited {
+                        Some((source, at)) => (source.as_str(), at.as_str()),
+                        None => (source, at),
+                    };
+                    self.conn()
+                        .execute(
+                            "INSERT INTO run_limits (run_id, dimension, scope, limit_value, \
+                             action, source, set_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                             ON CONFLICT (run_id, dimension, scope) DO UPDATE SET \
+                             limit_value = excluded.limit_value, action = excluded.action, \
+                             source = excluded.source, set_at = excluded.set_at",
+                            rusqlite::params![
+                                run_id.as_str(),
+                                dimension,
+                                scope,
+                                value,
+                                action.as_str(),
+                                row_source,
+                                row_at
+                            ],
+                        )
+                        .map_err(backend)?;
                 }
             }
         }
-        Ok(limits)
+        Ok(())
     }
 
     fn run_chain(&self, run_id: &RunId) -> Result<Vec<RunRecord>, StoreError> {
@@ -1147,6 +1380,101 @@ impl RunRecords for SqliteStore {
             )
             .map_err(backend)?;
         Ok(())
+    }
+
+    fn insert_token(&self, token: &crate::ports::TokenRow) -> Result<(), StoreError> {
+        super::tokens_sqlite::insert_token(self.conn(), token)
+    }
+
+    fn token(
+        &self,
+        hash: &crate::domain::credential::TokenHash,
+    ) -> Result<Option<crate::ports::TokenRow>, StoreError> {
+        super::tokens_sqlite::token(self.conn(), hash)
+    }
+
+    fn set_token_state(
+        &self,
+        hash: &crate::domain::credential::TokenHash,
+        state: crate::domain::credential::TokenState,
+        at: &str,
+        cause: &str,
+    ) -> Result<bool, StoreError> {
+        super::tokens_sqlite::set_token_state(self.conn(), hash, state, at, cause)
+    }
+
+    fn revoke_retired(
+        &self,
+        hash: &crate::domain::credential::TokenHash,
+        at: &str,
+        cause: &str,
+    ) -> Result<bool, StoreError> {
+        super::tokens_sqlite::revoke_retired(self.conn(), hash, at, cause)
+    }
+
+    fn active_tokens(&self, run_id: &RunId) -> Result<Vec<crate::ports::TokenRow>, StoreError> {
+        super::tokens_sqlite::active_tokens(self.conn(), run_id)
+    }
+
+    fn run_tokens(&self, run_id: &RunId) -> Result<Vec<crate::ports::TokenRow>, StoreError> {
+        super::tokens_sqlite::run_tokens(self.conn(), run_id)
+    }
+
+    fn active_issued_under(
+        &self,
+        roots: &[crate::domain::credential::TokenHash],
+    ) -> Result<Vec<crate::ports::TokenRow>, StoreError> {
+        super::tokens_sqlite::active_issued_under(self.conn(), roots)
+    }
+
+    fn active_key_rows(&self) -> Result<Vec<crate::ports::TokenRow>, StoreError> {
+        super::tokens_sqlite::active_key_rows(self.conn())
+    }
+
+    fn set_run_upstream(&self, run_id: &RunId, upstream: Option<&str>) -> Result<(), StoreError> {
+        self.record_run_upstream(run_id, upstream)
+    }
+
+    fn recently_revoked_keys(
+        &self,
+        since: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::credential::TokenHash>, StoreError> {
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT token_hash FROM tokens WHERE class = 'run' AND state = 'revoked' \
+                 AND revoked_at >= ?1 ORDER BY revoked_at DESC LIMIT ?2",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![since, limit.min(i64::MAX as usize) as i64],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(backend)?;
+        let mut hashes = Vec::new();
+        for row in rows {
+            if let Ok(bytes) = <[u8; 32]>::try_from(row.map_err(backend)?) {
+                hashes.push(crate::domain::credential::TokenHash::from_bytes(bytes));
+            }
+        }
+        Ok(hashes)
+    }
+
+    fn entry_extras(
+        &self,
+        run_id: &RunId,
+    ) -> Result<crate::domain::runs::snapshot::EntryExtras, StoreError> {
+        use crate::ports::RunStore;
+        let latches = self.latches(run_id)?;
+        let upstream = self.run_upstream(run_id)?;
+        let identity = self.run_identity(run_id)?;
+        Ok(crate::domain::runs::snapshot::EntryExtras {
+            disposition: crate::domain::runs::snapshot::Disposition::of_latches(&latches),
+            upstream: upstream.map(std::sync::Arc::from),
+            identity,
+        })
     }
 }
 
@@ -1427,7 +1755,7 @@ impl PolicyRecords for SqliteStore {
             return Ok(None);
         };
         let labels = self.run_labels(run_id)?;
-        let limits = self.run_limits(run_id)?;
+        let (limits, caller_limits) = self.run_limit_layers(run_id)?;
         let kept_on_pause = match &record.instance {
             Some(instance) => self.breach_default_kept(instance)?,
             None => false,
@@ -1436,8 +1764,115 @@ impl PolicyRecords for SqliteStore {
             record,
             labels,
             limits,
+            caller_limits,
             kept_on_pause,
         }))
+    }
+
+    fn open_owner_resolution_facts(&self) -> Result<crate::ports::OpenOwnerFacts, StoreError> {
+        use std::collections::{HashMap, HashSet};
+        // Four reads for the whole Fleet, whatever its size: the open
+        // process-owning Runs, their labels, their per-run limits and the
+        // kept-on-pause markers. Each Run's entry decodes exactly as
+        // `run_resolution_facts` would (the same helpers, the same
+        // per-Run order: labels by key, limits by dimension — the
+        // primary-key order the one-Run read walks).
+        const OPEN_OWNER: &str = "r.process_owner = 1 AND r.status <> 'ended'";
+        let records = self.records(&format!("WHERE {OPEN_OWNER}"), [])?;
+        let mut labels: HashMap<String, Vec<Label>> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn()
+                .prepare(&format!(
+                    "SELECT l.run_id, l.key, l.value, l.source, l.origin FROM run_labels l \
+                     JOIN runs r ON r.run_id = l.run_id WHERE {OPEN_OWNER} \
+                     ORDER BY l.run_id, l.key"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (run_id, key, value, source, origin) = row.map_err(backend)?;
+                let label = decode_label(&run_id, key, value, &source, origin)?;
+                labels.entry(run_id).or_default().push(label);
+            }
+        }
+        let mut limits: HashMap<String, (RunLimits, RunLimits)> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn()
+                .prepare(&format!(
+                    "SELECT l.run_id, l.dimension, l.scope, l.limit_value, l.action \
+                     FROM run_limits l JOIN runs r ON r.run_id = l.run_id \
+                     WHERE {OPEN_OWNER} ORDER BY l.run_id, l.dimension, l.scope"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(backend)?;
+            let mut folds: HashMap<String, LimitsFold> = HashMap::new();
+            for row in rows {
+                let (run_id, dimension, scope, limit, action) = row.map_err(backend)?;
+                folds
+                    .entry(run_id.clone())
+                    .or_default()
+                    .row(&run_id, &dimension, &scope, limit, &action)?;
+            }
+            for (run_id, fold) in folds {
+                limits.insert(run_id, fold.finish());
+            }
+        }
+        let kept: HashSet<String> = {
+            let mut stmt = self
+                .conn()
+                .prepare(
+                    "SELECT i.name FROM breach_default_upgrade b \
+                     JOIN agent_instances i ON i.id = b.instance_id",
+                )
+                .map_err(backend)?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(backend)?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(backend)?;
+            names
+        };
+        let runs = records
+            .into_iter()
+            .map(|record| {
+                let run_id = record.run_id.as_str();
+                let kept_on_pause = record
+                    .instance
+                    .as_deref()
+                    .is_some_and(|instance| kept.contains(instance));
+                let (run_limits, caller_limits) = limits.remove(run_id).unwrap_or_default();
+                crate::ports::ResolutionFacts {
+                    labels: labels.remove(run_id).unwrap_or_default(),
+                    limits: run_limits,
+                    caller_limits,
+                    kept_on_pause,
+                    record,
+                }
+            })
+            .collect();
+        Ok(crate::ports::OpenOwnerFacts { runs, kept })
     }
 }
 
@@ -1603,3 +2038,33 @@ fn decode_run_policy(
 
 #[cfg(test)]
 mod tests;
+
+impl SqliteStore {
+    /// One Run's two limit layers (the Operator/Host layer, the Caller
+    /// layer) in one read.
+    fn run_limit_layers(&self, run_id: &RunId) -> Result<(RunLimits, RunLimits), StoreError> {
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT dimension, scope, limit_value, action FROM run_limits \
+                 WHERE run_id = ?1",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([run_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(backend)?;
+        let mut fold = LimitsFold::default();
+        for row in rows {
+            let (dimension, scope, limit, action) = row.map_err(backend)?;
+            fold.row(run_id.as_str(), &dimension, &scope, limit, &action)?;
+        }
+        Ok(fold.finish())
+    }
+}

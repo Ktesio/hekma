@@ -62,6 +62,9 @@ pub(crate) enum ApiErrorKind {
     /// answers it yet — the classes that can be refused land with their
     /// stories (22-1, 22-3, 24-2, the Hub story).
     Forbidden,
+    /// Story 22-1: the engine could not issue a credential (the OS random
+    /// source failed) — `503`, retryable later, nothing changed.
+    Unavailable,
 }
 
 impl ApiErrorKind {
@@ -77,6 +80,7 @@ impl ApiErrorKind {
             ApiErrorKind::MethodNotAllowed => "method_not_allowed",
             ApiErrorKind::Unauthorized => "unauthorized",
             ApiErrorKind::Forbidden => "forbidden",
+            ApiErrorKind::Unavailable => "unavailable",
         }
     }
 
@@ -90,6 +94,7 @@ impl ApiErrorKind {
             ApiErrorKind::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             ApiErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiErrorKind::Forbidden => StatusCode::FORBIDDEN,
+            ApiErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }
@@ -130,6 +135,18 @@ impl ApiError {
         }
     }
 
+    /// Whether this is a 401 (story 22-1: an unresolved presentation is
+    /// counted for the rate-limited diagnostic).
+    pub(crate) fn is_unauthorized(&self) -> bool {
+        self.kind == ApiErrorKind::Unauthorized
+    }
+
+    /// Whether this is the credential-class refusal (`403 forbidden`).
+    #[cfg(test)]
+    pub(crate) fn is_forbidden(&self) -> bool {
+        self.code == Some("forbidden")
+    }
+
     /// Attach the encoded engine error (the `From` impls' builder).
     fn with_engine_error(mut self, encoded: serde_json::Value) -> Self {
         self.engine_error = Some(encoded);
@@ -139,10 +156,35 @@ impl ApiError {
     /// The credential-class refusal (story 21-4, reserved — see
     /// [`ApiErrorKind::Forbidden`]). Static: it never echoes the credential.
     pub(crate) fn forbidden() -> Self {
-        Self::new(
+        let mut error = Self::new(
             ApiErrorKind::Forbidden,
             "this credential's class is not allowed on this surface",
-        )
+        );
+        error.code = Some("forbidden");
+        error
+    }
+
+    /// Story 22-1: a revoked credential (static — never echoes it). Only a
+    /// holder of the token learns it was revoked, and it tells a legitimate
+    /// client to stop retrying.
+    pub(crate) fn credential_revoked() -> Self {
+        let mut error = Self::new(
+            ApiErrorKind::Unauthorized,
+            "the presented credential has been revoked",
+        );
+        error.code = Some("credential-revoked");
+        error
+    }
+
+    /// Story 22-1: a credential in a URL (static — never echoes it).
+    pub(crate) fn credential_in_url() -> Self {
+        let mut error = Self::new(
+            ApiErrorKind::InvalidBody,
+            "Credentials never go in a URL; send them in the Authorization header. A credential \
+             seen in a URL is revoked.",
+        );
+        error.code = Some("credential-in-url");
+        error
     }
 
     /// A request-body rejection (bad JSON / violated exactly-one-of / an
@@ -173,10 +215,12 @@ impl ApiError {
     /// The auth layer's 401 (static message — it must never echo the
     /// presented token).
     pub(crate) fn unauthorized() -> Self {
-        Self::new(
+        let mut error = Self::new(
             ApiErrorKind::Unauthorized,
             "missing or invalid bearer token",
-        )
+        );
+        error.code = Some("unauthorized");
+        error
     }
 
     /// The stable truncation-guard sentence the engine's resync reader builds
@@ -205,6 +249,27 @@ impl ApiError {
     fn is_outbox_cursor_refusal(detail: &str) -> bool {
         detail.contains(Self::OUTBOX_BELOW_FLOOR_SENTENCE)
             || detail.contains(Self::OUTBOX_PAST_TAIL_SENTENCE)
+    }
+
+    /// A set-token refusal (story 21-6): `set-token-not-found` 404,
+    /// `set-token-expired` / `set-token-used` 409, `set-token-foreign` 403.
+    /// The message never echoes the token.
+    pub(crate) fn set_token(err: super::sets::SetTokenError) -> Self {
+        use super::sets::SetTokenError;
+        let kind = match err {
+            SetTokenError::NotFound => ApiErrorKind::NotFound,
+            SetTokenError::Expired | SetTokenError::Used => ApiErrorKind::Conflict,
+            SetTokenError::Foreign => ApiErrorKind::Forbidden,
+        };
+        let mut error = Self::new(kind, err.message());
+        error.code = Some(err.code());
+        error
+    }
+
+    /// The `error` object this error renders (story 21-6: one Run's
+    /// refusal inside a set-form verb's per-Run results).
+    pub(crate) fn error_object(&self) -> serde_json::Value {
+        serde_json::to_value(self.body_json().error).unwrap_or(serde_json::Value::Null)
     }
 
     /// The versioned body this error renders — the serialization seam
@@ -340,19 +405,61 @@ impl From<RunError> for ApiError {
             | RunError::RunEnded { .. }
             | RunError::LabelFromConfig { .. }
             | RunError::LabelNotBound { .. }
-            | RunError::LabelBound { .. } => ApiErrorKind::Conflict,
+            | RunError::LabelBound { .. }
+            // Story 21-6: the Run's depth does not serve the verb yet.
+            | RunError::VerbUnavailable { .. } => ApiErrorKind::Conflict,
+            // Story 21-6: a Caller may only tighten (an authority refusal).
+            RunError::RaiseForbidden { .. } => ApiErrorKind::Forbidden,
+            // Story 22-1: a Run Key outside its own subtree (403
+            // `run-out-of-scope`); a credential revoked between
+            // authentication and its job, or not recognised (401); the
+            // Caller breadth cap (409); no credential could be issued (503).
+            RunError::RunOutOfScope { .. } => ApiErrorKind::Forbidden,
+            RunError::CredentialRevoked | RunError::CredentialUnknown => {
+                ApiErrorKind::Unauthorized
+            }
+            RunError::TooManyChildren { .. } => ApiErrorKind::Conflict,
+            RunError::CredentialUnavailable { .. } => ApiErrorKind::Unavailable,
             // The request itself cannot be honored.
             RunError::NestingTooDeep { .. }
             | RunError::ActionUnavailable { .. }
             | RunError::TooManyRuns { .. }
             // Story 21-3: a Scent-Check Mode before Scent-Check ships.
             | RunError::ScentUnavailable { .. }
+            // Story 21-6: a limit scope the Run cannot carry.
+            | RunError::ScopeUnavailable { .. }
             | RunError::Invalid { .. } => ApiErrorKind::InvalidBody,
             // Story 21-5: a listing cursor that is not the codec's form is
             // the caller's value being invalid → 400 `invalid-cursor`
             // (the code rides from `RunError::code`).
             RunError::InvalidCursor { .. } => ApiErrorKind::InvalidBody,
             RunError::Store(_) => ApiErrorKind::Internal,
+        };
+        let mut error = Self::new(kind, message);
+        error.code = Some(err.code());
+        error
+    }
+}
+
+impl From<hekma_engine::RunVerbError> for ApiError {
+    fn from(err: hekma_engine::RunVerbError) -> Self {
+        match err {
+            hekma_engine::RunVerbError::Run(err) => err.into(),
+            hekma_engine::RunVerbError::Engine(err) => err.into(),
+        }
+    }
+}
+
+impl From<hekma_engine::BindingError> for ApiError {
+    fn from(err: hekma_engine::BindingError) -> Self {
+        use hekma_engine::BindingError as B;
+        let message = err.to_string();
+        let kind = match &err {
+            B::NotFound { .. } | B::RouteNotFound { .. } => ApiErrorKind::NotFound,
+            B::Exists { .. } | B::PrefixTaken { .. } | B::TooMany { .. } => ApiErrorKind::Conflict,
+            B::LegacyRoute { .. } => ApiErrorKind::Conflict,
+            B::Invalid { .. } => ApiErrorKind::InvalidBody,
+            B::Credential(_) | B::Store(_) => ApiErrorKind::Internal,
         };
         let mut error = Self::new(kind, message);
         error.code = Some(err.code());

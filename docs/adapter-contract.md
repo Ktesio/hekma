@@ -56,7 +56,7 @@ Per-OS honesty is the adapter author's job: the contract lets an author declare 
 ## Metering
 
 - `self-reported`: the agent's usage accounting reaches the engine as `KTESIO_USAGE {json}` sentinel lines on the captured stdout. **The channel is adapter-implemented** (contract v1): the stream may be native or synthesized by an adapter shim over the agent's own surfaces (SSE tails, session reads); a shim derives `sequence` from the agent's per-Run message ordinals so the `UNIQUE(instance, run, sequence)` replay-dedup invariant holds identically. Delayed batches reconcile without double-counting in both variants.
-- `engine-observed`: the engine meters the agent's model traffic through a per-instance loopback forward proxy — no agent cooperation needed.
+- `engine-observed`: the engine meters the agent's model traffic through the host's shared loopback [metering proxy](metering-proxy.md); the injected `metering.base_url` is the agent's Run route, `<proxy url>/_hekma/runs/<run id>` — no agent cooperation needed beyond appending request paths to its base URL.
 
 **Unknown-vs-zero is a contract stance**: when the provider omits usage, an adapter must surface it as unknown — never coerce it to zero. A zero event asserts the provider reported zero; an absent event means the usage is unknown. (Hermes labels cost honesty; opencode silently coerces missing usage to zero — the contract sides with the label.)
 
@@ -78,6 +78,8 @@ The `[config]` mapping turns documented unified keys into native mechanisms (`en
 - **`{env:VAR}` substitution honesty**: agents that substitute `{env:VAR}` placeholders and render an unset variable as a silent empty string impose a duty on the adapter — every substituted variable must be guaranteed set, or the render must fail with a named reason, before the child launches. This is the freeze's only behavioral rider; a silently-empty rendered config is a contract violation.
 - **Self-updating agents** must have their update-disable mechanism mapped and delivered by the start seam, and adapter docs must state whether the agent's config chain contains a higher-authority (managed/MDM) layer that could override supervisor-delivered values (so an operator can verify the pin survived).
 - **Isolation keys**: adapters document the environment levers that give each instance its own data/config roots (Hermes: `HERMES_HOME`; XDG-based agents: `XDG_DATA_HOME` + `XDG_CONFIG_HOME`). **Per-instance isolated roots inside each Agent Home are the recommended normative posture** — they make shared-root concurrency out of contract scope. Where a lever is an undocumented agent interface, the adapter must say so and re-validate per pinned release (undocumented levers are acceptable with that per-release obligation, not silently).
+
+The engine reserves two more delivery keys for a launch's credentials, `run.key` and `run.refresh_key` ([Run Keys](run-keys.md)): every agent receives its Run Key in `HEKMA_RUN_KEY`, an adapter may map either key to an `env` target only (a `flag` or `file` target is refused at registration), and a refresh credential is issued only when `run.refresh_key` is mapped. They are ordinary `[config]` mappings; the contract version does not change.
 
 ### What is checked versus honored (the TCK's honest reach)
 

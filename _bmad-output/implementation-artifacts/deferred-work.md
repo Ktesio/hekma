@@ -400,6 +400,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-19-2-the-wire-fence-block-breach-action.md` (Design Notes: when the fence lifts)
   summary: A live Run's wire fence does not lift when its ceiling is raised; it lifts only when the Run ends (the next Run re-checks the ceiling at start). Live un-fencing needs a trigger on config write that clears the `block` reasons whose ceilings now sit above the totals, alongside the within-Run latch re-arm.
   evidence: `crates/hekma-engine/src/metering/fence.rs` (bits are only ever set; the fence lives with the listener); readiness 2026-10-30 finding (refuted to low), option 1 taken. Trigger: story 21.6 (`hekma budget`, the within-Run latch re-arm) — clear the matching fence reasons in the same change.
+  resolved: story 21-6 (`spec-21-6-selectors-and-hekma-budget.md`: every raise path — `hekma budget set`, an instance `budget.*`/`cost.rate.*` config write, a Policy change — runs the one `runs::limits::re_arm` pass, which clears the matching fence reasons per reason through `WireFence::clear`; docs/hosting.md and docs/commands.md fence sections updated) 2026-11-12
 - source_spec: `spec-19-2-the-wire-fence-block-breach-action.md` (Design Notes: Restart Policy relaunch)
   summary: A Restart Policy relaunch begins a new Run in today's code (a fresh run id and per-run total), so a per-run `block` fence does not carry into it; a fenced agent that crashes and is relaunched gets a fresh per-run budget each relaunch, bounded only by the Restart Policy and any cumulative ceiling. Surfaced by a diagnostic at relaunch (`note_relaunch_lifts_per_run_fence`) and in docs/hosting.md.
   evidence: `crates/hekma-engine/src/domain/supervisor/spawn.rs` mints a fresh `RunId` on every (re)spawn; the spine's Run (AD-25) spans Restart Policy relaunches. Trigger: story 21.2 (the AD-25 Run that spans relaunches) — carry the per-run fence reasons across a relaunch in the same change.
@@ -477,9 +478,11 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-21-9-bound-labels.md` (Design Notes: Selectors; Routing)
   summary: The CLI resolves a Selector locally (one indexed read of state.db, read-only), confirms, then labels exactly the listed ids with one `PATCH /v0/runs/{id}/labels` per Run through the local Service Host; the Control API has no Selector resolution or set token.
   evidence: `crates/hekma/src/cli/label.rs` (`run`, the routed write in `apply`), `Engine::select_runs`. Trigger: story 21.6 (Selector set tokens on the Control API and on every verb).
+  resolved: story 21-6 (`POST /v0/runs/select` mints a set token; `hekma label --selector` selects through the host and applies ONE `PATCH /v0/runs/labels`; the lifecycle verbs and `hekma budget` ride the same `cli/fanout.rs`) 2026-11-12
 - source_spec: `spec-21-9-bound-labels.md` (Design Notes: Caller guard)
   summary: The Caller guard (`labels::check_caller_labels`) has one caller today, the child open, where it is vacuous for a fresh Run; the store's Caller upsert (`RunRecords::replace_labels` with `LabelSource::Caller`, which never replaces a bound row at the SQL level) has no production caller yet.
   evidence: `domain/runs/ops.rs` (`open_child`), `store/runs_sqlite.rs` (`replace_labels`, `#[cfg_attr(not(test), allow(dead_code))]` on the port method). Trigger: stories 22.1/23.1 (announce and identity-header Caller labels) — route every Caller-label write through both.
+  partly-absorbed: story 22-1 (2026-11-12) — a Run-Key child open routes its Caller labels through `check_caller_labels` (`domain/runs/keys.rs::open_child_as` → `ops::open_child`). There is still no Caller label update after creation, so the Caller upsert's first caller stays with 23.1/23.2. Re-pointed trigger: stories 23.1/23.2 (identity-header and announce Caller labels).
 - source_spec: `spec-21-9-bound-labels.md` (Design Notes: the planners)
   summary: A configured key replaces a Caller label on the same key, and if the configuration later drops the key, the Caller's value does not come back (the Caller row was replaced, not shadowed). The same holds for a verb label set over a Caller key and then removed. Bound wins by design; the Caller can set the label again where its surface allows.
   evidence: `domain/runs/labels.rs` (`plan_config_sync`, `plan_label_change`). Trigger: an operator or Host report of a lost Caller label, or story 23.1 if identity-header labels need to survive an Operator override.
@@ -493,6 +496,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-21-3-policies.md` (Design Notes: the policy change job)
   summary: A Policy change's re-arm covers the POLICY trigger only; `hekma budget` and plain config-write raises re-arm with story 21.6 (which generalizes the same rule and clears matching fence reasons), and Selector set tokens on the Control API are 21.6's too — the CLI resolves a Selector locally today.
   evidence: `registry_policy.rs::re_arm` (the policy-change job); FR-60's budget-trigger sibling lands with 21.6. Trigger: story 21.6.
+  resolved: story 21-6 (`re_arm` promoted to `domain/runs/limits.rs`, its rule the pure `governance::re_armed_keys`; the budget job and the config-write path call it; Selector set tokens on the Control API) 2026-11-12
 
 - source_spec: `spec-21-3-policies.md` (Design Notes: What 21-3 does NOT do)
   summary: Wire Runs' enforcement through the shared proxy — the snapshot entry carries the resolution but nothing reads it on a call path until 23.1; until then depths below `supervised` execute no action (the depth fallback covers them honestly). `hekma ps` (21.5) carries the "kept on pause by upgrade" note to the Run-first surface; today the note lives on `fleet`/`show`/`run show`.
@@ -539,3 +543,132 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: Low follow-ups from the second review pass. (1) A long, lazily drained SSE replay can overflow the 1,024-slot event ring; the handover then emits a `lagged` frame whose `skipped` count covers events the client already received (nothing lost or duplicated, the frame is wrong) — heal a resume-mode lag by re-reading the outbox. (2) While a Selector filters out a long run of replayed events, the replay loop never checks for shutdown. (3) With a Selector the view arms no longer use their partial index and each page builds the full match set twice (measured ~20–40 ms per page and 70 ms per count at 200k matching Runs) — fold into the 24.4 listing-scale entry. (4) `latest_process_run` may attribute a pre-owner transition (such as `starting`) to the previous, ended owner Run and its labels (unverified on the start path). (5) The CI `--ps-seed` step re-runs every default perf gate (more minutes, more flake exposure); folding the flag into the serve step would avoid it. Also: `writable_api_state` leaks one engine and temp dir per test; the lazy-replay test pins order and dedup but not laziness.
   evidence: `crates/hekma-host/src/control/sse.rs` (the handover and replay loop), `crates/hekma-engine/src/store/runs_sqlite.rs` (the view arms with a Selector), `RunRecords::latest_process_run`, `.github/workflows/ci.yml` (the perf job). Trigger: story 24.4 (listing scale), a Host report of a false `lagged` frame, or the next CI-minutes review.
 
+## Deferred from: implementation of spec-21-6-selectors-and-hekma-budget (2026-11-12)
+
+- source_spec: `spec-21-6-selectors-and-hekma-budget.md` (Design Notes: `budget show`; the select route)
+  summary: 21-5 (`hekma ps`, `list_runs`, `RunSummary`) was not merged into the 21-6 base, so `hekma budget show --selector` pages over the capped Selector read (at most 1000 Runs, sorted by run id, `--limit`/`--cursor` applied client-side) instead of 21-5's indexed listing pages; `POST /v0/runs/select` answers each Run as its `RunRecord` (run id, depth, wire path, status, Anomalies, parent, instance) rather than `RunSummary`; a bare `hekma budget show` (every open Run) is refused — name a target or a Selector; and the set act's lost-patience note points at `hekma run show <run-id>` rather than `hekma ps`.
+  evidence: `crates/hekma/src/cli/budget.rs` (`show`), `crates/hekma-host/src/control/dto.rs` (`SelectDocument.runs`), `crates/hekma/src/cli/host_client.rs` (`transport_error`). Trigger: story 21-5 merging — move `budget show --selector` onto `list_runs` paging, answer `select` with `RunSummary`, list every open Run with no target, and name `hekma ps` in the note.
+  resolved: the 21-5 merge into ktesio/21-6-selectors-budget (2026-11-12) — `POST /v0/runs/select` answers each Run as its `RunSummary` listing row (`Engine::select_run_summaries`: the capped act set assembled in one snapshot); `hekma budget show --selector` and a bare `hekma budget show` page the Run listing (`list_runs`, the `--all` view, its opaque cursor) instead of a client-side cap; the set act's lost-patience note points at `hekma ps --all`. Pinned by `budget_cli` (bare show, a malformed cursor), the `budget_cli` Unix paging leg, and `control_api`'s select rows.
+
+- source_spec: `spec-21-6-selectors-and-hekma-budget.md` (Design Notes: Where a set limit lives; What 21-6 does NOT do)
+  summary: The Caller authority rule is a seam: `LimitActor::Caller` may only tighten (`raise-forbidden`), but no surface issues a Caller credential yet — the Control API maps its one bearer class to `Operator`, the CLI is the Operator. Since the first review round a Caller writes its OWN layer (`caller.*` rows), applied only where tighter than every other layer, so a later Operator, Host or Policy tightening wins again; open for 22.x: whether an Operator or Host `--clear` should also reach the Caller's layer (today each actor class edits only its own layer, so an Operator cannot lift a Caller's self-imposed limit), and how the Caller layer is surfaced to the Caller itself.
+  evidence: `domain/runs/limits.rs` (`plan_limits` authority check), `crates/hekma-host/src/control/routes.rs` (`LimitActor::Operator`). Trigger: stories 22.x (Run Keys and announce credential classes) — map those classes to `Caller`/`Host`.
+  resolved: story 22-1 (2026-11-12) — a Run Key maps to `RunActor::Caller` (→ `LimitActor::Caller`) on `PATCH /v0/runs/{id}/limits`, within its own subtree and re-validated in the job. The open question is decided: an Operator or Host `--clear` also clears the field in the Caller's layer (the Operator outranks; `domain/runs/limits.rs` `plan_limits` `caller_cleared`, pinned by `an_operator_clear_lifts_a_callers_row_too_the_operator_outranks`); an Operator SET never touches the Caller layer. The Caller layer is not surfaced to the Caller itself (a Run Key has no read route — AD-20); `limits-changed` now names the layer it describes (`limits_layer`).
+
+- source_spec: `spec-21-6-selectors-and-hekma-budget.md` (Design Notes: Slow verbs on a set)
+  summary: A set act issues its per-Run calls concurrently, but the engine's coarse registry/supervisor locks serialize the stop ladders and drains, so a set's worst case is the sum of its windows; the CLI bounds its wait (10 s + each Run's bound, capped at 10 minutes) and reports that it stopped waiting.
+  evidence: `crates/hekma-host/src/control/routes.rs` (`set_act`), `crates/hekma/src/cli/fanout.rs` (`set_wait`). Trigger: the lock-model rework (parallel ladders), or an operator report of a set stop outliving the CLI's wait.
+
+- source_spec: `spec-21-6-selectors-and-hekma-budget.md` (Design Notes: Run → instance verb mapping)
+  summary: A child Run's `stop`/`pause`/`resume`/`drain` are refused per Run (`verb-unavailable`, naming the depth) because the wire-verb cells at `announced` are unavailable; hold/release/reroute/reject do not take a Selector yet. The fan-out module is verb-agnostic for them.
+  evidence: `domain/runs/verbs.rs` (`run_verb_target`), `crates/hekma/src/cli/fanout.rs`. Trigger: story 23.4 (wire hold/reject) — flip the cells and adopt the fan-out for the hold family.
+
+- source_spec: `spec-21-6-selectors-and-hekma-budget.md` (the budget job's dry run)
+  summary: A `--dry-run` of `hekma budget set` plans the re-arm and breach-at-once over the Run's OWN level (the pure `governance::rearm`), while the act evaluates the full ancestor chain; on a child Run the plan can miss a breach an ancestor's ceiling would fire, and it never applies a process action. Reported as planned, subject to the act. The opposite gap too (review round 1, L5): the dry run reports what WOULD fire from the pure rule even for an instance no engine supervises here, where the act only re-arms and the lowering waits for the supervising engine — "subject to act" in the docs covers it.
+  evidence: `domain/runs/limits.rs` (`plan_limits`, `LimitsPlan::dry_outcome`). Trigger: an operator report of a dry run that under-reported a breach, or the ancestor-chain dry run a later story needs.
+
+- source_spec: `spec-21-6-selectors-and-hekma-budget.md` (Design Notes: the config-write trigger)
+  summary: The config-write re-arm runs on every `budget.*`/`cost.rate.*` write, so a `budget.breach_action` change re-fires an already-latched breach under the new action at the write (the latch is keyed by action) instead of at the next usage event, and it re-resolves only the instance's process-owning Run — a child priced at a stored instance-sourced Rate stays one read behind until its next re-resolution (the 21-3 round-4 item 6, unchanged).
+  evidence: `domain/registry_limits.rs` (`rearm_after_config_write`), `domain/supervisor/runs.rs` (`sync_run_policy`). Trigger: an operator report of a surprising breach event at a config write, or the child re-resolution 21-3's item 6 names.
+
+- source_spec: `spec-21-6-selectors-and-hekma-budget.md` (the 21-3 round-4 follow-ups whose trigger named this story)
+  summary: 21-6 promoted the re-arm unchanged and reviewed the seven multi-engine edges 21-3's round 4 left (a stale cached ceiling latching again after a foreign raise, the self-stamped fingerprint, the relaunch re-apply's `unwrap_or_default`, the reload re-check's lift-before-evaluate window and silent read-error skip, the fingerprint's second resolution and separators, the child's stored Rate, `block` acting as `warn` under a degraded cache): none is in the budget job's path (it reads the store inside its writer job, not the cache), so they keep their first-multi-engine-deployment trigger. One sibling 21-6 adds: a budget-job or config-write raise committed by an engine that does NOT supervise the agent unlatches the rows, but the supervising engine's fence only re-checks on a policy-table reload, so its `block` reason stays up (fail closed) until that engine's next reload or the Run ends — the CLI never hits it (every write goes to the supervising Service Host). The new 21-6 supervisor tests stop their agents with a kill-on-drop guard; the 21-3 tests' 10-minute `fake_agent` leak on a failed assertion is unchanged.
+  evidence: `domain/supervisor/usage.rs`, `domain/registry_policy.rs`, `domain/supervisor/tests.rs` (`KillOnDrop`). Trigger: the first multi-engine deployment (embedder plus host), or any report of a latch that never re-fires.
+
+- source_spec: `spec-21-6-selectors-and-hekma-budget.md` (I/O Impact Matrix)
+  summary: No semver baseline move and no version bump for 21-6: the new `RunEventKind`, `RunError`, `Case` and `CoverTag` variants and the new `RunLimits`/`RunEvent` fields are breaking additions within the unreleased 0.12.0 (the cycle rule), announced in the Unreleased banners.
+  evidence: CHANGELOG.md + docs/RELEASE_NOTES.md Unreleased banners. Trigger: none.
+
+- source_spec: `spec-21-6-selectors-and-hekma-budget.md` (independent review round 1, L2 — a product question for the owner)
+  summary: For the Caller authority rule, a Breach Action's tightness is the Policy tie order (warn < pause < stop < block), so a Caller may change its Run's `stop` to `block` as a "tightening". `block` is cooperative — it fences the model calls at the Metering Proxy, and an agent that calls its provider directly is not fenced — so the workload itself could trade a process kill for a fence it can bypass. Latent: no surface issues a Caller credential yet (every route is the Operator). Whether `block` and `stop`/`pause` are comparable for authority, or need an order of their own, is the owner's call.
+  evidence: `domain/runs/policy.rs` (`action_tightness`), `domain/runs/limits.rs` (`caller_loosens`, the authority check in `plan_limits`). Trigger: stories 22.x (the first Caller credential class) — decide the authority order before a Caller can set an action.
+  interim: story 22-1 (2026-11-12) made it reachable and took the conservative reading until the owner rules — a Caller's `block` never replaces `pause` or `stop` (refused `raise-forbidden` at write, and ignored by the resolver: `policy::caller_action_tightens`; governance case `policy-caller-block-never-replaces-stop`). `block` over `warn` is still a Caller tightening. Re-pointed trigger: the owner's ruling on the authority order (Islam).
+
+- source_spec: `spec-21-6-selectors-and-hekma-budget.md` (independent review round 1, L4 — inherited from 21-3)
+  summary: The budget job and the config-write re-arm resolve through `policy::resolve` over `store.policies()` directly, not through the registry's cached set and its fail-closed tail (`finish_resolution`: a degraded cache or a missing `default` row tightens the action to `pause`). In that degraded state the budget job can fire a breach at once under the looser resolved action (`warn`) and the next usage event fire the same crossing again under `pause`: two breach records for one crossing, and the budget job reporting a looser action than enforcement uses. Only reachable with the default Policy row missing or the policy read failing; 21-3's `resolve_run` (the config-write path before this story) has the same shape.
+  evidence: `domain/runs/limits.rs` (`resolve_with`), `domain/registry_limits.rs` (`rearm_after_config_write`), `domain/registry_policy.rs` (`finish_resolution`). Trigger: a degraded-state report of a doubled breach, or the next change to the resolution paths — route the budget and config-write jobs through the same fail-closed tail.
+
+- source_spec: `spec-21-6-selectors-and-hekma-budget.md` (independent review round 2 — READY with follow-ups)
+  summary: Seven lows from the second review pass, six latent until a Caller credential exists: N1 the resolver compares a Caller action with the pre-depth-fallback action while the authority check uses the post-fallback one (a Caller `pause` over a fallen-back Policy `block` commits and has no effect); N2 a Caller tightening an unpriced Policy dollar cap clears `unpriced-model`; N3 the `limits-changed` event and the snapshot don't name the Caller layer; N4 a child-open write's action row is re-attributed to the next writer; N5 a Caller cannot clear its own dormant row; N6 the `run-<d>-<d>` agent-name fix is not carried to `budget` and `label`; N7 no governance vector covers the Caller layer. Nits: `budget show` fails a page when a listed Run disappears mid-read; a committed verb's failed Fleet read-back is dropped silently.
+  evidence: the review report (orchestrator scratchpad, adversarial-review-2.md); `domain/runs/policy.rs` (the Caller layer), `domain/runs/limits.rs` (the authority check), `domain/runs/ops.rs`, `crates/hekma/src/cli/`. Trigger: story 22.1 (handed to its build, which issues the first Caller credential).
+  resolved: story 22-1 (2026-11-12, ktesio/22-1-run-keys) — N1-N7 folded in with a mutation-checked test each (`registry_limits_tests.rs` `n1_`…`n5_`, `fanout_cli.rs` `an_agent_named_like_a_legacy_run_id_is_still_the_agent`, the six `policy-caller-*` governance cases); the Operator clear now reaches the Caller layer; L2 taken conservatively (see the L2 entry above).
+
+- source_spec: `spec-22-1-run-keys.md` (Deferrals: the shared proxy's halves of R1.6/R1.8/R1.12)
+  summary: Nothing on the wire reads a Run Key in this story (today's per-instance listener attributes by socket). The shared Metering Proxy must look a presented key up by hash in the snapshot's key index (`RunSnapshot.keys`, already published), refuse the next call after a revocation while calls already forwarded complete, answer an unknown or revoked key with a typed body that echoes nothing, and refuse a token in a URL (the listener already does — the proxy must keep it). `KeyEntry.process_owner`/`launch_generation` carry what P5's loopback rule needs there.
+  evidence: `domain/runs/snapshot.rs` (`KeyEntry`, `RunSnapshot::key`), `metering/listener.rs` (`credential_in_url_response`, the `x-hekma-run-key` strip). Trigger: story 23.1 (the shared proxy and `X-Hekma-Run-Key` identification).
+
+- source_spec: `spec-22-1-run-keys.md` (Deferrals: R1.7 held calls)
+  summary: A call held at the proxy whose Run Key is revoked before release must be rejected at release with the typed revoked-credential response, never forwarded. No call can be held yet.
+  evidence: `domain/runs/keys.rs` (revocation commits and publishes before ack; a held-call path will need to re-read the key index at release). Trigger: story 23.4 (wire hold/release).
+
+- source_spec: `spec-22-1-run-keys.md` (Design Notes: the supervised launch; Ask First 11)
+  summary: The pre-record window: a supervised launch's Run Key is minted before spawn but committed with the launch record (after the ~300 ms startup survival window), so a request presenting it in that window is refused as unknown (fail closed; documented in docs/run-keys.md). An engine crash between spawn and commit leaves a key nobody ever honours.
+  evidence: `domain/supervisor/spawn.rs` (mint at 2b-run-key; commit in `write_spawn_record_new_launch`). Trigger: story 24.1 (the Shim commits the spawn record before launch, AD-23), which removes the window; R1.17 (Shim secret custody) lands there too.
+
+- source_spec: `spec-22-1-run-keys.md` (Deferrals: announce credentials)
+  summary: `hk_ann_` announce credentials have their format, class, store CHECK value, key-index slot and authority-matrix row (Heartbeat, OtlpIntake — no route yet), but nothing issues one: there is no endpoint binding to scope one to, and no announce endpoint or heartbeat route.
+  evidence: `domain/credential.rs` (`TokenClass::Announce`), `crates/hekma-host/src/control/auth.rs` (the matrix). Trigger: story 23.1 (`hekma binding`, announce-credential issuance) and story 23.2 (the announce endpoint, heartbeats and Leases).
+
+- source_spec: `spec-22-1-run-keys.md` (Design Notes: the snapshot index)
+  summary: Cross-engine revocation propagation: a second engine on the same state dir (an embedder beside `hekma serve`) publishes its own snapshot, so a revocation it commits reaches the host's snapshot only on the host's next open. Harmless for the Control API — every Run Key action is a write that re-validates the key's row inside its job, and a snapshot miss falls back to one store read (`Engine::credential_state`) — but a proxy that reads only the snapshot would honour a key another engine revoked.
+  evidence: `domain/runs/keys.rs` (`caller_check`), `crates/hekma-host/src/control/auth.rs` (`authorize`'s store fallback, now on the engine's lock-free credential reader). Trigger: story 23.1 (the proxy reads only the snapshot) and story 24.4 (snapshot scale and cross-process publication).
+
+- source_spec: `spec-22-1-run-keys.md` (Deferrals: one shared token generator)
+  summary: 21-6's `hkset_` set tokens are minted and hashed by the host (`ring`), while Run Keys use the engine's `credential::mint` and std-only SHA-256. Two generators for two token families; folding the set token onto the engine's generator (and its no-fallback rule) is a host-auth change.
+  evidence: `crates/hekma-host/src/control/sets.rs`, `crates/hekma-engine/src/domain/credential.rs`. Trigger: the next host-auth change.
+
+- source_spec: `spec-22-1-run-keys.md` (Design Notes: Breadth)
+  summary: The Caller breadth cap counts ALL open children of the parent (`open_children`), not only those a Caller opened, so an Operator-opened child counts against a Caller's 1000; and an announce-created Run has no cap yet. Simpler and stricter; revisit with announce.
+  evidence: `domain/runs/keys.rs` (`open_child_as`). Trigger: story 23.2 (announce creates Runs).
+
+- source_spec: `spec-22-1-run-keys.md` (security review pass 1, L8)
+  summary: The Caller breadth cap bounds one PARENT, not one key: nesting is 8 deep, so a single Run Key can create about 1000^7 Runs, each its own writer job, and every `publish_changes` clones the whole snapshot (Runs and key maps), so the cost per write grows with N. Accepted for this story (the spec's breadth rule); the fix is a per-root-key (or per-subtree) cap counted inside the open job.
+  evidence: `domain/runs/keys.rs` (`open_child_as`, `MAX_CALLER_OPEN_CHILDREN`), `domain/runs/snapshot.rs` (`RunSnapshot::with` clones). Trigger: story 23.2 (announce creates Runs and revisits the breadth rule) or story 24.4 (snapshot scale), whichever lands first.
+
+- source_spec: `spec-22-1-run-keys.md` (security review pass 1, L9 remainder)
+  summary: `hekma rm --force` now drops the removed instance's Runs' keys from the published key index in the same commit (fixed in the review's fix round), but the `tokens` rows themselves still go with the instance through `ON DELETE CASCADE`, so `hekma run keys` can no longer list them; the credential events in the outbox keep the history. Decide whether a removed instance's credential rows should be kept as an audit trail (and the foreign key relaxed).
+  evidence: `store/tokens_sqlite.rs` (`tokens.run_id … ON DELETE CASCADE`), `domain/registry.rs` (`remove`). Trigger: story 23.1 (the proxy and its audit surface) or the first audit-export story, whichever lands first.
+
+- source_spec: `spec-22-1-run-keys.md` (Design Notes: Display once; secret scanning)
+  summary: The `hk_run_`/`hk_ref_`/`hk_ann_` prefixes are distinctive enough for secret scanners, but they are not registered with GitHub secret scanning (a follow-up outside the code).
+  evidence: `docs/run-keys.md` (The format). Trigger: the first public release carrying Run Keys.
+
+
+## From spec-23-1 (the shared Metering Proxy) — build, 2026-11-13
+
+- source_spec: `spec-23-1-shared-metering-proxy.md` (Design Notes: Streaming, back-pressure and timeouts)
+  summary: Responses through the proxy are buffered whole, so a streamed completion's first token reaches the client only when the whole response has (time to first token equals the full response time).
+  evidence: `metering/proxy/forward.rs` (the `Limited` body collect before relay); docs/metering-proxy.md and docs/testing.md say so. Trigger: wire hold mid-stream (story 23.4) or a time-to-first-token report from a user.
+
+- source_spec: `spec-23-1-shared-metering-proxy.md` (Design Notes: Hints)
+  summary: A hint's `x-hekma-labels` apply only when it creates the Run; later different labels on the same hint are ignored. Caller label updates come with announce.
+  evidence: `domain/runs/wire.rs` (`ensure_wire_run` takes the labels on creation only). Trigger: story 23.2 (announce and Caller label updates).
+
+- source_spec: `spec-23-1-shared-metering-proxy.md` (Design Notes: Bind and auth posture)
+  summary: The proxy binds `127.0.0.1` only; IPv6 loopback (`::1`) is not served.
+  evidence: `metering/proxy/mod.rs` (the loopback check refuses any other address). Trigger: a user report that needs `::1`.
+
+- source_spec: `spec-23-1-shared-metering-proxy.md` (Design Notes: Pricing wire Runs)
+  summary: Cumulative ceilings bind an Agent Instance, which a wire Run lacks, so a Policy cumulative ceiling matching a binding's Runs is "not applicable" and never fires; only per-run ceilings and those of the Runs above apply.
+  evidence: `domain/runs/policy.rs` (cumulative scope keyed by instance). Trigger: a Host asking for a binding-level all-time ceiling.
+
+- source_spec: `spec-23-1-shared-metering-proxy.md` (Design Notes: Identification)
+  summary: The recently-revoked set (Run Keys revoked in the last 24 hours, told apart from unknown ones) is bounded at 100 000 hashes, oldest out; past that an older revoked key answers "unknown".
+  evidence: `domain/runs/snapshot.rs` (`RevokedSet`, `RECENTLY_REVOKED_MAX`), pinned by `the_revoked_set_keeps_at_most_its_bound_oldest_out`. Trigger: story 24.4 (snapshot scale).
+
+- source_spec: `spec-23-1-shared-metering-proxy.md` (build: the owner's question in the ledger)
+  summary: `hekma agent start --detach` still refuses an `engine-observed` agent (exit 5), though under a Service Host the proxy's sticky port means a later host serves the agent's base URL again. Lifting the refusal changes a frozen exit-code contract and the `start --help` text.
+  evidence: `domain/supervisor/spawn.rs` (`DetachRefused`), `crates/hekma/tests/agent_cli.rs` (`start_detach_of_an_engine_observed_instance_is_refused_with_exit_code_5`). Trigger: the owner's ruling (decisions ledger, item 9).
+
+- source_spec: `spec-23-1-shared-metering-proxy.md` (Deferrals: existing entries this story closes)
+  summary: The earlier entries naming story 23.1, as this build leaves them.
+  evidence: the spec's Deferrals list and the build's tests.
+  resolved: story 23-1 (2026-11-13, ktesio/23-1-shared-proxy):
+  - 21-1 instance-less dedup: a usage row on a Run with no Agent Instance must carry a call id (`store/run_store_sqlite.rs`), and proxied rows key on (run, call id).
+  - 21-1 calls store: created (`<state dir>/calls/`), with rotation left to 24.4.
+  - 21-2 child usage before 23.1: attributed calls commit through the pipeline job.
+  - 21-3 wire enforcement through the proxy: done for `warn` and `block` (`block` at any depth with a wire path); `pause`/`stop` below supervised stay with 23.4.
+  - 21-5 wire usage on the listing: the Run rollup is keyed by run id; `run show` reads it too (a bug fixed in this build).
+  - 22-1's proxy halves of R1.6/R1.8/R1.12, and announce-credential issuance: done.
+  - 22-1 cross-engine revocation: picked up within 1 s by the foreign-commit reload; the O(changed) refinement stays with 24.4.
+  The 19-2 fenced-marker entry stays with 23.4, and the 21-9 Caller upsert's first caller with 23.2.

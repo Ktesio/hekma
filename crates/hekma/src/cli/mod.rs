@@ -1,6 +1,10 @@
 pub mod agent;
+pub mod binding;
+pub mod budget;
+pub(crate) mod fanout;
 pub(crate) mod host_client;
 pub mod label;
+pub mod lifecycle;
 pub mod policy;
 pub mod ps;
 pub mod run;

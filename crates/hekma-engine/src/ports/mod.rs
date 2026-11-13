@@ -7,11 +7,10 @@
 //! resolution, AD-10 — env + the 0600 secrets file; OS-keychain stays a deferred
 //! resolver behind the same port), and, from story 3-1, [`UsageSource`] (the AD-7
 //! metering INGESTION seam — the self-reported channel that yields usage from a
-//! running instance). Story 3-4 landed the SECOND source, [`ObservedUsageSource`]
-//! (`engine-observed`): it is fed by the loopback forward listener
-//! (`crate::metering`) and, being event-driven rather than a log-tail drainer,
-//! mints its [`ParsedUsage`] directly while yielding the SAME shape into the SAME
-//! commit choke point. Story 5-1 landed the Memory Backing surface (AD-11) as the
+//! running instance). An `engine-observed` instance's calls no longer ride a
+//! source at all (story 23-1): the shared Metering Proxy meters each call by its
+//! call id through the proxied-close job in the store writer. Story 5-1 landed
+//! the Memory Backing surface (AD-11) as the
 //! [`memory_backing`] module: deliberately NOT a trait (A-8 — the `filesystem`
 //! implementation is pure path authority inside the engine), the module and its
 //! types ARE the seam richer backings land behind later. No speculative port
@@ -20,7 +19,7 @@
 mod memory_backing;
 mod process_backend;
 mod run_store;
-pub(crate) use run_store::{PolicyRecords, ResolutionFacts};
+pub(crate) use run_store::{LimitSlot, OpenOwnerFacts, PolicyRecords, ResolutionFacts};
 mod secret_resolver;
 mod state_store;
 mod usage_source;
@@ -36,7 +35,8 @@ pub use process_backend::{
     StdinState, StopOutcome, KILL_CONFIRM_TIMEOUT, STDIN_WRITE_TIMEOUT,
 };
 pub(crate) use run_store::{
-    clamp_page, NewRun, OutboxAppend, OutboxBounds, Page, Rollup, RunRecords, RunStore, PAGE_MAX,
+    clamp_page, NewRun, OutboxAppend, OutboxBounds, Page, Rollup, RunRecords, RunStore, TokenRow,
+    PAGE_MAX,
 };
 pub use secret_resolver::{
     file_permissions_error, mode_is_owner_only, CompositeSecretResolver, EnvSecretResolver,
@@ -44,8 +44,8 @@ pub use secret_resolver::{
 };
 pub use state_store::{MemoryBackingTxn, SpawnRecord, StateStore};
 pub use usage_source::{
-    assemble_usage_event, format_usage_line, parse_usage_block, parse_usage_line,
-    ObservedUsageSource, ParsedUsage, SelfReportedUsageSource, UsageSource, USAGE_SENTINEL_PREFIX,
+    assemble_usage_event, format_usage_line, parse_usage_block, parse_usage_line, ParsedUsage,
+    SelfReportedUsageSource, UsageSource, USAGE_SENTINEL_PREFIX,
 };
 
 use thiserror::Error;

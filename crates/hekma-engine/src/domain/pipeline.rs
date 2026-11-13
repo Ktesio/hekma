@@ -10,11 +10,11 @@
 //! * [`evaluate`] — read the just-committed totals from the rollups and the
 //!   Run's latches, run the pure [`governance::decide`], and for each
 //!   decision write the breach row, the latch row and the breach outbox row.
-//!   A `block` decision registers a post-commit hook that raises the
-//!   instance's wire fence before the caller is acked (the writer sets the
-//!   flag, AD-7's "`block` before the shared proxy").
+//!   A `block` decision's latch republishes the Run's snapshot entry, whose
+//!   disposition the shared proxy reads before the caller is acked (AD-7's
+//!   "`block` before the shared proxy", story 23-1).
 //!
-//! The evaluator's inputs (resolved budget, Rate, cap, actions, the fence)
+//! The evaluator's inputs (resolved budget, Rate, cap, actions)
 //! travel in the job (D2: the writer reads no engine state). The caller gets
 //! the committed events back in commit order and executes pause / stop through
 //! the normal lifecycle before releasing its locks.
@@ -31,7 +31,6 @@ use super::outbox::OUTBOX_MAX_BYTES;
 use super::runs::RunLimits;
 use super::runs::{self, ops::CommittedRunEvent, ops::RunChanges, snapshot::SnapshotPublisher};
 use super::usage::{RecordOutcome, RunId, UsageEvent, UsageUpdateEvent};
-use crate::metering::WireFence;
 use crate::ports::{OutboxAppend, Rollup, RunRecords, RunStore, StoreError};
 use crate::store::WriterCtx;
 use crate::time::now_rfc3339;
@@ -39,7 +38,10 @@ use crate::time::now_rfc3339;
 /// Everything [`evaluate`] needs, resolved by the caller under its locks.
 #[derive(Clone, Debug)]
 pub(crate) struct EvalInput {
-    pub name: InstanceName,
+    /// The hosting Agent Instance; `None` for a Run with no instance (a
+    /// wire Run of the shared proxy, story 23-1), which has no cumulative
+    /// scope and no process level.
+    pub name: Option<InstanceName>,
     pub run_id: RunId,
     pub metering_source: String,
     pub token_budget: TokenBudget,
@@ -51,8 +53,6 @@ pub(crate) struct EvalInput {
     /// instance commits its usage but fires nothing (the pre-21-1
     /// `apply_breach` declined the same way).
     pub supervised: bool,
-    /// The instance's wire fence, when it has a metering listener.
-    pub fence: Option<WireFence>,
     /// The Run snapshot publisher (story 21-2): a breach raises its Run's
     /// `breach` Anomaly, which republishes the Run. `None` only in writer
     /// tests that build an input by hand.
@@ -213,11 +213,6 @@ pub(crate) fn evaluate(
             store.latch(&level.run_id, key, decision.action, &event.at)?;
             let outbox =
                 store.append_outbox(&EngineEvent::BudgetBreach(event.clone()), OUTBOX_MAX_BYTES)?;
-            if level.acts && decision.action == BreachAction::Block {
-                if let Some(fence) = input.fence.clone() {
-                    ctx.after_commit(move || fence.raise(key));
-                }
-            }
             evaluation.breaches.push(CommittedBreach {
                 event,
                 decision,
@@ -233,6 +228,13 @@ pub(crate) fn evaluate(
             let changes = runs::ops::mark_breach(store, &level.run_id, &now)?;
             run_changes.events.extend(changes.events);
             run_changes.entries.extend(changes.entries);
+            // Story 23-1: the entry carries the Run's disposition (its
+            // `block` and latched reasons) — republish it even when the
+            // `breach` Anomaly was already set, so the proxy refuses the
+            // next call before this batch acks.
+            if let Some(entry) = runs::ops::refreshed_entry(store, &level.run_id)? {
+                run_changes.entries.push(entry);
+            }
         }
     }
     evaluation.run_changes = run_changes;
@@ -273,6 +275,9 @@ struct ResolvedArms {
     /// fallback already applied); `None` when the action is set directly
     /// (the 21-2 loud-degrade contract keeps the configured action).
     policy_action: Option<BreachAction>,
+    /// A Caller's tighter action (story 21-6): set directly, so it keeps
+    /// the depth check below like the Run's own action.
+    caller_action: Option<BreachAction>,
 }
 
 impl Level {
@@ -294,8 +299,12 @@ fn levels_for<S: RunRecords + ?Sized>(
     let chain = store.run_chain(&input.run_id)?;
     if chain.is_empty() {
         // A run id with no Run row: one process level, as before Runs; the
-        // placeholder row gives its latches their reference.
-        store.ensure_run_row(&input.run_id, &input.name)?;
+        // placeholder row gives its latches their reference. An instance-
+        // less id with no row governs nothing.
+        let Some(name) = &input.name else {
+            return Ok(Vec::new());
+        };
+        store.ensure_run_row(&input.run_id, name)?;
         return Ok(vec![Level {
             run_id: input.run_id.clone(),
             process: true,
@@ -328,11 +337,14 @@ fn levels_for<S: RunRecords + ?Sized>(
         // the process level alone (the owner's resolution, in the
         // EvalInput) — a child level enforcing them too would fire the
         // instance ceiling once per level.
+        // A Caller's tighter limit (story 21-6) also arms from the stored
+        // resolution: it is not in the Run's own (Operator/Host) row.
         let policy_sourced = |source: &crate::domain::runs::LimitSource| {
             matches!(
                 source,
                 crate::domain::runs::LimitSource::Policy(_)
                     | crate::domain::runs::LimitSource::Default
+                    | crate::domain::runs::LimitSource::Caller
             )
         };
         let resolution = store.run_policy(&record.run_id)?.map(|row| {
@@ -350,18 +362,22 @@ fn levels_for<S: RunRecords + ?Sized>(
             let rate = policy_sourced(&row.resolution.sources.rate)
                 .then_some(row.resolution.rate)
                 .flatten();
-            let policy_action = policy_sourced(&row.resolution.sources.breach_action)
+            let action_source = &row.resolution.sources.breach_action;
+            let caller_action = (*action_source == crate::domain::runs::LimitSource::Caller)
+                .then_some(row.resolution.action);
+            let policy_action = (caller_action.is_none() && policy_sourced(action_source))
                 .then_some(row.resolution.effective_action);
             ResolvedArms {
                 token_per_run,
                 dollar_per_run_micros,
                 rate,
                 policy_action,
+                caller_action,
             }
         });
         let action = resolution
             .as_ref()
-            .and_then(|arms| arms.policy_action)
+            .and_then(|arms| arms.policy_action.or(arms.caller_action))
             .unwrap_or_else(|| limits.action());
         let child_action = if resolution
             .as_ref()
@@ -444,6 +460,13 @@ fn level_input(
             Rollup::zero()
         }
     };
+    // Story 23-1 (v18): the Run rollup is keyed by run id alone; the
+    // cumulative scope binds an Agent Instance, so an instance-less chain
+    // reads none.
+    let instance_read = || match &input.name {
+        Some(name) => store.instance_rollup(name),
+        None => Ok(Rollup::zero()),
+    };
     #[cfg(test)]
     let (run_read, cumulative_read) = if input.totals_fault {
         let fault = || {
@@ -453,16 +476,10 @@ fn level_input(
         };
         (fault(), fault())
     } else {
-        (
-            store.run_rollup(&input.name, &level.run_id),
-            store.instance_rollup(&input.name),
-        )
+        (store.run_rollup_by_id(&level.run_id), instance_read())
     };
     #[cfg(not(test))]
-    let (run_read, cumulative_read) = (
-        store.run_rollup(&input.name, &level.run_id),
-        store.instance_rollup(&input.name),
-    );
+    let (run_read, cumulative_read) = (store.run_rollup_by_id(&level.run_id), instance_read());
     let run = read("per-run", run_read);
     let cumulative = if level.process {
         read("cumulative", cumulative_read)
@@ -507,9 +524,14 @@ fn breach_event(
     run_id: &RunId,
     decision: &GovernanceDecision,
 ) -> BudgetBreachEvent {
-    match decision.dimension {
+    let instance = input
+        .name
+        .as_ref()
+        .map(|name| name.as_str())
+        .unwrap_or_default();
+    let event = match decision.dimension {
         BreachDimension::Tokens => BudgetBreachEvent::new(
-            input.name.as_str(),
+            instance,
             run_id.as_str(),
             decision.scope,
             decision.limit,
@@ -519,7 +541,7 @@ fn breach_event(
             now_rfc3339(),
         ),
         BreachDimension::Dollars => BudgetBreachEvent::new_cost(
-            input.name.as_str(),
+            instance,
             run_id.as_str(),
             decision.scope,
             Micros(decision.limit as i64),
@@ -529,6 +551,11 @@ fn breach_event(
             &input.metering_source,
             now_rfc3339(),
         ),
+    };
+    if input.name.is_some() {
+        event
+    } else {
+        event.without_instance()
     }
 }
 
@@ -543,7 +570,7 @@ pub(crate) fn record_breach(
 ) -> Result<OutboxAppend, StoreError> {
     let store = ctx.store();
     store.append_breach(event)?;
-    if let Ok(instance) = InstanceName::new(&event.instance) {
+    if let Some(Ok(instance)) = event.instance.as_deref().map(InstanceName::new) {
         store.ensure_run_row(&RunId::from_wire(event.run_id.clone()), &instance)?;
     }
     store.latch(
@@ -553,4 +580,232 @@ pub(crate) fn record_breach(
         &event.at,
     )?;
     store.append_outbox(&EngineEvent::BudgetBreach(event.clone()), OUTBOX_MAX_BYTES)
+}
+
+// ---------------------------------------------------------------------------
+// Story 23-1: the shared Metering Proxy's per-call jobs.
+// ---------------------------------------------------------------------------
+
+/// The usage a proxied call's response reported (the OpenAI / Anthropic
+/// JSON and SSE parse seams).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProxiedUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cached: u64,
+}
+
+/// A proxied call's close: its record and, when it reported one, its usage.
+#[derive(Clone, Debug)]
+pub(crate) struct ProxiedClose {
+    pub record: crate::domain::calls::CallRecord,
+    pub usage: Option<ProxiedUsage>,
+}
+
+/// What one committed proxied close hands the Supervisor (through the
+/// evaluation inbox, drained on the reaper tick): the usage event to
+/// publish, then the evaluation exactly as `apply_evaluation` takes it.
+#[derive(Debug)]
+pub(crate) struct ProxiedCommit {
+    pub instance: Option<InstanceName>,
+    pub update: (UsageUpdateEvent, OutboxAppend),
+    pub evaluation: Evaluation,
+}
+
+/// The Supervisor's evaluation inbox (story 23-1): a writer post-commit
+/// hook pushes each committed proxied evaluation (cheap, no engine lock);
+/// the reaper tick drains it in commit order and publishes and acts under
+/// its locks.
+#[derive(Debug)]
+pub(crate) struct EvaluationInbox {
+    tx: std::sync::Mutex<std::sync::mpsc::Sender<InboxItem>>,
+    rx: std::sync::Mutex<std::sync::mpsc::Receiver<InboxItem>>,
+}
+
+/// One inbox item, in commit order.
+#[derive(Debug)]
+pub(crate) enum InboxItem {
+    /// A committed proxied close's usage and evaluation.
+    Proxied(Box<ProxiedCommit>),
+    /// Run events a proxy job committed (a wire Run's `created`).
+    RunEvents(Vec<runs::ops::CommittedRunEvent>),
+}
+
+impl Default for EvaluationInbox {
+    fn default() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            tx: std::sync::Mutex::new(tx),
+            rx: std::sync::Mutex::new(rx),
+        }
+    }
+}
+
+impl EvaluationInbox {
+    /// Push one committed evaluation (a post-commit hook).
+    pub(crate) fn push(&self, commit: ProxiedCommit) {
+        let tx = self.tx.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = tx.send(InboxItem::Proxied(Box::new(commit)));
+    }
+
+    /// Push the Run events a proxy job committed.
+    pub(crate) fn push_run_events(&self, events: Vec<runs::ops::CommittedRunEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let tx = self.tx.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = tx.send(InboxItem::RunEvents(events));
+    }
+
+    /// Take everything queued, in push (commit) order.
+    pub(crate) fn drain(&self) -> Vec<InboxItem> {
+        let rx = self.rx.lock().unwrap_or_else(|p| p.into_inner());
+        rx.try_iter().collect()
+    }
+}
+
+/// The call-start job (unacked): the `open_calls` row.
+pub(crate) fn record_call_start(
+    ctx: &mut WriterCtx<'_>,
+    start: &crate::domain::calls::CallStart,
+) -> Result<(), StoreError> {
+    ctx.store().insert_open_call(start)
+}
+
+/// The Rate a proxied row prices at (story 23-1, D2 and "pricing wire
+/// Runs"): a Run under a supervised process keeps its process-owning Run's
+/// instance-resolved Rate (the instance's configured model); a Run with no
+/// process owner prices at its own resolution's Rate (a Policy flat Rate)
+/// if one resolves, else the default Policy's model-keyed entry for the
+/// call's model; neither → unpriced.
+fn proxied_row_rate(
+    store: &crate::store::SqliteStore,
+    own: Option<&crate::domain::PolicyResolution>,
+    owner: Option<&crate::domain::PolicyResolution>,
+    model: Option<&str>,
+) -> Result<Option<Rate>, StoreError> {
+    use crate::ports::PolicyRecords as _;
+    if let Some(owner) = owner {
+        // A child of a supervised Run prices at its own Policy Rate when
+        // one resolves, as `commit_usage`'s `row_rate` does.
+        return Ok(own.and_then(|own| own.rate).or(owner.rate));
+    }
+    if let Some(rate) = own.and_then(|own| own.rate) {
+        return Ok(Some(rate));
+    }
+    let Some(model) = model else {
+        return Ok(None);
+    };
+    Ok(store
+        .policy(super::runs::DEFAULT_POLICY_NAME)?
+        .and_then(|policy| policy.rates.get(model).copied()))
+}
+
+/// The proxied close job (unacked): the calls-store record and the
+/// `open_calls` delete, then — when the call reported usage — the usage row
+/// keyed (run, call id), both rollups, the outbox row and the evaluation
+/// over the Run's ancestor chain, all in this job's SAVEPOINT. The
+/// evaluator's inputs come from state the writer owns (D2): the process-
+/// owning ancestor's stored resolution for the process level, each level's
+/// own stored resolution for its own. A replayed close (the record already
+/// exists) changes nothing. The post-commit hooks republish the changed
+/// entries (the `block` reasons ride them) and push the committed
+/// evaluation into the Supervisor's inbox.
+pub(crate) fn commit_proxied_call(
+    ctx: &mut WriterCtx<'_>,
+    close: ProxiedClose,
+    runs: &Arc<SnapshotPublisher>,
+    inbox: &Arc<EvaluationInbox>,
+) -> Result<(), StoreError> {
+    use crate::ports::PolicyRecords as _;
+    let store = ctx.store();
+    if !store.insert_call_record(&close.record)? {
+        return Ok(());
+    }
+    let Some(usage) = close.usage else {
+        return Ok(());
+    };
+    let run_id = close.record.run_id.clone();
+    let chain = store.run_chain(&run_id)?;
+    let Some(record) = chain.first().cloned() else {
+        // The Run's row is not committed yet (a call on a pending Run route
+        // that beat its launch job): fail the job so the record pump
+        // re-queues it — the record and the usage commit together, later.
+        return Err(StoreError::Backend(format!(
+            "the Run {} of call {} is not recorded yet",
+            run_id.as_str(),
+            close.record.call_id
+        )));
+    };
+    let instance = record
+        .instance
+        .as_deref()
+        .and_then(|name| InstanceName::new(name).ok());
+    let owner = chain.iter().find(|run| run.process_owner);
+    let owner_resolution = match owner {
+        Some(owner) => store.run_policy(&owner.run_id)?.map(|row| row.resolution),
+        None => None,
+    };
+    let own_resolution = store.run_policy(&run_id)?.map(|row| row.resolution);
+    let rate = proxied_row_rate(
+        store,
+        own_resolution.as_ref(),
+        owner_resolution.as_ref().filter(|_| owner.is_some()),
+        close.record.model.as_deref(),
+    )?;
+    let generation = match &instance {
+        Some(name) => store.launch_generation(name).unwrap_or(0),
+        None => 0,
+    };
+    let event = UsageEvent {
+        instance: instance.as_ref().map(|name| name.as_str().to_string()),
+        run_id: run_id.clone(),
+        call_id: Some(close.record.call_id.clone()),
+        input_tokens: usage.input,
+        output_tokens: usage.output,
+        cached_tokens: Some(usage.cached.min(usage.input)),
+        metering_source: "engine-observed".to_string(),
+        sequence: 0,
+        occurred_at: close.record.ended_at.clone(),
+    };
+    if store.insert_usage(&event, rate, generation)? == RecordOutcome::DuplicateReplay {
+        return Ok(());
+    }
+    let update = UsageUpdateEvent::new(event);
+    let append =
+        store.append_outbox(&EngineEvent::UsageUpdate(update.clone()), OUTBOX_MAX_BYTES)?;
+    // The process level's arms: the process-owning ancestor's stored
+    // resolution (none for an instance-less chain — its levels arm from
+    // their own resolutions).
+    let (token_budget, cost_cap, action) = match &owner_resolution {
+        Some(arms) => (arms.tokens, arms.dollars, arms.effective_action),
+        None => (
+            TokenBudget::default(),
+            CostCap::default(),
+            BreachAction::Warn,
+        ),
+    };
+    let input = EvalInput {
+        name: owner.and(instance.clone()),
+        run_id: run_id.clone(),
+        metering_source: "engine-observed".to_string(),
+        token_budget,
+        token_action: action,
+        rate: owner_resolution.as_ref().and_then(|r| r.rate),
+        cost_cap,
+        cost_action: action,
+        supervised: true,
+        runs: Some(Arc::clone(runs)),
+        #[cfg(test)]
+        totals_fault: false,
+    };
+    let evaluation = evaluate(ctx, &input)?;
+    let inbox = Arc::clone(inbox);
+    let commit = ProxiedCommit {
+        instance,
+        update: (update, append),
+        evaluation,
+    };
+    ctx.after_commit(move || inbox.push(commit));
+    Ok(())
 }

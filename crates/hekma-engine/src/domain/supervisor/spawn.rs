@@ -171,24 +171,23 @@ impl Supervisor {
         };
 
         // Story 12-1 — the DETACHED REFUSAL for engine-observed instances,
-        // BEFORE ANY SIDE EFFECT (no `starting` transition, no loopback
-        // listener, no spawn — every fallible step below still lies ahead, so
-        // the instance keeps its prior state). A detached observed instance is
-        // structurally broken: the loopback forward listener lives inside THIS
-        // engine process, so a detached start would inject a `base_url` whose
-        // server dies the moment the CLI exits — the agent's model calls would
-        // then hit a dead port (the loud stranded-listener condition adoption
-        // already announces). Refuse with the why + the remediation; a
-        // self-reported instance detaches fine (no listener to strand).
+        // BEFORE ANY SIDE EFFECT (no `starting` transition, no spawn — every
+        // fallible step below still lies ahead, so the instance keeps its
+        // prior state). The agent's injected `base_url` is this engine's
+        // shared Metering Proxy (story 23-1), which dies with this engine.
+        // Under a Service Host the proxy port is sticky, so a later host
+        // would serve it again; whether to lift the refusal there is an
+        // owner decision (it changes a frozen exit-5 contract), so it stays.
+        // A self-reported instance detaches fine (no proxy to depend on).
         if detach && metering_source == "engine-observed" {
             return Err(EngineError::DetachRefused {
                 name: name.as_str().to_string(),
-                detail: "the instance meters via the engine-observed channel, whose loopback \
-                         forward listener lives inside the engine that starts it (for the hekma \
-                         CLI, the local Service Host) — detaching would leave the agent pointed \
-                         at a listener that dies with the command or host that started it. \
-                         Start it without --detach (the supervising engine keeps the listener \
-                         alive), or switch the adapter's metering source to self-reported."
+                detail: "the instance meters via the engine-observed channel: its base URL points \
+                         at the metering proxy's listener inside the engine that starts it (for \
+                         the hekma CLI, the local Service Host), so detaching would leave the \
+                         agent pointed at a listener that dies with the command or host that \
+                         started it. Start it without --detach (the supervising engine keeps the \
+                         proxy alive), or switch the adapter's metering source to self-reported."
                     .to_string(),
             });
         }
@@ -240,8 +239,50 @@ impl Supervisor {
         // masquerade as engine-delivered memory. Only the invocation-override
         // layer built further below may supply this key.
         let _ = effective.remove(super::config::MEMORY_DIR_KEY);
+        // Story 22-1: the reserved credential leaves are delivery mechanisms
+        // too — a hand-set value never reaches the mapping or the snapshot.
+        let _ = effective.remove(super::config::RUN_KEY_KEY);
+        let _ = effective.remove(super::config::RUN_REFRESH_KEY_KEY);
         let mapping = adapter::resolve_config_mapping(&kind, manifest_path.as_deref())
             .map_err(|e| launch_to_engine(&name, e))?;
+
+        // (2b-run-key) Story 22-1 (P1): THIS launch's Run Key, minted from
+        // the OS random source BEFORE any state change — an RNG failure
+        // refuses the start with nothing spawned and nothing written (no
+        // fallback). A refresh credential is minted only when the Adapter
+        // maps `run.refresh_key` to an `env` target (none does today: a
+        // CLI cannot swap its own key mid-process, so its rotation is the
+        // relaunch). The cleartext lives in `SecretString`s until the
+        // mapping places it in the spawn environment; only the hashes are
+        // committed, with the launch record (step 6).
+        let launch_key =
+            crate::domain::credential::mint(crate::domain::credential::TokenClass::RunKey)
+                .map_err(|e| credential_to_engine(&name, e))?;
+        let launch_refresh = match mapping.target(super::config::RUN_REFRESH_KEY_KEY) {
+            Some(hekma_adapter_api::ConfigTarget::Env { .. }) => Some(
+                crate::domain::credential::mint(crate::domain::credential::TokenClass::Refresh)
+                    .map_err(|e| credential_to_engine(&name, e))?,
+            ),
+            _ => None,
+        };
+        let mut run_key_markers = vec![(
+            super::config::RUN_KEY_KEY,
+            format!(
+                "{}{}",
+                super::config::RUN_KEY_MARKER_PREFIX,
+                launch_key.token_id()
+            ),
+        )];
+        if let Some(refresh) = &launch_refresh {
+            run_key_markers.push((
+                super::config::RUN_REFRESH_KEY_KEY,
+                format!(
+                    "{}{}",
+                    super::config::RUN_KEY_MARKER_PREFIX,
+                    refresh.token_id()
+                ),
+            ));
+        }
 
         // (2b-readiness) Resolve the adapter's optional declared readiness gate
         // (contract `1.1.0`): the `[readiness]` section's ONE probe + its
@@ -366,11 +407,29 @@ impl Supervisor {
         let kept_run_id = restart
             .and_then(|_| registry.spawn_record(&name).ok().flatten())
             .and_then(|record| record.run_id);
-        let run_fence = crate::metering::WireFence::default();
-        let run_start_fenced = metering_source == "engine-observed"
-            && self.run_start_fence(registry, &name, &run_fence, kept_run_id.as_ref());
-        let observed_listener =
-            self.start_observed_listener(&name, &metering_source, &effective, run_fence)?;
+        // Story 23-1: the Run id is minted before the mapping, because the
+        // injected base URL names it (`<proxy url>/_hekma/runs/<run id>`).
+        let run_id = kept_run_id.clone().unwrap_or_else(RunId::mint);
+        let start_fence = if metering_source == "engine-observed" {
+            self.run_start_fence(registry, &name, kept_run_id.as_ref())
+        } else {
+            0
+        };
+        let run_start_fenced = start_fence != 0;
+        let observed_route = self.observed_route(&name, &metering_source, &effective, &run_id)?;
+        // The Run route answers from the moment the agent can call: its
+        // upstream and any Run-start `block` reasons ride the snapshot as a
+        // pending route until the launch job's entry (and the latch the
+        // Run-start enforcement records below) carry them.
+        let upstream = observed_route
+            .as_ref()
+            .map(|(_, upstream)| upstream.clone());
+        if let Some(upstream) = &upstream {
+            registry.run_publisher().publish_pending_route(
+                run_id.clone(),
+                Some((std::sync::Arc::from(upstream.as_str()), start_fence)),
+            );
+        }
         // The effective config the MAPPING applies: for an observed instance it
         // carries the engine-injected loopback base_url (story 3-4), and for a
         // filesystem-backed instance the engine-computed managed memory dir at the
@@ -380,9 +439,12 @@ impl Supervisor {
         // so NEITHER injected value is persisted as "what applied" — honest
         // provenance (3-4's rule; 5-1's CORRECTION extends it: `memory.dir` is a
         // delivery mechanism, not operator configuration).
-        let mut mapping_effective = match invocation_overrides(
-            observed_listener.as_ref().map(ObservedListener::base_url),
+        let mut mapping_effective = match invocation_overrides_with_keys(
+            observed_route
+                .as_ref()
+                .map(|(base_url, _)| base_url.as_str()),
             memory_dir.as_deref(),
+            &run_key_markers,
         ) {
             Some(layer) => registry
                 .effective_config(&name, layer)
@@ -438,9 +500,21 @@ impl Supervisor {
         // persisted state change, so an unresolved/ill-permissioned secret REJECTS
         // the start cleanly (no half-launch, mirroring the config-apply + snapshot
         // failures) — a typed `EngineError::Secret` that NEVER echoes a value.
-        let secrets = registry
+        let mut secrets = registry
             .resolve_secrets(&mapping_effective)
             .map_err(|e| secret_to_engine(&name, e))?;
+        // Story 22-1: the launch's credentials join the per-launch secrets
+        // map — the ONLY way their cleartext reaches the mapping.
+        secrets.insert(
+            super::config::RUN_KEY_KEY.to_string(),
+            crate::domain::SecretString::new(launch_key.secret().expose_secret()),
+        );
+        if let Some(refresh) = &launch_refresh {
+            secrets.insert(
+                super::config::RUN_REFRESH_KEY_KEY.to_string(),
+                crate::domain::SecretString::new(refresh.secret().expose_secret()),
+            );
+        }
         // (AI-27 shadow capture) The pre-apply launch env, snapshotted BEFORE
         // the mapping application mutates `launch.env` (whatever the persisted
         // registration snapshot carried): an env-targeted mapping whose name
@@ -708,7 +782,6 @@ impl Supervisor {
         // keeps the Run it relaunches (per-run budgets, latches and the
         // `block` fence carry — PRD FR-49). A relaunch whose record carries
         // no id (a pre-v9 record) mints.
-        let run_id = kept_run_id.clone().unwrap_or_else(RunId::mint);
         let restart_count = restart.map(|(attempt, _)| attempt).unwrap_or(0);
         let record = SpawnRecord {
             name: name.clone(),
@@ -765,48 +838,57 @@ impl Supervisor {
             // with fresh caller-side inputs; an unreadable configuration
             // fail-closes the action to `pause`, never to nothing-set.
             inputs: Some(registry.resolve_inputs_fail_closed(&name)),
+            // Story 23-1: the instance's resolved upstream, recorded on its
+            // Run in the launch job (the Run route forwards there).
+            upstream: upstream.clone(),
         };
-        let launch_generation =
-            match registry.write_spawn_record_new_launch(&record, supervised_run) {
-                Ok((generation, run_events)) => {
-                    // The Run's `created` (or a kept Run's re-sync) precedes the
-                    // `running` transition on the bus.
-                    self.publish_run_events(run_events);
-                    generation
+        let launch_generation = match registry.write_spawn_record_new_launch(
+            &record,
+            supervised_run,
+            Some(crate::domain::runs::ops::LaunchCredentials {
+                key: launch_key.stub(),
+                refresh: launch_refresh.as_ref().map(|refresh| refresh.stub()),
+            }),
+        ) {
+            Ok((generation, run_events)) => {
+                // The Run's `created` (or a kept Run's re-sync) precedes the
+                // `running` transition on the bus.
+                self.publish_run_events(run_events);
+                generation
+            }
+            Err(e) => {
+                // Persisting the record failed: kill the just-spawned process and
+                // land the instance in `failed` so we never leave an unrecorded
+                // process behind (AD-5 safety).
+                //
+                // Review round 2: `drop(handle)` alone only tears the process down
+                // when the handle is ATTACHED (drop = group/job kill). A DETACHED
+                // handle is DISARMED — its Drop deliberately kills nothing — so a
+                // detached start whose record commit fails would LEAK a live,
+                // unrecorded process. The teardown is therefore explicit on the
+                // detach path: a short graceful window through the backend stop
+                // (which still works on a detached handle — the pgid/job is
+                // unchanged), then the drop releases whatever remains.
+                //
+                // AUDIT of the other post-spawn error paths in this function (why
+                // this is the ONLY fix site): between `spawn` and this commit the
+                // sole fallible step is `watch_startup`, whose failure branch runs
+                // only when the process ALREADY exited (reaped by the poll —
+                // nothing survives, detached or not); every `?` after the commit
+                // happens once the record is DURABLE, so a dropped detached
+                // handle there leaves a recorded (adoptable) process, not an
+                // unrecorded one.
+                if detach {
+                    let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
                 }
-                Err(e) => {
-                    // Persisting the record failed: kill the just-spawned process and
-                    // land the instance in `failed` so we never leave an unrecorded
-                    // process behind (AD-5 safety).
-                    //
-                    // Review round 2: `drop(handle)` alone only tears the process down
-                    // when the handle is ATTACHED (drop = group/job kill). A DETACHED
-                    // handle is DISARMED — its Drop deliberately kills nothing — so a
-                    // detached start whose record commit fails would LEAK a live,
-                    // unrecorded process. The teardown is therefore explicit on the
-                    // detach path: a short graceful window through the backend stop
-                    // (which still works on a detached handle — the pgid/job is
-                    // unchanged), then the drop releases whatever remains.
-                    //
-                    // AUDIT of the other post-spawn error paths in this function (why
-                    // this is the ONLY fix site): between `spawn` and this commit the
-                    // sole fallible step is `watch_startup`, whose failure branch runs
-                    // only when the process ALREADY exited (reaped by the poll —
-                    // nothing survives, detached or not); every `?` after the commit
-                    // happens once the record is DURABLE, so a dropped detached
-                    // handle there leaves a recorded (adoptable) process, not an
-                    // unrecorded one.
-                    if detach {
-                        let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
-                    }
-                    drop(handle);
-                    return Err(self.fail_launch_detail(
-                        registry,
-                        &name,
-                        format!("could not commit the write-ahead spawn record: {e}"),
-                    ));
-                }
-            };
+                drop(handle);
+                return Err(self.fail_launch_detail(
+                    registry,
+                    &name,
+                    format!("could not commit the write-ahead spawn record: {e}"),
+                ));
+            }
+        };
 
         // (6b) ACP HANDSHAKE (story 14-1, spine AD-19) — for an `acp` instance,
         // take ownership of the child's pipe halves, start the connection
@@ -1217,9 +1299,6 @@ impl Supervisor {
         // run_id, so the ordinal resets per Run — the AD-7 Run boundary + the dedup
         // invariant). A `self-reported` instance leaves both `None` (its log-tail
         // drain is unchanged).
-        let observed_source = observed_listener
-            .as_ref()
-            .map(|_| ObservedUsageSource::new());
         // A fresh Run starts from a ZERO poll-error streak (AI-12): a stale entry
         // from this name's PRIOR handle must never pre-load the new one.
         self.clear_poll_error_streak(&name);
@@ -1263,14 +1342,12 @@ impl Supervisor {
                 // cadence gates the stderr channel without a re-read.
                 is_acp,
                 // Story 12-4: a fresh Run starts with no parked observed events.
-                observed_park: None,
                 // Story 21-1: this launch's generation (committed with the
                 // record above). The breach latch is durable (`run_latches`),
                 // keyed by the freshly minted run id, so it resets per Run by
                 // construction.
                 launch_generation,
-                observed_listener,
-                observed_source,
+                observed_route: observed_route.is_some(),
                 // A fresh start's stop attempt has not happened yet.
                 stop_unconfirmed: false,
                 // A fresh start (operator or restart) spawned this process itself.
@@ -1320,6 +1397,13 @@ impl Supervisor {
         if run_start_fenced || self.block_configured(registry, &name) {
             self.enforce_budget(registry, &name, &fence_run_id, &fence_metering_source);
         }
+        // Story 23-1: the latch (and the launch job's upstream) now ride the
+        // Run's own entry; the pending route retires.
+        if upstream.is_some() {
+            registry
+                .run_publisher()
+                .publish_pending_route(fence_run_id.clone(), None);
+        }
         // Story 21-2: a relaunch keeps the Run and its spent latch, so a
         // `pause` or `stop` the Run had already fired is re-applied here.
         if restart.is_some() && kept_run_id.is_some() {
@@ -1329,35 +1413,22 @@ impl Supervisor {
         registry.lookup(&name).map_err(registry_to_engine)
     }
 
-    /// Start the loopback forward listener for an `engine-observed` instance
-    /// (story 3-4, AC-A/AC-B/AC6), or return `Ok(None)` for a `self-reported`
-    /// instance (whose start path is UNCHANGED). Runs at `starting`, BEFORE any
-    /// persisted state change, so a failure rejects the start cleanly.
-    ///
-    /// For an `engine-observed` instance it: (1) resolves the operator-configured
-    /// real upstream provider URL (`metering.upstream_base_url`) from `effective`;
-    /// (2) requires the engine runtime handle (the listener's accept loop runs on
-    /// it) — absent → a clear error (only the handle-less unit-test supervisor lacks
-    /// it, and it never starts an observed instance); (3) binds `127.0.0.1` on the
-    /// Host seam's port (loopback ONLY — AC-B; port 0 = ephemeral, the pre-17-2
-    /// default) and spawns the accept loop. Every failure maps to a
-    /// TRAFFIC-FREE [`EngineError::ObservedMetering`] (no body/header/key — 2-4
-    /// no-leak). The returned [`ObservedListener`] is moved into `Supervised`; its
-    /// `base_url` is what the caller injects via the config-mapping (AC6).
-    pub(super) fn start_observed_listener(
+    /// The shared Metering Proxy route for an `engine-observed` instance
+    /// (story 23-1), or `Ok(None)` for a `self-reported` instance (whose start
+    /// path is unchanged): `(<proxy url>/_hekma/runs/<run id>, <upstream>)`.
+    /// Runs at `starting`, BEFORE any persisted state change, so a failure
+    /// rejects the start cleanly. Refused (typed, traffic-free) when the
+    /// upstream is not configured or this engine runs no metering proxy.
+    pub(super) fn observed_route(
         &self,
         name: &InstanceName,
         metering_source: &str,
         effective: &crate::domain::EffectiveConfig,
-        fence: crate::metering::WireFence,
-    ) -> Result<Option<ObservedListener>, EngineError> {
-        // Only an `engine-observed` instance runs a listener. `self-reported`
-        // (and any other) leaves it None — its start path is byte-unchanged.
+        run_id: &RunId,
+    ) -> Result<Option<(String, String)>, EngineError> {
         if metering_source != "engine-observed" {
             return Ok(None);
         }
-        // The operator MUST configure the real upstream provider URL (there is
-        // nowhere to forward otherwise). Absent → a clear start error naming the key.
         let upstream = config::resolve_upstream_base_url(effective).ok_or_else(|| {
             EngineError::ObservedMetering {
                 name: name.as_str().to_string(),
@@ -1368,38 +1439,25 @@ impl Supervisor {
                 ),
             }
         })?;
-        // The listener's accept loop runs on the engine runtime; the sync start path
-        // (on the blocking pool) cannot use `Handle::current`, so the engine threads
-        // its handle in (`with_runtime`). A handle-less supervisor cannot observe.
-        let runtime = self
-            .runtime
-            .as_ref()
+        crate::domain::runs::bindings::validate_upstream("metering.upstream_base_url", &upstream)
+            .map_err(|err| EngineError::ObservedMetering {
+            name: name.as_str().to_string(),
+            detail: err.to_string(),
+        })?;
+        let proxy = self
+            .proxy_url
+            .as_deref()
             .ok_or_else(|| EngineError::ObservedMetering {
                 name: name.as_str().to_string(),
-                detail: "the engine has no runtime handle to run the loopback listener \
-                     (engine-observed metering requires the async engine)"
+                detail: "the metering proxy is not running, so an engine-observed agent \
+                     cannot start: start the Service Host (`hekma serve`), or free the metering \
+                     proxy port and restart it"
                     .to_string(),
             })?;
-        // Bind loopback + spawn. The PORT comes from the story-17-2 Host seam
-        // (`metering_listen_port`: 0 = the OS-ephemeral default every pre-17-2
-        // caller takes; non-zero = the Host's pinned `metering.listen` port, so
-        // restarts/adoption re-bind the SAME port). The ADDRESS stays
-        // engine-computed loopback (AC-B). A ListenerError is TRAFFIC-FREE by
-        // construction (bind/upstream-shape only — never a body/header/key), so
-        // mapping it into the detail cannot leak a secret (2-4 rigor); a pinned
-        // port that is already taken surfaces here as the typed bind error
-        // (AI-18 — never a silent hop).
-        let listener = ObservedListener::start_on_port_with_fence(
-            runtime,
-            upstream,
-            self.metering_listen_port,
-            fence,
-        )
-        .map_err(|e: ListenerError| EngineError::ObservedMetering {
-            name: name.as_str().to_string(),
-            detail: e.to_string(),
-        })?;
-        Ok(Some(listener))
+        Ok(Some((
+            format!("{proxy}/_hekma/runs/{}", run_id.as_str()),
+            upstream.to_string(),
+        )))
     }
 
     /// Watch a freshly spawned process for [`READINESS_WINDOW`]. Returns

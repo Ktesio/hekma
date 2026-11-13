@@ -494,18 +494,16 @@ fn adoption_helper_subprocess() {
             }
             hekma_conformance::exit_helper_subprocess(0);
         }
-        // AI-46: start `obssurv` as an ENGINE-OBSERVED instance (engine 1 binds
-        // its loopback forward listener), then crash. The listener dies with
-        // this engine while the agent survives with its injected `base_url`
-        // still pointing at the now-dead port — the stranded-listener
-        // condition the next engine's adoption must surface.
+        // AI-46: start `obssurv` as an ENGINE-OBSERVED instance (its
+        // injected `base_url` is the shared proxy's Run route), then crash.
+        // The agent survives; the next engine's adoption must strand nothing.
         "observed_survivor" => {
             facade
                 .register_with_adapter("obssurv", &AdapterRef::Manifest(manifest.clone()))
                 .unwrap();
-            // A valid-shaped (dead) upstream: the listener needs a URL to
-            // start; the agent makes no calls (no `--observed-calls`), so
-            // nothing ever forwards to it.
+            // A valid-shaped (dead) upstream: the Run records it; the agent
+            // makes no calls (no `--observed-calls`), so nothing ever
+            // forwards to it.
             let dead_upstream = {
                 let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
                 let addr = l.local_addr().unwrap();
@@ -1758,17 +1756,19 @@ fn make_sink(shared: &Arc<Mutex<Vec<u8>>>) -> DiagnosticSink {
 }
 
 #[test]
-fn ai46_adopting_an_engine_observed_instance_surfaces_the_stranded_listener() {
-    // AI-46 (story 11-3): adopting a live ENGINE-OBSERVED orphan must SAY the
-    // stranding out loud. The adopted agent's injected `base_url` still points
-    // at the PREVIOUS engine's loopback listener, which died with that engine —
-    // the engine cannot rewrite the running child's already-injected
-    // environment, so the honest fix is a diagnostic (through the story-10-2
-    // sink channel) naming the stranded observed listener and the stop→start
-    // remediation. The adoption semantics are otherwise EXACTLY unchanged: the
-    // row stays `running`, the process is re-held, and a stop still terminates
-    // it. Runs where the siblings run (Unix survival harness; same CI
-    // mitigation).
+fn ai46_adopting_an_engine_observed_instance_strands_no_listener() {
+    // AI-46 (story 11-3), moved to the shared Metering Proxy (story 23-1).
+    // Before the shared proxy, an adopted ENGINE-OBSERVED agent's injected
+    // `base_url` pointed at the previous engine's per-instance listener,
+    // which died with it, so adoption had to say so. Now the agent's
+    // `base_url` is the shared proxy's Run route (`<proxy url>/_hekma/runs/
+    // <run id>`) on the state directory's sticky port, so nothing is
+    // stranded: adoption says only what it says for every agent, and gives
+    // no legacy root route (the Run recorded its upstream, so it is not a
+    // pre-proxy launch). The adoption semantics are otherwise unchanged:
+    // the row stays `running`, the process is re-held, and a stop still
+    // terminates it. Runs where the siblings run (Unix survival harness;
+    // same CI mitigation).
     if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
         return;
     }
@@ -1802,29 +1802,30 @@ fn ai46_adopting_an_engine_observed_instance_surfaces_the_stranded_listener() {
         "a live orphan must be adopted as running (unchanged by AI-46)"
     );
 
-    // The diagnostic reached the sink and names the condition: the instance,
-    // the stranded observed listener, and the stop→start remediation.
-    // (Adoption runs inside Engine::open, so by the time the open returned the
-    // line is already out; the bounded poll only guards reordering.)
+    // The adoption line reached the sink. (Adoption runs inside Engine::open,
+    // so by the time the open returned the line is already out; the bounded
+    // poll only guards reordering.)
     let deadline = Instant::now() + Duration::from_secs(10);
     let text = loop {
         let bytes = captured.lock().unwrap().clone();
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        if text.contains("obssurv")
-            && text.contains("stranded observed listener")
-            && text.contains("stop the instance and start it again")
-        {
+        if text.contains("obssurv: adopted from a previous engine") {
             break text;
         }
         assert!(
             Instant::now() < deadline,
-            "the stranded-listener diagnostic never reached the sink (captured: {text})"
+            "the adoption diagnostic never reached the sink (captured: {text})"
         );
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(
         text.contains("[hekma] obssurv:"),
         "the diagnostic is a [hekma]-prefixed engine line: {text}"
+    );
+    assert!(
+        !text.contains("stranded") && !text.contains("legacy root route"),
+        "an agent launched under the shared proxy is neither stranded nor on the \
+         legacy route: {text}"
     );
 
     // Supervision itself has no strand: the adopted process is alive and a
@@ -2445,20 +2446,31 @@ fn adopting_an_over_budget_run_with_no_recorded_breach_fires_at_adoption() {
     assert!(pid_alive(pid));
     let run = record_run_id(state.path(), "away").expect("the record carries the Run id");
 
-    // Engine 2 (no budget yet): adopt + resume; arm the ceiling AFTERWARD.
+    // Engine 2 (no budget yet): adopt + resume, then release it.
     let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
     let facade = engine.blocking();
     assert!(
         facade.budget_breach_events("away").unwrap().is_empty(),
         "no breach exists yet (the budget was never armed)"
     );
-    facade
-        .set_config("away", "budget.tokens.cumulative", "15")
-        .unwrap();
-    facade
-        .set_config("away", "budget.breach_action", "pause")
-        .unwrap();
+    let config = engine
+        .agent_home(&hekma_engine::InstanceName::new("away").unwrap())
+        .join(hekma_engine::paths::INSTANCE_CONFIG_FILE);
     drop(engine);
+    // Arm the ceiling while NO engine supervises the agent — a hand edit of
+    // the instance config between hosts. (Since story 21-6 a `config set`
+    // through a supervising engine breaches AT ONCE on a ceiling at or
+    // below the usage, so the un-recorded crossing this leg proves can only
+    // arise when no engine evaluated the write.)
+    let existing = std::fs::read_to_string(&config).unwrap_or_default();
+    assert!(!existing.contains("[budget"), "{existing}");
+    std::fs::write(
+        &config,
+        format!(
+            "{existing}\n[budget]\nbreach_action = \"pause\"\n\n[budget.tokens]\ncumulative = 15\n"
+        ),
+    )
+    .unwrap();
 
     // Engine 3: adopt → re-evaluate → the crash-gap breach FIRES, under the
     // RESUMED Run id, with the (default) pause action.

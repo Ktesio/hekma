@@ -365,7 +365,8 @@ mod tests {
 
     fn usage(seq: u64) -> UsageEvent {
         UsageEvent {
-            instance: "probe".to_string(),
+            instance: Some("probe".to_string()),
+            call_id: None,
             run_id: super::super::RunId::from_wire("run-1"),
             input_tokens: 10,
             output_tokens: 20,

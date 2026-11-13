@@ -372,6 +372,20 @@ pub enum EngineError {
         detail: String,
     },
 
+    /// A supervised start could not issue the launch's Run Key (story 22-1):
+    /// the operating system's random source failed. There is no fallback, so
+    /// no process was spawned and nothing changed.
+    #[error(
+        "Agent Instance '{name}' was not started: the operating system's random source failed, \
+         so no Run Key was issued ({detail})"
+    )]
+    CredentialUnavailable {
+        /// The instance asked for.
+        name: String,
+        /// The random source's own error text.
+        detail: String,
+    },
+
     /// The instance's adapter could not be re-resolved for launch (a corrupt or
     /// now-missing manifest/snapshot). Names the instance + detail.
     #[error("could not resolve the adapter for Agent Instance '{name}': {detail}")]

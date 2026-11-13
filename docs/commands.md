@@ -222,18 +222,22 @@ Every start runs under the local Service Host (see [How the CLI reaches the Serv
 
 **One Run across the whole detached life.** The Run id is persisted with the spawn record, and every later adoption **resumes** it instead of minting a fresh one — so a detached instance is a single Run from its `start` until a genuine `stop`/`start` opens a new one (a crash relaunch keeps it). Per-run token and dollar totals therefore keep accumulating across commands (`show`'s "this run" numbers no longer reset per command), and a budget breach that already fired for that Run is **spent**: the adoption-time re-evaluation still runs, but a breach already recorded in the instance's breach log for the resumed Run neither re-records a duplicate breach event nor re-fires the action — once per Run, not once per command. A genuine `stop`/`start` still resets both: a fresh Run mints and, if the cumulative total is still over a ceiling, the breach fires again under the new Run. A Restart Policy relaunch after a crash does not: it continues the same Run. A spawn record written before durable Run ids existed (pre-upgrade) is minted once, persisted back, and noted once on stderr — the next command resumes that minted id.
 
-## `hekma agent stop <name> [--timeout <secs>]`
+## `hekma agent stop <name|run-id|--selector <selector>> [--timeout <secs>] [--dry-run] [--yes] [--json]`
 
 Stop a running Agent Instance: graceful shutdown, then a forced kill after the window.
 
 ```bash
 hekma agent stop my-agent
 hekma agent stop my-agent --timeout 10
+hekma agent stop run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
+hekma agent stop --selector team=core --dry-run
 ```
+
+`stop`, `pause`, `resume` and `drain` take an agent, a run id, or a Selector — see [Selectors on the lifecycle verbs](#selectors-on-the-lifecycle-verbs).
 
 - `--timeout <secs>` — the graceful-shutdown window before a forced kill (default 30). No child process survives. The Service Host serves windows of `1` to `86400` seconds: `--timeout 0` is served as a 1-second window (SIGTERM, then a forced kill after at most one second), and a stderr note says so; a value above `86400` is served as `86400`, with the same note.
 
-## `hekma agent pause <name>` / `hekma agent resume <name>`
+## `hekma agent pause <name|run-id|--selector <selector>>` / `hekma agent resume <name|run-id|--selector <selector>>`
 
 Pause a running instance, or resume a paused one, with honest per-OS semantics.
 
@@ -246,7 +250,7 @@ A **guaranteed** pause suspends the process (SIGSTOP on Unix); a **best-effort**
 
 **The cooperative-first dispatch (adapter-declared lifecycle commands).** When the adapter's manifest declares the `[lifecycle.pause]`/`[lifecycle.resume]` command pair, `pause` RUNS THE COMMAND instead of dispatching the OS signal path — on every OS the same way, and even where the capability table says `unsupported` (the agent suspends itself under its own program; see [the manifest reference](manifest.md) for the pair rule and the 30 s standalone command cap). The `resume` direction is gated on WHICH KIND of pause is in place, because an instance can read `paused` three ways: OPERATOR (the engine's signal suspension), BREACH (the budget enforcement freeze), or COOPERATIVE (its declared pause command completed) — only a COOPERATIVE pause runs the declared resume command; a `resume` of a signal-frozen instance stays on the SIGCONT path even when the pair is declared, because the suspension to undo is the engine's, not the agent's (a command edge there would record `running` over a still-frozen process). A command that exits nonzero or cannot spawn rejects the verb with the state untouched (`PauseCommandFailed`, exit 1 — never a fake pause; the command's captured stderr tail rides along in the failure detail), and a command that outlives the 30 s standalone cap is killed and rejected the same way — a pause command stuck in an infinite loop fails the verb in bounded time rather than hanging it (a corpse that never confirms its kill gets its own honest note). The recorded causes are `pause-cooperative`/`resume-cooperative` naming the rendered command, and the stop of a cooperatively-paused instance SKIPS the OS resume signal (there is no suspension to undo) with a visible note saying so. One deliberate exception: a budget-breach pause keeps the real signal suspension — enforcement needs a process the engine actually froze.
 
-## `hekma agent drain <name> [--timeout-ms <ms>]`
+## `hekma agent drain <name|run-id|--selector <selector>> [--timeout-ms <ms>]`
 
 Drain a running instance: stop new work, wait — bounded — for the agent's in-flight work to reach zero, then stop it. The composite runs the adapter's declared `[lifecycle.pause]` command (cooperative, never an OS signal), polls the declared `[drain].idle_file` (when declared) for freshness while also watching the agent process itself, then drives the ordinary stop ladder.
 
@@ -258,6 +262,21 @@ hekma agent drain my-agent --timeout-ms 10000
 The bound is three-tier: `--timeout-ms` (`1..=600000` ms — outside the range is a usage error, exit 2) wins; else the manifest's `[drain].timeout_ms`; else the engine default of 30 s. Both outcomes are command SUCCESSes (exit 0): a drain whose bounded wait COMPLETED prints the final state like a stop; a drain that outlived its bound STILL stopped the instance (the last step is unconditional) and prints a stderr note saying the wait did not complete, with the outcome recorded on the final `drain-stopped` transition either way. A manifest with neither lifecycle commands nor a `[drain]` section has nothing declared to wait for — the drain stops directly, reports a zero wait, and says so with a diagnostic. Refusals: the instance must be `running` (a registered or paused instance is refused, exit 4), and a declared pause command that exits nonzero or cannot spawn rejects the drain with the state untouched (`PauseCommandFailed`, exit 1 — the captured stderr tail rides along). An OVERRUN is different inside a drain: a pause command that outlives the drain's bound is killed, commits NO `pause-cooperative` edge (the row stays `running` — the bound, not the adapter, ended it), and the drain simply becomes the timed-out path: the stop still happens and the outcome is honestly recorded as not completed — unlike the standalone `pause`, which rejects with exit 1 on the same overrun. The agent itself is watched during the wait too: a process that ends on its own mid-drain (a crash or a declared exit) breaks the wait early with an "ended on its own" diagnostic, and the drain's outcome is honestly not-completed there as well — never a fabricated completion over a corpse.
 
 One interaction with detach is worth knowing — **what happens to a paused detached agent when the engine holding it exits (for the CLI: the local Service Host) depends on WHY it is paused**. Below, "command" reads "host": every CLI start is held by the host, and the "between commands" window is the window between hosts. For an **operator pause** (you ran `pause`), the suspension holds for exactly as long as some engine session holds the agent: when the holding command exits, the engine **SIGCONTs the child before releasing it** and records the `paused → running` edge with a dedicated `detached-resumed` cause (visible in the lifecycle log and surfaced with a stderr note) — an operator-paused detached child is never left SIGSTOP-frozen and unwatched between commands, which was the old behavior. For a **budget-breach pause** (the default `breach_action: pause` crossed a ceiling), the engine deliberately does **not** resume at release: between commands there is no supervision or budget enforcement (the enforcement window), and resuming the agent there would let it run unsupervised past its ceiling while the resumed-run breach latch suppresses re-enforcement — so the freeze holds into the between-commands window, a stderr note names why, and the next command's adoption names the stranded-paused state again; an explicit `resume` (or `stop`) from a later command is the way out. For a **cooperative pause** (the adapter's declared pause command ran), release is the most hands-off of the three: the suspension lives in the agent, not the process, so there is **no OS resume to send** — no signal, no transition, the row keeps reading `paused`, and the stderr note names that plus the recovery (a later `resume` runs the declared resume command). This is the one shape that CAN stay paused across commands by design: the agent is not frozen, it is honoring its own pause. If the engine itself dies mid-pause (no clean exit), the next command's adoption keeps the row **paused** — adoption never auto-resumes — and says so on stderr with the matching release semantics named (operator: released at that command's exit; breach: held frozen; cooperative: left paused, the agent still honoring it). For the signal-frozen kinds there is still no v1 mechanism to hold a detached agent paused across a release — `stop` is the terminal alternative (it can always be resumed by a later `start`).
+
+## Selectors on the lifecycle verbs
+
+`hekma agent stop`, `pause`, `resume` and `drain`, and `hekma run close`, take one target or a set (see [Runs: verbs at scale](runs.md#verbs-at-scale)):
+
+| Argument / flag | Meaning |
+|---|---|
+| `<name>` | An agent: today's command, unchanged |
+| `<run-id>` | A Run: on the Run that owns an agent's process the verb is the agent's own; any other Run is refused, naming its depth. A registered agent whose name has an older run id's shape (`run-<digits>-<digits>`) is read as that agent |
+| `--selector key=value[,key=value...]` | Every open Run carrying all these labels, bound or caller (at most 1000) |
+| `--dry-run` | Show each Run's planned outcome (`would-stop`, or the refusal and its code); change nothing and start no Service Host |
+| `--yes` | Do not ask before acting on several Runs |
+| `--json` | Print `{"schema_version": 1, "verb", "dry_run", "matched", "results": [{"run_id", "outcome", "instance", "error"}]}` |
+
+When a Selector matches more than one Run, the set is listed (run id, CONTROL, STATUS, agent) and you are asked to confirm, for example `Stop these 3 Runs? [y/N]`. Only a terminal is asked: without one the command is refused (exit 2) unless `--yes` is given, and stdin is never read. A child Run's lifecycle verbs act on its model calls, which Hekma cannot hold or reject yet, so a child is refused (exit 4) and the others still act; a child held because its parent is paused is refused naming the parent. Each Run reports its own result, and the exit code is the first failure's (`3` not found, `4` refused by the Run's state or depth, `2` an invalid request), with the count in its message. A Selector that matches nothing is a success with a note. A set is acted on in one call carrying a set token, so exactly the listed Runs act; a Run that ended in between is its own `run-ended` refusal. Stops and drains on a set wait out their windows one after another; the command waits at most 10 seconds plus each Run's bound (capped at 10 minutes), then says it stopped waiting while the acts may still be committing. `start` and `send` take no Selector: a Selector matches open Runs, so there is nothing to start, and `send` carries text to one agent.
 
 ## `hekma agent send <name> <text>`
 
@@ -466,7 +485,7 @@ checksum exactly. The command reads the artifact embedded in the binary; it
 touches no state directory, needs no registered instance, and works offline.
 The same files ship as release assets with every release.
 
-## `hekma run open --parent <run-id|agent> [...]` / `close <run-id>` / `show <run-id>`
+## `hekma run open --parent <run-id|agent> [...]` / `close <run-id|--selector <selector>>` / `show <run-id>`
 
 Open, close and show Runs (see [Runs](runs.md)). Every started agent owns a
 Run; `open` starts a **child Run** under it for one unit of a Host's work.
@@ -488,17 +507,48 @@ hekma run close run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
 | `--dollar-cap <dollars>` | A per-run dollar cap over the child and its own children (needs the agent's Rate) |
 | `--breach-action warn` | The child's ceilings take `warn`; `pause`, `stop` and `block` are refused for a child Run |
 | `--external-id <id>` | A retried `open` with the same id returns the same Run |
+| `--print-key` | Issue the child's [Run Key](run-keys.md) and refresh credential and print them once (`run key: hk_run_…`, `refresh credential: hk_ref_…`; with `--json` a `credentials` object), with a stderr note that they are not shown again. Without it no credential is issued |
 | `--json` | Print the Run as `{"schema_version": 1, "run": {…}}` |
 
 `show` prints the Run's CONTROL depth (`supervised (no wire)` when its calls
-skip the metering listener), status, Anomalies, parent, instance, labels with
+skip the metering proxy), status, Anomalies, parent, instance, labels with
 their source (`bound, config`, `bound, label-verb` or `caller`), limits, subtree usage and open children. A child's usage counts
 on every ancestor, and every ancestor's ceilings apply to it. `close` ends a
 child Run (closing an ended one changes nothing); a Run that owns an agent's
 process is stopped with `hekma agent stop`, never closed. Exit codes: `3` when
 no Run has the id, `4` when the agent has no open Run, the parent has ended or
 the Run owns a process, `2` for a malformed flag, more than 8 levels of
-nesting, or a Breach Action the child cannot execute.
+nesting, or a Breach Action the child cannot execute. `close` also takes
+`--selector`, `--dry-run`, `--yes` and `--json` like the
+[lifecycle verbs](#selectors-on-the-lifecycle-verbs); a Run that owns an
+agent's process is that Run's refusal.
+
+## Run Keys
+
+### `hekma run keys <run-id> [--json]` / `revoke-keys <run-id> [--no-cascade] [--json]`
+
+`keys` lists a Run's credentials (see [Run Keys](run-keys.md)): each one's
+token id, class (`run-key`, `refresh`), state (`active`, `retired`,
+`revoked`), launch generation, the token id it was issued under, the issue
+time and the revocation cause. Never a key. It reads `state.db` read-only and
+starts nothing; for a live supervised Run with no key it says "This Run
+started before Run Keys; it gets one at its next launch."
+
+`revoke-keys` revokes the Run's active credentials and, by default, every
+credential issued under any of them — the keys of child Runs opened with
+them, and their refresh chains. `--no-cascade` revokes the Run's own only.
+It goes through the local Service Host and returns once the revocation is
+committed, so the next request presenting a revoked key is refused:
+
+```text
+✓ Revoked 2 credential(s) for run_01JZ6Q9G3S8V2X7K4M1N5P0R2T and 1 under its child Runs; calls presenting them are refused from now on.
+  run_01JZ6Q9G3S8V2X7K4M1N5P0R2T  run-key  3f9a1c0b7d2e
+  …
+```
+
+It also clears the Run's `credential-reuse` Anomaly. Revocation never ends a
+Run. Exit codes: `3` when no Run has the id, `1` when the host cannot be
+reached.
 
 ## `hekma ps [--selector <sel>] [--all] [--limit <n>] [--cursor <c>] [--json]`
 
@@ -527,7 +577,7 @@ not listed, and `--all` adds every Run inside the window. Rows are ordered
 by run id, newest first, and the cursor pages without duplicates. The
 columns: **RUN** (the agent's name on process-owning rows, the run id on
 child Runs), **CONTROL** (the depth; `supervised (no wire)` for an agent
-whose model calls skip the metering listener), **STATUS**, **ANOMALIES**
+whose model calls skip the metering proxy), **STATUS**, **ANOMALIES**
 (the `breach` Anomaly with each latched Breach Action — `breach[block]`),
 **LABELS** (a caller label is suffixed `(caller)`), **Usage** (the Run's
 subtree tokens and derived dollars — an estimate; a dollar figure appears
@@ -561,13 +611,39 @@ hekma label remove --selector team=core tier --yes
 |---|---|
 | `<run-id\|agent>` | The target, unless `--selector` is given: a run id, or an agent name (its open Run) |
 | `--selector key=value[,key=value...]` | Every open Run carrying all these labels, bound or caller (at most 1000) |
-| `--dry-run` | Show each Run's planned change; write nothing |
+| `--dry-run` | Show each Run's planned change, and each refusal as `Run <id> would refuse (<code>): <reason>` on stdout like every set-taking verb; write nothing |
 | `--yes` | Do not ask before acting on several Runs |
-| `--json` | Print `{"schema_version": 1, "dry_run", "matched", "results": [{"run_id", "outcome", "labels", "prior_labels", "error"}]}` |
+| `--json` | Print `{"schema_version": 1, "verb": "label", "dry_run", "matched", "results": [{"run_id", "outcome", "labels", "prior_labels", "error"}]}` |
 
 A label set here is bound with origin `label-verb`: it outranks the agent's
 `labels.<key>` configuration and any caller label on the key, and stays with
 the Run across a relaunch.
+
+## `hekma budget show|set <run-id|agent|--selector <selector>> [flags] [--dry-run] [--yes] [--json]`
+
+Read and set the limits of Runs (see [Runs: limits on a Run](runs.md#run-limits)).
+
+```bash
+hekma budget show my-agent
+hekma budget show --selector team=core --limit 20 --json
+hekma budget set my-agent --tokens-per-run 500000
+hekma budget set run_01JZ6Q9G3S8V2X7K4M1N5P0R2T --dollars-per-run 3.00 --breach-action pause
+hekma budget set --selector team=core --clear tokens-per-run,breach-action --yes
+```
+
+| Flag (`set`) | Meaning |
+|---|---|
+| `--tokens-per-run <n>` | A per-run token ceiling on the Run |
+| `--tokens-cumulative <n>` | A cumulative token ceiling (an agent's own Run only — it counts the agent's lifetime usage) |
+| `--dollars-per-run <dollars>` | A per-run dollar cap (`3.00`; needs a Rate) |
+| `--dollars-cumulative <dollars>` | A cumulative dollar cap (an agent's own Run only) |
+| `--breach-action <action>` | The Run's Breach Action: `warn`, `pause`, `stop` or `block` |
+| `--clear <limit>[,<limit>]` | Clear limits set on the Run: `tokens-per-run`, `tokens-cumulative`, `dollars-per-run`, `dollars-cumulative`, `breach-action` (repeatable) |
+| `--dry-run`, `--yes`, `--json` | As for the [lifecycle verbs](#selectors-on-the-lifecycle-verbs); `--json` carries `verb: "budget"` and, per Run, the outcome (`raised`, `lowered`, `cleared`, `set`, `unchanged`, `would-set`), the limits before and after, the resolved limits with their sources, what fired or re-armed, `run_scoped: true` and a note |
+
+A limit set here outranks the agent's `budget.*` configuration and every Policy for that limit, and it **belongs to the Run**: a crash relaunch keeps it, it ends with the Run, and a new `start` opens a new Run without it — every result says so. For limits every future Run should carry, use the agent's `budget.*` configuration or a [Policy](policies.md). A ceiling raised above the usage re-arms its breach and lifts a matching `block` fence at once; one lowered to or below the usage breaches at once and applies the Breach Action. Over a Selector, the command waits up to 45 seconds per Run (capped at 10 minutes), enough for a breach whose `stop` runs the default 30-second ladder inside the act. Refusals: a cumulative ceiling on a child Run (`scope-unavailable`, exit 2); a Breach Action the Run cannot execute, such as `block` with no wire path (naming the Metering Source) or `pause` on a child Run (exit 2); an ended Run (exit 4); no such Run or agent (exit 3).
+
+`show` prints, per Run, each ceiling with its source (`run`, `instance`, `policy:<name>`, `default`, or `caller` where a Caller's tighter limit applies), its usage and headroom, the Breach Action, the latched breaches and the limits set on the Run itself. With `--selector`, or with no target at all, `show` lists Runs the way [`hekma ps --all`](#hekma-ps---selector-sel--all---limit-n---cursor-c---json) does — every open Run and those that ended in the last seven days, newest first — and pages with `--limit` (default 50, at most 1000) and `--cursor <cursor>` (the next page's cursor is printed on stderr, and is `next_cursor` in `--json`). `show` only reads and starts no Service Host.
 
 ## `hekma policy list|show|create|change|delete <name> [flags] [--dry-run] [--json]`
 
@@ -619,7 +695,37 @@ the Run has ended or the label cannot be removed, `2` for a malformed label
 or Selector, a Selector matching more than 1000 Runs, or several matches with
 no terminal and no `--yes`.
 
-## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--listen <addr> --bearer-secret <name> [--tls-cert <pem> --tls-key <pem>]] [--state-dir <dir>] [--log-capture <mode>] [--otlp-endpoint <url> [--otlp-headers <k=v,...>] [--otlp-flush-interval <secs>]]`
+## `hekma binding create|list|show|set|delete` / `route add|remove` / `credential issue|revoke|list`
+
+Manage **endpoint bindings**, the routes the [metering proxy](metering-proxy.md) uses for clients Hekma did not start. A binding says: calls arriving on this path prefix forward to this upstream, and are charged to Runs that carry these labels. Reads open the state directory read-only and start nothing. Each change is one call to the local Service Host and one `binding` event.
+
+```bash
+hekma binding create openai --prefix /openai --upstream https://api.openai.com/v1 --label team=core
+hekma binding list [--after <name>] [--limit <n>] [--json]
+hekma binding show openai [--json]
+hekma binding set openai --label team=platform
+hekma binding set openai --clear-labels
+hekma binding delete openai
+hekma binding route add openai backup --upstream https://backup.example.com/v1
+hekma binding route remove openai backup
+hekma binding credential issue openai --class proxy-access
+hekma binding credential revoke openai --class proxy-access
+hekma binding credential list openai [--json]
+```
+
+- `create <name> --prefix <prefix> --upstream <url> [--label k=v]... [--custodied-key secret:NAME] [--json]`:
+  - The prefix is `/` plus segments of letters, digits and `._~-`, at most 128 characters, unique, and never under `/_hekma`. `/` alone catches every call no other binding matches.
+  - The upstream is `http://` or `https://`, with no user info, query or fragment.
+  - The custodied key is stored as a `secret:NAME` reference only. It is inert until key custody ships, and `create` says so.
+- `show` prints the **client base URL**: the proxy's address plus the prefix, for example `http://127.0.0.1:8400/openai`. Point the client's base URL there. Before any host has served the state directory, no port is recorded yet, and `show` says so.
+- `set` changes the prefix, the upstream, the labels (`--label` replaces the whole set; `--clear-labels` removes them) or the custodied-key reference (`--clear-custodied-key` removes it). A prefix or upstream change keeps the binding's Runs. A label change updates its open Runs.
+- `delete` ends the binding's Run and its split Runs with cause `binding-removed`. Further calls on its prefix get `404 hekma_no_route`.
+- `route add|remove` manages up to 16 **reroute routes** per binding. They are stored and checked now, and used when reroute ships.
+- `credential issue --class announce|proxy-access` prints the binding's credential once, on stdout, with a note on stderr: `hk_ann_…` for announce, `hk_pxy_…` for proxy-access. Only its hash is stored. Issuing again revokes the previous credential of that class. `revoke` works per class, and `list` shows token ids and states, never a value. **Nothing accepts either credential yet**; the releases that add announce and the proxy beyond loopback will.
+
+There are at most 256 bindings. A refusal names the field or the clash: a bad prefix, upstream or reference, a duplicate name or prefix, or a `/` binding while an upgraded agent holds the legacy route. A refusal exits `2`, and a missing binding or route exits `3`. The same operations are on the Control API under [`/v0/bindings`](control-api.md), for the Operator bearer only.
+
+## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--no-identity-headers] [--listen <addr> --bearer-secret <name> [--tls-cert <pem> --tls-key <pem>]] [--state-dir <dir>] [--log-capture <mode>] [--otlp-endpoint <url> [--otlp-headers <k=v,...>] [--otlp-flush-interval <secs>]]`
 
 Run the long-running **Service Host**: one process that owns a state directory for its whole lifetime — it adopts every live agent at open, holds the single-writer host lock, and waits. On SIGTERM (or Ctrl+C / SIGINT) it stops every RUNNING agent through the bounded graceful ladder, surfaces each per-instance outcome, and only then exits. While it runs, stdout stays silent — the command's "result" is the long-running process itself, and everything of operator consequence is a `[hekma] `-prefixed diagnostic line on **stderr** (host startup naming the state root, the signal receipt, each per-instance stop outcome, shutdown complete), interleaved with the engine's own diagnostics on the same stream.
 
@@ -637,7 +743,8 @@ hekma serve --otlp-endpoint http://127.0.0.1:4318 --otlp-headers authorization=s
 Every serve — explicit or auto-started by a `hekma agent` write — binds a **loopback local endpoint** for the CLI and records it in `<state-dir>/control.json` (owner-only; removed at shutdown); a `local control endpoint on <addr>` notice names it. While a host serves the directory, every `hekma agent` write goes through it (see [How the CLI reaches the Service Host](#how-the-cli-reaches-the-service-host)). If an auto-started host already holds the directory, an explicit `hekma serve` there is refused like any second host — stop that host's agents and let it idle out (or end its process; `control.json` names the pid), then start yours.
 
 - `--stop-window <secs>` — the graceful stop window, in whole seconds, each running agent gets to exit on before the stop ladder escalates to a forced kill (default `30`, the same default as `hekma agent stop`; bounded `1..=86400` — `0` and out-of-range values are refused as a usage error, on this flag and on every other serve surface).
-- `--metering-listen <port>` — a fixed loopback port for every `engine-observed` instance's metering listener for this host's lifetime (default `0` = OS-ephemeral). With a fixed port, a host restart re-binds the SAME port, so a detached `engine-observed` instance adopted by the new host keeps its injected `base_url` live — without it, an adopted observed instance is stranded (its listener died with the starting command) and the adoption says so. A port that is already in use **refuses the start** with a typed diagnostic naming the port — the host never silently hops to another port. Port `0` keeps the pre-serve ephemeral behavior.
+- `--metering-listen <port>` — the loopback port of the host's **metering proxy**, the one listener every metered model call goes through (see [The metering proxy](metering-proxy.md)). Without it the host uses the port recorded for this state directory, or lets the OS pick one the first time and records it, so a restart binds the same port and adopted agents keep a live base URL. A port that is already in use never makes the host move to another: the host keeps serving the Control API, names the port and why in a diagnostic (and in `GET /v0/proxy`), and refuses `engine-observed` starts until you free the port or pass another.
+- `--no-identity-headers` — stop adding the outbound identity headers. By default every call the metering proxy forwards carries `x-hekma-run-id` and `x-hekma-labels` (the Run's id and labels) to the model provider; with this flag neither is sent.
 - `--listen <addr>` / `--bearer-secret <name>` — expose the **Control API** (v0, unstable) on an operator address too: an HTTP/JSON surface over the hosted fleet — registration, lifecycle, config, budgets and usage, input, memory, live SSE events — guarded by the resolved bearer token. Both flags or neither (a half-configured API is a usage error); the secret NAME resolves like every Hekma secret (env var, then the state root's `secrets.toml`), and an unresolvable name — or a secret that resolved to an EMPTY value — refuses the startup before anything binds. Operator tooling for a trusted operator — not a multi-tenant service. See [the Control API reference](control-api.md).
 - `--tls-cert <pem>` / `--tls-key <pem>` — serve `--listen` over HTTPS with this PEM certificate chain and private key (both or neither; they need `--listen`). **Required for a non-loopback `--listen`**: `--listen 0.0.0.0:8477` without them is refused with exit code `2` before anything binds or opens, and so is an unreadable PEM file or a key that does not match the certificate (the error names the path). The local endpoint never uses TLS.
 - `--state-dir <dir>` — serve this state directory instead of the resolved default (`HEKMA_STATE_DIR`/`KTESIO_STATE_DIR`, else the platform data dir; same resolution order as every other command).
@@ -693,7 +800,7 @@ Set these with `hekma agent config set <name> <key> <value>`.
 | `model` | string | Model name or identifier passed to the agent through its declared config mapping (if any; the builtin `mock` maps it to the `MODEL` env var, `hermes` does not map it) |
 | `budget.tokens.per_run` | integer | Per-run token ceiling |
 | `budget.tokens.cumulative` | integer | Cumulative token ceiling |
-| `budget.breach_action` | `pause` \| `stop` \| `warn` \| `block` | Action on any budget/cap breach (default `pause`). `warn` records the breach event only — it performs no lifecycle transition. `block` keeps the agent running but its metering listener refuses further model calls (engine-observed instances only — see below) |
+| `budget.breach_action` | `pause` \| `stop` \| `warn` \| `block` | Action on any budget/cap breach (default `pause`). `warn` records the breach event only — it performs no lifecycle transition. `block` keeps the agent running but its metering proxy refuses further model calls (engine-observed instances only — see below) |
 | `cost.rate.input` | dollar string (e.g. `3.00`) | Input price per 1M tokens |
 | `cost.rate.output` | dollar string | Output price per 1M tokens |
 | `cost.rate.cached` | dollar string | Cached-token price per 1M tokens (optional; unset prices cached tokens at the input rate) |
@@ -703,7 +810,7 @@ Set these with `hekma agent config set <name> <key> <value>`.
 | `agent.<key>` | any | Pass-through namespace delivered verbatim to the agent (bypasses known-key validation) |
 | `labels.<key>` | label value | A bound label on the agent's Runs (keys: a lowercase letter then up to 62 of `a-z 0-9 _ . -`; values: 1–128 of letters, digits, `_ . : / @ + -`, never `secret:`). Merged per key across layers; applied at start, and at once to a running agent's Run when set with `config set`. Never delivered to the agent |
 
-Two additional known keys are **engine-reserved and never operator-set**: `metering.base_url` (the loopback proxy endpoint the engine injects at start for an `engine-observed` instance) and `memory.dir` (the managed Memory Backing directory the engine injects at start for a `filesystem` backing). Hand-set values are stripped from the operator layers at resolve time, so these can only ever be delivered by the engine itself.
+Two additional known keys are **engine-reserved and never operator-set**: `metering.base_url` (the loopback proxy endpoint the engine injects at start for an `engine-observed` instance) and `memory.dir` (the managed Memory Backing directory the engine injects at start for a `filesystem` backing). Hand-set values are stripped from the operator layers at resolve time, so these can only ever be delivered by the engine itself. Two more are reserved for the launch's [Run Key](run-keys.md): `run.key` and `run.refresh_key`. Setting either is refused (`config set` exits `2` without echoing the value), a hand-edited value is stripped at start, and they never appear in `effective-config.json`; every agent receives its Run Key in `HEKMA_RUN_KEY`.
 
 Both Rate directions are required for dollars to be derived; with no Rate, dollar features are inert (no fabricated `$0.00`). The cached price is OPTIONAL: when set, an event's cached tokens (the subset the provider served from its prompt cache) price at the cached rate and the remaining input at the input rate; when unset, cached tokens price AT the input rate — a deliberate conservative default that can only overstate the cost, never understate it. Cached tokens ride inside `input_tokens` (the input is inclusive), so token budgets count them once, through the ordinary totals, and surfaces show a `/ cached N` suffix only when a known non-zero subset exists. Dollars are integer micro-dollars internally and always labeled estimates. A config value of the form `secret:NAME` (on any key) is a secret reference — resolved at start, masked everywhere Hekma displays it.
 
@@ -713,7 +820,7 @@ When a token ceiling or dollar Cost Cap is crossed, the recorded breach names it
 
 ### The wire fence: `block`
 
-`block` is for engine-observed instances. On a breach, the metering listener refuses every further model call with HTTP `402` and a `hekma_budget_block` error that common SDKs do not retry. The agent process keeps running, and its state does not change. `GET`, `HEAD` and `OPTIONS` requests still pass. The fence lifts when the Run ends: raise the ceiling, then `stop` and `start` the instance. A Run that starts or relaunches at or over a `block` ceiling is fenced before its first call. `config set ... budget.breach_action block` is refused on an instance without the listener (for example a `self-reported` one), naming its metering source. `block` is never a default, and it is cooperative: an agent that calls its provider directly is not fenced. The refusal's exact shape (`proxy-wire v1`) and the full rules are in [Hosting: the wire fence](hosting.md#the-wire-fence-block-refuses-further-model-calls).
+`block` is for any Run whose model calls go through the [metering proxy](metering-proxy.md): a supervised `engine-observed` agent, and the Runs of endpoint bindings and their child and split Runs. On a breach, the proxy refuses every further model call with HTTP `402` and a `hekma_budget_block` error that common SDKs do not retry. The agent process keeps running, and its state does not change. `GET`, `HEAD` and `OPTIONS` requests still pass. The fence lifts when the Run ends, or as soon as the matching ceiling is raised above the totals on the live Run — with `hekma budget set`, an agent `budget.*` configuration write or a Policy change — reason by reason: a fence still holding another latched `block` reason stays up. A Run that starts or relaunches at or over a `block` ceiling is fenced before its first call. `config set ... budget.breach_action block` is refused on an instance whose calls skip the proxy (for example a `self-reported` one), naming its metering source. `block` is never a default, and it is cooperative: an agent that calls its provider directly is not fenced. The refusal's exact shape (`proxy-wire v1`) and the full rules are in [Hosting: the wire fence](hosting.md#the-wire-fence-block-refuses-further-model-calls).
 
 ## Global Behavior
 

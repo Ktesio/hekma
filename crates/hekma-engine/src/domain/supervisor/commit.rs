@@ -83,6 +83,12 @@ pub(super) fn commit_transition(
         store.append_transition(&event)?;
         let append =
             store.append_outbox(&EngineEvent::Transition(event.clone()), OUTBOX_MAX_BYTES)?;
+        // Story 22-1: the credentials this exit takes out of service are
+        // revoked HERE, in the transition's own transaction and before the
+        // savepoint below — a revocation that cannot be written fails the
+        // whole transition (it never fails open).
+        let revoked = runs::ops::revoke_on_exit(store, &name, new, fate, &event.at)?;
+        let mut run_events = runs::ops::commit(ctx, &publisher, revoked)?;
         // The Run projection runs in its own savepoint: Run bookkeeping
         // never blocks a lifecycle transition (graceful degradation) — a
         // failure rolls back only the projection and is surfaced.
@@ -92,9 +98,12 @@ pub(super) fn commit_transition(
                 runs::ops::project_transition(store, &name, new, fate, &cause, &event.at)?;
             runs::ops::commit(ctx, &publisher, changes)
         });
-        let (run_events, projection_failed) = match projected {
-            Ok(events) => (events, None),
-            Err(err) => (Vec::new(), Some(err.to_string())),
+        let projection_failed = match projected {
+            Ok(events) => {
+                run_events.extend(events);
+                None
+            }
+            Err(err) => Some(err.to_string()),
         };
         Ok(CommittedTransition {
             snapshot,

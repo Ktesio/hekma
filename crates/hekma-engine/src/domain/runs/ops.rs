@@ -34,6 +34,11 @@ pub(crate) struct RunChanges {
     /// Diagnostics the operation surfaced (a fail-closed resolution note):
     /// the caller emits them on the engine's diagnostic surface.
     pub notes: Vec<String>,
+    /// Story 22-1: the credential events the operation caused (one per
+    /// token per change), appended to the outbox after the Run events.
+    pub credentials: Vec<crate::domain::credential::CredentialEvent>,
+    /// Story 22-1: the key-index changes, published with the Run entries.
+    pub keys: Vec<super::snapshot::KeyChange>,
     /// Test-only: the Runs whose Policy hook ran in this operation.
     #[cfg(test)]
     pub policy_resolved: Vec<RunId>,
@@ -44,6 +49,8 @@ impl RunChanges {
         self.events.extend(other.events);
         self.entries.extend(other.entries);
         self.notes.extend(other.notes);
+        self.credentials.extend(other.credentials);
+        self.keys.extend(other.keys);
         #[cfg(test)]
         self.policy_resolved.extend(other.policy_resolved);
     }
@@ -59,8 +66,9 @@ pub(crate) enum RunFate {
     Terminal,
 }
 
-/// A Run event + its outbox position, as committed.
-pub(crate) type CommittedRunEvent = (RunEvent, OutboxAppend);
+/// A Run-registry event (a Run event, or since story 22-1 a credential
+/// event) + its outbox position, as committed.
+pub(crate) type CommittedRunEvent = (EngineEvent, OutboxAppend);
 
 /// Append `changes`' events to the outbox and register the snapshot
 /// publish after commit. Returns the events in commit order for the caller
@@ -70,17 +78,22 @@ pub(crate) fn commit(
     publisher: &Arc<SnapshotPublisher>,
     changes: RunChanges,
 ) -> Result<Vec<CommittedRunEvent>, StoreError> {
-    let mut committed = Vec::with_capacity(changes.events.len());
-    for event in changes.events {
-        let append = ctx
-            .store()
-            .append_outbox(&EngineEvent::Run(event.clone()), OUTBOX_MAX_BYTES)?;
+    let mut committed = Vec::with_capacity(changes.events.len() + changes.credentials.len());
+    let events = changes.events.into_iter().map(EngineEvent::Run).chain(
+        changes
+            .credentials
+            .into_iter()
+            .map(|event| EngineEvent::Credential(Box::new(event))),
+    );
+    for event in events {
+        let append = ctx.store().append_outbox(&event, OUTBOX_MAX_BYTES)?;
         committed.push((event, append));
     }
-    if !changes.entries.is_empty() {
+    if !changes.entries.is_empty() || !changes.keys.is_empty() {
         let publisher = Arc::clone(publisher);
         let entries = changes.entries;
-        ctx.after_commit(move || publisher.publish(entries));
+        let keys = changes.keys;
+        ctx.after_commit(move || publisher.publish_changes(entries, keys));
     }
     Ok(committed)
 }
@@ -114,6 +127,11 @@ fn note<S: RunRecords + ?Sized>(
         anomalies: record.anomalies.clone(),
         labels: bound_only(&labels),
         prior_labels: prior.labels,
+        limits: prior
+            .limits
+            .map(|_| Box::new(prior.after_limits.unwrap_or(limits))),
+        prior_limits: prior.limits.map(Box::new),
+        limits_layer: prior.layer.map(str::to_string),
         cause,
         policies: resolution
             .as_ref()
@@ -126,8 +144,50 @@ fn note<S: RunRecords + ?Sized>(
         &labels,
         limits,
         resolution.as_ref(),
+        store.entry_extras(&record.run_id)?,
     ));
     Ok(())
+}
+
+/// Note a just-inserted Run's `created` event and entry (story 23-1: the
+/// wire-Run job).
+pub(crate) fn note_created<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    record: &RunRecord,
+    cause: Option<String>,
+) -> Result<(), StoreError> {
+    note(
+        store,
+        changes,
+        record,
+        RunEventKind::Created,
+        Prior::default(),
+        cause,
+    )
+}
+
+/// A fresh snapshot entry for `run_id` with no event (story 23-1: a job
+/// that changed only a latch — a `block` breach on a Run already carrying
+/// its `breach` Anomaly, a re-arm — republishes the disposition). `None`
+/// for a Run with no row.
+pub(crate) fn refreshed_entry<S: RunRecords + ?Sized>(
+    store: &S,
+    run_id: &RunId,
+) -> Result<Option<RunEntry>, StoreError> {
+    let Some(record) = store.run_record(run_id)? else {
+        return Ok(None);
+    };
+    let labels = store.run_labels(run_id)?;
+    let limits = store.run_limits(run_id)?;
+    let resolution = store.run_policy(run_id)?.map(|row| row.resolution);
+    Ok(Some(super::snapshot::entry_of(
+        &record,
+        &labels,
+        limits,
+        resolution.as_ref(),
+        store.entry_extras(run_id)?,
+    )))
 }
 
 #[derive(Default)]
@@ -136,6 +196,14 @@ struct Prior {
     depth: Option<ControlDepth>,
     wire_path: Option<bool>,
     labels: Option<Vec<Label>>,
+    /// The Run's own limits before, on `limits-changed` (the event then
+    /// carries the limits after too).
+    limits: Option<super::RunLimits>,
+    /// The changed layer after, on `limits-changed` (else the Run's
+    /// Operator/Host layer as read back).
+    after_limits: Option<super::RunLimits>,
+    /// Which layer the limits describe, on `limits-changed` (story 22-1).
+    layer: Option<&'static str>,
 }
 
 /// The bound subset of `labels` (what a Run event carries).
@@ -149,8 +217,9 @@ fn bound_only(labels: &[Label]) -> Vec<Label> {
 
 /// Move `record` to `status` with `anomalies`, saving it and noting the
 /// event (`ended`, `status-changed` or `anomalies-changed`). Nothing when
-/// neither changed.
-fn move_to<S: RunRecords + ?Sized>(
+/// neither changed. Story 22-1: a move to `ended` revokes the Run's
+/// remaining active credentials in the same job (`run-ended`).
+pub(crate) fn move_to<S: RunRecords + ?Sized>(
     store: &S,
     changes: &mut RunChanges,
     mut record: RunRecord,
@@ -184,6 +253,9 @@ fn move_to<S: RunRecords + ?Sized>(
         ..Prior::default()
     };
     note(store, changes, &record, kind, prior, cause)?;
+    if kind == RunEventKind::Ended {
+        super::keys::on_run_ended(store, changes, &record.run_id, at)?;
+    }
     Ok(Some(record))
 }
 
@@ -293,6 +365,10 @@ pub(crate) fn project_transition<S: RunRecords + ?Sized>(
     };
     let from = run.status;
     let owner = run.run_id.clone();
+    // Story 22-1: the credentials an exit takes out of service are revoked
+    // by [`revoke_on_exit`], in the transition's own transaction — never in
+    // this projection, which a caller may run in a savepoint that absorbs
+    // failures.
     move_to(store, &mut changes, run, status, anomalies, end_cause, at)?;
     cascade(
         store,
@@ -303,6 +379,37 @@ pub(crate) fn project_transition<S: RunRecords + ?Sized>(
         new_state == LifecycleState::Stopped,
         at,
     )?;
+    Ok(changes)
+}
+
+/// The credentials a lifecycle transition takes out of service (story 22-1,
+/// P1): `failed` and `stopped` record a confirmed exit, so the instance's
+/// open process-owning Run loses every launch-issued credential
+/// (`process-exited`) — before any relaunch spawns its next generation —
+/// and, when the edge ends the Run (`stopped`, or a terminal `failed`),
+/// every remaining one (`run-ended`). The caller commits these in the
+/// transition's OWN transaction, outside any failure-absorbing savepoint:
+/// a revocation that cannot be written fails the transition, so an exit is
+/// never recorded with its key still honoured.
+pub(crate) fn revoke_on_exit<S: RunRecords + ?Sized>(
+    store: &S,
+    instance: &InstanceName,
+    new_state: LifecycleState,
+    fate: RunFate,
+    at: &str,
+) -> Result<RunChanges, StoreError> {
+    let mut changes = RunChanges::default();
+    if !matches!(new_state, LifecycleState::Failed | LifecycleState::Stopped) {
+        return Ok(changes);
+    }
+    let Some(run) = store.open_process_run(instance)? else {
+        return Ok(changes);
+    };
+    super::keys::on_process_exited(store, &mut changes, &run.run_id, at)?;
+    let ends = new_state == LifecycleState::Stopped || fate == RunFate::Terminal;
+    if ends {
+        super::keys::on_run_ended(store, &mut changes, &run.run_id, at)?;
+    }
     Ok(changes)
 }
 
@@ -323,6 +430,81 @@ pub(crate) struct SupervisedRun {
     /// Run); a fresh Run with `None` resolves with no explicit instance
     /// limits.
     pub inputs: Option<super::policy::ResolveInputs>,
+    /// Story 23-1: the instance's resolved upstream base URL, recorded on
+    /// the Run (the shared proxy's Run route forwards there); `None` keeps
+    /// what is recorded (an adoption) or records none (self-reported).
+    pub upstream: Option<String>,
+}
+
+/// A supervised launch's credentials (story 22-1), value-free: the Run Key
+/// and, when the Adapter maps one, its refresh credential.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LaunchCredentials {
+    pub key: crate::domain::credential::TokenStub,
+    pub refresh: Option<crate::domain::credential::TokenStub>,
+}
+
+/// Issue a supervised launch's credentials on its Run (story 22-1, P1): in
+/// the launch-record job, with the launch's generation, custody-eligible,
+/// issued by the engine. A token exists in state.db only if its launch was
+/// recorded.
+pub(crate) fn issue_launch<S: RunRecords + ?Sized>(
+    store: &S,
+    run_id: &RunId,
+    generation: u64,
+    credentials: LaunchCredentials,
+    at: &str,
+) -> Result<RunChanges, StoreError> {
+    let mut changes = RunChanges::default();
+    let Some(record) = store.run_record(run_id)? else {
+        return Ok(changes);
+    };
+    // One live generation at a time, by construction: whatever an earlier
+    // launch of this Run still holds is revoked before the new generation
+    // is issued (its exit should already have revoked it — this holds even
+    // when that exit was never recorded).
+    super::keys::revoke_run_tokens(
+        store,
+        &mut changes,
+        run_id,
+        |row| {
+            row.launch_generation
+                .is_some_and(|older| older < generation)
+        },
+        super::keys::cause::PROCESS_EXITED,
+        at,
+    )?;
+    match credentials.refresh {
+        Some(refresh) => super::keys::issue_pair(
+            store,
+            &mut changes,
+            &record,
+            credentials.key,
+            refresh,
+            Some(generation),
+            None,
+            "engine",
+            true,
+            None,
+            at,
+        )?,
+        None => super::keys::issue(
+            store,
+            &mut changes,
+            &record,
+            super::keys::Issue {
+                token: credentials.key,
+                launch_generation: Some(generation),
+                paired: None,
+                issued_by_hash: None,
+                issuer: "engine".to_string(),
+                custody_eligible: true,
+                prior_token_id: None,
+            },
+            at,
+        )?,
+    }
+    Ok(changes)
 }
 
 /// Create the supervised Run (fresh start), or keep it (relaunch, adoption):
@@ -453,6 +635,14 @@ pub(crate) fn ensure_supervised<S: RunRecords + ?Sized>(
             )?);
         }
     }
+    // Story 23-1: the instance's upstream rides the Run (the shared proxy's
+    // Run route forwards there); the freshest entry publishes last.
+    if let Some(upstream) = &run.upstream {
+        store.set_run_upstream(&run.run_id, Some(upstream))?;
+        if let Some(entry) = refreshed_entry(store, &run.run_id)? {
+            changes.entries.push(entry);
+        }
+    }
     Ok(changes)
 }
 
@@ -537,6 +727,36 @@ pub(crate) fn sync_bound_labels<S: RunRecords + ?Sized>(
     Ok(changes)
 }
 
+/// Re-sync a binding Run's `binding`-origin labels to `binding` (story
+/// 23-1: a binding label change re-resolves its Runs in the same job).
+pub(crate) fn sync_binding_labels<S: RunRecords + ?Sized>(
+    store: &S,
+    run_id: &RunId,
+    binding: &[(String, String)],
+    at: &str,
+) -> Result<RunChanges, StoreError> {
+    let mut changes = RunChanges::default();
+    let Some(record) = store.run_record(run_id)? else {
+        return Ok(changes);
+    };
+    let current = store.run_labels(run_id)?;
+    let next = labels::plan_binding_sync(&current, binding);
+    if next == current {
+        return Ok(changes);
+    }
+    write_labels(
+        store,
+        &mut changes,
+        record,
+        &current,
+        &next,
+        "binding",
+        None,
+        at,
+    )?;
+    Ok(changes)
+}
+
 /// Write a Run's next label set (`next`, from a planner), then run the
 /// Policy hook inside the same job, then note the `labels-changed` event
 /// (bound labels before and after) and the snapshot entry — so a Policy
@@ -572,6 +792,40 @@ fn write_labels<S: RunRecords + ?Sized>(
     )?;
     changes.extend(resolved);
     Ok(())
+}
+
+/// Note a `limits-changed` event for `record` (story 21-6): the changed
+/// layer of the Run's own limits before (`prior`) and after (`after`), with
+/// the actor as the cause. The change is the Run's latest update: the row
+/// is saved here with `updated_at = at`, and the event carries that `at`
+/// (the audit time of a money change, not the Run's last earlier write).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn note_limits_changed<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    record: &RunRecord,
+    prior: super::RunLimits,
+    after: super::RunLimits,
+    actor: &str,
+    layer: &'static str,
+    at: &str,
+) -> Result<(), StoreError> {
+    let mut record = record.clone();
+    record.updated_at = at.to_string();
+    store.save_run(&record)?;
+    note(
+        store,
+        changes,
+        &record,
+        RunEventKind::LimitsChanged,
+        Prior {
+            limits: Some(prior),
+            after_limits: Some(after),
+            layer: Some(layer),
+            ..Prior::default()
+        },
+        Some(actor.to_string()),
+    )
 }
 
 /// Note an `anomalies-changed` event for `record` (already saved with its
@@ -738,6 +992,11 @@ pub(crate) fn action_refusal(
     if action == BreachAction::Warn {
         return None;
     }
+    // Story 23-1: `block` executes at any depth with a wire path (the shared
+    // proxy fences the Run and everything beneath it).
+    if action == BreachAction::Block && wire_path {
+        return None;
+    }
     let cell = super::verb_cell(super::RunVerb::BreachActionPauseStopBlock, depth, wire_path);
     if !wire_path {
         Some(
@@ -768,9 +1027,23 @@ pub(crate) fn open_child<S: RunRecords + RunStore + ?Sized>(
     inputs: Option<super::policy::ResolveInputs>,
     at: &str,
 ) -> Result<(RunId, RunChanges), RunError> {
+    open_child_bound(store, request, run_id, inputs, HOST_IDENTITY_BINDING, at)
+}
+
+/// [`open_child`] with the external id resolved under `binding` (story
+/// 22-1: a Caller's external ids live in its own namespace, so a Run Key can
+/// never claim — or probe — an id the Operator or a Host will use).
+pub(crate) fn open_child_bound<S: RunRecords + RunStore + ?Sized>(
+    store: &S,
+    request: &ChildRunRequest,
+    run_id: RunId,
+    inputs: Option<super::policy::ResolveInputs>,
+    binding: &str,
+    at: &str,
+) -> Result<(RunId, RunChanges), RunError> {
     let mut changes = RunChanges::default();
     if let Some(external) = &request.external_id {
-        if let Some(existing) = store.identity_run(HOST_IDENTITY_BINDING, external)? {
+        if let Some(existing) = store.identity_run(binding, external)? {
             return Ok((existing, changes));
         }
     }
@@ -868,7 +1141,7 @@ pub(crate) fn open_child<S: RunRecords + RunStore + ?Sized>(
         identity: request
             .external_id
             .clone()
-            .map(|external| (HOST_IDENTITY_BINDING.to_string(), external)),
+            .map(|external| (binding.to_string(), external)),
     })?;
     note(
         store,
@@ -931,24 +1204,16 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
         .ok_or_else(|| RunError::NotFound {
             run_id: run_id.as_str().to_string(),
         })?;
-    let usage = match &record.instance {
-        Some(instance) => {
-            let name = InstanceName::new(instance).map_err(|e| {
-                RunError::Store(StoreError::CorruptRow {
-                    name: instance.clone(),
-                    detail: e.to_string(),
-                })
-            })?;
-            let rollup = store.run_rollup(&name, run_id)?;
-            RunUsage {
-                input_tokens: rollup.totals.input_tokens,
-                output_tokens: rollup.totals.output_tokens,
-                cached_tokens: rollup.totals.cached_tokens,
-                cost_micros: rollup.cost,
-                estimate: EstimateLabel::Estimated,
-            }
-        }
-        None => RunUsage::default(),
+    // Story 23-1 (v18): the Run rollup is keyed by the run id alone, so a
+    // Run without an Agent Instance (a wire Run of the shared proxy) shows
+    // its usage too — it used to read as zero.
+    let rollup = store.run_rollup_by_id(run_id)?;
+    let usage = RunUsage {
+        input_tokens: rollup.totals.input_tokens,
+        output_tokens: rollup.totals.output_tokens,
+        cached_tokens: rollup.totals.cached_tokens,
+        cost_micros: rollup.cost,
+        estimate: EstimateLabel::Estimated,
     };
     Ok(RunView {
         labels: store.run_labels(run_id)?,
@@ -974,6 +1239,7 @@ pub(crate) fn open_entries<S: RunRecords + ?Sized>(store: &S) -> Result<Vec<RunE
                 &labels,
                 limits,
                 resolution.as_ref(),
+                store.entry_extras(&record.run_id)?,
             ))
         })
         .collect()

@@ -250,6 +250,124 @@ impl StoreWriter {
     }
 }
 
+impl StoreWriter {
+    /// A cloneable send handle for an async producer outside the Registry
+    /// mutex (story 23-1: the shared Metering Proxy). `None` on a closed
+    /// (read-only) writer. The writer thread exits only once every handle
+    /// is dropped, so the holder drops it before the Registry closes.
+    pub(crate) fn handle(&self) -> Option<WriterHandle> {
+        self.tx.as_ref().map(|tx| WriterHandle {
+            tx: tx.clone(),
+            stats: Arc::clone(&self.stats),
+        })
+    }
+}
+
+/// A cloneable send handle on the store writer (story 23-1).
+#[derive(Clone)]
+pub(crate) struct WriterHandle {
+    tx: Sender<Job>,
+    stats: Arc<WriterStats>,
+}
+
+impl std::fmt::Debug for WriterHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriterHandle").finish_non_exhaustive()
+    }
+}
+
+impl WriterHandle {
+    /// Queue `work` unacked, with `finish` told its outcome on the writer
+    /// thread after the batch commits or fails (the proxy's record pump
+    /// re-queues a failed record from there).
+    pub(crate) fn submit_then(
+        &self,
+        work: impl FnOnce(&mut WriterCtx<'_>) -> Result<(), StoreError> + Send + 'static,
+        finish: impl FnOnce(Result<(), StoreError>) + Send + 'static,
+    ) -> Result<(), StoreError> {
+        let stats = Arc::clone(&self.stats);
+        let submitted = Instant::now();
+        self.tx
+            .send(Job {
+                acked: false,
+                weight: 1,
+                state: Arc::new(AtomicU8::new(PENDING)),
+                work: Box::new(work),
+                finish: Box::new(move |outcome| {
+                    if outcome.is_err() {
+                        stats.unacked_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let waited = submitted.elapsed().as_micros() as u64;
+                    stats
+                        .max_unacked_flush_micros
+                        .fetch_max(waited, Ordering::Relaxed);
+                    finish(outcome);
+                }),
+            })
+            .map_err(|_| writer_gone())
+    }
+
+    /// The acked write for an async caller: wait for the job's commit, at
+    /// most [`ACK_BOUND`] while it is still queued (then `Busy`, and the job
+    /// is abandoned — never applied); once taken, wait for its commit.
+    pub(crate) async fn call_async<R: Send + 'static>(
+        &self,
+        work: impl FnOnce(&mut WriterCtx<'_>) -> Result<R, StoreError> + Send + 'static,
+    ) -> Result<R, StoreError> {
+        self.call_async_bounded(ACK_BOUND, work).await
+    }
+
+    /// [`Self::call_async`] with an explicit queue bound (tests).
+    pub(crate) async fn call_async_bounded<R: Send + 'static>(
+        &self,
+        bound: Duration,
+        work: impl FnOnce(&mut WriterCtx<'_>) -> Result<R, StoreError> + Send + 'static,
+    ) -> Result<R, StoreError> {
+        let slot: Arc<Mutex<Option<R>>> = Arc::new(Mutex::new(None));
+        let work_slot = Arc::clone(&slot);
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel::<Result<R, StoreError>>();
+        let state = Arc::new(AtomicU8::new(PENDING));
+        let job = Job {
+            acked: true,
+            weight: 1,
+            state: Arc::clone(&state),
+            work: Box::new(move |ctx| {
+                let value = work(ctx)?;
+                *work_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
+                Ok(())
+            }),
+            finish: Box::new(move |outcome| {
+                let result = outcome.and_then(|()| {
+                    slot.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take()
+                        .ok_or_else(|| {
+                            StoreError::Backend("the store writer lost a job's result".to_string())
+                        })
+                });
+                let _ = reply_tx.send(result);
+            }),
+        };
+        self.tx.send(job).map_err(|_| writer_gone())?;
+        match tokio::time::timeout(bound, &mut reply_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(writer_gone()),
+            Err(_elapsed) => {
+                if state
+                    .compare_exchange(PENDING, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    Err(StoreError::Busy {
+                        waited_ms: bound.as_millis() as u64,
+                    })
+                } else {
+                    reply_rx.await.unwrap_or_else(|_| Err(writer_gone()))
+                }
+            }
+        }
+    }
+}
+
 impl Drop for StoreWriter {
     fn drop(&mut self) {
         // Close the channel, then wait for the queued jobs to commit.

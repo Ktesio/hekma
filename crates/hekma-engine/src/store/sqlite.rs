@@ -95,7 +95,9 @@ use crate::ports::{
 /// upgrade marker — see [`super::runs_sqlite`].
 /// v16 (story 21-5): the Run listing's three partial indexes —
 /// see [`super::runs_sqlite`].
-pub(crate) const SCHEMA_VERSION: i64 = 16;
+/// v17 (story 22-1): `tokens`, the credential hashes and their metadata —
+/// see [`super::tokens_sqlite`].
+pub(crate) const SCHEMA_VERSION: i64 = 18;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -583,7 +585,8 @@ impl SqliteStore {
             .conn
             .prepare(
                 "SELECT run_id, input_tokens, output_tokens, metering_source, sequence, \
-                 occurred_at, cached_tokens FROM usage_events WHERE instance_id = ?1 ORDER BY rowid",
+                 occurred_at, cached_tokens, call_id FROM usage_events WHERE instance_id = ?1 \
+                 ORDER BY rowid",
             )
             .map_err(backend)?;
         let rows = stmt
@@ -592,7 +595,8 @@ impl SqliteStore {
                     // The instance name round-trips from the lookup (the
                     // column itself is the FK's `agent_instances.id`, not a
                     // string).
-                    instance: name.as_str().to_string(),
+                    instance: Some(name.as_str().to_string()),
+                    call_id: row.get::<_, Option<String>>(7)?,
                     run_id: RunId::from_wire(row.get::<_, String>(0)?),
                     // The store clamps on WRITE (saturating into the signed
                     // column), so a stored count is always a faithful u64 —
@@ -731,6 +735,17 @@ fn migrate(
     // crash-atomic step, additive DDL only).
     if version < 16 {
         super::runs_sqlite::migrate_v16(conn)?;
+    }
+    // Story 22-1: v17 adds `tokens` and its three indexes (one crash-atomic
+    // step, additive DDL only, no backfill).
+    if version < 17 {
+        super::tokens_sqlite::migrate_v17(conn)?;
+    }
+    // Story 23-1: v18 adds the shared proxy's bindings, routes, binding
+    // credentials, the Run upstream and the sticky port, and re-keys the
+    // Run rollup by run id (one crash-atomic step, one-way).
+    if version < 18 {
+        super::proxy_sqlite::migrate_v18(conn)?;
     }
     Ok(notes)
 }
@@ -3341,7 +3356,8 @@ mod tests {
 
     fn usage_event(instance: &str, run: &str, seq: u64, input: u64, output: u64) -> UsageEvent {
         UsageEvent {
-            instance: instance.to_string(),
+            instance: Some(instance.to_string()),
+            call_id: None,
             run_id: RunId::from_wire(run),
             input_tokens: input,
             output_tokens: output,

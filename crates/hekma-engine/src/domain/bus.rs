@@ -126,12 +126,26 @@ pub enum EngineEvent {
     Run(super::runs::RunEvent),
     /// A Policy change (story 21-3, AD-14 amendment): created, changed or
     /// deleted — committed with the outbox row in the change's own writer
-    /// job, published after commit.
-    Policy(super::runs::policy::PolicyEvent),
+    /// job, published after commit. Boxed: it is the largest payload, and
+    /// the bus's fixed ring holds every variant at the enum's size, so an
+    /// inline Policy event would grow all 1024 slots (the perf-budgets RSS
+    /// ratchet caught about 120 KiB of resident memory).
+    Policy(Box<super::runs::policy::PolicyEvent>),
     /// The one event the FR-21 breach-default upgrade emits (story 21-3):
     /// which instances were kept on `pause`, and whether each one's config
     /// was written.
     BreachDefaultUpgraded(super::runs::policy::BreachDefaultUpgradedEvent),
+    /// A credential change (story 22-1): issued, rotated, revoked or
+    /// reuse-detected — committed with its outbox row in the job that made
+    /// the change. Carries a token id, never a token or a hash. Boxed for the
+    /// same ring-size reason as `Policy`.
+    Credential(Box<super::credential::CredentialEvent>),
+    /// An endpoint-binding change (story 23-1): created, changed, deleted,
+    /// a route added or removed, a per-binding credential issued or revoked
+    /// — committed with its outbox row in the job that made the change.
+    /// Carries a token id on a credential change, never a token or a hash.
+    /// Boxed for the same ring-size reason as `Policy`.
+    Binding(Box<super::runs::bindings::BindingEvent>),
 }
 
 /// The in-supervisor handle to the event bus: a cloneable pair of
@@ -413,7 +427,8 @@ mod tests {
             "2026-09-09T00:00:00Z",
         );
         let usage = UsageUpdateEvent::new(super::super::UsageEvent {
-            instance: "probe".to_string(),
+            instance: Some("probe".to_string()),
+            call_id: None,
             run_id: super::super::RunId::from_wire("run-1"),
             input_tokens: 10,
             output_tokens: 20,

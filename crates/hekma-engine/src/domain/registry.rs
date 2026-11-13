@@ -275,6 +275,12 @@ pub struct Registry {
     /// upgrade event) for `Engine::open` to publish on the bus; they are
     /// already durable in the outbox.
     pub(crate) open_events: std::sync::Mutex<Vec<(u64, crate::domain::bus::EngineEvent)>>,
+    /// Story 23-1: the `PRAGMA data_version` the reader last saw. The reaper
+    /// tick compares against it to notice a FOREIGN engine's commits (this
+    /// engine's own commits publish through the writer's post-commit hooks;
+    /// they may bump the counter too, and an extra reload publish is
+    /// harmless).
+    pub(crate) data_version: std::sync::Mutex<i64>,
 }
 
 impl Registry {
@@ -310,6 +316,43 @@ impl Registry {
             other => RegistryError::Store(other),
         })?;
         legacy.retire_outbox_files();
+        // Story 23-1: the per-call records store attaches to the writer's
+        // connection (one batch commits both files), and the calls a dead
+        // proxy owner left open close now — `recovered` when the ledger has
+        // their usage, else `crash` — before anything else runs. A live
+        // owner's rows (another engine on this state dir) are left alone.
+        let mut notes = notes;
+        match crate::store::calls_sqlite::segment_path(&paths.calls_dir())
+            .and_then(|segment| write_store.attach_calls(Some(&segment)))
+        {
+            Ok(()) => {
+                let backend = crate::backends::current();
+                let probe = |fingerprint: &crate::ports::ProcessFingerprint| {
+                    crate::ports::ProcessBackend::probe_alive(&backend, fingerprint)
+                };
+                match write_store.close_orphaned_calls(&probe) {
+                    Ok((0, 0)) => {}
+                    Ok((crashed, recovered)) => notes.push(format!(
+                        "{crashed} proxied call(s) in flight when the previous host stopped were \
+                         closed as crashed (their usage is unknown) and {recovered} as recovered"
+                    )),
+                    Err(err) => notes.push(format!(
+                        "the proxied calls left open by a stopped host could not be closed \
+                         ({err}); they stay open until the next start"
+                    )),
+                }
+            }
+            Err(err) => {
+                // Fall back to an in-memory segment so proxied calls still
+                // meter (their usage rows are in state.db); the records of
+                // this run are lost, and the note says so.
+                notes.push(format!(
+                    "the per-call records store could not be opened ({err}); calls are metered \
+                     but their records are not kept until it opens"
+                ));
+                let _ = write_store.attach_calls(None);
+            }
+        }
         let writer = StoreWriter::spawn(write_store)?;
         let store = SqliteStore::open_read_only(&paths.state_db())?;
         // Story 21-2: the writer publishes the initial Run snapshot (every
@@ -319,10 +362,16 @@ impl Registry {
         // An unreadable Run row degrades the snapshot to empty with a note
         // rather than refusing the open (graceful degradation).
         let publisher = std::sync::Arc::clone(&run_snapshot);
-        let mut notes = notes;
         if let Err(err) = writer.call(move |ctx| {
             let entries = crate::domain::runs::ops::open_entries(ctx.store())?;
-            ctx.after_commit(move || publisher.publish(entries));
+            // Story 22-1: the key index loads with the Runs.
+            let keys = crate::domain::runs::keys::open_keys(ctx.store())?;
+            // Story 23-1: the endpoint bindings load with them.
+            let bindings = crate::domain::runs::bindings::table_of(&ctx.store().bindings()?);
+            ctx.after_commit(move || {
+                publisher.publish_changes(entries, keys);
+                publisher.publish_bindings(bindings);
+            });
             Ok(())
         }) {
             notes.push(format!(
@@ -338,7 +387,14 @@ impl Registry {
             run_snapshot,
             policies: std::sync::Arc::new(crate::domain::runs::policy::PolicyCache::default()),
             open_events: std::sync::Mutex::new(Vec::new()),
+            data_version: std::sync::Mutex::new(0),
         };
+        // Story 23-1: anchor the reader's change counter so the engine's own
+        // open-time jobs (the policy sweep below) never read as a foreign
+        // commit on the first tick.
+        if let Ok(version) = registry.store.data_version() {
+            *registry.data_version.lock().expect("data version mutex") = version;
+        }
         // Story 21-3: the cached policy set loads, the FR-21 upgrade
         // finishes (pending list → config writes → markers + one event),
         // and every open Run resolves once so the stored resolutions and
@@ -362,14 +418,6 @@ impl Registry {
         registry.finish_breach_default_upgrade();
         registry.initial_policy_sweep();
         Ok(registry)
-    }
-
-    /// Whether the instance carries the FR-21 "kept on pause by upgrade"
-    /// marker (story 21-3): the Fleet and Run surfaces render the note from
-    /// this read.
-    pub(crate) fn breach_default_upgraded(&self, name: &InstanceName) -> Result<bool, StoreError> {
-        self.store
-            .snapshot(|store| store.breach_default_kept(name.as_str()))
     }
 
     /// Clear an instance's FR-21 upgrade marker (story 21-3): an explicit
@@ -446,6 +494,10 @@ impl Registry {
                     })
             }
             EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => None,
+            // Story 22-1: a credential event's subject is its Run.
+            EngineEvent::Credential(event) => Some(event.run_id.clone()),
+            // Story 23-1: a binding event names no Run.
+            EngineEvent::Binding(_) => None,
         }
     }
 
@@ -627,6 +679,26 @@ impl Registry {
             .snapshot(|store| Ok(crate::domain::runs::ops::select(store, selector)))?
     }
 
+    /// [`Self::select_runs`] with each Run assembled as its listing row
+    /// (story 21-6's `POST /v0/runs/select` answer): the same capped act
+    /// set, read in ONE snapshot so the rows and the set agree.
+    pub(crate) fn select_run_summaries(
+        &self,
+        selector: &crate::domain::Selector,
+    ) -> Result<Vec<crate::domain::runs::RunSummary>, crate::domain::RunError> {
+        self.store.snapshot(|store| {
+            let records = match crate::domain::runs::ops::select(store, selector) {
+                Ok(records) => records,
+                Err(err) => return Ok(Err(err)),
+            };
+            let legacy = store.legacy_run().ok().flatten();
+            Ok(
+                crate::domain::runs::listing::assemble(store, records, legacy)
+                    .map_err(crate::domain::RunError::Store),
+            )
+        })?
+    }
+
     /// The Run listing (story 21-5): one exception-first (or all-inside-the-
     /// window) keyset page plus its counts, with each row's labels, stored
     /// resolution, usage, latches and headroom assembled as bounded point
@@ -650,7 +722,8 @@ impl Registry {
                     limit,
                     &cutoff,
                 )?;
-                let items = listing::assemble(store, records)?;
+                let legacy = store.legacy_run().ok().flatten();
+                let items = listing::assemble(store, records, legacy)?;
                 let counts = store.listing_counts(query.view, query.selector.as_ref(), &cutoff)?;
                 Ok(crate::domain::runs::RunListing {
                     items,
@@ -706,6 +779,7 @@ impl Registry {
             // list`): the cache loads from the read-only connection.
             policies: std::sync::Arc::new(crate::domain::runs::policy::PolicyCache::default()),
             open_events: std::sync::Mutex::new(Vec::new()),
+            data_version: std::sync::Mutex::new(0),
         };
         // Fingerprint first, then load (see the writer open above).
         let baseline = registry.store.policies_fingerprint();
@@ -767,6 +841,91 @@ impl Registry {
     /// The store writer, for the supervisor's pipeline and transition jobs.
     pub(crate) fn writer(&self) -> &StoreWriter {
         &self.writer
+    }
+
+    /// Run one endpoint-binding job in the store writer (story 23-1): the
+    /// job commits with its outbox rows and its snapshot publishes; the
+    /// returned outcome carries its committed events for the bus. The
+    /// legacy root route (the migration rule) is read INSIDE the job so a
+    /// `/` prefix refusal cannot race the decision.
+    pub(crate) fn run_binding(
+        &self,
+        op: impl FnOnce(
+                &mut crate::domain::runs::bindings::BindingJob<'_, '_>,
+                Option<crate::domain::RunId>,
+            ) -> Result<
+                crate::domain::runs::bindings::BindingOutcome,
+                crate::domain::runs::bindings::BindingError,
+            > + Send
+            + 'static,
+    ) -> Result<
+        crate::domain::runs::bindings::BindingOutcome,
+        crate::domain::runs::bindings::BindingError,
+    > {
+        use crate::domain::runs::bindings::BindingError;
+        let publisher = std::sync::Arc::clone(&self.run_snapshot);
+        // A refusal must ROLL BACK (an `update` can refuse after its first
+        // write), so the job always fails it as a store error; the typed
+        // refusal travels out beside it and replaces it here, so a caller
+        // sees `PrefixTaken`, never "backend error: …".
+        let refusal: std::sync::Arc<std::sync::Mutex<Option<BindingError>>> =
+            std::sync::Arc::default();
+        let slot = std::sync::Arc::clone(&refusal);
+        let result = self.writer.call(move |ctx| {
+            let legacy_root = ctx.store().legacy_run()?;
+            let mut job = crate::domain::runs::bindings::BindingJob {
+                ctx,
+                publisher: &publisher,
+            };
+            op(&mut job, legacy_root).map_err(|err| match err {
+                BindingError::Store(store) => store,
+                other => {
+                    let message = other.to_string();
+                    *slot.lock().expect("binding refusal slot") = Some(other);
+                    crate::ports::StoreError::Backend(message)
+                }
+            })
+        });
+        result.map_err(|err| {
+            refusal
+                .lock()
+                .expect("binding refusal slot")
+                .take()
+                .unwrap_or(BindingError::Store(err))
+        })
+    }
+
+    /// Story 23-1 (cross-process freshness): the reaper tick's foreign-commit
+    /// check. `PRAGMA data_version` advances whenever another connection
+    /// commits — including this engine's own writer, whose post-commit hooks
+    /// already published, so a reload publish is at worst a duplicate. When
+    /// it advanced, one writer job re-reads the Runs, the key index and the
+    /// bindings and REPLACES the published snapshot (never on the hot path;
+    /// ≤ 1 s pickup for a foreign revocation, a foreign binding change or a
+    /// foreign Run end). The O(changed-entries) refinement is deferred (24-4).
+    /// A failed reload keeps the last good snapshot serving; the caller
+    /// surfaces it.
+    pub(crate) fn poll_foreign_commits(&self) -> Result<(), StoreError> {
+        let Ok(version) = self.store.data_version() else {
+            return Ok(());
+        };
+        let mut seen = self.data_version.lock().expect("data version mutex");
+        if *seen == version {
+            return Ok(());
+        }
+        *seen = version;
+        drop(seen);
+        let publisher = std::sync::Arc::clone(&self.run_snapshot);
+        self.writer.call(move |ctx| {
+            let entries = crate::domain::runs::ops::open_entries(ctx.store())?;
+            let keys = crate::domain::runs::keys::open_keys(ctx.store())?;
+            let bindings = crate::domain::runs::bindings::table_of(&ctx.store().bindings()?);
+            ctx.after_commit(move || {
+                publisher.publish_reload(entries, keys);
+                publisher.publish_bindings(bindings);
+            });
+            Ok(())
+        })
     }
 
     /// The read-only store, for the Run-scale reads ([`RunStore`]).
@@ -1096,9 +1255,26 @@ impl Registry {
             });
         }
 
-        // Always delete the row first.
+        // Always delete the row first. Story 22-1: its Runs' credential rows
+        // go with it (the foreign keys cascade), so their keys leave the
+        // published key index in the same commit — a removed instance's key
+        // is never honoured by a snapshot-only reader.
         let row = name.clone();
-        self.write(move |store| store.delete_instance(&row))?;
+        let publisher = std::sync::Arc::clone(&self.run_snapshot);
+        self.writer.call(move |ctx| {
+            use crate::ports::RunRecords as _;
+            let store = ctx.store();
+            let mut gone = Vec::new();
+            for key in store.active_key_rows()? {
+                let owner = store.run_record(&key.run_id)?.and_then(|run| run.instance);
+                if owner.as_deref() == Some(row.as_str()) {
+                    gone.push(crate::domain::runs::snapshot::KeyChange::Remove(key.hash));
+                }
+            }
+            store.delete_instance(&row)?;
+            ctx.after_commit(move || publisher.publish_changes(Vec::new(), gone));
+            Ok(())
+        })?;
 
         // Then handle the Agent Home per disposition.
         if disposition == RemoveDisposition::Delete {
@@ -1442,6 +1618,7 @@ impl Registry {
         &self,
         record: &SpawnRecord,
         run: crate::domain::runs::ops::SupervisedRun,
+        credentials: Option<crate::domain::runs::ops::LaunchCredentials>,
     ) -> Result<(u64, Vec<crate::domain::runs::ops::CommittedRunEvent>), RegistryError> {
         // Story 21-2: the Run is created (fresh start) or kept (relaunch) in
         // the same job as the record, so the durable Run identity and the
@@ -1451,11 +1628,19 @@ impl Registry {
         Ok(self.writer.call(move |ctx| {
             ctx.store().upsert_spawn_record(&record)?;
             let generation = ctx.store().bump_launch_generation(&record.name)?;
-            let changes = crate::domain::runs::ops::ensure_supervised(
-                ctx.store(),
-                &run,
-                &crate::time::now_rfc3339(),
-            )?;
+            let at = crate::time::now_rfc3339();
+            let mut changes = crate::domain::runs::ops::ensure_supervised(ctx.store(), &run, &at)?;
+            // Story 22-1: the launch's Run Key commits with its record and
+            // its new generation, published with the Run entry.
+            if let Some(credentials) = credentials {
+                changes.extend(crate::domain::runs::ops::issue_launch(
+                    ctx.store(),
+                    &run.run_id,
+                    generation,
+                    credentials,
+                    &at,
+                )?);
+            }
             let events = crate::domain::runs::ops::commit(ctx, &publisher, changes)?;
             Ok((generation, events))
         })?)
@@ -1478,15 +1663,9 @@ impl Registry {
         })?)
     }
 
-    /// Bump the instance's launch generation (story 21-1: an adoption is a
-    /// new attach, so an engine-minted sequence that restarts never collides
-    /// with the previous attach's rows). Returns the new generation.
-    pub(crate) fn bump_launch_generation(&self, name: &InstanceName) -> Result<u64, RegistryError> {
-        let row = name.clone();
-        Ok(self.write(move |store| store.bump_launch_generation(&row))?)
-    }
-
     /// The instance's current launch generation (0 before its first launch).
+    /// Since story 23-1 only spawn and a Restart Policy relaunch bump it
+    /// (inside the spawn-record job); adoption does not.
     pub(crate) fn launch_generation(&self, name: &InstanceName) -> Result<u64, RegistryError> {
         Ok(self.store.launch_generation(name)?)
     }
@@ -1793,15 +1972,15 @@ impl Registry {
         let reason = match self.resolved_metering_source(name) {
             Ok(source) if source == "engine-observed" => return Ok(()),
             Ok(source) => format!(
-                "`block` fences model calls at the engine-observed metering listener, and this \
-                 instance meters via `{source}` (no listener) — choose pause, stop or warn, or \
-                 move the instance to engine-observed metering (set \
+                "`block` fences model calls through the metering proxy, and this instance \
+                 meters via `{source}` (its calls do not pass through it) — choose pause, stop \
+                 or warn, or move the instance to engine-observed metering (set \
                  `metering.upstream_base_url` where the adapter supports it)"
             ),
             Err(err) => format!(
-                "`block` needs the engine-observed metering listener, and this instance's \
-                 metering source could not be read ({err}) — fix the instance's registration \
-                 snapshot, or choose pause, stop or warn"
+                "`block` needs the metering proxy, and this instance's metering source could \
+                 not be read ({err}) — fix the instance's registration snapshot, or choose \
+                 pause, stop or warn"
             ),
         };
         Err(ConfigError::InvalidValue {

@@ -72,8 +72,14 @@ use crate::domain::{
     TransitionEvent,
 };
 use crate::domain::{
-    ChildRunRequest, Label, LabelChange, LabelOutcome, ListRunsQuery, PolicyChange, PolicyOutcome,
-    PolicyRecord, RunError, RunId, RunListing, RunRecord, RunView, Selector,
+    ChildRunRequest, Label, LabelChange, LabelOutcome, LimitActor, ListRunsQuery, PolicyChange,
+    PolicyOutcome, PolicyRecord, RunError, RunId, RunLifecycleVerb, RunLimitChange, RunLimitsView,
+    RunListing, RunRecord, RunSummary, RunVerbError, RunView, Selector,
+};
+// Story 23-1: the endpoint bindings the facade writes and reads.
+use crate::domain::{
+    Binding, BindingCredential, BindingCredentialClass, BindingError, BindingPatch, BindingSpec,
+    IssuedBindingCredential, RouteSpec,
 };
 use crate::ports::{LogCaptureMode, SpawnRecord};
 use crate::shutdown::DrainOutcome;
@@ -259,6 +265,12 @@ impl Drop for Engine {
 /// not a hot path and the engine is single-lifetime, so a coarse mutex is the
 /// correct, simplest altitude here.
 struct EngineInner {
+    /// Story 23-1: the shared Metering Proxy, when it runs. FIRST so it
+    /// drops (closing its store-writer handle) before the registry, whose
+    /// writer joins once every handle is gone.
+    metering_proxy: Mutex<Option<crate::metering::proxy::MeteringProxy>>,
+    /// Story 23-1: why the proxy is not running, when it is enabled.
+    metering_proxy_error: Option<String>,
     /// Story 21-4: this engine was opened read-only ([`Engine::open_read_only`])
     /// — no writer, no adoption, no reaper. Its Fleet reads take a live
     /// instance's current Run id from the persisted spawn record (the id the
@@ -276,6 +288,12 @@ struct EngineInner {
     /// resident subject Run's labels lock-free, so a filtered stream never
     /// contends with supervision on the registry lock per event.
     run_snapshot: Arc<crate::domain::runs::snapshot::SnapshotPublisher>,
+    /// Story 22-1: a read-only connection for the credential lookups an
+    /// UNAUTHENTICATED request can cause (a snapshot miss, a refresh
+    /// presentation, a token seen in a URL). Held OUTSIDE the registry and
+    /// supervisor mutexes, and never a writer job: only a credential that
+    /// resolves here goes on to take those locks or the store writer.
+    credential_reader: Mutex<crate::store::SqliteStore>,
 }
 
 /// Open-time options for the long-running Host (story 17-2) — the additive,
@@ -291,13 +309,12 @@ struct EngineInner {
 /// first moment adoption and any start can run.
 #[derive(Clone, Default)]
 pub struct EngineOptions {
-    /// The fixed loopback PORT every `engine-observed` instance's metering
-    /// listener binds (`0` = the OS-ephemeral default). Non-zero pins the port
-    /// so engine restarts and orphan adoptions re-bind the SAME port and the
-    /// injected `base_url` stays live (the AI-46 strand closure). A pinned
-    /// port that is already taken surfaces the typed bind error at start —
-    /// never a silent hop.
-    pub metering_listen_port: u16,
+    /// The shared Metering Proxy (story 23-1): on by default on an
+    /// ephemeral, unrecorded port; the Service Host makes the port sticky
+    /// per state directory. A taken port never hops: the engine opens
+    /// without a proxy, says why ([`Engine::metering_proxy_error`]), and
+    /// refuses `engine-observed` starts until it is free.
+    pub metering_proxy: crate::metering::proxy::MeteringProxyOptions,
     /// When `true`, every child spawn CLEARS the inherited environment first
     /// and applies ONLY the manifest-declared mappings (the Host's
     /// `child_env_allowlist`: no ambient Host-shell variables leak into hosted
@@ -350,7 +367,7 @@ impl std::fmt::Debug for EngineOptions {
         // Manual impl: `DiagnosticSink` (a boxed writer) is not `Debug`, and a
         // sink must never be printed anyway (no-leak discipline).
         f.debug_struct("EngineOptions")
-            .field("metering_listen_port", &self.metering_listen_port)
+            .field("metering_proxy", &self.metering_proxy)
             .field("child_env_allowlist", &self.child_env_allowlist)
             .field("log_capture", &self.log_capture)
             .field("diagnostics", &self.diagnostics.as_ref().map(|_| "<sink>"))
@@ -495,7 +512,7 @@ impl Engine {
     /// `open_with_options` threads the Host's serve options through.
     fn open_inner(base: Option<PathBuf>, options: EngineOptions) -> Result<Self, RegistryError> {
         let EngineOptions {
-            metering_listen_port,
+            metering_proxy,
             child_env_allowlist,
             log_capture,
             diagnostics,
@@ -517,8 +534,22 @@ impl Engine {
         // adoption — an adopted observed instance re-binds the pinned port on
         // this very open.
         let mut supervisor = Supervisor::with_runtime(rt.handle().clone());
+        if let Some(sink) = diagnostics {
+            supervisor.install_diagnostics(sink);
+        }
+        // Story 23-1: the shared Metering Proxy starts BEFORE adoption and the
+        // reaper, so an adopted engine-observed agent's base URL is live on
+        // this very open and the first snapshot it reads already carries
+        // every durable `block` reason. A bind failure is surfaced, never a
+        // port hop.
+        let (proxy, proxy_error) =
+            Self::start_metering_proxy(&rt, &registry, &supervisor, &metering_proxy);
+        let proxy_url = proxy.as_ref().map(|proxy| proxy.info().url.clone());
+        if let Some(error) = &proxy_error {
+            supervisor.emit_open_note(error);
+        }
         supervisor
-            .set_serve_options(metering_listen_port, child_env_allowlist, log_capture)
+            .set_serve_options(proxy_url, child_env_allowlist, log_capture)
             .map_err(|err| RegistryError::ServeOptionsOpenTimeOnly {
                 detail: err.to_string(),
             })?;
@@ -533,9 +564,6 @@ impl Engine {
         if let Some(cap) = pause_command_cap_override {
             supervisor.override_pause_command_cap(cap);
         }
-        if let Some(sink) = diagnostics {
-            supervisor.install_diagnostics(sink);
-        }
         // Story 21-1: anything the one-time v12 import could not carry into
         // state.db (a torn or corrupt legacy log line) is surfaced once, on
         // the engine's diagnostic surface, before supervision starts.
@@ -544,12 +572,16 @@ impl Engine {
         }
         let events = supervisor.event_bus();
         let run_snapshot = Arc::clone(registry.run_publisher());
+        let credential_reader = Mutex::new(registry.open_credential_reader(false)?);
         let inner = Arc::new(EngineInner {
+            metering_proxy: Mutex::new(proxy),
+            metering_proxy_error: proxy_error,
             read_only: false,
             registry: Mutex::new(registry),
             supervisor: Mutex::new(supervisor),
             events,
             run_snapshot,
+            credential_reader,
         });
 
         // (1) Orphan adoption on open (AC-B / AI-7 / AI-8). Reconcile BEFORE the
@@ -604,12 +636,16 @@ impl Engine {
         let supervisor = Supervisor::with_runtime(rt.handle().clone());
         let events = supervisor.event_bus();
         let run_snapshot = Arc::clone(registry.run_publisher());
+        let credential_reader = Mutex::new(registry.open_credential_reader(true)?);
         let inner = Arc::new(EngineInner {
+            metering_proxy: Mutex::new(None),
+            metering_proxy_error: None,
             read_only: true,
             registry: Mutex::new(registry),
             supervisor: Mutex::new(supervisor),
             events,
             run_snapshot,
+            credential_reader,
         });
         Ok(Self {
             rt: Arc::new(rt),
@@ -649,6 +685,364 @@ impl Engine {
     /// DELAYED restart: sleep the backoff, then run [`Supervisor::restart`] via
     /// `spawn_blocking`. A restart whose instance was meanwhile stopped is a
     /// harmless no-op (the transition gate rejects a non-`failed` start — AC7).
+    /// Start the shared Metering Proxy (story 23-1) when enabled: the port
+    /// is the given one, else (sticky) the state directory's recorded one,
+    /// else an OS pick — recorded when sticky. Returns the proxy, or the
+    /// surfaced reason it is not running.
+    fn start_metering_proxy(
+        rt: &Runtime,
+        registry: &Registry,
+        supervisor: &Supervisor,
+        options: &crate::metering::proxy::MeteringProxyOptions,
+    ) -> (
+        Option<crate::metering::proxy::MeteringProxy>,
+        Option<String>,
+    ) {
+        if !options.enabled {
+            return (None, None);
+        }
+        let Some(writer) = registry.writer().handle() else {
+            return (None, None);
+        };
+        let recorded = if options.sticky && options.port == 0 {
+            registry.reader().proxy_port().ok().flatten()
+        } else {
+            None
+        };
+        let mut chosen = options.clone();
+        if let Some(port) = recorded {
+            chosen.port = port;
+        }
+        let diagnostics = supervisor.diagnostic_fn();
+        let deps = crate::metering::proxy::ProxyDeps {
+            snapshot: Arc::clone(registry.run_publisher()),
+            writer,
+            inbox: supervisor.proxy_inbox(),
+            diagnostics,
+        };
+        match crate::metering::proxy::MeteringProxy::start(rt.handle(), &chosen, deps) {
+            Ok(proxy) => {
+                if options.sticky && recorded != Some(proxy.info().port) {
+                    let port = proxy.info().port;
+                    if let Err(err) = registry
+                        .writer()
+                        .call(move |ctx| ctx.store().set_proxy_port(port))
+                    {
+                        supervisor.emit_open_note(&format!(
+                            "the metering proxy port {port} could not be recorded for this \
+                             state directory ({err}); the next start may pick another port"
+                        ));
+                    }
+                }
+                (Some(proxy), None)
+            }
+            Err(err) => {
+                let port = chosen.port;
+                (
+                    None,
+                    Some(format!(
+                        "Port {port} is in use or not available ({err}), so the metering proxy \
+                         is not running. Agents that meter through it cannot start until the \
+                         port is free or you pass --metering-listen."
+                    )),
+                )
+            }
+        }
+    }
+
+    /// The running proxy's shared call state (the proxy seam tests).
+    #[cfg(test)]
+    pub(crate) fn proxy_shared_for_tests(
+        &self,
+    ) -> Option<Arc<crate::metering::proxy::forward::ProxyShared>> {
+        self.inner
+            .metering_proxy
+            .lock()
+            .expect("metering proxy mutex poisoned")
+            .as_ref()
+            .map(|proxy| Arc::clone(proxy.shared()))
+    }
+
+    /// Where the shared Metering Proxy listens (story 23-1), when it runs.
+    pub fn metering_proxy(&self) -> Option<crate::metering::proxy::ProxyInfo> {
+        self.inner
+            .metering_proxy
+            .lock()
+            .expect("metering proxy mutex poisoned")
+            .as_ref()
+            .map(|proxy| proxy.info().clone())
+    }
+
+    /// The metering proxy port RECORDED for this state directory (story
+    /// 23-1) — the sticky address a client points at even when this engine
+    /// (a read-only CLI, say) runs no proxy itself. `None` before any host
+    /// recorded one.
+    pub fn recorded_metering_port(&self) -> Option<u16> {
+        self.inner
+            .registry
+            .lock()
+            .expect("registry mutex poisoned")
+            .reader()
+            .proxy_port()
+            .ok()
+            .flatten()
+    }
+
+    /// Why the shared Metering Proxy is not running, when it was enabled
+    /// and could not start (story 23-1).
+    pub fn metering_proxy_error(&self) -> Option<String> {
+        self.inner.metering_proxy_error.clone()
+    }
+
+    /// Stop the shared Metering Proxy gracefully (story 23-1): stop
+    /// accepting, let in-flight calls finish within `grace`, abort the rest
+    /// (recorded `shutdown`), then close its record pump. Idempotent.
+    pub async fn stop_metering_proxy(&self, grace: Duration) {
+        let proxy = self
+            .inner
+            .metering_proxy
+            .lock()
+            .expect("metering proxy mutex poisoned")
+            .take();
+        if let Some(mut proxy) = proxy {
+            proxy.shutdown(grace).await;
+        }
+    }
+
+    /// The binding a write job answers with (every binding write but
+    /// delete returns one; a job that returned none is a store fault).
+    fn bound_binding(
+        outcome: crate::domain::runs::bindings::BindingOutcome,
+        job: &str,
+    ) -> Result<Binding, BindingError> {
+        outcome.binding.ok_or_else(|| {
+            BindingError::Store(crate::ports::StoreError::Backend(format!(
+                "the {job} job returned no binding"
+            )))
+        })
+    }
+
+    /// Run one binding job and publish its committed events on the bus, in
+    /// commit order (story 23-1). Every public binding write runs through
+    /// this internal helper.
+    fn binding_write(
+        inner: &Arc<EngineInner>,
+        op: impl FnOnce(
+                &mut crate::domain::runs::bindings::BindingJob<'_, '_>,
+                Option<RunId>,
+            )
+                -> Result<crate::domain::runs::bindings::BindingOutcome, BindingError>
+            + Send
+            + 'static,
+    ) -> Result<crate::domain::runs::bindings::BindingOutcome, BindingError> {
+        inner
+            .registry
+            .lock()
+            .expect("registry mutex poisoned")
+            .run_binding(op)
+            .inspect(|outcome| {
+                let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+                supervisor.publish_run_events(outcome.events.clone());
+            })
+    }
+
+    /// Create an endpoint binding (story 23-1, D3): the Operator surface the
+    /// shared Metering Proxy routes on. One `binding` event.
+    pub async fn create_binding(&self, spec: BindingSpec) -> Result<Binding, BindingError> {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            Self::binding_write(&inner, move |job, legacy| {
+                let at = crate::time::now_rfc3339();
+                crate::domain::runs::bindings::create(
+                    job,
+                    spec,
+                    legacy.map(|run| run.to_string()),
+                    &at,
+                )
+            })
+        })
+        .await
+        .and_then(|outcome| Self::bound_binding(outcome, "create"))
+    }
+
+    /// Change a binding (story 23-1): a prefix or upstream change keeps its
+    /// Runs; a label change re-resolves them in the same job. One event.
+    pub async fn update_binding(
+        &self,
+        name: &str,
+        patch: BindingPatch,
+    ) -> Result<Binding, BindingError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            Self::binding_write(&inner, move |job, legacy| {
+                let at = crate::time::now_rfc3339();
+                crate::domain::runs::bindings::update(
+                    job,
+                    &name,
+                    patch,
+                    legacy.map(|run| run.to_string()),
+                    &at,
+                )
+            })
+        })
+        .await
+        .and_then(|outcome| Self::bound_binding(outcome, "update"))
+    }
+
+    /// Delete a binding (story 23-1): its Run and its split Runs end with
+    /// cause `binding-removed`; further calls on its prefix answer no route.
+    /// One event.
+    pub async fn delete_binding(&self, name: &str) -> Result<(), BindingError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            Self::binding_write(&inner, move |job, _legacy| {
+                let at = crate::time::now_rfc3339();
+                crate::domain::runs::bindings::delete(job, &name, &at)
+            })
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Add (or replace) one of a binding's reroute routes (story 23-1):
+    /// stored and validated now, used by reroute when it ships. One event.
+    pub async fn put_binding_route(
+        &self,
+        name: &str,
+        route: RouteSpec,
+    ) -> Result<Binding, BindingError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            Self::binding_write(&inner, move |job, _legacy| {
+                let at = crate::time::now_rfc3339();
+                crate::domain::runs::bindings::put_route(job, &name, route, &at)
+            })
+        })
+        .await
+        .and_then(|outcome| Self::bound_binding(outcome, "route"))
+    }
+
+    /// Remove one of a binding's routes (story 23-1). One event.
+    pub async fn remove_binding_route(
+        &self,
+        name: &str,
+        route: &str,
+    ) -> Result<Binding, BindingError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        let route = route.to_string();
+        self.run_blocking(move || {
+            Self::binding_write(&inner, move |job, _legacy| {
+                let at = crate::time::now_rfc3339();
+                crate::domain::runs::bindings::remove_route(job, &name, &route, &at)
+            })
+        })
+        .await
+        .and_then(|outcome| Self::bound_binding(outcome, "route"))
+    }
+
+    /// Issue (rotating any previous one) a binding credential (story 23-1,
+    /// D3/P6-A): `hk_ann_` or `hk_pxy_`, shown ONCE — only its hash and
+    /// token id are stored. Nothing accepts either credential in this
+    /// release. One event.
+    pub async fn issue_binding_credential(
+        &self,
+        name: &str,
+        class: BindingCredentialClass,
+    ) -> Result<IssuedBindingCredential, BindingError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            // Mint OUTSIDE the job (the cleartext never enters the writer);
+            // a failure to record leaves a minted-but-unknown token, which
+            // nothing accepts — harmless and never retried as a duplicate.
+            let minted = crate::domain::runs::bindings::mint(class)?;
+            let stub = minted.stub();
+            let secret = minted.into_secret();
+            Self::binding_write(&inner, move |job, _legacy| {
+                let at = crate::time::now_rfc3339();
+                crate::domain::runs::bindings::issue_credential(job, &name, class, stub, &at)
+                    .map(|(outcome, _token_id)| outcome)
+            })
+            .map(|_| IssuedBindingCredential {
+                class,
+                token_id: stub.hash.token_id(),
+                token: secret,
+            })
+        })
+        .await
+    }
+
+    /// Revoke a binding credential by class (story 23-1). One event.
+    pub async fn revoke_binding_credential(
+        &self,
+        name: &str,
+        class: BindingCredentialClass,
+    ) -> Result<(), BindingError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            Self::binding_write(&inner, move |job, _legacy| {
+                let at = crate::time::now_rfc3339();
+                crate::domain::runs::bindings::revoke_credential(job, &name, class, &at)
+            })
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Read one binding (story 23-1): `None` when no binding has the name.
+    pub async fn binding(&self, name: &str) -> Result<Option<Binding>, BindingError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            match registry.reader().binding(&name)? {
+                Some(row) => crate::domain::runs::bindings::view(registry.reader(), row)
+                    .map(Some)
+                    .map_err(BindingError::Store),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    /// Read every binding by name, after `after` (keyset), at most `limit`
+    /// (story 23-1).
+    pub async fn bindings(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Binding>, BindingError> {
+        let inner = Arc::clone(&self.inner);
+        let after = after.map(str::to_string);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            crate::domain::runs::bindings::list(registry.reader(), after.as_deref(), limit)
+                .map_err(BindingError::Store)
+        })
+        .await
+    }
+
+    /// Read a binding's credentials (metadata only — token ids, classes,
+    /// states; story 23-1: a token is never stored whole and never shown
+    /// again).
+    pub async fn binding_credentials(
+        &self,
+        name: &str,
+    ) -> Result<Vec<BindingCredential>, BindingError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            crate::domain::runs::bindings::credentials(registry.reader(), &name)
+        })
+        .await
+    }
+
     fn spawn_reaper(rt: &Runtime, inner: Arc<EngineInner>) -> tokio::task::AbortHandle {
         let handle = rt.spawn(async move {
             let mut ticker = tokio::time::interval(CRASH_POLL_INTERVAL);
@@ -976,6 +1370,13 @@ impl Engine {
                 ),
                 Err(_) => None,
             };
+            // Story 21-3 (the perf-budgets ratchet): ONE batched read of
+            // every instance's Policy-resolution facts (the open
+            // process-owning Runs' rows, labels and limits, and the
+            // kept-on-pause markers), in the same AI-16 shape as the spawn
+            // records above. A failed batch (`None`) falls back to each
+            // row's own read, so it degrades one row at a time.
+            let resolution_facts = registry.fleet_resolution_facts();
             let entries = instances
                 .into_iter()
                 .map(|instance| {
@@ -983,6 +1384,7 @@ impl Engine {
                         &registry,
                         &supervisor,
                         records.as_ref(),
+                        resolution_facts.as_ref(),
                         instance,
                         inner.read_only,
                     )
@@ -1026,6 +1428,7 @@ impl Engine {
                 &registry,
                 &supervisor,
                 Some(&records),
+                None,
                 instance,
                 inner.read_only,
             ))
@@ -1043,6 +1446,7 @@ impl Engine {
         registry: &Registry,
         supervisor: &Supervisor,
         records: Option<&HashMap<InstanceName, SpawnRecord>>,
+        resolution_facts: Option<&crate::domain::registry_policy::FleetResolutionFacts>,
         instance: AgentInstance,
         read_only: bool,
     ) -> FleetEntry {
@@ -1167,7 +1571,12 @@ impl Engine {
         let effective_opt = registry
             .effective_config(&instance.name, crate::domain::ConfigLayer::empty())
             .ok();
-        let resolution = registry.resolved_limits(&instance.name, current_run_id.as_ref());
+        let (resolution, breach_default_upgraded) = registry.resolved_limits_from_batch(
+            &instance.name,
+            current_run_id.as_ref(),
+            effective_opt.as_ref(),
+            resolution_facts,
+        );
         let rate = resolution.rate;
         let cost_cap = resolution.dollars;
         let action = resolution.effective_action;
@@ -1273,10 +1682,8 @@ impl Engine {
             None
         };
         // Story 21-3: the FR-21 "kept on pause by upgrade" marker rides the
-        // row (rendered as the note; the explicit-key write clears it).
-        let breach_default_upgraded = registry
-            .breach_default_upgraded(&instance.name)
-            .unwrap_or(false);
+        // row (rendered as the note; the explicit-key write clears it). It
+        // was read with the resolution above, in the same snapshot.
         FleetEntry {
             name: instance.name,
             kind: instance.kind,
@@ -1424,6 +1831,9 @@ impl Engine {
         window: Duration,
         notes: Option<&DiagnosticSink>,
     ) -> Vec<DrainOutcome> {
+        // Story 23-1: the proxy stops first (in-flight calls get the grace),
+        // so its records flush before the drain stops the agents.
+        self.stop_metering_proxy(window).await;
         let notes = crate::shutdown::Notes::over(notes);
         crate::shutdown::drain_and_stop(self, window, &notes).await
     }
@@ -1876,6 +2286,427 @@ impl Engine {
                 .lock()
                 .expect("registry mutex poisoned")
                 .select_runs(&selector)
+        })
+        .await
+    }
+
+    /// [`Engine::select_runs`] with each matched Run assembled as its
+    /// listing row ([`RunSummary`]: labels, subtree usage, latches and
+    /// headroom) — the act set `POST /v0/runs/select` answers (story 21-6).
+    /// The same cap ([`RunError::TooManyRuns`]); reads only.
+    pub async fn select_run_summaries(
+        &self,
+        selector: &Selector,
+    ) -> Result<Vec<RunSummary>, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let selector = selector.clone();
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .select_run_summaries(&selector)
+        })
+        .await
+    }
+
+    /// Whether `verb` would act on Run `run_id` (story 21-6): the Run's
+    /// row when the verb maps to its instance's verb, else the per-Run
+    /// refusal ([`RunError::RunEnded`], [`RunError::VerbUnavailable`]) the
+    /// act would answer. Reads only — the `--dry-run` planner; an act can
+    /// still meet the instance verb's own refusals (capability, state).
+    pub async fn plan_run_verb(
+        &self,
+        run_id: &str,
+        verb: RunLifecycleVerb,
+    ) -> Result<RunRecord, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let record = registry
+                .run_record(&run_id)?
+                .ok_or_else(|| RunError::NotFound {
+                    run_id: run_id.as_str().to_string(),
+                })?;
+            crate::domain::runs::verbs::run_verb_target(verb, &record)?;
+            Ok(record)
+        })
+        .await
+    }
+
+    /// The instance a Run-grain verb acts on, checked and acted under the
+    /// SAME locks (so a Run that ends — and a fresh start that replaces it
+    /// — between the check and the act cannot redirect the verb onto
+    /// another Run).
+    async fn act_on_run<T: Send + 'static>(
+        &self,
+        run_id: &str,
+        verb: RunLifecycleVerb,
+        act: impl FnOnce(&Registry, &mut Supervisor, &str) -> Result<T, EngineError> + Send + 'static,
+    ) -> Result<T, RunVerbError> {
+        self.refuse_if_read_only()
+            .map_err(|err| RunVerbError::Run(RunError::Store(err)))?;
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let record = registry
+                .run_record(&run_id)?
+                .ok_or_else(|| RunError::NotFound {
+                    run_id: run_id.as_str().to_string(),
+                })?;
+            let instance = crate::domain::runs::verbs::run_verb_target(verb, &record)?;
+            act(&registry, &mut supervisor, &instance).map_err(RunVerbError::Engine)
+        })
+        .await
+    }
+
+    /// Stop the instance whose supervised process Run `run_id` owns (story
+    /// 21-6, PRD FR-50): exactly [`Engine::stop`] on that instance. A child
+    /// Run, an ended Run, and any depth the verb × depth table does not
+    /// serve yet are refused per Run ([`RunVerbError::Run`]).
+    pub async fn stop_run(
+        &self,
+        run_id: &str,
+        window: Option<Duration>,
+    ) -> Result<AgentInstance, RunVerbError> {
+        self.act_on_run(
+            run_id,
+            RunLifecycleVerb::Stop,
+            move |registry, supervisor, name| supervisor.stop(registry, name, window),
+        )
+        .await
+    }
+
+    /// Pause the instance whose process Run `run_id` owns (story 21-6):
+    /// exactly [`Engine::pause`] on it (the Run goes `held`). Other Runs
+    /// are refused per Run.
+    pub async fn pause_run(&self, run_id: &str) -> Result<AgentInstance, RunVerbError> {
+        self.act_on_run(
+            run_id,
+            RunLifecycleVerb::Pause,
+            |registry, supervisor, name| supervisor.pause(registry, name),
+        )
+        .await
+    }
+
+    /// Resume the instance whose process Run `run_id` owns (story 21-6):
+    /// exactly [`Engine::resume`] on it. A child held because its parent is
+    /// paused is refused, naming the parent.
+    pub async fn resume_run(&self, run_id: &str) -> Result<AgentInstance, RunVerbError> {
+        self.act_on_run(
+            run_id,
+            RunLifecycleVerb::Resume,
+            |registry, supervisor, name| supervisor.resume(registry, name),
+        )
+        .await
+    }
+
+    /// Drain the instance whose process Run `run_id` owns (story 21-6):
+    /// exactly [`Engine::drain`] on it, with its own bound. Other Runs are
+    /// refused per Run.
+    pub async fn drain_run(
+        &self,
+        run_id: &str,
+        timeout_override: Option<Duration>,
+    ) -> Result<DrainReport, RunVerbError> {
+        self.act_on_run(
+            run_id,
+            RunLifecycleVerb::Drain,
+            move |registry, supervisor, name| {
+                supervisor
+                    .drain(registry, name, timeout_override)
+                    .map(|(instance, outcome)| DrainReport { instance, outcome })
+            },
+        )
+        .await
+    }
+
+    /// Set limits on Runs as `actor` (story 21-6, PRD FR-50 / FR-60): the
+    /// budget job behind `hekma budget set` and `PATCH /v0/runs/{id}/limits`.
+    /// Each Run is one writer job and answers on its own (a refusal on one
+    /// never stops the others): `scope-unavailable` (a cumulative ceiling on
+    /// a child Run), `action-unavailable` (an action its depth cannot
+    /// execute, naming the Metering Source), `raise-forbidden` (a Caller
+    /// loosening a limit), `run-ended`, `run-not-found`. A committed change
+    /// writes the Run's `run_limits`, re-resolves it, commits one
+    /// `limits-changed` event and runs the shared re-arm pass: a ceiling
+    /// raised above the totals re-arms its latch and lifts the matching
+    /// `block` fence reason per reason; one lowered to at or below the usage
+    /// breaches at once, its Breach Action applied before this returns. A
+    /// limit set here belongs to the Run — it ends with the Run. `dry_run`
+    /// plans each Run and writes nothing. A malformed change is refused
+    /// whole.
+    pub async fn set_run_limits(
+        &self,
+        run_ids: Vec<String>,
+        change: RunLimitChange,
+        actor: LimitActor,
+        dry_run: bool,
+    ) -> Result<crate::domain::RunLimitsResults, RunError> {
+        if !dry_run {
+            self.refuse_if_read_only().map_err(RunError::Store)?;
+        }
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let ids: Vec<RunId> = run_ids.into_iter().map(RunId::from_wire).collect();
+            supervisor.set_run_limits(&registry, &ids, &change, actor, dry_run)
+        })
+        .await
+    }
+
+    /// Recognise a presented credential (story 22-1): a lock-free read of
+    /// the published snapshot's key index — no SQLite, no engine lock. The
+    /// presentation is shape-checked on public structure (prefix, length,
+    /// alphabet), hashed, looked up by the FULL hash, and the matched entry's
+    /// 32 bytes compared in constant time. `None` for anything the index does
+    /// not hold (an unknown, revoked or refresh credential —
+    /// [`Engine::credential_state`] tells them apart).
+    pub fn authenticate(&self, presented: &str) -> Option<crate::domain::CredentialMatch> {
+        let (_, secret) = crate::domain::parse_presented(presented)?;
+        let hash = crate::domain::credential::hash_presented(&secret);
+        let snapshot = self.inner.run_snapshot.current();
+        let (stored, entry) = snapshot.keys.get_key_value(&hash)?;
+        if !stored.ct_eq(&hash) {
+            return None;
+        }
+        Some(crate::domain::CredentialMatch {
+            class: entry.class,
+            run_id: entry.run_id.clone(),
+            token_id: entry.token_id.clone(),
+            supervised: entry.launch_generation.is_some(),
+            hash: *stored,
+        })
+    }
+
+    /// What a presented credential is (story 22-1): the lock-free snapshot
+    /// first, then ONE read on the engine's credential reader — unknown,
+    /// revoked, a used refresh credential, or active (a refresh credential,
+    /// which the snapshot never indexes). Never takes the registry or
+    /// supervisor mutex and never submits a writer job, so a flood of
+    /// unrecognised presentations cannot queue behind (or ahead of)
+    /// supervision. A presentation that is not token-shaped is unknown.
+    pub async fn credential_state(
+        &self,
+        presented: &str,
+    ) -> Result<crate::domain::PresentedState, RunError> {
+        if let Some(matched) = self.authenticate(presented) {
+            return Ok(crate::domain::PresentedState::Active(matched));
+        }
+        let Some((_, secret)) = crate::domain::parse_presented(presented) else {
+            return Ok(crate::domain::PresentedState::Unknown);
+        };
+        self.read_presented_state(secret).await
+    }
+
+    /// One credential-reader lookup (no registry or supervisor lock).
+    async fn read_presented_state(
+        &self,
+        secret: crate::domain::SecretString,
+    ) -> Result<crate::domain::PresentedState, RunError> {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let reader = inner
+                .credential_reader
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::domain::registry_keys::presented_state(&reader, &secret)
+        })
+        .await
+    }
+
+    /// Open a child Run as `actor` (story 22-1): the Operator or a Host
+    /// anywhere, a Caller (a Run Key) only beneath its own Run or a
+    /// descendant, at most [`crate::MAX_CALLER_OPEN_CHILDREN`] open children
+    /// per parent, with its key re-validated inside the job. When
+    /// `request.issue_credentials` is set the child's Run Key and refresh
+    /// credential are minted (from the OS random source, no fallback) and
+    /// returned ONCE in [`crate::OpenedRun::credentials`]; nothing can show
+    /// them again.
+    pub async fn open_child_run_as(
+        &self,
+        actor: crate::domain::RunActor,
+        request: ChildRunRequest,
+    ) -> Result<crate::domain::OpenedRun, RunError> {
+        self.refuse_if_read_only().map_err(RunError::Store)?;
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.open_child_run_as(&registry, actor, request)
+        })
+        .await
+    }
+
+    /// Close a child Run as `actor` (story 22-1): a Caller only within its
+    /// own Run's subtree.
+    pub async fn close_run_as(
+        &self,
+        actor: crate::domain::RunActor,
+        run_id: &str,
+    ) -> Result<RunView, RunError> {
+        self.refuse_if_read_only().map_err(RunError::Store)?;
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.close_run_as(&registry, actor, &run_id)
+        })
+        .await
+    }
+
+    /// Set Run-level limits as `actor` (story 22-1): a Caller writes its own
+    /// layer, may only tighten, only within its own Run's subtree, with its
+    /// key re-validated inside each job.
+    pub async fn set_run_limits_as(
+        &self,
+        run_ids: Vec<String>,
+        change: RunLimitChange,
+        actor: crate::domain::RunActor,
+        dry_run: bool,
+    ) -> Result<crate::domain::RunLimitsResults, RunError> {
+        if !dry_run {
+            self.refuse_if_read_only().map_err(RunError::Store)?;
+        }
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let ids: Vec<RunId> = run_ids.into_iter().map(RunId::from_wire).collect();
+            supervisor.set_run_limits_as(&registry, &ids, &change, actor, dry_run)
+        })
+        .await
+    }
+
+    /// Trade a Run's active refresh credential for a new Run Key and refresh
+    /// credential, once (story 22-1). The old Run Key is refused from the
+    /// next request on. Presenting a USED refresh credential again revokes
+    /// the Run's current credentials, raises the `credential-reuse` Anomaly
+    /// and answers [`RunError::CredentialRevoked`].
+    pub async fn refresh_credentials(
+        &self,
+        presented: &crate::domain::SecretString,
+    ) -> Result<crate::domain::IssuedCredentials, RunError> {
+        use crate::domain::{PresentedState, SecretString, TokenClass};
+        self.refuse_if_read_only().map_err(RunError::Store)?;
+        // Resolve first, on the credential reader: only a refresh credential
+        // that was issued and not revoked goes on to mint, take the engine's
+        // locks and the store writer (the job re-reads the row and decides).
+        match self
+            .read_presented_state(SecretString::new(presented.expose_secret()))
+            .await?
+        {
+            PresentedState::Active(matched) | PresentedState::Used(matched)
+                if matched.class == TokenClass::Refresh => {}
+            PresentedState::Revoked => return Err(RunError::CredentialRevoked),
+            _ => return Err(RunError::CredentialUnknown),
+        }
+        let presented = SecretString::new(presented.expose_secret());
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.refresh_credentials(&registry, &presented)
+        })
+        .await
+    }
+
+    /// Revoke a Run's active credentials (story 22-1, `hekma run
+    /// revoke-keys`) and, with `cascade`, every active credential issued
+    /// under any of them. Committed and published before this returns: the
+    /// next request presenting any of them is refused. Clears the
+    /// `credential-reuse` Anomaly. Never ends a Run.
+    pub async fn revoke_run_keys(
+        &self,
+        run_id: &str,
+        cascade: bool,
+    ) -> Result<crate::domain::RevokeOutcome, RunError> {
+        self.refuse_if_read_only().map_err(RunError::Store)?;
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.revoke_run_keys(&registry, &run_id, cascade)
+        })
+        .await
+    }
+
+    /// Revoke credentials seen in a URL (story 22-1): an active one among
+    /// `presented` is revoked (`exposed-in-url`) — it has reached an access
+    /// log. Returns how many were revoked. Each value is resolved first —
+    /// the lock-free snapshot, then the credential reader — and only one that
+    /// resolves to an active credential takes the engine's locks and a writer
+    /// job: a URL full of token-shaped noise costs reads, never a write.
+    pub async fn revoke_exposed(
+        &self,
+        presented: Vec<crate::domain::SecretString>,
+    ) -> Result<usize, RunError> {
+        self.refuse_if_read_only().map_err(RunError::Store)?;
+        let mut resolved = Vec::new();
+        for secret in presented {
+            if self.authenticate(secret.expose_secret()).is_some()
+                || matches!(
+                    self.read_presented_state(crate::domain::SecretString::new(
+                        secret.expose_secret()
+                    ))
+                    .await?,
+                    crate::domain::PresentedState::Active(_)
+                )
+            {
+                resolved.push(secret);
+            }
+        }
+        if resolved.is_empty() {
+            return Ok(0);
+        }
+        let presented = resolved;
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.revoke_exposed(&registry, &presented)
+        })
+        .await
+    }
+
+    /// Every credential of one Run, any state, oldest first (story 22-1,
+    /// `hekma run keys`): metadata only — token ids, classes, states,
+    /// generations and causes; never a token or a hash. Reads only.
+    pub async fn run_keys(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<crate::domain::CredentialSummary>, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .run_keys(&run_id)
+        })
+        .await
+    }
+
+    /// The budget read of one Run (story 21-6, `hekma budget show`): the
+    /// limits set on the Run, the resolved limits with each source, its
+    /// subtree and cumulative usage, the headroom and the latches. Reads
+    /// only.
+    pub async fn run_limits_view(&self, run_id: &str) -> Result<RunLimitsView, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .run_limits_view(&run_id)
         })
         .await
     }
@@ -2563,6 +3394,27 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.list())
     }
 
+    /// Blocking [`Engine::binding`] (story 23-1).
+    pub fn binding(&self, name: &str) -> Result<Option<Binding>, BindingError> {
+        self.engine.rt.block_on(self.engine.binding(name))
+    }
+
+    /// Blocking [`Engine::bindings`] (story 23-1).
+    pub fn bindings(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Binding>, BindingError> {
+        self.engine.rt.block_on(self.engine.bindings(after, limit))
+    }
+
+    /// Blocking [`Engine::binding_credentials`] (story 23-1).
+    pub fn binding_credentials(&self, name: &str) -> Result<Vec<BindingCredential>, BindingError> {
+        self.engine
+            .rt
+            .block_on(self.engine.binding_credentials(name))
+    }
+
     /// Blocking [`Engine::fleet`] (story 1-7, FR-4). The Fleet as serializable
     /// [`FleetEntry`] rows — what `hekma agent list [--json]` renders.
     pub fn fleet(&self) -> Result<Vec<FleetEntry>, RegistryError> {
@@ -2836,6 +3688,159 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.select_runs(selector))
     }
 
+    /// Blocking twin of [`Engine::select_run_summaries`].
+    pub fn select_run_summaries(&self, selector: &Selector) -> Result<Vec<RunSummary>, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.select_run_summaries(selector))
+    }
+
+    /// Blocking twin of [`Engine::plan_run_verb`].
+    pub fn plan_run_verb(
+        &self,
+        run_id: &str,
+        verb: RunLifecycleVerb,
+    ) -> Result<RunRecord, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.plan_run_verb(run_id, verb))
+    }
+
+    /// Blocking twin of [`Engine::stop_run`].
+    pub fn stop_run(
+        &self,
+        run_id: &str,
+        window: Option<Duration>,
+    ) -> Result<AgentInstance, RunVerbError> {
+        self.engine
+            .rt
+            .block_on(self.engine.stop_run(run_id, window))
+    }
+
+    /// Blocking twin of [`Engine::pause_run`].
+    pub fn pause_run(&self, run_id: &str) -> Result<AgentInstance, RunVerbError> {
+        self.engine.rt.block_on(self.engine.pause_run(run_id))
+    }
+
+    /// Blocking twin of [`Engine::resume_run`].
+    pub fn resume_run(&self, run_id: &str) -> Result<AgentInstance, RunVerbError> {
+        self.engine.rt.block_on(self.engine.resume_run(run_id))
+    }
+
+    /// Blocking twin of [`Engine::drain_run`].
+    pub fn drain_run(
+        &self,
+        run_id: &str,
+        timeout_override: Option<Duration>,
+    ) -> Result<DrainReport, RunVerbError> {
+        self.engine
+            .rt
+            .block_on(self.engine.drain_run(run_id, timeout_override))
+    }
+
+    /// Blocking twin of [`Engine::set_run_limits`].
+    pub fn set_run_limits(
+        &self,
+        run_ids: Vec<String>,
+        change: RunLimitChange,
+        actor: LimitActor,
+        dry_run: bool,
+    ) -> Result<crate::domain::RunLimitsResults, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.set_run_limits(run_ids, change, actor, dry_run))
+    }
+
+    /// Blocking twin of [`Engine::credential_state`].
+    pub fn credential_state(
+        &self,
+        presented: &str,
+    ) -> Result<crate::domain::PresentedState, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.credential_state(presented))
+    }
+
+    /// Blocking twin of [`Engine::open_child_run_as`].
+    pub fn open_child_run_as(
+        &self,
+        actor: crate::domain::RunActor,
+        request: ChildRunRequest,
+    ) -> Result<crate::domain::OpenedRun, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.open_child_run_as(actor, request))
+    }
+
+    /// Blocking twin of [`Engine::close_run_as`].
+    pub fn close_run_as(
+        &self,
+        actor: crate::domain::RunActor,
+        run_id: &str,
+    ) -> Result<RunView, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.close_run_as(actor, run_id))
+    }
+
+    /// Blocking twin of [`Engine::set_run_limits_as`].
+    pub fn set_run_limits_as(
+        &self,
+        run_ids: Vec<String>,
+        change: RunLimitChange,
+        actor: crate::domain::RunActor,
+        dry_run: bool,
+    ) -> Result<crate::domain::RunLimitsResults, RunError> {
+        self.engine.rt.block_on(
+            self.engine
+                .set_run_limits_as(run_ids, change, actor, dry_run),
+        )
+    }
+
+    /// Blocking twin of [`Engine::refresh_credentials`].
+    pub fn refresh_credentials(
+        &self,
+        presented: &crate::domain::SecretString,
+    ) -> Result<crate::domain::IssuedCredentials, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.refresh_credentials(presented))
+    }
+
+    /// Blocking twin of [`Engine::revoke_run_keys`].
+    pub fn revoke_run_keys(
+        &self,
+        run_id: &str,
+        cascade: bool,
+    ) -> Result<crate::domain::RevokeOutcome, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.revoke_run_keys(run_id, cascade))
+    }
+
+    /// Blocking twin of [`Engine::revoke_exposed`].
+    pub fn revoke_exposed(
+        &self,
+        presented: Vec<crate::domain::SecretString>,
+    ) -> Result<usize, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.revoke_exposed(presented))
+    }
+
+    /// Blocking twin of [`Engine::run_keys`].
+    pub fn run_keys(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<crate::domain::CredentialSummary>, RunError> {
+        self.engine.rt.block_on(self.engine.run_keys(run_id))
+    }
+
+    /// Blocking twin of [`Engine::run_limits_view`].
+    pub fn run_limits_view(&self, run_id: &str) -> Result<RunLimitsView, RunError> {
+        self.engine.rt.block_on(self.engine.run_limits_view(run_id))
+    }
+
     /// Blocking twin of [`Engine::seed_runs_for_perf`] (the perf harness's
     /// `#[doc(hidden)]` seeding seam).
     #[doc(hidden)]
@@ -2940,6 +3945,66 @@ impl Blocking<'_> {
         name: &str,
     ) -> Result<Option<crate::ports::MemoryBackingStatus>, RegistryError> {
         self.engine.rt.block_on(self.engine.memory_status(name))
+    }
+
+    /// Blocking twin of [`Engine::stop_metering_proxy`].
+    pub fn stop_metering_proxy(&self, grace: Duration) {
+        self.engine
+            .rt
+            .block_on(self.engine.stop_metering_proxy(grace))
+    }
+
+    /// Blocking twin of [`Engine::create_binding`].
+    pub fn create_binding(&self, spec: BindingSpec) -> Result<Binding, BindingError> {
+        self.engine.rt.block_on(self.engine.create_binding(spec))
+    }
+
+    /// Blocking twin of [`Engine::update_binding`].
+    pub fn update_binding(&self, name: &str, patch: BindingPatch) -> Result<Binding, BindingError> {
+        self.engine
+            .rt
+            .block_on(self.engine.update_binding(name, patch))
+    }
+
+    /// Blocking twin of [`Engine::delete_binding`].
+    pub fn delete_binding(&self, name: &str) -> Result<(), BindingError> {
+        self.engine.rt.block_on(self.engine.delete_binding(name))
+    }
+
+    /// Blocking twin of [`Engine::put_binding_route`].
+    pub fn put_binding_route(&self, name: &str, route: RouteSpec) -> Result<Binding, BindingError> {
+        self.engine
+            .rt
+            .block_on(self.engine.put_binding_route(name, route))
+    }
+
+    /// Blocking twin of [`Engine::remove_binding_route`].
+    pub fn remove_binding_route(&self, name: &str, route: &str) -> Result<Binding, BindingError> {
+        self.engine
+            .rt
+            .block_on(self.engine.remove_binding_route(name, route))
+    }
+
+    /// Blocking twin of [`Engine::issue_binding_credential`].
+    pub fn issue_binding_credential(
+        &self,
+        name: &str,
+        class: BindingCredentialClass,
+    ) -> Result<IssuedBindingCredential, BindingError> {
+        self.engine
+            .rt
+            .block_on(self.engine.issue_binding_credential(name, class))
+    }
+
+    /// Blocking twin of [`Engine::revoke_binding_credential`].
+    pub fn revoke_binding_credential(
+        &self,
+        name: &str,
+        class: BindingCredentialClass,
+    ) -> Result<(), BindingError> {
+        self.engine
+            .rt
+            .block_on(self.engine.revoke_binding_credential(name, class))
     }
 }
 
@@ -3061,7 +4126,7 @@ mod tests {
             assert!(labels.contains(&Label::bound("team", "core")), "{labels:?}");
         });
         // An event naming no Run answers None on the same fast path.
-        let policy = EngineEvent::Policy(crate::domain::runs::PolicyEvent {
+        let policy = EngineEvent::Policy(Box::new(crate::domain::runs::PolicyEvent {
             schema_version: crate::domain::runs::POLICY_EVENT_SCHEMA_VERSION,
             kind: crate::domain::runs::PolicyEventKind::Created,
             name: "p".to_string(),
@@ -3072,11 +4137,185 @@ mod tests {
             matched: 0,
             fallbacks: 0,
             at: "t".to_string(),
-        });
+        }));
         assert_eq!(
             engine.blocking().event_subject_labels(&policy).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn an_embedder_drives_the_whole_run_key_lifecycle_through_the_blocking_facade() {
+        // Story 22-1, the embedder's path (no host): the Operator opens a
+        // child with credentials; its Run Key opens, tightens and closes
+        // beneath it; the listing shows metadata only; a refresh rotates
+        // once; revoke-keys cascades; and the revoked keys are refused.
+        use crate::domain::{
+            ChildRunRequest, PresentedState, RunActor, RunLimitChange, RunLimits, RunParent,
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        drop(Engine::open(Some(tmp.path().to_path_buf())).unwrap());
+        rusqlite::Connection::open(tmp.path().join("state.db"))
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+                 process_owner, created_at, updated_at) \
+                 VALUES ('run_ROOT', 'announced', 0, 'active', '', 0, 't', 't');",
+            )
+            .unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        let under = |parent: &str| {
+            let mut request = ChildRunRequest::under(RunParent::Run(RunId::from_wire(parent)));
+            request.issue_credentials = true;
+            request
+        };
+        let child = facade
+            .open_child_run_as(RunActor::Operator, under("run_ROOT"))
+            .unwrap();
+        let child_id = child.view.record.run_id.to_string();
+        let issued = child.credentials.expect("issued once");
+        let caller = engine
+            .authenticate(issued.run_key().expose_secret())
+            .expect("the key is indexed")
+            .actor();
+        let grandchild = facade
+            .open_child_run_as(caller.clone(), under(&child_id))
+            .unwrap();
+        let gc_id = grandchild.view.record.run_id.to_string();
+        // Tighten-only on its own subtree.
+        let tighten = RunLimitChange {
+            set: RunLimits {
+                token_per_run: Some(5_000),
+                ..RunLimits::default()
+            },
+            clear: Vec::new(),
+        };
+        let mut results = facade
+            .set_run_limits_as(vec![gc_id.clone()], tighten, caller.clone(), false)
+            .unwrap();
+        assert!(results.pop().unwrap().1.is_ok());
+        let closed = facade.close_run_as(caller.clone(), &gc_id).unwrap();
+        assert!(closed.record.is_ended());
+        // The listing is metadata only.
+        let keys = facade.run_keys(&child_id).unwrap();
+        assert_eq!(keys.len(), 2);
+        let listed = format!("{keys:?}");
+        assert!(
+            !listed.contains(issued.run_key().expose_secret()),
+            "{listed}"
+        );
+        // A refresh rotates once; the old key is refused from then on.
+        let rotated = facade
+            .refresh_credentials(issued.refresh_credential())
+            .unwrap();
+        assert!(engine
+            .authenticate(issued.run_key().expose_secret())
+            .is_none());
+        assert_eq!(
+            facade
+                .credential_state(issued.run_key().expose_secret())
+                .unwrap(),
+            PresentedState::Revoked
+        );
+        assert!(matches!(
+            facade
+                .credential_state(issued.refresh_credential().expose_secret())
+                .unwrap(),
+            PresentedState::Used(_)
+        ));
+        // revoke-keys cascades, and a request authenticated just before it
+        // is refused inside its own job.
+        let rotated_caller = engine
+            .authenticate(rotated.run_key().expose_secret())
+            .expect("the rotated key is indexed")
+            .actor();
+        let outcome = facade.revoke_run_keys(&child_id, true).unwrap();
+        assert!(!outcome.revoked.is_empty());
+        assert!(engine
+            .authenticate(rotated.run_key().expose_secret())
+            .is_none());
+        assert!(matches!(
+            facade.close_run_as(rotated_caller, &child_id),
+            Err(RunError::CredentialRevoked)
+        ));
+        let _ = caller;
+        assert!(matches!(
+            facade.run_keys("run_missing"),
+            Err(RunError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn unresolvable_credentials_never_take_an_engine_lock_or_a_writer_job() {
+        // Story 22-1 (the security review's M1): a credential that does not
+        // resolve costs reads only. A flood of token-shaped values that were
+        // never issued — Run Keys on any route, refresh credentials on the
+        // refresh route, tokens in a URL — is answered while another thread
+        // HOLDS the registry and supervisor mutexes, and the store writer
+        // runs no job for any of it.
+        use crate::domain::credential::{mint, TokenClass};
+        use crate::domain::SecretString;
+        use std::sync::atomic::Ordering;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let registry = engine.inner.registry.lock().unwrap();
+        let supervisor = engine.inner.supervisor.lock().unwrap();
+        // Let anything already in flight land before counting.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let jobs = |registry: &Registry| registry.writer().stats().jobs.load(Ordering::Relaxed);
+        let before = jobs(&registry);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let engine = &engine;
+            scope.spawn(move || {
+                let facade = engine.blocking();
+                let token = |class| mint(class).unwrap().secret().expose_secret().to_string();
+                for _ in 0..100 {
+                    for class in [
+                        TokenClass::RunKey,
+                        TokenClass::Refresh,
+                        TokenClass::Announce,
+                    ] {
+                        assert_eq!(
+                            facade.credential_state(&token(class)).unwrap(),
+                            crate::domain::PresentedState::Unknown
+                        );
+                    }
+                    let refresh = SecretString::new(token(TokenClass::Refresh));
+                    assert!(matches!(
+                        facade.refresh_credentials(&refresh),
+                        Err(RunError::CredentialUnknown)
+                    ));
+                    // A Run Key presented on the refresh route is not a
+                    // refresh credential either.
+                    let key = SecretString::new(token(TokenClass::RunKey));
+                    assert!(matches!(
+                        facade.refresh_credentials(&key),
+                        Err(RunError::CredentialUnknown)
+                    ));
+                    let exposed = [
+                        TokenClass::RunKey,
+                        TokenClass::Refresh,
+                        TokenClass::Announce,
+                    ]
+                    .map(|class| SecretString::new(token(class)))
+                    .into_iter()
+                    .collect();
+                    assert_eq!(facade.revoke_exposed(exposed).unwrap(), 0);
+                }
+                let _ = tx.send(());
+            });
+            let answered = rx.recv_timeout(std::time::Duration::from_secs(20));
+            let after = jobs(&registry);
+            drop(supervisor);
+            drop(registry);
+            answered.expect("every unresolvable presentation answered while both locks were held");
+            assert_eq!(
+                after, before,
+                "no writer job ran for an unresolvable credential"
+            );
+        });
     }
 
     #[test]
@@ -3270,6 +4509,7 @@ mod tests {
                     labels: Vec::new(),
                     fresh: true,
                     inputs: None,
+                    upstream: None,
                 })
                 .unwrap();
         }
@@ -3297,6 +4537,177 @@ mod tests {
         assert!(matches!(
             facade.run("run_none"),
             Err(RunError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn the_run_verb_and_limit_facades_map_refuse_and_plan_per_run() {
+        // Story 21-6: the Run-grain verbs and the budget job through the
+        // async + blocking facade, over a supervised Run seeded through the
+        // registry (the builtin `mock` cannot start a process).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        facade.register("demo", "mock").unwrap();
+        let owner = RunId::mint();
+        {
+            let registry = engine.inner.registry.lock().unwrap();
+            registry
+                .ensure_supervised_run(crate::domain::runs::ops::SupervisedRun {
+                    instance: InstanceName::new("demo").unwrap(),
+                    run_id: owner.clone(),
+                    wire_path: false,
+                    labels: Vec::new(),
+                    fresh: true,
+                    inputs: None,
+                    upstream: None,
+                })
+                .unwrap();
+        }
+        let child = facade
+            .open_child_run(ChildRunRequest::under(crate::domain::RunParent::Run(
+                owner.clone(),
+            )))
+            .unwrap()
+            .record
+            .run_id;
+        // The owner maps to the instance's verb (which refuses here: the
+        // registered mock is not running — an ENGINE error, decoded as such).
+        assert_eq!(
+            facade
+                .plan_run_verb(owner.as_str(), RunLifecycleVerb::Stop)
+                .unwrap()
+                .instance
+                .as_deref(),
+            Some("demo")
+        );
+        for result in [
+            facade.stop_run(owner.as_str(), None).map(|_| ()),
+            facade.pause_run(owner.as_str()).map(|_| ()),
+            facade.resume_run(owner.as_str()).map(|_| ()),
+            facade.drain_run(owner.as_str(), None).map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(RunVerbError::Engine(_))), "{result:?}");
+        }
+        // The child is refused per Run, naming its depth.
+        for result in [
+            facade.stop_run(child.as_str(), None).map(|_| ()),
+            facade.pause_run(child.as_str()).map(|_| ()),
+            facade.resume_run(child.as_str()).map(|_| ()),
+            facade.drain_run(child.as_str(), None).map(|_| ()),
+        ] {
+            match result {
+                Err(RunVerbError::Run(err)) => assert_eq!(err.code(), "verb-unavailable"),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(
+            facade
+                .plan_run_verb(child.as_str(), RunLifecycleVerb::Pause)
+                .unwrap_err()
+                .code(),
+            "verb-unavailable"
+        );
+        assert_eq!(
+            facade
+                .plan_run_verb("run_none", RunLifecycleVerb::Pause)
+                .unwrap_err()
+                .code(),
+            "run-not-found"
+        );
+        assert!(matches!(
+            facade.stop_run("run_none", None),
+            Err(RunVerbError::Run(RunError::NotFound { .. }))
+        ));
+        // The budget job: a dry run plans, a write commits, a child's
+        // cumulative ceiling is that Run's refusal.
+        let change = RunLimitChange {
+            set: crate::domain::RunLimits {
+                token_per_run: Some(5_000),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+        };
+        let planned = facade
+            .set_run_limits(
+                vec![owner.to_string()],
+                change.clone(),
+                LimitActor::Operator,
+                true,
+            )
+            .unwrap();
+        assert!(planned[0].1.as_ref().unwrap().dry_run);
+        assert_eq!(
+            facade.run_limits_view(owner.as_str()).unwrap().limits,
+            crate::domain::RunLimits::default()
+        );
+        let results = facade
+            .set_run_limits(
+                vec![owner.to_string(), child.to_string()],
+                RunLimitChange {
+                    set: crate::domain::RunLimits {
+                        token_per_run: Some(5_000),
+                        token_cumulative: Some(9_000),
+                        ..Default::default()
+                    },
+                    clear: Vec::new(),
+                },
+                LimitActor::Operator,
+                false,
+            )
+            .unwrap();
+        assert!(results[0].1.is_ok());
+        assert_eq!(
+            results[1].1.as_ref().unwrap_err().code(),
+            "scope-unavailable"
+        );
+        let view = facade.run_limits_view(owner.as_str()).unwrap();
+        assert_eq!(view.limits.token_cumulative, Some(9_000));
+        assert_eq!(
+            view.resolution.sources.tokens_cumulative,
+            crate::domain::LimitSource::Run
+        );
+        // A config write runs the re-arm pass (nothing latched here) and
+        // leaves the Run-level limit on top.
+        facade
+            .set_config("demo", "budget.tokens.per_run", "100")
+            .unwrap();
+        assert_eq!(
+            facade
+                .run_limits_view(owner.as_str())
+                .unwrap()
+                .resolution
+                .tokens
+                .per_run,
+            Some(5_000)
+        );
+        // A malformed change is refused whole.
+        assert!(facade
+            .set_run_limits(
+                vec![owner.to_string()],
+                RunLimitChange::default(),
+                LimitActor::Operator,
+                false
+            )
+            .is_err());
+        // A read-only engine plans but refuses every write.
+        drop(engine);
+        let read_only = Engine::open_read_only(Some(tmp.path().to_path_buf())).unwrap();
+        let ro = read_only.blocking();
+        assert!(ro
+            .set_run_limits(
+                vec![owner.to_string()],
+                change.clone(),
+                LimitActor::Operator,
+                true
+            )
+            .is_ok());
+        assert!(ro
+            .set_run_limits(vec![owner.to_string()], change, LimitActor::Operator, false)
+            .is_err());
+        assert!(matches!(
+            ro.stop_run(owner.as_str(), None),
+            Err(RunVerbError::Run(RunError::Store(_)))
         ));
     }
 
@@ -3338,6 +4749,7 @@ mod tests {
                     labels: vec![Label::bound("team", "payments")],
                     fresh: true,
                     inputs: None,
+                    upstream: None,
                 })
                 .unwrap();
         }
@@ -3557,6 +4969,7 @@ mod tests {
                     labels: vec![crate::domain::Label::bound("team", "core")],
                     fresh: true,
                     inputs: None,
+                    upstream: None,
                 })
                 .unwrap();
         }

@@ -23,6 +23,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use hekma_engine::DiagnosticSink;
 
+use super::auth::Authority;
 use super::ApiState;
 
 /// The response header carrying the captured engine notes.
@@ -198,13 +199,20 @@ pub fn decode(text: &str) -> Vec<u8> {
 }
 
 /// The capture layer: every non-GET request's engine notes ride back in the
-/// [`ENGINE_NOTES_HEADER`] (success and error responses alike).
+/// [`ENGINE_NOTES_HEADER`] (success and error responses alike) — for the
+/// Operator only. The notes are fleet-wide (any instance, any Run), so a
+/// Run Key's Caller or a refresh holder gets none, and does not consume the
+/// startup notes kept for the Operator's first write.
 pub(crate) async fn capture_engine_notes(
     State(state): State<ApiState>,
     request: Request,
     next: Next,
 ) -> Response {
-    if request.method() == Method::GET {
+    let operator = matches!(
+        request.extensions().get::<Authority>(),
+        Some(Authority::Operator)
+    );
+    if request.method() == Method::GET || !operator {
         return next.run(request).await;
     }
     let mut bytes = state.notes.take_startup();
@@ -320,5 +328,83 @@ mod tests {
         assert_eq!(decode("%zz"), b"%zz");
         assert_eq!(decode("%4"), b"%4");
         assert_eq!(decode("%+1"), b"%+1");
+    }
+
+    /// One POST through the capture layer, acting as `authority` (a stand-in
+    /// for `require_bearer`'s extension); the handler raises a note while
+    /// the request runs. Answers the decoded notes header, if any.
+    async fn write_as(state: &ApiState, authority: Authority) -> Option<String> {
+        use axum::routing::post;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tap = state.notes.clone();
+        let app = axum::Router::new()
+            .route(
+                "/w",
+                post(move || async move {
+                    tap.record(b"[hekma] instance other: a fleet note\n");
+                    "ok"
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                capture_engine_notes,
+            ))
+            .layer(axum::middleware::from_fn(
+                move |mut request: Request, next: Next| {
+                    let authority = authority.clone();
+                    async move {
+                        request.extensions_mut().insert(authority);
+                        next.run(request).await
+                    }
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"POST /w HTTP/1.1\r\nhost: x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        server.abort();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        response.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case(ENGINE_NOTES_HEADER)
+                .then(|| String::from_utf8(decode(value.trim())).unwrap())
+        })
+    }
+
+    #[tokio::test]
+    async fn only_the_operators_write_carries_engine_notes() {
+        let (state, _shutdown) = super::super::test_support::quiet_api_state();
+        state
+            .notes
+            .record(b"[hekma] startup: adopted instance other\n");
+        let caller = Authority::Caller(hekma_engine::CredentialMatch {
+            class: hekma_engine::TokenClass::RunKey,
+            run_id: hekma_engine::RunId::from_wire("run_x"),
+            token_id: "0123456789ab".to_string(),
+            supervised: false,
+            hash: hekma_engine::TokenHash::of_token("hk_run_x"),
+        });
+        // A Run Key's Caller and a refresh holder get no notes header, and
+        // do not consume the startup notes.
+        assert_eq!(write_as(&state, caller).await, None);
+        let refresh = Authority::Refresh(Arc::new(hekma_engine::SecretString::new("hk_ref_x")));
+        assert_eq!(write_as(&state, refresh).await, None);
+        // The Operator's write still carries them: the startup notes and the
+        // note raised while it ran.
+        let notes = write_as(&state, Authority::Operator)
+            .await
+            .expect("a notes header");
+        assert!(notes.contains("startup: adopted instance other"), "{notes}");
+        assert!(notes.contains("a fleet note"), "{notes}");
     }
 }

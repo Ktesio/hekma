@@ -34,7 +34,8 @@ fn usage_in_run(
     cached: Option<u64>,
 ) -> EngineEvent {
     EngineEvent::UsageUpdate(UsageUpdateEvent::new(UsageEvent {
-        instance: instance.to_string(),
+        instance: Some(instance.to_string()),
+        call_id: None,
         run_id: RunId::from_wire(run),
         input_tokens: input,
         output_tokens: output,
@@ -727,4 +728,32 @@ fn a_refreshed_run_survives_while_staler_runs_evict() {
         !run_ids.contains(&"run-001".to_string()),
         "the stalest run evicted instead"
     );
+}
+
+#[test]
+fn a_credential_event_exports_nothing_and_carries_no_token() {
+    // Story 22-1: `otlp-metrics v1` has no series for credential events;
+    // the payload is byte-identical with or without one.
+    let mut with = state();
+    let mut without = state();
+    with.observe(&usage("agent", 10, 5, None));
+    without.observe(&usage("agent", 10, 5, None));
+    with.observe(&EngineEvent::Credential(Box::new(
+        hekma_engine::CredentialEvent {
+            schema_version: hekma_engine::CREDENTIAL_EVENT_SCHEMA_VERSION,
+            change: hekma_engine::CredentialChange::Issued,
+            class: hekma_engine::TokenClass::RunKey,
+            token_id: "0123456789ab".to_string(),
+            run_id: hekma_engine::RunId::from_wire("run_x"),
+            launch_generation: Some(1),
+            issued_by: Some("engine".to_string()),
+            prior_token_id: None,
+            cause: None,
+            at: "t".to_string(),
+        },
+    )));
+    let a = serde_json::to_string(&with.snapshot(2_000)).unwrap();
+    let b = serde_json::to_string(&without.snapshot(2_000)).unwrap();
+    assert_eq!(a, b);
+    assert!(!a.contains("0123456789ab"));
 }

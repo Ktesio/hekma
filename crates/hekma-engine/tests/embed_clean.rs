@@ -342,8 +342,25 @@ fn assert_subscriber_isolation(result: &FlowResult) {
         "the flow must never approach the bus capacity"
     );
 
-    // Every received event is instance-scoped to THIS flow's instance.
+    // Every received event is instance-scoped to THIS flow's instance; a
+    // credential event (story 22-1) names a Run this stream's own Run
+    // events named.
+    let own_runs: BTreeSet<String> = result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::Run(run) => Some(run.run_id.to_string()),
+            _ => None,
+        })
+        .collect();
     for event in &result.events {
+        if let EngineEvent::Credential(credential) = event {
+            assert!(
+                own_runs.contains(credential.run_id.as_str()),
+                "a foreign Run's credential event arrived: {event:?}"
+            );
+            continue;
+        }
         assert_eq!(
             event_instance(event),
             uj3::FLOW_INSTANCE,
@@ -424,11 +441,16 @@ fn assert_subscriber_isolation(result: &FlowResult) {
 fn event_instance(event: &EngineEvent) -> &str {
     match event {
         EngineEvent::Transition(t) => &t.instance,
-        EngineEvent::BudgetBreach(b) => &b.instance,
-        EngineEvent::UsageUpdate(u) => &u.event.instance,
+        EngineEvent::BudgetBreach(b) => b.instance.as_deref().unwrap_or_default(),
+        EngineEvent::UsageUpdate(u) => u.event.instance.as_deref().unwrap_or_default(),
         EngineEvent::Run(r) => r.instance.as_deref().unwrap_or_default(),
         // Policy-family events are fleet-wide: they name no instance.
         EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => "",
+        // Story 22-1: a credential event names its Run, not an instance —
+        // checked by run id in the isolation assertion.
+        EngineEvent::Credential(_) => "",
+        // Story 23-1: binding events are fleet-wide.
+        EngineEvent::Binding(_) => "",
     }
 }
 

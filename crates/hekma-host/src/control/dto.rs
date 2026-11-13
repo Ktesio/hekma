@@ -512,6 +512,99 @@ pub(crate) struct RunOpenRequest {
     pub breach_action: Option<String>,
     /// An id under which a retried open returns the same Run.
     pub external_id: Option<String>,
+    /// Story 22-1: whether to issue the child's Run Key and refresh
+    /// credential (default `true`); they come back once in the 201.
+    pub issue_credentials: Option<bool>,
+}
+
+/// `POST /v0/runs`'s 201 (story 22-1): the Run, and — when issued — its
+/// credentials, shown this once.
+#[derive(Serialize)]
+pub(crate) struct RunOpenedDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The Run.
+    pub run: hekma_engine::RunView,
+    /// Its Run Key and refresh credential (absent when not issued).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<CredentialsDocument>,
+}
+
+/// One issued Run Key + refresh credential pair, on the wire ONCE (the 201
+/// of a child open, the 200 of a refresh). The cleartext crosses into a
+/// serializable value here and nowhere else (story 22-1: one greppable
+/// `expose_secret` site); `Debug` shows the token ids only.
+#[derive(Serialize)]
+pub(crate) struct CredentialsDocument {
+    /// The Run Key (`hk_run_…`).
+    pub run_key: String,
+    /// The refresh credential (`hk_ref_…`).
+    pub refresh_credential: String,
+    /// The Run Key's token id.
+    pub token_id: String,
+    /// The refresh credential's token id.
+    pub refresh_token_id: String,
+}
+
+impl From<&hekma_engine::IssuedCredentials> for CredentialsDocument {
+    fn from(issued: &hekma_engine::IssuedCredentials) -> Self {
+        CredentialsDocument {
+            run_key: issued.run_key().expose_secret().to_string(),
+            refresh_credential: issued.refresh_credential().expose_secret().to_string(),
+            token_id: issued.token_id(),
+            refresh_token_id: issued.refresh_token_id(),
+        }
+    }
+}
+
+impl std::fmt::Debug for CredentialsDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialsDocument")
+            .field("token_id", &self.token_id)
+            .field("refresh_token_id", &self.refresh_token_id)
+            .finish()
+    }
+}
+
+/// `POST /v0/runs/refresh`'s 200 (story 22-1): the new pair, once.
+#[derive(Serialize)]
+pub(crate) struct RefreshDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The Run the credentials belong to.
+    pub run_id: hekma_engine::RunId,
+    /// The new Run Key and refresh credential.
+    pub credentials: CredentialsDocument,
+}
+
+/// `POST /v0/runs/{id}/revoke-keys` (story 22-1). An empty body cascades.
+#[derive(Deserialize, Default)]
+pub(crate) struct RevokeKeysRequest {
+    /// Revoke the credentials issued under the Run's own too (default
+    /// `true`).
+    pub cascade: Option<bool>,
+}
+
+/// `POST /v0/runs/{id}/revoke-keys`'s answer (story 22-1).
+#[derive(Serialize)]
+pub(crate) struct RevokeKeysDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// What was revoked (token ids, never a token).
+    #[serde(flatten)]
+    pub outcome: hekma_engine::RevokeOutcome,
+}
+
+/// `GET /v0/runs/{id}/keys` (story 22-1): a Run's credential metadata.
+#[derive(Serialize)]
+pub(crate) struct RunKeysDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The Run.
+    pub run_id: hekma_engine::RunId,
+    /// Every credential it was issued, oldest first: token ids, classes,
+    /// states — never a token or a hash.
+    pub keys: Vec<hekma_engine::CredentialSummary>,
 }
 
 /// `GET /v0/runs/{id}/labels` (story 21-9): one Run's labels, bound and
@@ -819,4 +912,319 @@ pub(crate) struct PolicyChangeDocument {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
     pub dry_run: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Story 21-6: Selector sets, the Run-grain verbs and Run-level limits.
+// ---------------------------------------------------------------------------
+
+/// The act-results family's schema version (the per-Run results every
+/// set-form verb answers, and the CLI's `--json` document for every verb).
+pub(crate) const ACT_RESULTS_SCHEMA_VERSION: u32 = 1;
+
+/// `POST /v0/runs/select` — resolve a Selector into a set to act on.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SelectRequest {
+    /// `key=value[,key=value…]` — every non-ended Run carrying all the
+    /// terms (bound or Caller labels).
+    pub selector: String,
+}
+
+/// The `POST /v0/runs/select` answer: the set token and the exact Runs a
+/// set-form verb will act on.
+#[derive(Serialize)]
+pub(crate) struct SelectDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The set token (`hkset_…`): single-use, bound to this credential,
+    /// expiring at `expires_at`. Present it in a set-form verb's BODY.
+    pub token: String,
+    /// The matched Runs, ordered by run id, each as its listing row (the
+    /// `GET /v0/runs` item: the Run's fields plus labels, usage, latches
+    /// and headroom).
+    pub runs: Vec<hekma_engine::RunSummary>,
+    /// How many Runs matched.
+    pub matched: usize,
+    /// When the token expires (RFC 3339 UTC).
+    pub expires_at: String,
+}
+
+/// The body of a set-form verb (`POST /v0/runs/stop|pause|resume|drain|close`)
+/// — the set token, plus the verb's own optional bound.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetActRequest {
+    /// The token `POST /v0/runs/select` answered.
+    pub set_token: String,
+    /// `stop` only: the graceful window in whole seconds.
+    #[serde(default)]
+    pub window_secs: Option<u64>,
+    /// `drain` only: the drain bound in milliseconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// `PATCH /v0/runs/labels` — bind and unbind labels on a selected set.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetLabelsRequest {
+    /// The token `POST /v0/runs/select` answered.
+    pub set_token: String,
+    /// `key: value` labels to bind.
+    #[serde(default)]
+    pub set: std::collections::BTreeMap<String, String>,
+    /// Keys to unbind.
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// `PATCH /v0/runs/{id}/limits` — one Run's limits: ceilings to set
+/// (dollars as decimal strings, `"3.00"`), the Breach Action, the limits
+/// to clear (`tokens-per-run`, `tokens-cumulative`, `dollars-per-run`,
+/// `dollars-cumulative`, `breach-action`). An unknown key is refused — a
+/// typo on a money field must never be silently dropped.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunLimitsPatch {
+    /// A per-run token ceiling.
+    #[serde(default)]
+    pub tokens_per_run: Option<u64>,
+    /// A cumulative token ceiling (a process-owning Run only).
+    #[serde(default)]
+    pub tokens_cumulative: Option<u64>,
+    /// A per-run dollar cap, `"3.00"`.
+    #[serde(default)]
+    pub dollars_per_run: Option<String>,
+    /// A cumulative dollar cap, `"3.00"` (a process-owning Run only).
+    #[serde(default)]
+    pub dollars_cumulative: Option<String>,
+    /// The Run's Breach Action (`warn`, `pause`, `stop`, `block`).
+    #[serde(default)]
+    pub breach_action: Option<String>,
+    /// Limits to clear.
+    #[serde(default)]
+    pub clear: Vec<String>,
+    /// Plan only: answer with the planned outcome, write nothing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `POST /v0/runs/limits` — limits on a selected set (the
+/// [`RunLimitsPatch`] fields, with the set token instead of a dry run).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetLimitsRequest {
+    /// The token `POST /v0/runs/select` answered.
+    pub set_token: String,
+    /// A per-run token ceiling.
+    #[serde(default)]
+    pub tokens_per_run: Option<u64>,
+    /// A cumulative token ceiling (a process-owning Run only).
+    #[serde(default)]
+    pub tokens_cumulative: Option<u64>,
+    /// A per-run dollar cap, `"3.00"`.
+    #[serde(default)]
+    pub dollars_per_run: Option<String>,
+    /// A cumulative dollar cap, `"3.00"` (a process-owning Run only).
+    #[serde(default)]
+    pub dollars_cumulative: Option<String>,
+    /// The Run's Breach Action (`warn`, `pause`, `stop`, `block`).
+    #[serde(default)]
+    pub breach_action: Option<String>,
+    /// Limits to clear.
+    #[serde(default)]
+    pub clear: Vec<String>,
+}
+
+impl SetLimitsRequest {
+    /// The change fields, as the per-Run patch carries them.
+    pub(crate) fn into_parts(self) -> (String, RunLimitsPatch) {
+        (
+            self.set_token,
+            RunLimitsPatch {
+                tokens_per_run: self.tokens_per_run,
+                tokens_cumulative: self.tokens_cumulative,
+                dollars_per_run: self.dollars_per_run,
+                dollars_cumulative: self.dollars_cumulative,
+                breach_action: self.breach_action,
+                clear: self.clear,
+                dry_run: false,
+            },
+        )
+    }
+}
+
+/// One Run-grain verb's answer (`POST /v0/runs/{id}/stop|pause|resume|drain`):
+/// the Run, the instance it acted on, and (drain) the composite's outcome.
+#[derive(Serialize)]
+pub(crate) struct RunActDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The Run.
+    pub run_id: String,
+    /// The instance's Fleet row after the verb — absent only when the verb
+    /// committed but the read-back failed (the act still happened: it is
+    /// never reported as refused).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<hekma_engine::FleetEntry>,
+    /// `drain` only: whether the bounded wait completed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed: Option<bool>,
+    /// `drain` only: the measured bounded phase, milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waited_ms: Option<u64>,
+}
+
+/// `GET /v0/runs/{id}/limits` — one Run's budget read.
+#[derive(Serialize)]
+pub(crate) struct RunLimitsDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The read.
+    #[serde(flatten)]
+    pub view: hekma_engine::RunLimitsView,
+}
+
+/// `PATCH /v0/runs/{id}/limits` — the outcome on one Run.
+#[derive(Serialize)]
+pub(crate) struct RunLimitsChangeDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The outcome.
+    #[serde(flatten)]
+    pub outcome: hekma_engine::RunLimitsOutcome,
+}
+
+/// One Run's result in a set-form verb's answer.
+#[derive(Serialize, Default)]
+pub(crate) struct ActResult {
+    /// The Run.
+    pub run_id: String,
+    /// The verb's past tense (`stopped`, `paused`, `resumed`, `drained`,
+    /// `closed`, `labeled`, a limits direction), `unchanged`, or `refused`.
+    pub outcome: String,
+    /// The instance's Fleet row after a lifecycle verb.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<hekma_engine::FleetEntry>,
+    /// `drain` only: whether the bounded wait completed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed: Option<bool>,
+    /// `drain` only: the measured bounded phase, milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waited_ms: Option<u64>,
+    /// `close` only: the Run after.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<hekma_engine::RunView>,
+    /// `labels` only: the labels after.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<hekma_engine::Label>>,
+    /// `labels` only: the labels before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_labels: Option<Vec<hekma_engine::Label>>,
+    /// `limits` only: the budget job's outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits: Option<hekma_engine::RunLimitsOutcome>,
+    /// A refusal: the error envelope's `error` object (`kind`, `code`,
+    /// `message`, and `engine_error` when the instance verb failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
+}
+
+/// A set-form verb's answer: one result per Run of the set, in set order.
+#[derive(Serialize)]
+pub(crate) struct ActResultsDocument {
+    /// [`ACT_RESULTS_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The verb, named as the CLI's `--json` document names it (`stop`,
+    /// `pause`, `resume`, `drain`, `close`, `label`, `budget`).
+    pub verb: &'static str,
+    /// Always `false`: a set act acts (plan with the CLI's `--dry-run`, or
+    /// a single Run's `dry_run`). Present so the document is the CLI's
+    /// shape field for field.
+    pub dry_run: bool,
+    /// How many Runs the set held.
+    pub matched: usize,
+    /// One result per Run.
+    pub results: Vec<ActResult>,
+}
+
+// ---- Story 23-1: the endpoint bindings and the metering proxy ----
+
+/// `GET /v0/bindings?after=&limit=` — the keyset listing by name.
+#[derive(Serialize)]
+pub(crate) struct BindingsDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The bindings, by name order, at most `limit`.
+    pub bindings: Vec<hekma_engine::Binding>,
+    /// The last name of this page (the next request's `after`), present
+    /// when the page is non-empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<String>,
+}
+
+/// `POST /v0/bindings` — create one binding; `201` + `Location` + the
+/// binding. A refusal is `400 invalid_body` (a field) or `409 conflict`
+/// (a taken name, a taken or legacy-held prefix, a limit).
+#[derive(Serialize)]
+pub(crate) struct BindingDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The binding after the change.
+    pub binding: hekma_engine::Binding,
+}
+
+/// `POST /v0/bindings/{name}/credentials` — issue (rotating any previous
+/// one). The token is in this answer ONCE and is never stored or shown
+/// again; nothing accepts it in this release.
+#[derive(Serialize)]
+pub(crate) struct BindingCredentialDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The class as the request named it.
+    pub class: hekma_engine::BindingCredentialClass,
+    /// The token id (the metadata listing shows this).
+    pub token_id: String,
+    /// The token itself — this response is its only delivery.
+    pub token: String,
+    /// The one-time note (never the token).
+    pub note: String,
+}
+
+/// `GET /v0/bindings/{name}/credentials` — the metadata listing: token ids,
+/// classes and states, never a value.
+#[derive(Serialize)]
+pub(crate) struct BindingCredentialsDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The binding's credentials, oldest first.
+    pub credentials: Vec<hekma_engine::BindingCredential>,
+}
+
+/// `GET /v0/proxy` — where the shared Metering Proxy listens, or why it is
+/// not running.
+#[derive(Serialize)]
+pub(crate) struct ProxyDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// `true` when the proxy is running.
+    pub running: bool,
+    /// Its URL (`http://127.0.0.1:<port>`), present when running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The bound port, present when running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Why it is not running, present when it is not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The `POST /v0/bindings/{name}/credentials` body: the class to issue
+/// (`announce` or `proxy-access`).
+#[derive(Deserialize, Default)]
+pub(crate) struct BindingCredentialRequest {
+    /// The credential class as its wire string.
+    pub class: String,
 }
