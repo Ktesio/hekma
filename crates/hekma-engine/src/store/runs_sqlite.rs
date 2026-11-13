@@ -695,12 +695,12 @@ const ACTION_SCOPE: &str = "run";
 /// step: the existing key `(run_id, dimension, scope)` holds both layers.
 const CALLER_PREFIX: &str = "caller.";
 
-/// The dimension a layer's row is stored under.
 /// The `run_limits` row a Caller's Scent-Check Mode is stored in (story
 /// 22-3).
 const SCENT_DIMENSION: &str = "scent";
 const SCENT_SCOPE: &str = "mode";
 
+/// The dimension a layer's row is stored under.
 fn slot_dimension(slot: crate::ports::LimitSlot, dimension: &str) -> String {
     match slot {
         crate::ports::LimitSlot::Run => dimension.to_string(),
