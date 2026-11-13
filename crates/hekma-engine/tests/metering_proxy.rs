@@ -3034,10 +3034,7 @@ fn a_parked_call_is_re_validated_at_release_and_a_stop_interrupts_it() {
     let parked =
         std::thread::spawn(move || post(port, "/openai/chat", &[("x-hekma-announce", "job")]));
     std::thread::sleep(Duration::from_millis(400));
-    drop(facade);
-    engine
-        .blocking()
-        .stop_metering_proxy(Duration::from_secs(2));
+    facade.stop_metering_proxy(Duration::from_secs(2));
     let interrupted = parked.join().unwrap();
     assert_eq!(interrupted.status, 503, "{}", interrupted.body);
     assert_eq!(interrupted.error_type(), "hekma_hold_interrupted");
