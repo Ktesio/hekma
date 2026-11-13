@@ -542,7 +542,10 @@ pub fn drain_subscription(sub: &mut EventSubscription) -> (Vec<EngineEvent>, Opt
 /// `fake_agent` sibling from: integration-test binaries run from
 /// `target/<profile>/deps/`, example binaries from
 /// `target/<profile>/examples/`, workspace bins directly from
-/// `target/<profile>/` (no marker — passed through unchanged).
+/// `target/<profile>/` (no marker — passed through unchanged). Under
+/// Cargo 1.100 a library's unit-test binary runs from
+/// `target/<profile>/build/<package>/<hash>/out/`, which resolves to the
+/// same profile directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinDir {
     /// The integration-test `deps/` hop ([`fake_agent_bin`]'s default).
@@ -558,6 +561,20 @@ pub enum BinDir {
 /// `fake_agent` helper is hardlinked.
 fn profile_dir(mut exe: PathBuf, hop: BinDir) -> PathBuf {
     exe.pop(); // drop the binary file name
+
+    // Cargo 1.100's build-dir layout runs a library's own unit-test binary
+    // from `target/<profile>/build/<package>/<hash>/out/`, not `deps/`. The
+    // helper is still uplifted to `target/<profile>/`, so climb back to it.
+    if exe.ends_with("out") {
+        let mut profile = exe.clone();
+        profile.pop(); // out
+        profile.pop(); // <hash>
+        profile.pop(); // <package>
+        if profile.ends_with("build") {
+            profile.pop(); // build → .../target/<profile>/
+            return profile;
+        }
+    }
     let marker = match hop {
         BinDir::TestDeps => "deps",
         BinDir::Examples => "examples",
@@ -748,6 +765,14 @@ pub fn fake_agent_bin() -> PathBuf {
     fake_agent_bin_in(BinDir::TestDeps)
 }
 
+/// Locate any `hekma-conformance` `[[bin]]` (such as `hermes_shim`) for an
+/// integration test, building it on demand when absent: the same resolution
+/// as [`fake_agent_bin`], so every layout Cargo runs tests from (`deps/`, or
+/// Cargo 1.100's `build/<package>/<hash>/out/`) resolves to the profile dir.
+pub fn workspace_bin(name: &str) -> PathBuf {
+    helper_bin_in(BinDir::TestDeps, name)
+}
+
 /// The manifest wire key for the host OS (the `[capabilities.*]` entries are
 /// keyed `linux`/`macos`/`windows` — the engine's `OsId` wire form). Runtime
 /// data (matches the engine's `OsId::current()` mapping), not conditional
@@ -809,6 +834,27 @@ mod tests {
                 BinDir::Examples
             ),
             PathBuf::from("/t/release")
+        );
+        // Cargo 1.100's build-dir layout: a library's unit-test binary runs
+        // from `<profile>/build/<package>/<hash>/out/`, for either hop.
+        assert_eq!(
+            profile_dir(
+                PathBuf::from("/t/debug/build/hekma/17931f34ce3e3732/out/hekma-abc"),
+                BinDir::TestDeps
+            ),
+            PathBuf::from("/t/debug")
+        );
+        assert_eq!(
+            profile_dir(
+                PathBuf::from("/t/release/build/hekma-engine/0123abcd/out/perf-budgets"),
+                BinDir::Examples
+            ),
+            PathBuf::from("/t/release")
+        );
+        // An `out/` that is not under `build/<package>/<hash>/` is left alone.
+        assert_eq!(
+            profile_dir(PathBuf::from("/t/debug/x/out/some_bin"), BinDir::TestDeps),
+            PathBuf::from("/t/debug/x/out")
         );
         // A workspace bin (no marker): passed through — hermes_shim's shape.
         assert_eq!(
