@@ -385,6 +385,31 @@ proxy, not the provider.
 Invocation: `cargo run --release -p hekma-engine --example perf-budgets --
 --proxy` (exit 0 green, 1 red, 2 usage or scenario error).
 
+### The per-call records listing scenario (`--calls-seed <N>`)
+
+Reading the metering proxy's per-call records must stay under **1 s at
+p99** however many there are. `--calls-seed <N>` runs on its own (it
+refuses the other flags): it opens an engine so the calls store is created
+with its current schema and indexes, then seeds N records straight into two
+calls segments (the older half in a segment named for an earlier date, so
+every read merges across files), 1% of them on one measured Run and 2% of
+them problem calls. A read-only engine then times
+`PERF_BUDGETS_CALLS_ITERATIONS` (default 40) reads each of the unscoped
+first page, the measured Run's first page, the problems first page and the
+by-id probe; each is gated at p99 < 1 s. One sparse filter that matches
+nothing, and so runs the scan budget out, is reported but not gated. The
+`calls_listing` report block carries every p99. The `perf-budgets` job runs
+`perf-budgets --calls-seed 100000` as its own blocking step, and its
+report, `perf-budgets-calls-report.json`, rides the job's artifact.
+
+| Date | Platform | Records / segments | unscoped / Run / problems / by id p99 (ms) | sparse filter p99 (ms) | Verdict |
+|---|---|---|---|---|---|
+| 2026-11-13 | macOS arm64 (this development machine), release | 100 000 / 2 | 1.12 / 1.05 / 1.05 / 0.82 | 81.6 | PASS (budget 1000) |
+| 2026-11-13 | macOS arm64 (this development machine), release | 1 000 000 / 2 | 1.94 / 1.08 / 1.21 / 1.03 | not gated | PASS (budget 1000) |
+
+Invocation: `cargo run --release -p hekma-engine --example perf-budgets --
+--calls-seed 100000` (exit 0 green, 1 red, 2 usage or scenario error).
+
 ## Cross-platform testing (3-OS matrix)
 
 The per-OS process-control code lives only under `crates/hekma-engine/src/backends/{unix,windows}` (the sole place OS-conditional compilation is allowed). This code cannot be verified on a single operating system — the Windows Job-Object backend does not even compile on Linux. The CI `test` job therefore runs on a matrix of `ubuntu-latest`, `macos-latest`, and `windows-latest`:

@@ -171,6 +171,8 @@ masked, exactly as the CLI displays it).
 | `POST` | `/v0/bindings/{name}/credentials/revoke` | Revoke the binding's active credential of `{"class"}` | 204 |
 | `GET` | `/v0/bindings/{name}/credentials` | The binding's credentials: token ids, classes and states, never a value | 200 |
 | `GET` | `/v0/proxy` | Where the metering proxy listens (`running`, `url`, `port`), or why it is not running (`error`) | 200 |
+| `GET` | `/v0/calls?run=&token_id=&outcome=&disposition=&status_class=&model=&depth=&binding=&from=&to=&view=all\|problems&limit=&cursor=` | The metering proxy's per-call records, newest first (see [Per-call records](#per-call-records)) | 200 |
+| `GET` | `/v0/calls/{call_id}` | One per-call record | 200 + `{"schema_version", "call"}` |
 
 The identity-bearing reads return the engine's own documents — the same wire
 shapes (and schema versions) the CLI already renders. A `POST` lifecycle verb
@@ -201,6 +203,26 @@ A refusal carries an `error.code`:
 | `binding-legacy-route` | 409 | A `/` binding while an upgraded agent holds the legacy root route |
 
 The binding credentials are issued and listed now. Nothing accepts either class yet; the answer's `note` says so.
+
+## Per-call records
+
+`GET /v0/calls` and `GET /v0/calls/{call_id}` read the [metering proxy's](metering-proxy.md#reading-the-records) per-call records. They are for the Operator bearer only; every other credential class, a Run Key for its own Run included, gets `403 forbidden`. Neither adds an event or an SSE frame.
+
+The listing's query parameters are all optional: `run` (one Run's calls, never its child Runs'), `token_id`, `outcome`, `disposition`, `status_class`, `model`, `depth`, `binding`, `from` and `to` (an RFC 3339 window on the call's start, `from` inclusive and `to` exclusive), `view` (`all` or `problems`), `limit` (default 50; `0` means the maximum of 1,000, and a larger value clamps to it) and `cursor`. The answer is `{"schema_version": 1, "filters", "skipped_segments", "items", "next_cursor", "scan_limited", "searched_back_to"}`, the same document `hekma calls list --json` prints.
+
+A refusal carries an `error.code`:
+
+| Code | Status | When |
+|---|---|---|
+| `invalid-cursor` | 400 | The cursor is not one this listing printed (a Run listing's cursor included; the Run listing refuses a calls cursor the same way) |
+| `invalid-limit` | 400 | `limit` is not a whole number |
+| `invalid-run` | 400 | `run` is not a run id |
+| `invalid-time` | 400 | `from` or `to` is not RFC 3339, or `to` is not after `from` |
+| `invalid-view` | 400 | `view` is neither `all` nor `problems` |
+| `invalid-filter` | 400 | `outcome`, `disposition`, `status_class` or `depth` has a value this build does not know; the message names the parameter |
+| `invalid-call-id` | 400 | The path's id is not a call id |
+| `call-not-found` | 404 | No record has the call id |
+| `calls-unavailable` | 503 | The calls store could not be read; retry |
 
 ## Runs
 
