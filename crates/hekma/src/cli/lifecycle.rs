@@ -252,6 +252,26 @@ fn single(
         Err(err) => return Err(err.into_diagnostic()),
     };
     let document = routed.value.unwrap_or(Value::Null);
+    // Story 23-4: on a wire Run the verb acted on its model calls at the
+    // metering proxy — qualified, never a process verb.
+    if let Some(disposition) = hekma_engine::disposition_for(verb, &record) {
+        let row = ActResult::ok(run_id, words.past).with("acts_on", json!("calls"));
+        if flags.json {
+            return fanout::finish(words, flags, 1, vec![row], None, &render);
+        }
+        ui::success(format!("{} Run {run_id}", capitalized(words.past)));
+        ui::note(format!(
+            "on this Run, {} {} its model calls at the metering proxy: the process keeps \
+             running, and calls already sent complete and are billed",
+            verb.as_str(),
+            match disposition {
+                hekma_engine::DispositionVerb::Hold => "holds",
+                hekma_engine::DispositionVerb::Release => "releases",
+                _ => "rejects",
+            }
+        ));
+        return Ok(());
+    }
     let instance = document.get("instance").cloned().ok_or_else(|| {
         Box::new(AgentIo {
             message: format!(
