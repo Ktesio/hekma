@@ -240,3 +240,17 @@ Each is a public-contract or scope choice; the recommendation is the spec's curr
   - **Typed binding refusals:** `Registry::run_binding` stringified every binding refusal across the writer, so a duplicate prefix gave 500 and exit 1. Fixed: the job still rolls back, and the typed refusal travels out beside it. `BindingError::code()` gives `error.code`, and the CLI maps those codes to exit 3 and exit 2. This is a contract addition, flagged for Islam.
   - **`hekma ps`:** the before-the-shared-proxy note now rides the adopted agent's own row (it only rode instanceless Runs before).
   - **The two per-instance-listener tests are rewritten for the shared proxy**, not retired.
+  - **The test suites, and the bugs they found:**
+    - The spec's Verification suites, which were missing:
+      - an identification table;
+      - end-to-end proxy tests against a recording upstream;
+      - failure seams;
+      - crash closing of open calls;
+      - the legacy root route;
+      - binding lifecycle, host route and CLI tests.
+    - Changed-line coverage rose from 77.40%.
+    - Bugs found and fixed:
+      - (1) `--clear-custodied-key` was a no-op, because plain serde reads `null` as "unchanged";
+      - (2) `GET /v0/bindings/{name}` not-found had no `error.code`;
+      - (3) `RunView.usage` (`hekma run show`, `GET /v0/runs/{id}`) read zero for every Run without an Agent Instance, though v18 keys the Run rollup by run id alone.
+    - The `ensure_delay` seam is documented as what it actually proves: the writer's ack bound covers a job being taken, so the refused call is a creation queued behind a slow one.

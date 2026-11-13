@@ -1204,24 +1204,16 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
         .ok_or_else(|| RunError::NotFound {
             run_id: run_id.as_str().to_string(),
         })?;
-    let usage = match &record.instance {
-        Some(instance) => {
-            let name = InstanceName::new(instance).map_err(|e| {
-                RunError::Store(StoreError::CorruptRow {
-                    name: instance.clone(),
-                    detail: e.to_string(),
-                })
-            })?;
-            let rollup = store.run_rollup(&name, run_id)?;
-            RunUsage {
-                input_tokens: rollup.totals.input_tokens,
-                output_tokens: rollup.totals.output_tokens,
-                cached_tokens: rollup.totals.cached_tokens,
-                cost_micros: rollup.cost,
-                estimate: EstimateLabel::Estimated,
-            }
-        }
-        None => RunUsage::default(),
+    // Story 23-1 (v18): the Run rollup is keyed by the run id alone, so a
+    // Run without an Agent Instance (a wire Run of the shared proxy) shows
+    // its usage too — it used to read as zero.
+    let rollup = store.run_rollup_by_id(run_id)?;
+    let usage = RunUsage {
+        input_tokens: rollup.totals.input_tokens,
+        output_tokens: rollup.totals.output_tokens,
+        cached_tokens: rollup.totals.cached_tokens,
+        cost_micros: rollup.cost,
+        estimate: EstimateLabel::Estimated,
     };
     Ok(RunView {
         labels: store.run_labels(run_id)?,

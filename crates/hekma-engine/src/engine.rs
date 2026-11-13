@@ -809,6 +809,19 @@ impl Engine {
         }
     }
 
+    /// The binding a write job answers with (every binding write but
+    /// delete returns one; a job that returned none is a store fault).
+    fn bound_binding(
+        outcome: crate::domain::runs::bindings::BindingOutcome,
+        job: &str,
+    ) -> Result<Binding, BindingError> {
+        outcome.binding.ok_or_else(|| {
+            BindingError::Store(crate::ports::StoreError::Backend(format!(
+                "the {job} job returned no binding"
+            )))
+        })
+    }
+
     /// Run one binding job and publish its committed events on the bus, in
     /// commit order (story 23-1). Every public binding write runs through
     /// this internal helper.
@@ -849,13 +862,7 @@ impl Engine {
             })
         })
         .await
-        .and_then(|outcome| {
-            outcome.binding.ok_or_else(|| {
-                BindingError::Store(crate::ports::StoreError::Backend(
-                    "the create job returned no binding".into(),
-                ))
-            })
-        })
+        .and_then(|outcome| Self::bound_binding(outcome, "create"))
     }
 
     /// Change a binding (story 23-1): a prefix or upstream change keeps its
@@ -880,13 +887,7 @@ impl Engine {
             })
         })
         .await
-        .and_then(|outcome| {
-            outcome.binding.ok_or_else(|| {
-                BindingError::Store(crate::ports::StoreError::Backend(
-                    "the update job returned no binding".into(),
-                ))
-            })
-        })
+        .and_then(|outcome| Self::bound_binding(outcome, "update"))
     }
 
     /// Delete a binding (story 23-1): its Run and its split Runs end with
@@ -921,13 +922,7 @@ impl Engine {
             })
         })
         .await
-        .and_then(|outcome| {
-            outcome.binding.ok_or_else(|| {
-                BindingError::Store(crate::ports::StoreError::Backend(
-                    "the route job returned no binding".into(),
-                ))
-            })
-        })
+        .and_then(|outcome| Self::bound_binding(outcome, "route"))
     }
 
     /// Remove one of a binding's routes (story 23-1). One event.
@@ -946,13 +941,7 @@ impl Engine {
             })
         })
         .await
-        .and_then(|outcome| {
-            outcome.binding.ok_or_else(|| {
-                BindingError::Store(crate::ports::StoreError::Backend(
-                    "the route job returned no binding".into(),
-                ))
-            })
-        })
+        .and_then(|outcome| Self::bound_binding(outcome, "route"))
     }
 
     /// Issue (rotating any previous one) a binding credential (story 23-1,

@@ -2242,3 +2242,32 @@ mod observed_retry_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod base_url_tests {
+    use super::split_base_url;
+
+    #[test]
+    fn a_run_route_base_url_keeps_its_path_for_appending() {
+        assert_eq!(
+            split_base_url("http://127.0.0.1:8400/_hekma/runs/run_X").unwrap(),
+            (
+                "127.0.0.1:8400".to_string(),
+                "/_hekma/runs/run_X".to_string()
+            )
+        );
+        // A trailing slash is trimmed, so appending never doubles it.
+        assert_eq!(
+            split_base_url("http://127.0.0.1:8400/_hekma/runs/run_X/")
+                .unwrap()
+                .1,
+            "/_hekma/runs/run_X"
+        );
+        // An origin alone has an empty path.
+        assert_eq!(
+            split_base_url("http://127.0.0.1:8400").unwrap(),
+            ("127.0.0.1:8400".to_string(), String::new())
+        );
+        assert!(split_base_url("http:///nothing").is_err());
+    }
+}

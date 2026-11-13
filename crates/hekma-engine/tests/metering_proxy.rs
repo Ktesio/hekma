@@ -1243,3 +1243,48 @@ fn a_wire_runs_usage_and_breach_reach_the_event_bus() {
         }
     }
 }
+
+#[test]
+fn past_the_breadth_cap_a_split_hint_stays_on_the_bindings_run_attributed_never_refused() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    // The binding's own Run first.
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    let own = wait_for_usage(&engine, ("binding", "openai"), 10);
+    for n in 0..hekma_engine::MAX_CALLER_OPEN_CHILDREN {
+        let id = format!("s{n}");
+        let answer = post(port, "/openai/chat", &[("x-hekma-run", &id)]);
+        assert_eq!(answer.status, 200, "{id}: {}", answer.body);
+    }
+    // One past the cap: served, and charged to the binding's own Run.
+    let answer = post(port, "/openai/chat", &[("x-hekma-run", "one-too-many")]);
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    let run_id = upstream
+        .served()
+        .last()
+        .unwrap()
+        .header("x-hekma-run-id")
+        .map(str::to_string);
+    assert_eq!(run_id.as_deref(), Some(own.record.run_id.as_str()));
+    // The listing pages past 1,000 Runs, so read the Run itself.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while engine
+        .blocking()
+        .run(own.record.run_id.as_str())
+        .unwrap()
+        .usage
+        .input_tokens
+        < 20
+    {
+        assert!(Instant::now() < deadline, "the capped call was not charged");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
