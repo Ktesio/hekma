@@ -1567,3 +1567,50 @@ fn a_lowered_ceiling_applies_on_the_next_proxied_call_and_wire_runs_price_by_mod
     );
     assert_eq!(post(port, "/openai/chat", &[]).status, 402);
 }
+
+#[test]
+fn concurrent_first_calls_for_one_identity_converge_on_one_run() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let barrier = Arc::new(std::sync::Barrier::new(16));
+    let calls: Vec<_> = (0..16)
+        .map(|n| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                // Half create the binding's Run, half one split Run.
+                let headers: &[(&str, &str)] = if n % 2 == 0 {
+                    &[]
+                } else {
+                    &[("x-hekma-run", "team-a")]
+                };
+                post(port, "/openai/chat", headers).status
+            })
+        })
+        .collect();
+    for call in calls {
+        assert_eq!(call.join().unwrap(), 200);
+    }
+    wait_for_usage(&engine, ("binding", "openai"), 80);
+    wait_for_usage(&engine, ("binding:openai", "team-a"), 80);
+    let all = runs(&engine);
+    let count = |ns: &str, id: &str| {
+        all.iter()
+            .filter(|run| {
+                run.identity
+                    .as_ref()
+                    .is_some_and(|(n, i)| n == ns && i == id)
+            })
+            .count()
+    };
+    assert_eq!(count("binding", "openai"), 1);
+    assert_eq!(count("binding:openai", "team-a"), 1);
+}
