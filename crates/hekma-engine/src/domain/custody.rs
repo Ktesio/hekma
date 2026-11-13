@@ -638,22 +638,17 @@ mod tests {
             None,
         )
         .unwrap_err();
-        match err {
-            CustodyError::UpstreamNotPinned { origin, name } => {
-                assert_eq!(origin, "https://evil.example");
-                assert_eq!(name, "PROVIDER");
-                assert!(
-                    orig_(&err).contains("Add it there, or point this agent or binding"),
-                    "{}",
-                    orig_(&err)
-                );
-            }
-            other => panic!("expected UpstreamNotPinned, got {other:?}"),
-        }
-    }
-
-    fn orig_(err: &CustodyError) -> String {
-        err.to_string()
+        assert!(
+            err.to_string()
+                .contains("Add it there, or point this agent or binding"),
+            "{}",
+            err
+        );
+        assert!(matches!(
+            &err,
+            CustodyError::UpstreamNotPinned { origin, name }
+                if origin == "https://evil.example" && name == "PROVIDER"
+        ));
     }
 
     #[test]

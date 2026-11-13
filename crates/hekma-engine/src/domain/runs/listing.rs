@@ -221,6 +221,40 @@ pub struct RunSummary {
     /// proxy (the legacy root route serves it until it ends).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub before_shared_proxy: bool,
+    /// Story 22-2: the Run's custody, when it owns a supervised process —
+    /// whether the real provider key is held out of the agent (`on`) and,
+    /// when it is not, why (`no-held-key`, `opted-out`, `pre-custody`).
+    /// Absent on Runs that own no process (a binding's Run, a child).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custody: Option<CustodyView>,
+}
+
+/// A listing row's custody slice (story 22-2): `on` or `off`, and the
+/// honest reason when off. No value or secret name ever appears.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustodyView {
+    /// `on` or `off`.
+    pub state: String,
+    /// `held` when on; `no-held-key`, `opted-out` or `pre-custody` when off.
+    pub reason: String,
+}
+
+impl CustodyView {
+    /// Derive the view from a stored custody row: a supervised Run whose
+    /// row is absent predates custody (`pre-custody`); a stored row renders
+    /// verbatim.
+    pub(crate) fn of(stored: Option<crate::ports::RunCustodyRow>) -> Self {
+        match stored {
+            Some(row) => Self {
+                state: row.state,
+                reason: row.reason,
+            },
+            None => Self {
+                state: "off".to_string(),
+                reason: "pre-custody".to_string(),
+            },
+        }
+    }
 }
 
 /// The headroom block a listing row carries: [`BudgetView`]'s stable field
@@ -513,6 +547,7 @@ pub(crate) fn summarize(
     kept_on_pause: bool,
     identity: Option<(String, String)>,
     before_shared_proxy: bool,
+    custody: Option<CustodyView>,
 ) -> RunSummary {
     RunSummary {
         budget: resolution
@@ -525,6 +560,7 @@ pub(crate) fn summarize(
         kept_on_pause,
         identity,
         before_shared_proxy,
+        custody,
     }
 }
 
@@ -601,6 +637,13 @@ pub(crate) fn assemble<S: crate::ports::RunRecords + crate::ports::RunStore + ?S
         // The migration marker (story 23-1): the one pre-proxy Run the
         // legacy root route serves.
         let before_shared_proxy = legacy.as_ref().is_some_and(|legacy| legacy == &run_id);
+        // Story 22-2: custody surfaces on process-owning rows only (a
+        // binding's Run or a child holds no process environment to fence).
+        let custody = if process_owner {
+            Some(CustodyView::of(store.run_custody(&run_id)?))
+        } else {
+            None
+        };
         items.push(summarize(
             record,
             labels,
@@ -611,6 +654,7 @@ pub(crate) fn assemble<S: crate::ports::RunRecords + crate::ports::RunStore + ?S
             kept_on_pause,
             identity,
             before_shared_proxy,
+            custody,
         ));
     }
     Ok(items)
@@ -1053,6 +1097,7 @@ mod tests {
             true,
             None,
             false,
+            None,
         );
         assert_eq!(summary.latched.len(), 2);
         // Sorted by (dimension, scope): dollars sorts before tokens.

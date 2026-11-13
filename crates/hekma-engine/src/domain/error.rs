@@ -446,6 +446,24 @@ pub enum EngineError {
         detail: String,
     },
 
+    /// A KEY-CUSTODY start refusal (story 22-2): the instance's
+    /// configuration cannot carry custody — an `engine-observed` instance
+    /// with no held provider key, a second delivery of the same secret, a
+    /// pass-through or launch-environment provider variable, or an origin
+    /// that cannot be pinned beside the key. The refusal fires
+    /// PRE-TRANSITION: no state change, no spawn, nothing seeded — the
+    /// instance keeps its prior state. `detail` carries the exact
+    /// remediation and never a secret value.
+    #[error(
+        "Agent Instance '{name}' cannot start under key custody: {detail}"
+    )]
+    Custody {
+        /// The instance whose start was refused.
+        name: String,
+        /// The why + remediation (never a secret value).
+        detail: String,
+    },
+
     /// A DETACHED start (`kt agent start --detach`, story 12-1) was requested
     /// for an instance whose configuration cannot be detached. v1's single
     /// refusal: an `engine-observed` instance — its loopback forward listener

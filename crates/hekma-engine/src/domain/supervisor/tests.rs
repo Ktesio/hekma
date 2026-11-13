@@ -8851,6 +8851,7 @@ fn an_unsupervised_instances_re_resolve_uses_fresh_inputs() {
         fresh: true,
         inputs: None,
         upstream: None,
+        custody: None,
     };
     registry.ensure_supervised_run(run).unwrap();
     // A first change resolves and stores a row (no explicit inputs yet).
@@ -10310,6 +10311,7 @@ fn an_exit_whose_key_revocation_cannot_be_written_is_not_recorded() {
                 fresh: true,
                 inputs: None,
                 upstream: None,
+                custody: None,
             };
             let generation = ctx.store().bump_launch_generation(&n)?;
             let mut changes = ops::ensure_supervised(ctx.store(), &supervised, "t")?;
@@ -10437,6 +10439,7 @@ fn an_exit_revokes_its_in_process_childrens_keys_even_when_the_projection_fails(
                 fresh: true,
                 inputs: None,
                 upstream: None,
+                custody: None,
             };
             let generation = ctx.store().bump_launch_generation(&n)?;
             let mut changes = ops::ensure_supervised(ctx.store(), &supervised, "t")?;

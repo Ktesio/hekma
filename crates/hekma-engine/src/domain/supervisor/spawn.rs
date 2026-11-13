@@ -5,6 +5,28 @@
 use super::*;
 use crate::domain::runs::ops::RunFate;
 
+/// The custody resolution of one start (story 22-2, the (2b-custody)
+/// block): the honest OFF reason, or the ON pinning — the held key's name
+/// and reference, the origin frozen on the Run for its life, and the
+/// home-isolation opt-in.
+#[derive(Clone, Debug)]
+pub(super) enum CustodyStart {
+    /// Custody is off: `no-held-key` or `opted-out` (an opted-out
+    /// instance's key is still HELD — recorded as a reference, never
+    /// delivered under custody).
+    Off {
+        reason: &'static str,
+        key_ref: Option<String>,
+    },
+    /// Custody is on: the real key never reaches the adapter mapping; the
+    /// per-launch secrets map carries the Run Key at `provider.api_key`.
+    On {
+        key_ref: String,
+        origin: String,
+        isolate_home: bool,
+    },
+}
+
 impl Supervisor {
     /// Start a registered / previously stopped / FAILED Agent Instance
     /// (AC1/AC2; AC3 restart-from-failed via the 1-6 transition row).
@@ -410,6 +432,17 @@ impl Supervisor {
         // Story 23-1: the Run id is minted before the mapping, because the
         // injected base URL names it (`<proxy url>/_hekma/runs/<run id>`).
         let run_id = kept_run_id.clone().unwrap_or_else(RunId::mint);
+
+        // (2b-custody) KEY CUSTODY (story 22-2): resolve whether THIS start
+        // custodies the instance's provider key — still pre-transition, so
+        // every custody refusal (an `engine-observed` instance with no held
+        // key, a second delivery of the same secret, a provider variable in
+        // a pass-through key or the launch environment, an origin that
+        // cannot be pinned) rejects the start with NO state change, no
+        // spawn, nothing seeded. The one side effect on the SUCCESS path is
+        // the custody-cache seed below (in-memory only).
+        let custody =
+            self.custody_start(registry, &name, &effective, &metering_source, &launch, &run_id)?;
         let start_fence = if metering_source == "engine-observed" {
             self.run_start_fence(registry, &name, kept_run_id.as_ref())
         } else {
@@ -519,6 +552,19 @@ impl Supervisor {
                 crate::domain::SecretString::new(refresh.secret().expose_secret()),
             );
         }
+        // Story 22-2: under custody the provider key's per-launch entry —
+        // which `resolve_secrets` just resolved to the REAL cleartext — is
+        // REPLACED with this launch's Run Key. The adapter's `env` target
+        // for `provider.api_key` can therefore only ever receive the Run
+        // Key; the real value's one home outside this line's reach is the
+        // custody cache `custody_start` seeded (never the mapping, the
+        // environment, argv or the Agent Home).
+        if let CustodyStart::On { .. } = &custody {
+            secrets.insert(
+                super::config::PROVIDER_API_KEY_KEY.to_string(),
+                crate::domain::SecretString::new(launch_key.secret().expose_secret()),
+            );
+        }
         // (AI-27 shadow capture) The pre-apply launch env, snapshotted BEFORE
         // the mapping application mutates `launch.env` (whatever the persisted
         // registration snapshot carried): an env-targeted mapping whose name
@@ -578,6 +624,31 @@ impl Supervisor {
                 mapping_report.secret_flag_keys.join(", "),
             );
             self.emit_diagnostic(&flag_notice);
+        }
+
+        // (2b-custody-home) Story 22-2 (`provider.isolate_home = "on"`,
+        // opt-in): point the home variables at a directory INSIDE the Agent
+        // Home, keeping the agent from FINDING the user's other stored
+        // logins by default. The directory is created before the spawn; the
+        // spawn environment applies these ON TOP of the OS floor (which
+        // would otherwise re-apply the inherited `HOME`), so the rewrite
+        // wins. This does not hide anything from a shell that names a full
+        // path — the docs say so, and bypass detection stays the backstop.
+        if let CustodyStart::On {
+            isolate_home: true, ..
+        } = &custody
+        {
+            let isolated = home.join("isolated-home");
+            std::fs::create_dir_all(&isolated).map_err(|e| EngineError::Log {
+                name: name.as_str().to_string(),
+                path: isolated.to_string_lossy().into_owned(),
+                detail: format!("could not create the isolated home directory: {e}"),
+            })?;
+            for var in backends::isolated_home_env_vars() {
+                launch
+                    .env
+                    .insert(var.to_string(), isolated.to_string_lossy().into_owned());
+            }
         }
 
         // (2c) Persist the effective-config snapshot into the Agent Home (story
@@ -743,7 +814,10 @@ impl Supervisor {
             // manifest-declared mappings are applied (the supervisor owns the
             // decision, the backends stay dumb executors). Every pre-17-2
             // caller (and the default) keeps full inheritance.
-            inherit_env: !self.child_env_allowlist,
+            // Story 22-2: a CUSTODIED start forces the clear-then-apply path
+            // for THIS spawn regardless of the Host option — inherited
+            // provider variables die in the clear, not by enumeration.
+            inherit_env: !self.child_env_allowlist && !matches!(custody, CustodyStart::On { .. }),
             // Story 17-4: THIS spawn's capture posture, resolved above.
             capture_mode,
         };
@@ -845,6 +919,28 @@ impl Supervisor {
             // Story 23-1: the instance's resolved upstream, recorded on its
             // Run in the launch job (the Run route forwards there).
             upstream: upstream.clone(),
+            // Story 22-2: the custody row this launch freezes on the Run —
+            // the state and honest reason, the held-key reference (never a
+            // value) and, when custody is on, the origin frozen for the
+            // Run's life.
+            custody: Some(match &custody {
+                CustodyStart::On {
+                    key_ref,
+                    origin,
+                    ..
+                } => crate::ports::RunCustodyRow {
+                    state: "on".to_string(),
+                    reason: "held".to_string(),
+                    origin: Some(origin.clone()),
+                    key_ref: Some(key_ref.clone()),
+                },
+                CustodyStart::Off { reason, key_ref } => crate::ports::RunCustodyRow {
+                    state: "off".to_string(),
+                    reason: reason.to_string(),
+                    origin: None,
+                    key_ref: key_ref.clone(),
+                },
+            }),
         };
         let launch_generation = match registry.write_spawn_record_new_launch(
             &record,
@@ -1419,6 +1515,144 @@ impl Supervisor {
     /// Runs at `starting`, BEFORE any persisted state change, so a failure
     /// rejects the start cleanly. Refused (typed, traffic-free) when the
     /// upstream is not configured or this engine runs no metering proxy.
+    /// The (2b-custody) resolution (story 22-2): read the `provider.*`
+    /// leaves, refuse every custody-breaking configuration, resolve and
+    /// freeze the origin, validate the real key fail-closed, and seed the
+    /// custody cache. Registry reads and the cache seed are its only
+    /// effects — every refusal precedes any state change.
+    fn custody_start(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        effective: &crate::domain::EffectiveConfig,
+        metering_source: &str,
+        launch: &adapter::StartLaunch,
+        run_id: &RunId,
+    ) -> Result<CustodyStart, EngineError> {
+        use crate::domain::config::{
+            PROVIDER_API_KEY_KEY, PROVIDER_CUSTODY_KEY, PROVIDER_ISOLATE_HOME_KEY,
+        };
+        let refuse = |detail: String| EngineError::Custody {
+            name: name.as_str().to_string(),
+            detail,
+        };
+        // The held key, when the operator named one. The write path already
+        // refused a non-`secret:NAME` value, so an effective leaf that is
+        // not a reference means a hand-edited layer: treated as no held key
+        // (the honest reason surfaces at the listing).
+        let provider_ref = effective
+            .value(PROVIDER_API_KEY_KEY)
+            .and_then(toml::Value::as_str)
+            .and_then(crate::domain::config::secret_name)
+            .map(str::to_string);
+        if provider_ref.is_none() && metering_source == "engine-observed" {
+            return Err(refuse(
+                "this agent meters through Hekma's proxy, so Hekma must hold its provider \
+                 key: set 'provider.api_key' to a secret:NAME reference, or switch the \
+                 adapter's metering source to self-reported"
+                    .to_string(),
+            ));
+        }
+        let custody_on = provider_ref.is_some()
+            && effective.value(PROVIDER_CUSTODY_KEY).and_then(toml::Value::as_str)
+                != Some("off");
+        let Some(key_name) = provider_ref else {
+            return Ok(CustodyStart::Off {
+                reason: "no-held-key",
+                key_ref: None,
+            });
+        };
+        let key_ref = format!("secret:{key_name}");
+        if !custody_on {
+            return Ok(CustodyStart::Off {
+                reason: "opted-out",
+                key_ref: Some(key_ref),
+            });
+        }
+
+        // The second-delivery refusals: the custodied key is delivered
+        // ONCE, by Hekma, or not at all. Values are inspected, not just
+        // references — a pass-through naming a listed provider variable is
+        // caught by its NAME whatever its value carries.
+        for (leaf, value) in effective.iter() {
+            if leaf == PROVIDER_API_KEY_KEY {
+                continue;
+            }
+            if let toml::Value::String(text) = &value.value {
+                if crate::domain::config::secret_name(text) == Some(key_name.as_str()) {
+                    return Err(refuse(format!(
+                        "this agent would receive the provider key twice: 'provider.api_key' \
+                         and '{leaf}'. Remove the other delivery — under key custody Hekma \
+                         holds the key and the agent receives a Run Key"
+                    )));
+                }
+            }
+            if let Some(var) = crate::domain::config::pass_through_tail(leaf) {
+                if crate::domain::config::is_provider_env_var(var) {
+                    return Err(refuse(format!(
+                        "'agent.{var}' names a provider credential variable. Remove it and \
+                         set 'provider.api_key' to the secret reference instead"
+                    )));
+                }
+            }
+        }
+        for var in launch.env.keys() {
+            if crate::domain::config::is_provider_env_var(var) {
+                return Err(refuse(format!(
+                    "this agent would receive the provider key twice: 'provider.api_key' and \
+                     the launch environment's {var}. Remove the other delivery — under key \
+                     custody Hekma holds the key and the agent receives a Run Key"
+                )));
+            }
+        }
+
+        // The origin: declared beside the key, else the built-in provider
+        // entry matching the configured upstream, else a typed refusal. A
+        // KEPT Run's frozen origin survives verbatim (an edited
+        // configuration changes nothing).
+        let declared = registry
+            .custody_pin(&key_name)
+            .map_err(|e| secret_to_engine(name, e))?;
+        let frozen = registry
+            .run_custody(run_id)
+            .map_err(registry_to_engine)?
+            .filter(|row| row.state == "on")
+            .and_then(|row| row.origin);
+        let upstream = effective
+            .value(crate::domain::METERING_UPSTREAM_BASE_URL_KEY)
+            .and_then(toml::Value::as_str)
+            .map(str::to_string);
+        let resolved = crate::domain::custody::resolve_origin(
+            &key_name,
+            &key_ref,
+            declared.as_ref(),
+            upstream.as_deref(),
+            frozen.as_deref(),
+        )
+        .map_err(|e| refuse(e.to_string()))?;
+
+        // The real key resolves fail-closed — an unresolvable reference
+        // refuses the start — and lands ONLY in the in-memory custody
+        // cache; the per-launch secrets map gets the Run Key instead
+        // (the replacement below the resolve_secrets call).
+        let held = registry
+            .require_secret(&key_name)
+            .map_err(|e| secret_to_engine(name, e))?;
+        if let Some(cache) = &self.custody_cache {
+            cache.seed(&key_name, held, declared.clone());
+        }
+
+        let isolate_home = effective
+            .value(PROVIDER_ISOLATE_HOME_KEY)
+            .and_then(toml::Value::as_str)
+            == Some("on");
+        Ok(CustodyStart::On {
+            key_ref: resolved.key_ref,
+            origin: resolved.origin,
+            isolate_home,
+        })
+    }
+
     pub(super) fn observed_route(
         &self,
         name: &InstanceName,

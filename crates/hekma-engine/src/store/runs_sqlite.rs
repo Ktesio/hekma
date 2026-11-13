@@ -558,6 +558,53 @@ pub(super) fn migrate_v16(conn: &Connection) -> Result<(), StoreError> {
     }
 }
 
+/// Schema v19 (story 22-2): the Run custody columns. Four additive
+/// `ALTER TABLE`s — `custody_state` (`on`/`off`), `custody_reason`
+/// (`held`/`no-held-key`/`opted-out`/`pre-custody`), `custody_origin` (the
+/// origin frozen at start, for the Run's life) and `custody_key_ref` (the
+/// `secret:NAME` reference — a reference only, never a value; the drift
+/// note lives in the story's change log). NO backfill: a Run live at
+/// upgrade honestly reads `pre-custody` (NULL state) and its next launch
+/// picks custody up.
+const SCHEMA_V19: &str = "\
+ALTER TABLE runs ADD COLUMN custody_state TEXT;
+ALTER TABLE runs ADD COLUMN custody_reason TEXT;
+ALTER TABLE runs ADD COLUMN custody_origin TEXT;
+ALTER TABLE runs ADD COLUMN custody_key_ref TEXT;
+";
+
+/// Run the v19 step (DDL + stamp) in one `BEGIN IMMEDIATE`, stepping aside
+/// when another process finished it while this one waited.
+pub(super) fn migrate_v19(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
+    let body = || -> Result<bool, StoreError> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(backend)?;
+        if version >= 19 {
+            return Ok(false);
+        }
+        conn.execute_batch(SCHEMA_V19).map_err(backend)?;
+        conn.execute_batch("PRAGMA user_version = 19")
+            .map_err(backend)?;
+        Ok(true)
+    };
+    match body() {
+        Ok(true) => conn.execute_batch("COMMIT").map_err(|err| {
+            let _ = conn.execute_batch("ROLLBACK");
+            backend(err)
+        }),
+        Ok(false) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
 /// Reads an instance's persisted config layers for the FR-21 upgrade
 /// (story 21-3): the merged explicit limits and model key the real
 /// resolution would produce from the engine-default const, the kind-default
@@ -1450,6 +1497,68 @@ impl RunRecords for SqliteStore {
         self.record_run_upstream(run_id, upstream)
     }
 
+    fn set_run_custody(
+        &self,
+        run_id: &RunId,
+        custody: Option<crate::ports::RunCustodyRow>,
+    ) -> Result<(), StoreError> {
+        let (state, reason, origin, key_ref) = match custody {
+            Some(row) => (
+                Some(row.state),
+                Some(row.reason),
+                row.origin,
+                row.key_ref,
+            ),
+            None => (None, None, None, None),
+        };
+        self.conn()
+            .execute(
+                "UPDATE runs SET custody_state = ?2, custody_reason = ?3, custody_origin = ?4, \
+                 custody_key_ref = ?5 WHERE run_id = ?1",
+                rusqlite::params![
+                    run_id.as_str(),
+                    state,
+                    reason,
+                    origin,
+                    key_ref
+                ],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn run_custody(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<crate::ports::RunCustodyRow>, StoreError> {
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT custody_state, custody_reason, custody_origin, custody_key_ref \
+                 FROM runs WHERE run_id = ?1",
+                [run_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(backend)?;
+        Ok(row.and_then(|(state, reason, origin, key_ref)| {
+            let state = state?;
+            Some(crate::ports::RunCustodyRow {
+                state,
+                reason: reason.unwrap_or_else(|| "pre-custody".to_string()),
+                origin,
+                key_ref,
+            })
+        }))
+    }
+
     fn recently_revoked_keys(
         &self,
         since: &str,
@@ -1485,10 +1594,23 @@ impl RunRecords for SqliteStore {
         let latches = self.latches(run_id)?;
         let upstream = self.run_upstream(run_id)?;
         let identity = self.run_identity(run_id)?;
+        // Story 22-2: a Run whose custody is ON carries its held-key
+        // reference and frozen origin into the snapshot — references only;
+        // the value stays in the custody cache.
+        let custody = self
+            .run_custody(run_id)?
+            .filter(|row| row.state == "on")
+            .and_then(|row| {
+                Some(crate::domain::custody::CustodyInfo {
+                    key_ref: std::sync::Arc::from(row.key_ref?.as_str()),
+                    origin: std::sync::Arc::from(row.origin?.as_str()),
+                })
+            });
         Ok(crate::domain::runs::snapshot::EntryExtras {
             disposition: crate::domain::runs::snapshot::Disposition::of_latches(&latches),
             upstream: upstream.map(std::sync::Arc::from),
             identity,
+            custody,
         })
     }
 }

@@ -542,13 +542,31 @@ impl Engine {
         if let Some(sink) = diagnostics {
             supervisor.install_diagnostics(sink);
         }
+        // Story 22-2: the custody cache — the one in-memory home for
+        // custodied provider values — is created BEFORE the supervisor and
+        // the proxy (both hold it), with its refresher on this runtime (a
+        // rotated secrets entry is picked up within the documented bound).
+        let custody_cache = Arc::new(crate::domain::custody::CustodyCache::new(
+            registry.secrets_file(),
+        ));
+        custody_cache.install_diagnostics(supervisor.diagnostic_fn());
+        supervisor.install_custody_cache(Arc::clone(&custody_cache));
+        let _custody_refresher = custody_cache.start_refresher(
+            rt.handle(),
+            std::time::Duration::from_secs(crate::domain::custody::CUSTODY_REFRESH_SECS),
+        );
         // Story 23-1: the shared Metering Proxy starts BEFORE adoption and the
         // reaper, so an adopted engine-observed agent's base URL is live on
         // this very open and the first snapshot it reads already carries
         // every durable `block` reason. A bind failure is surfaced, never a
         // port hop.
-        let (proxy, proxy_error) =
-            Self::start_metering_proxy(&rt, &registry, &supervisor, &metering_proxy);
+        let (proxy, proxy_error) = Self::start_metering_proxy(
+            &rt,
+            &registry,
+            &supervisor,
+            &metering_proxy,
+            &custody_cache,
+        );
         let proxy_url = proxy.as_ref().map(|proxy| proxy.info().url.clone());
         if let Some(error) = &proxy_error {
             supervisor.emit_open_note(error);
@@ -703,6 +721,7 @@ impl Engine {
         registry: &Registry,
         supervisor: &Supervisor,
         options: &crate::metering::proxy::MeteringProxyOptions,
+        custody: &Arc<crate::domain::custody::CustodyCache>,
     ) -> (
         Option<crate::metering::proxy::MeteringProxy>,
         Option<String>,
@@ -728,6 +747,7 @@ impl Engine {
             writer,
             inbox: supervisor.proxy_inbox(),
             diagnostics,
+            custody: Arc::clone(custody),
         };
         match crate::metering::proxy::MeteringProxy::start(rt.handle(), &chosen, deps) {
             Ok(proxy) => {
@@ -4578,6 +4598,7 @@ mod tests {
                     fresh: true,
                     inputs: None,
                     upstream: None,
+                    custody: None,
                 })
                 .unwrap();
         }
@@ -4629,6 +4650,7 @@ mod tests {
                     fresh: true,
                     inputs: None,
                     upstream: None,
+                    custody: None,
                 })
                 .unwrap();
         }
@@ -4818,6 +4840,7 @@ mod tests {
                     fresh: true,
                     inputs: None,
                     upstream: None,
+                    custody: None,
                 })
                 .unwrap();
         }
@@ -5038,6 +5061,7 @@ mod tests {
                     fresh: true,
                     inputs: None,
                     upstream: None,
+                    custody: None,
                 })
                 .unwrap();
         }

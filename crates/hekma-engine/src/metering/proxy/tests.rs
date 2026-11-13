@@ -38,6 +38,7 @@ fn run_entry(id: &str, parent: Option<&str>, upstream: Option<&str>) -> RunEntry
         policy: None,
         disposition: Disposition::default(),
         upstream: upstream.map(Arc::from),
+        custody: None,
         identity: None,
     }
 }
@@ -85,6 +86,7 @@ fn openai() -> BindingEntry {
         prefix: "/openai".into(),
         upstream: Arc::from(BINDING_UPSTREAM),
         labels: labels(),
+        custodied_key: None,
     }
 }
 
@@ -118,6 +120,7 @@ fn world() -> World {
             prefix: "/plain".into(),
             upstream: Arc::from(BINDING_UPSTREAM),
             labels: Vec::new(),
+            custodied_key: None,
         },
     ]);
     let mut identities = HashMap::new();
@@ -534,6 +537,7 @@ fn the_legacy_root_route_catches_what_no_binding_or_run_route_claims() {
             prefix: "/".into(),
             upstream: Arc::from(CATCH_ALL_UPSTREAM),
             labels: Vec::new(),
+            custodied_key: None,
         },
         openai(),
     ]));

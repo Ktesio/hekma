@@ -52,6 +52,8 @@ pub(crate) struct RefusalCounters {
     pub out_of_scope: AtomicU64,
     pub no_route: AtomicU64,
     pub bad_target: AtomicU64,
+    pub bad_host: AtomicU64,
+    pub path_not_allowed: AtomicU64,
     pub busy: AtomicU64,
     pub ignored_hints: AtomicU64,
     pub capped_hints: AtomicU64,
@@ -101,6 +103,16 @@ pub(crate) struct ProxyShared {
     pub diagnostics: Arc<dyn Fn(String) + Send + Sync>,
     /// The minute of the last pre-identification refusal note.
     pub last_note_minute: AtomicU64,
+    /// Story 22-2: the custody cache — the swap's value source (in-memory
+    /// only; a missing entry means the key was never seeded or its refresh
+    /// never succeeded, and the call is refused, never forwarded bare).
+    pub custody: Arc<crate::domain::custody::CustodyCache>,
+    /// Story 22-2: the Host header values beyond the loopback literals the
+    /// guard accepts (`--proxy-allowed-hosts`).
+    pub allowed_hosts: Arc<[String]>,
+    /// Story 22-2: the `Origin` values the guard accepts
+    /// (`--proxy-allowed-origins`); an `Origin` NOT on the list is refused.
+    pub allowed_origins: Arc<[String]>,
     /// cfg(test) seam: slow each Run creation down inside the writer, so a
     /// creation queued behind it is not taken within the ack bound.
     #[cfg(test)]
@@ -131,7 +143,7 @@ impl ProxyShared {
         (self.diagnostics)(format!(
             "metering proxy refusals so far: {} credential in URL, {} unknown credential, {} \
              revoked credential, {} Run Key in the API-key slot, {} out of scope, {} no route, \
-             {} bad target, {} busy",
+             {} bad target, {} bad host, {} path outside the held key's list, {} busy",
             c.credential_in_url.load(Ordering::Relaxed),
             c.unknown_credential.load(Ordering::Relaxed),
             c.credential_revoked.load(Ordering::Relaxed),
@@ -139,6 +151,8 @@ impl ProxyShared {
             c.out_of_scope.load(Ordering::Relaxed),
             c.no_route.load(Ordering::Relaxed),
             c.bad_target.load(Ordering::Relaxed),
+            c.bad_host.load(Ordering::Relaxed),
+            c.path_not_allowed.load(Ordering::Relaxed),
             c.busy.load(Ordering::Relaxed),
         ));
     }
@@ -188,6 +202,52 @@ fn refusal_error(refusal: Refusal) -> WireError {
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// Whether a `Host` header value names a loopback literal (`127.0.0.0/8`,
+/// `::1`, `localhost` — the port stripped, brackets kept honest) — the DNS
+/// rebinding half of the boundary: only the proxy's own loopback addresses
+/// are ever acceptable by default.
+fn host_is_loopback_literal(host: &str) -> bool {
+    let hostname = host.rsplit_once(':').map_or(host, |(name, _)| name);
+    let hostname = hostname.trim_start_matches('[').trim_end_matches(']');
+    if hostname.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = hostname.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    false
+}
+
+/// The Host/Origin guard (story 22-2): `Host` must be a loopback literal or
+/// on the Operator's `--proxy-allowed-hosts` list; `Origin`, when present,
+/// must be on `--proxy-allowed-origins` (browser pages send `Origin` on
+/// cross-site requests; SDKs send none). The refusal precedes
+/// identification and any dial, and no `Access-Control-*` header is ever
+/// added — a page's read of a response body fails in the browser regardless.
+fn host_origin_ok(
+    headers: &HeaderMap,
+    allowed_hosts: &[String],
+    allowed_origins: &[String],
+) -> bool {
+    let listed = |value: &str, list: &[String]| {
+        list.iter()
+            .any(|allowed| allowed.trim().eq_ignore_ascii_case(value.trim()))
+    };
+    let host_ok = match header(headers, hyper::header::HOST.as_str()) {
+        Some(host) => {
+            host_is_loopback_literal(host) || listed(host, allowed_hosts)
+        }
+        None => false,
+    };
+    if !host_ok {
+        return false;
+    }
+    match header(headers, "origin") {
+        Some(origin) => listed(origin, allowed_origins),
+        None => true,
+    }
 }
 
 /// The canonical (scheme, host, port) of a URI: lowercased host, no
@@ -437,6 +497,20 @@ pub(crate) async fn serve(
     shared: Arc<ProxyShared>,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
+    // Story 22-2: the Host/Origin guard runs FIRST — before the target
+    // check, before identification, before any dial — so a rebinding-shaped
+    // request never reaches the key. `OPTIONS` preflights meet the same
+    // guard (never a permissive answer, never a CORS header).
+    if !host_origin_ok(
+        req.headers(),
+        &shared.allowed_hosts,
+        &shared.allowed_origins,
+    ) {
+        shared.counters.bad_host.fetch_add(1, Ordering::Relaxed);
+        drain_request_body(req.into_body()).await;
+        shared.note_refusals();
+        return WireError::BadHost.response();
+    }
     if !target_ok(req.method(), req.uri(), &shared.authority) {
         shared.counters.bad_target.fetch_add(1, Ordering::Relaxed);
         drain_request_body(req.into_body()).await;
@@ -603,6 +677,71 @@ async fn serve_admitted(
         return WireError::BadTarget.response();
     };
 
+    // Story 22-2 — the custody swap's gates, before the body is buffered
+    // and before any dial: the outbound scheme is `https` with certificate
+    // verification on (the client is built with the webpki store and no
+    // bypass exists), the outbound ORIGIN equals the origin frozen on the
+    // Run (canonical equality: scheme, lowercased host, effective port),
+    // and the outbound PATH is on the key's allow-list. A failure refuses
+    // with nothing forwarded and the upstream seeing nothing.
+    let mut custody = None;
+    if let Some(info) = target.custody.clone() {
+        let name = crate::domain::config::secret_name(&info.key_ref)
+            .unwrap_or_default()
+            .to_string();
+        let Some(entry) = shared.custody.get(&name) else {
+            drain_request_body(req.into_body()).await;
+            guard.close(
+                CallDisposition::Pass,
+                CallOutcome::Refused,
+                None,
+                StatusClass::Refused,
+                None,
+                None,
+            );
+            shared.count(Refusal::CustodyUnavailable);
+            return WireError::CustodyUnavailable.response();
+        };
+        let scheme_https = uri.scheme_str() == Some("https");
+        let origin_pinned = scheme_https
+            && crate::domain::custody::origins_equal(
+                &uri.to_string(),
+                &info.origin,
+            );
+        if !origin_pinned {
+            drain_request_body(req.into_body()).await;
+            guard.close(
+                CallDisposition::Pass,
+                CallOutcome::Refused,
+                None,
+                StatusClass::Refused,
+                None,
+                None,
+            );
+            shared.counters.bad_target.fetch_add(1, Ordering::Relaxed);
+            return WireError::BadTarget.response();
+        }
+        let paths = crate::domain::custody::allowed_paths(entry.declared.as_ref(), &info.origin);
+        if !crate::domain::custody::path_allowed(&paths, uri.path()) {
+            drain_request_body(req.into_body()).await;
+            guard.close(
+                CallDisposition::Pass,
+                CallOutcome::Refused,
+                None,
+                StatusClass::Refused,
+                None,
+                None,
+            );
+            shared
+                .counters
+                .path_not_allowed
+                .fetch_add(1, Ordering::Relaxed);
+            shared.note_refusals();
+            return WireError::PathNotAllowed.response();
+        }
+        custody = Some((info, entry));
+    }
+
     // The request body (capped), and the byte budget.
     let declared = req
         .headers()
@@ -671,8 +810,8 @@ async fn serve_admitted(
         &mut req_bytes,
     );
 
-    // The outbound headers: hop-by-hop, Host and every `x-hekma-*` stripped;
-    // credential values marked sensitive; identity headers added.
+    // The outbound headers: hop-by-hop, Host and every `x-hekma-*` header
+    // stripped; credential values marked sensitive; identity headers added.
     strip_hop_by_hop(&mut parts.headers);
     wire::strip_hekma_headers(&mut parts.headers);
     parts.headers.remove(hyper::header::HOST);
@@ -683,6 +822,39 @@ async fn serve_admitted(
     ] {
         if let Some(value) = parts.headers.get_mut(&name) {
             value.set_sensitive(true);
+        }
+    }
+    // Story 22-2 — the swap: under custody the presented credential
+    // headers LEAVE (the Run Key itself, or a client's own key — a
+    // custodied Run spends only its custodied key, which is what makes
+    // attribution total) and the custodied key is inserted ONCE, in the
+    // provider's scheme for the frozen origin, its `HeaderValue` marked
+    // sensitive so no `Debug` path ever prints it.
+    if let Some((info, entry)) = &custody {
+        for name in [
+            hyper::header::AUTHORIZATION,
+            hyper::header::PROXY_AUTHORIZATION,
+            HeaderName::from_static("x-api-key"),
+        ] {
+            parts.headers.remove(&name);
+        }
+        let scheme = crate::domain::custody::scheme_for(&info.origin);
+        match scheme.header_value(&entry.value) {
+            Some((name, value)) => {
+                parts.headers.insert(name, value);
+            }
+            None => {
+                guard.close(
+                    CallDisposition::Pass,
+                    CallOutcome::Refused,
+                    None,
+                    StatusClass::Refused,
+                    None,
+                    None,
+                );
+                shared.counters.bad_target.fetch_add(1, Ordering::Relaxed);
+                return WireError::BadTarget.response();
+            }
         }
     }
     if shared.identity_headers {
@@ -786,13 +958,46 @@ async fn serve_admitted(
     // Relay the buffered response, with the breach header when the Run or
     // an ancestor holds a latched breach of any action.
     strip_hop_by_hop(&mut res_parts.headers);
+    // Story 22-2 — response redaction: exact occurrences of the custodied
+    // key in the relayed headers and body are replaced with the fixed mask
+    // (a provider can echo a presented key in an error body; the response
+    // the agent reads must not carry the real key back into everything the
+    // agent prints or writes). Responses are buffered whole today; when
+    // incremental relay lands the redaction moves to a sliding window.
+    let relay_bytes = if let Some((_, entry)) = &custody {
+        let needle = entry.value.expose_secret();
+        for value in res_parts.headers.values_mut() {
+            if let Ok(text) = value.to_str() {
+                if text.contains(needle) {
+                    if let Ok(replaced) =
+                        HeaderValue::from_str(&text.replace(needle, wire::REDACTION_MASK))
+                    {
+                        let mut replaced = replaced;
+                        replaced.set_sensitive(value.is_sensitive());
+                        *value = replaced;
+                    }
+                }
+            }
+        }
+        if res_bytes.windows(needle.len()).any(|window| window == needle.as_bytes()) {
+            Bytes::from(
+                String::from_utf8_lossy(&res_bytes)
+                    .replace(needle, wire::REDACTION_MASK)
+                    .into_bytes(),
+            )
+        } else {
+            res_bytes
+        }
+    } else {
+        res_bytes
+    };
     let latched = shared.snapshot.current().disposition_over(&run_id);
     if let Some(value) = wire::breach_header_value(&Disposition::reasons(latched.breach_latched)) {
         res_parts
             .headers
             .insert(HeaderName::from_static(wire::BREACH_HEADER), value);
     }
-    let mut response = Response::new(Full::new(res_bytes));
+    let mut response = Response::new(Full::new(relay_bytes));
     *response.status_mut() = res_parts.status;
     *response.headers_mut() = res_parts.headers;
     response

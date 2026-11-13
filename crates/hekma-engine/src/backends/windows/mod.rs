@@ -271,6 +271,15 @@ const ENV_FLOOR: &[&str] = &[
     "HOME",
 ];
 
+/// The home-pointing variables home isolation rewrites (story 22-2; see
+/// `backends::isolated_home_env_vars`). The profile variables, matched
+/// case-insensitively by the spawn (like the floor itself); tools that
+/// reach the known-folder APIs bypass them, which the docs name as the
+/// residual limit.
+pub fn isolated_home_env_vars() -> &'static [&'static str] {
+    &["USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOME"]
+}
+
 impl WindowsBackend {
     /// Construct the backend.
     pub fn new() -> Self {

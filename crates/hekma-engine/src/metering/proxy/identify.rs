@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use crate::domain::credential::{parse_presented, scan_url, TokenClass, TokenHash};
+use crate::domain::custody::CustodyInfo;
 use crate::domain::runs::snapshot::RunSnapshot;
 use crate::domain::runs::wire::{parse_hint_labels, valid_external_id, WireIdentity};
 use crate::domain::RunId;
@@ -70,6 +71,13 @@ pub(crate) struct Target {
     pub via: Via,
     /// The presented Run Key's token id, when one identified the call.
     pub token_id: Option<String>,
+    /// The custody the call may draw on (story 22-2): present when the
+    /// call is authenticated by a custody-eligible Run Key AND its
+    /// attribution Run (or an ancestor) holds a key. The swap at forward
+    /// time draws ONLY on this — a binding's Run reached with no
+    /// credential, the unattributed Run and a header-announced Run never
+    /// get one (they hold no eligible credential to begin with).
+    pub custody: Option<CustodyInfo>,
 }
 
 /// Which Run a call is attributed to.
@@ -115,7 +123,10 @@ fn looks_like_token(value: &str) -> bool {
 
 /// A presented token's verdict against the snapshot.
 enum KeyVerdict {
-    Run(RunId, String),
+    /// The key's Run, token id and custody eligibility (recorded at mint:
+    /// supervised starts, credentialed opens and their descendants are
+    /// eligible; the swap draws only on an eligible key).
+    Run(RunId, String, bool),
     Unknown,
     Revoked,
 }
@@ -127,7 +138,11 @@ fn verdict(snapshot: &RunSnapshot, raw: &str) -> KeyVerdict {
     let hash = TokenHash::of_token(secret.expose_secret());
     match snapshot.keys.get(&hash) {
         Some(entry) if entry.class == TokenClass::RunKey && class == TokenClass::RunKey => {
-            KeyVerdict::Run(entry.run_id.clone(), entry.token_id.clone())
+            KeyVerdict::Run(
+                entry.run_id.clone(),
+                entry.token_id.clone(),
+                entry.custody_eligible,
+            )
         }
         Some(_) => KeyVerdict::Unknown,
         None if snapshot.revoked.contains(&hash) => KeyVerdict::Revoked,
@@ -146,27 +161,54 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
         return Identified::Refused(Refusal::CredentialInUrl);
     }
 
-    // 2. A presented Run Key; an `hk_` token in the API-key slot.
+    // 2. A presented Run Key; an `hk_` token in the API-key slot. Story
+    // 22-2: an ELIGIBLE Run Key in the slot is custody's identification —
+    // the call proceeds like an `x-hekma-run-key` call and the swap (or,
+    // when its Run holds no key, the `custody_unavailable` refusal below)
+    // is decided once the attribution Run is known. An INELIGIBLE key in
+    // the slot keeps the refusal: the slot means "swap for me", and only
+    // an eligible key ever may.
     let slot = facts
         .authorization
         .and_then(bearer)
         .filter(|value| looks_like_token(value))
         .or(facts.api_key.map(str::trim).filter(|v| looks_like_token(v)));
-    if let Some(raw) = slot {
-        return Identified::Refused(match verdict(snapshot, raw) {
-            KeyVerdict::Run(..) => Refusal::CustodyUnavailable,
-            KeyVerdict::Unknown => Refusal::UnknownCredential,
-            KeyVerdict::Revoked => Refusal::CredentialRevoked,
-        });
-    }
+    let mut custody_slot = false;
+    let key = if let Some(raw) = slot {
+        match verdict(snapshot, raw) {
+            KeyVerdict::Run(run, token_id, eligible) if eligible => {
+                custody_slot = true;
+                Some((run, token_id))
+            }
+            KeyVerdict::Run(..) => {
+                return Identified::Refused(Refusal::CustodyUnavailable);
+            }
+            KeyVerdict::Unknown => return Identified::Refused(Refusal::UnknownCredential),
+            KeyVerdict::Revoked => return Identified::Refused(Refusal::CredentialRevoked),
+        }
+    } else {
+        None
+    };
     let key = match facts.run_key.map(str::trim).filter(|v| !v.is_empty()) {
         Some(raw) => match verdict(snapshot, raw) {
-            KeyVerdict::Run(run, token_id) => Some((run, token_id)),
+            KeyVerdict::Run(run, token_id, _) => Some((run, token_id)),
             KeyVerdict::Unknown => return Identified::Refused(Refusal::UnknownCredential),
             KeyVerdict::Revoked => return Identified::Refused(Refusal::CredentialRevoked),
         },
-        None => None,
+        None => key,
     };
+
+    // Story 22-2: an eligible Run Key (the slot above, or `x-hekma-run-key`)
+    // draws on the custody its Run's chain holds — decided HERE, before the
+    // route, so a key in the API-key slot whose Run holds no key keeps the
+    // same `custody_unavailable` answer whatever the path. A call with no
+    // eligible credential NEVER draws custody (a labelled binding's Run
+    // reached bare, the unattributed Run, a header-announced Run): it is
+    // forwarded with whatever key the client sent.
+    let custody = key.as_ref().and_then(|(run, _)| snapshot.custody_of(run));
+    if custody_slot && custody.is_none() {
+        return Identified::Refused(Refusal::CustodyUnavailable);
+    }
 
     // 3–5. The route.
     enum Route {
@@ -329,6 +371,7 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
             rest,
             via,
             token_id,
+            custody,
         },
         attribution,
         hint_ignored,

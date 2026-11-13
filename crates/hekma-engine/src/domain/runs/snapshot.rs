@@ -155,6 +155,9 @@ pub(crate) struct EntryExtras {
     pub upstream: Option<Arc<str>>,
     /// The Run's `(namespace, external id)` identity, when it has one.
     pub identity: Option<(String, String)>,
+    /// The Run's held-key custody (story 22-2): the reference and the
+    /// frozen origin, when custody is on.
+    pub custody: Option<crate::domain::custody::CustodyInfo>,
 }
 
 /// One Operator endpoint binding as the data path sees it (story 23-1).
@@ -166,6 +169,10 @@ pub(crate) struct BindingEntry {
     pub upstream: Arc<str>,
     /// The bound labels its Runs carry (sorted by key).
     pub labels: Vec<(String, String)>,
+    /// The binding's inert custodied-key reference (story 22-2: a
+    /// `secret:NAME` string, never a value; the swap never draws on it
+    /// without a custody-eligible credential).
+    pub custodied_key: Option<String>,
 }
 
 impl BindingEntry {
@@ -235,6 +242,11 @@ pub(crate) struct RunEntry {
     pub upstream: Option<Arc<str>>,
     /// Its `(namespace, external id)` identity (story 23-1).
     pub identity: Option<(String, String)>,
+    /// Its held-key custody (story 22-2): the `secret:NAME` reference and
+    /// the frozen origin, when custody is on. A child Run reads up the
+    /// chain ([`RunSnapshot::custody_of`]) — a child of a custodied
+    /// supervised Run keeps custody.
+    pub custody: Option<crate::domain::custody::CustodyInfo>,
 }
 
 /// Build one snapshot entry: the record, its labels and limits, its stored
@@ -254,6 +266,7 @@ pub(crate) fn entry_of(
         disposition: extras.disposition,
         upstream: extras.upstream,
         identity: extras.identity,
+        custody: extras.custody,
     }
 }
 
@@ -365,6 +378,19 @@ impl RunSnapshot {
                     .get(run_id)
                     .map(|(up, _)| Arc::clone(up))
             })
+    }
+
+    /// The custody a call attributed to `run_id` may draw on (story 22-2):
+    /// the FIRST held-key custody up the Run's chain — a supervised Run's
+    /// own, or the process-owning ancestor's for its in-process children
+    /// (a child of a custodied supervised Run keeps custody). A binding's
+    /// Run has no process-owning ancestor and no chain custody: on
+    /// loopback its key is drawn ONLY through an eligible credential, so
+    /// nothing else is needed.
+    pub(crate) fn custody_of(&self, run_id: &RunId) -> Option<crate::domain::custody::CustodyInfo> {
+        self.chain(run_id)
+            .iter()
+            .find_map(|entry| entry.custody.clone())
     }
 
     /// The next snapshot with `changes` applied: an ended entry leaves the
@@ -642,6 +668,7 @@ mod tests {
             disposition: Disposition::default(),
             upstream: None,
             identity: None,
+            custody: None,
         }
     }
 

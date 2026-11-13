@@ -51,6 +51,15 @@ pub struct MeteringProxyOptions {
     pub max_concurrent_calls: usize,
     /// The most request and response bytes buffered at once.
     pub max_buffered_bytes: u64,
+    /// Host header values beyond the loopback literals the Host/Origin
+    /// guard accepts (story 22-2, `--proxy-allowed-hosts`; empty = the
+    /// loopback literals alone).
+    pub allowed_hosts: Vec<String>,
+    /// `Origin` header values the Host/Origin guard accepts (story 22-2,
+    /// `--proxy-allowed-origins`; empty = every `Origin` is refused —
+    /// SDKs send none, and a browser page's cross-site request is the
+    /// threat).
+    pub allowed_origins: Vec<String>,
 }
 
 impl Default for MeteringProxyOptions {
@@ -62,6 +71,8 @@ impl Default for MeteringProxyOptions {
             identity_headers: true,
             max_concurrent_calls: 512,
             max_buffered_bytes: 512 * 1024 * 1024,
+            allowed_hosts: Vec::new(),
+            allowed_origins: Vec::new(),
         }
     }
 }
@@ -103,6 +114,9 @@ pub(crate) struct ProxyDeps {
     pub writer: WriterHandle,
     pub inbox: Arc<EvaluationInbox>,
     pub diagnostics: Arc<dyn Fn(String) + Send + Sync>,
+    /// Story 22-2: the custody cache — the swap's value source (in-memory
+    /// only, refreshed off the hot path).
+    pub custody: Arc<crate::domain::custody::CustodyCache>,
 }
 
 impl MeteringProxy {
@@ -171,6 +185,9 @@ impl MeteringProxy {
             pending: std::sync::Mutex::default(),
             diagnostics: deps.diagnostics,
             last_note_minute: std::sync::atomic::AtomicU64::new(0),
+            custody: deps.custody,
+            allowed_hosts: options.allowed_hosts.clone().into(),
+            allowed_origins: options.allowed_origins.clone().into(),
             #[cfg(test)]
             ensure_delay: std::sync::Mutex::new(None),
         });

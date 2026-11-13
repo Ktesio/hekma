@@ -168,6 +168,20 @@ impl UnixBackend {
 /// everything else (see the spawn guard + docs/commands.md).
 const ENV_FLOOR: &[&str] = &["PATH", "HOME"];
 
+/// The home-pointing variables home isolation rewrites (story 22-2; see
+/// `backends::isolated_home_env_vars`). `HOME` heads the list because the
+/// clear-then-apply floor re-applies it — the mapped environment wins on
+/// top, which is exactly the override an isolated home needs.
+pub fn isolated_home_env_vars() -> &'static [&'static str] {
+    &[
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+    ]
+}
+
 impl ProcessBackend for UnixBackend {
     type Handle = UnixProcess;
 
