@@ -2154,6 +2154,10 @@ struct CliArgs {
     /// latency through the proxy against the same upstream called
     /// directly) and its absolute gate; refused beside the other flags.
     proxy: bool,
+    /// Story 19-4: run ONLY the per-call records listing scenario over N
+    /// seeded records and its absolute gates; refused beside the other
+    /// flags.
+    calls_seed: Option<u64>,
     help: bool,
 }
 
@@ -2191,6 +2195,12 @@ fn usage_text() -> String {
          \x20                          open Runs, and the same calls straight to the upstream;\n\
          \x20                          gates the proxy's added p99 at 10 ms (CI retries once).\n\
          \x20                          Refused beside the other flags.\n\
+         \x20 --calls-seed <N>       story 19-4: run ONLY the per-call records listing\n\
+         \x20                          scenario: seed N records into two calls segments, then\n\
+         \x20                          time the unscoped, Run-scoped and problems first pages\n\
+         \x20                          and the by-id probe (PERF_BUDGETS_CALLS_ITERATIONS,\n\
+         \x20                          default 40); gates each p99 under 1 s. Refused beside\n\
+         \x20                          the other flags.\n\
          \x20 --help | -h             this text.\n\
          \n\
          \x20 No flags: the absolute budgets gate exactly as before and the report is\n\
@@ -2233,7 +2243,7 @@ fn parse_cli_args(argv: &[String]) -> Result<CliArgs, String> {
             return Err(format!(
                 "unknown argument {raw:?} \
                  (supported: --baseline <file>, --write-baseline <file>, --serve-shape, \
-                 --ps-seed <N>, --proxy, --help)"
+                 --ps-seed <N>, --proxy, --calls-seed <N>, --help)"
             ));
         };
         if flag == "--proxy" {
@@ -2265,6 +2275,30 @@ fn parse_cli_args(argv: &[String]) -> Result<CliArgs, String> {
             index += 1;
             continue;
         }
+        if flag == "--calls-seed" {
+            // Story 19-4: a count, like --ps-seed.
+            let value = match inline_value {
+                Some(value) => value,
+                None => {
+                    index += 1;
+                    argv.get(index).cloned().ok_or_else(|| {
+                        "--calls-seed requires a count (usage: --calls-seed <N>)".to_string()
+                    })?
+                }
+            };
+            let count: u64 = value.parse().map_err(|_| {
+                format!("--calls-seed requires a whole number of records (got {value:?})")
+            })?;
+            if count == 0 {
+                return Err("--calls-seed requires a count of at least 1".to_string());
+            }
+            if parsed.calls_seed.is_some() {
+                return Err("--calls-seed given more than once".to_string());
+            }
+            parsed.calls_seed = Some(count);
+            index += 1;
+            continue;
+        }
         if flag == "--ps-seed" {
             let value = match inline_value {
                 Some(value) => value,
@@ -2292,7 +2326,7 @@ fn parse_cli_args(argv: &[String]) -> Result<CliArgs, String> {
             return Err(format!(
                 "unknown argument {raw:?} \
                  (supported: --baseline <file>, --write-baseline <file>, --serve-shape, \
-                 --ps-seed <N>, --proxy, --help)"
+                 --ps-seed <N>, --proxy, --calls-seed <N>, --help)"
             ));
         }
         let value = match inline_value {
@@ -3330,6 +3364,199 @@ fn proxy_scenario(ci: bool) -> Result<bool, String> {
     Ok(passed)
 }
 
+// ---- Story 19-4: the per-call records listing scenario. ----
+
+/// The listing gate: each measured read's p99 strictly under one second.
+const CALLS_P99_BUDGET_MS: f64 = 1000.0;
+/// Iterations per measured read (`PERF_BUDGETS_CALLS_ITERATIONS`).
+const CALLS_DEFAULT_ITERATIONS: u64 = 40;
+/// The seed's distinct Runs; the measured Run holds 1% of the records.
+const CALLS_SEED_RUNS: u64 = 1_000;
+
+/// A Crockford ULID body at `unix_millis` with `nonce` in its random half:
+/// deterministic, order-preserving ids.
+fn bench_ulid(unix_millis: u64, nonce: u64) -> String {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut value: u128 = u128::from(unix_millis & ((1 << 48) - 1)) << 80;
+    value |= u128::from(nonce);
+    (0..26)
+        .rev()
+        .map(|group| ALPHABET[((value >> (5 * group)) & 0x1F) as usize] as char)
+        .collect()
+}
+
+/// One seeded record's shape: (run index, a problem call). 1% go to the
+/// measured Run (index 0), the rest spread over the others; 2% are
+/// problems.
+fn calls_seed_shape(i: u64) -> (u64, bool) {
+    let run = if i.is_multiple_of(100) {
+        0
+    } else {
+        1 + i % (CALLS_SEED_RUNS - 1)
+    };
+    (run, i % 50 == 7)
+}
+
+fn run_calls_scenario(seed: u64) -> i32 {
+    match calls_scenario(seed) {
+        Ok(passed) => i32::from(!passed),
+        Err(reason) => {
+            note(&format!(
+                "the calls scenario could not run: {reason} — exiting 2"
+            ));
+            2
+        }
+    }
+}
+
+/// Fill one segment with records `range` (one transaction).
+fn seed_calls_segment(
+    path: &std::path::Path,
+    range: std::ops::Range<u64>,
+    base_ms: u64,
+) -> Result<(), String> {
+    let mut conn = rusqlite::Connection::open(path).map_err(|err| err.to_string())?;
+    let tx = conn.transaction().map_err(|err| err.to_string())?;
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO calls VALUES (?1, ?2, NULL, 'wire', 'bench', ?3, NULL, ?4, ?5, ?6, \
+                 'gpt-demo', 10, 5, 0, ?7, ?7, 1000, 900)",
+            )
+            .map_err(|err| err.to_string())?;
+        for i in range {
+            let (run, problem) = calls_seed_shape(i);
+            let millis = base_ms + i;
+            let (disposition, outcome, status, class) = if problem {
+                ("block", "refused", 402, "refused")
+            } else {
+                ("pass", "completed", 200, "2xx")
+            };
+            let started_at =
+                hekma_engine::format_rfc3339_micros(millis / 1000, ((millis % 1000) * 1000) as u32);
+            insert
+                .execute(rusqlite::params![
+                    format!("call_{}", bench_ulid(millis, i)),
+                    format!("run_{}", bench_ulid(1_700_000_000_000, run)),
+                    disposition,
+                    outcome,
+                    status,
+                    class,
+                    started_at,
+                ])
+                .map_err(|err| err.to_string())?;
+        }
+    }
+    tx.commit().map_err(|err| err.to_string())
+}
+
+fn calls_scenario(seed: u64) -> Result<bool, String> {
+    let iterations = env_u64("PERF_BUDGETS_CALLS_ITERATIONS", CALLS_DEFAULT_ITERATIONS).max(1);
+    let state = tempfile::TempDir::new().map_err(|err| err.to_string())?;
+    // The proxy-owning open creates today's segment at the current calls
+    // schema (the real DDL and indexes); the bench then fills it.
+    drop(
+        hekma_engine::Engine::open(Some(state.path().to_path_buf()))
+            .map_err(|err| format!("open the engine: {err}"))?,
+    );
+    let calls_dir = state.path().join("calls");
+    let head = std::fs::read_dir(&calls_dir)
+        .map_err(|err| err.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "db"))
+        .ok_or("the engine created no calls segment")?;
+    // Two segments: the older half in a copy named for an earlier date, so
+    // every read merges across the boundary.
+    let older = calls_dir.join("2000-01-01.db");
+    std::fs::copy(&head, &older).map_err(|err| err.to_string())?;
+    let base_ms: u64 = 1_750_000_000_000;
+    let started = std::time::Instant::now();
+    seed_calls_segment(&older, 0..seed / 2, base_ms)?;
+    seed_calls_segment(&head, seed / 2..seed, base_ms)?;
+    note(&format!(
+        "calls run (story 19-4): seeded {seed} records into 2 segments in {:.1} s; measuring \
+         {iterations} iterations per read",
+        started.elapsed().as_secs_f64()
+    ));
+    let engine = hekma_engine::Engine::open_read_only(Some(state.path().to_path_buf()))
+        .map_err(|err| format!("open read-only: {err}"))?;
+    let facade = engine.blocking();
+    let probe_id = format!("call_{}", bench_ulid(base_ms + 1, 1));
+    let measured_run = format!("run_{}", bench_ulid(1_700_000_000_000, 0));
+    let time = |read: &dyn Fn() -> Result<(), String>| -> Result<f64, String> {
+        let mut samples = Vec::with_capacity(iterations as usize);
+        for _ in 0..iterations {
+            let at = std::time::Instant::now();
+            read()?;
+            samples.push(at.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        Ok(percentile(&samples, 99.0))
+    };
+    let page = |query: hekma_engine::CallsQuery| -> Result<(), String> {
+        facade
+            .list_calls(query)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    };
+    let unscoped = time(&|| page(hekma_engine::CallsQuery::all()))?;
+    let run_scoped = time(&|| {
+        page(hekma_engine::CallsQuery {
+            run: Some(measured_run.clone()),
+            ..hekma_engine::CallsQuery::all()
+        })
+    })?;
+    let problems = time(&|| {
+        page(hekma_engine::CallsQuery {
+            view: hekma_engine::CallView::Problems,
+            ..hekma_engine::CallsQuery::all()
+        })
+    })?;
+    let by_id = time(&|| {
+        facade
+            .call(&probe_id)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    })?;
+    // A sparse filter that matches nothing exhausts the scan budget
+    // (reported, not gated).
+    let sparse = time(&|| {
+        page(hekma_engine::CallsQuery {
+            model: Some("no-such-model".into()),
+            ..hekma_engine::CallsQuery::all()
+        })
+    })?;
+    let passed = [unscoped, run_scoped, problems, by_id]
+        .iter()
+        .all(|p99| *p99 < CALLS_P99_BUDGET_MS);
+    let report = serde_json::json!({
+        "calls_listing": {
+            "seed": seed,
+            "segments": 2,
+            "iterations": iterations,
+            "unscoped_first_page_p99_ms": unscoped,
+            "run_scoped_first_page_p99_ms": run_scoped,
+            "problems_first_page_p99_ms": problems,
+            "by_id_p99_ms": by_id,
+            "sparse_scan_budget_p99_ms": sparse,
+            "budget_p99_ms": CALLS_P99_BUDGET_MS,
+            "passed": passed,
+        }
+    });
+    let text = serde_json::to_string_pretty(&report).map_err(|err| err.to_string())?;
+    println!("{text}");
+    if let Ok(path) = std::env::var("PERF_BUDGETS_REPORT_PATH") {
+        std::fs::write(&path, &text).map_err(|err| format!("write {path}: {err}"))?;
+    }
+    note(&format!(
+        "calls listing p99: unscoped {unscoped:.2} ms, Run-scoped {run_scoped:.2} ms, problems \
+         {problems:.2} ms, by id {by_id:.2} ms (budget < {CALLS_P99_BUDGET_MS} ms) — {}",
+        if passed { "PASS" } else { "FAIL" }
+    ));
+    Ok(passed)
+}
+
 fn main() {
     // Story 15-5: the flag surface (--baseline / --write-baseline). Parsed
     // FIRST so a usage error cannot waste a minute of measurement; invalid
@@ -3347,6 +3574,18 @@ fn main() {
         return;
     }
     let config = HarnessConfig::from_env();
+    if let Some(seed) = cli.calls_seed {
+        if cli.baseline.is_some()
+            || cli.write_baseline.is_some()
+            || cli.serve_shape
+            || cli.ps_seed.is_some()
+            || cli.proxy
+        {
+            note("--calls-seed runs on its own: drop the other flags — exiting 2");
+            std::process::exit(2);
+        }
+        std::process::exit(run_calls_scenario(seed));
+    }
     if cli.proxy {
         if cli.baseline.is_some()
             || cli.write_baseline.is_some()
@@ -5541,6 +5780,7 @@ mod tests {
                 serve_shape: false,
                 ps_seed: None,
                 proxy: false,
+                calls_seed: None,
                 help: false,
             }
         );
@@ -5556,6 +5796,7 @@ mod tests {
                 serve_shape: false,
                 ps_seed: None,
                 proxy: false,
+                calls_seed: None,
                 help: false,
             }
         );
@@ -5573,6 +5814,7 @@ mod tests {
                 serve_shape: false,
                 ps_seed: None,
                 proxy: false,
+                calls_seed: None,
                 help: false,
             }
         );
@@ -6105,6 +6347,41 @@ mod tests {
         assert_eq!(outcome.page_p(0.95), 12.0);
         assert_eq!(outcome.page_p(0.50), 6.0);
         assert_eq!(outcome.open_p(0.99), 1.0, "constant samples rank constant");
+    }
+
+    #[test]
+    fn the_calls_seed_flag_parses_and_refuses_bad_usage() {
+        let parse =
+            |args: &[&str]| parse_cli_args(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            parse(&["--calls-seed", "100000"]).unwrap().calls_seed,
+            Some(100_000)
+        );
+        assert_eq!(parse(&["--calls-seed=7"]).unwrap().calls_seed, Some(7));
+        assert_eq!(parse(&[]).unwrap().calls_seed, None);
+        assert!(parse(&["--calls-seed", "0"])
+            .unwrap_err()
+            .contains("at least 1"));
+        assert!(parse(&["--calls-seed", "x"])
+            .unwrap_err()
+            .contains("whole number"));
+        assert!(parse(&["--calls-seed"])
+            .unwrap_err()
+            .contains("requires a count"));
+        assert!(parse(&["--calls-seed", "1", "--calls-seed", "2"])
+            .unwrap_err()
+            .contains("more than once"));
+        assert!(usage_text().contains("--calls-seed"));
+    }
+
+    #[test]
+    fn the_calls_seed_mix_is_one_percent_measured_and_two_percent_problems() {
+        let shapes: Vec<_> = (0..10_000).map(calls_seed_shape).collect();
+        assert_eq!(shapes.iter().filter(|(run, _)| *run == 0).count(), 100);
+        assert_eq!(shapes.iter().filter(|(_, problem)| *problem).count(), 200);
+        assert!(shapes.iter().all(|(run, _)| *run < CALLS_SEED_RUNS));
+        // Ids sort by time: a later millisecond is a later id.
+        assert!(bench_ulid(1_000, 5) < bench_ulid(1_001, 0));
     }
 
     #[test]

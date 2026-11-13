@@ -87,6 +87,36 @@ Responses are buffered whole before they are relayed, so through the proxy a str
 - If the host is killed, calls in flight fail at the client as connection errors. At the next start, Hekma closes their records: `recovered` when the usage made it into the ledger, else `crash` with unknown tokens. A call relayed in the last batch window before a hard kill can go uncounted; it shows up as a `crash` record, never as a double count.
 - A client that disconnects cancels the upstream request, and the call is recorded as `client-disconnect` with unknown tokens. The provider may still bill a partial generation Hekma cannot see.
 
+## Reading the records
+
+Every call the proxy admits leaves one record in the calls store. Read them with `hekma calls list` and `hekma calls show` (see [Commands](commands.md#hekma-calls-listshow)), with `GET /v0/calls` and `GET /v0/calls/{call_id}` (see [Control API](control-api.md#per-call-records)), or with `Engine::list_calls` and `Engine::call` when you embed the engine.
+
+A record carries:
+
+| Field | Meaning |
+|---|---|
+| `call_id` | `call_` + a ULID, minted when the call is admitted |
+| `run_id` | The Run the call was charged to |
+| `token_id` | The 12-hex label of the Run Key the call presented; `null` when it presented none |
+| `control_depth` | The Run's Control Depth at the call |
+| `binding` | The binding the call came through; `null` off a binding |
+| `disposition` | What the proxy did: `pass` or `block` (`hold`, `reroute` and `reject` are reserved) |
+| `hold_end` | Always `null` until holds ship |
+| `outcome` | `completed`, `refused`, `upstream-error`, `client-disconnect`, `shutdown`, `crash` or `recovered` |
+| `status`, `status_class` | The status the client got (`null` when none) and its class: `2xx`, `3xx`, `4xx`, `5xx`, `refused` or `transport-error` |
+| `model` | The model the response or request named. A value that contains anything shaped like a Hekma credential (an `hk_run_`, `hk_ref_`, `hk_ann_` or `hk_pxy_` prefix in any case, followed by credential characters) reads back as `[redacted]` |
+| `input_tokens`, `output_tokens`, `cached_tokens` | The counts the provider reported; `null` when unknown, never a made-up `0` |
+| `started_at`, `ended_at`, `latency_us`, `upstream_us` | When the call started and ended, the whole call's time, and the upstream leg's (`null` when nothing was dialled) |
+
+A record never holds a prompt, a response, a header, a key or the upstream's address.
+
+- **Order and paging:** newest call id first. Each page is at most 1,000 records (default 50), and its `next_cursor` continues the same listing with no gap and no duplicate. A record whose call closes after a page was read appears on a later page when its id is below the cursor.
+- **Freshness:** a call is listed within one batch window (about a quarter of a second) after its response is relayed. A call still in flight is not listed.
+- **The problems view** (`--problems`, `view=problems`) lists every call that did not pass cleanly: a disposition other than `pass`, an outcome other than `completed`, or a status class other than `2xx` or `3xx`.
+- **The scan budget:** a page examines at most 100,000 records. A filter that matches almost nothing can stop before the page fills; the page then says `scan_limited: true`, names how far back it searched (`searched_back_to`), and its cursor continues the search. The unfiltered, Run-scoped and problems listings always read an index.
+- **Segments:** the calls store is a set of SQLite files. A file written by a newer Hekma, or one that cannot be read (not SQLite, no calls table, or a record that will not decode), is skipped: `skipped_segments` counts it, `skipped_files` names it and says why (`hekma calls list` prints the same note), and the other files are still served. The files are merged by call id, whatever their names say, so a page never skips or repeats a record. Looking one call up by id over a file that could not be read answers `503 calls-unavailable` rather than `404`, because the record might be in it.
+- **Who can read them:** the Operator only. Reads take no lock the proxy or supervision uses, and work from a read-only open while a Service Host writes.
+
 ## Budgets and `block`
 
 Usage through the proxy enforces exactly like any other usage: the Run's own budgets and every Run above it, through the same [Policies](policies.md) and [budget verbs](commands.md). A change to a budget applies on the very next call.

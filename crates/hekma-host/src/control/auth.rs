@@ -762,6 +762,15 @@ mod tests {
             (Method::GET, "/v0/fleet", F::Operator),
             (Method::GET, "/v0/events", F::Operator),
             (Method::POST, "/v0/runs/", F::RunOpen),
+            // The calls routes sit in the Operator family: the operator
+            // bearer reads, every other class (a Run Key — including the
+            // Run's own — refresh, announce, proxy-access) answers 403.
+            (Method::GET, "/v0/calls", F::Operator),
+            (
+                Method::GET,
+                "/v0/calls/call_01JZ6Q9G3S8V2X7K4M1N5P0R2T",
+                F::Operator,
+            ),
         ];
         for (method, path, family) in cases {
             assert_eq!(RouteFamily::of(&method, path), family, "{method} {path}");

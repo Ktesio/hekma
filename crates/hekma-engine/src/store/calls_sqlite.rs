@@ -22,10 +22,14 @@ use crate::domain::calls::{CallOutcome, CallRecord, CallStart, StatusClass};
 use crate::domain::RunId;
 use crate::ports::{ProcessFingerprint, StoreError};
 
-/// The calls segment's schema version.
-pub(crate) const CALLS_SCHEMA_VERSION: i64 = 1;
+/// The calls segment's schema version. Version 2 (the read surface) adds
+/// the two indexes the bounded reads need — additive, applied by the
+/// proxy-owning engine when it opens the segment it writes; a read-only
+/// reader never migrates and still reads version 1 (only more slowly for
+/// Run-scoped pages).
+pub(crate) const CALLS_SCHEMA_VERSION: i64 = 2;
 
-const CALLS_V1: &str = "\
+pub(crate) const CALLS_V1: &str = "\
 CREATE TABLE IF NOT EXISTS calls.calls (
     call_id       TEXT PRIMARY KEY,
     run_id        TEXT NOT NULL,
@@ -58,6 +62,25 @@ CREATE TABLE IF NOT EXISTS calls.open_calls (
     owner_start_time INTEGER
 );
 ";
+
+/// The read surface's additive index step (schema 2): the Run-scoped
+/// keyset's index and the `problems` view's partial index. The partial
+/// index's `WHERE` text is [`CALLS_PROBLEM_WHERE`] verbatim — SQLite uses a
+/// partial index only when the statement carries its predicate as written,
+/// so the reader's `problems` statement repeats the same constant and the
+/// plan pin catches a drift.
+const CALLS_V2: &str = "\
+CREATE INDEX IF NOT EXISTS calls.idx_calls_run_call ON calls(run_id, call_id);
+CREATE INDEX IF NOT EXISTS calls.idx_calls_problem ON calls(call_id) \
+WHERE disposition <> 'pass' OR outcome <> 'completed' OR status_class NOT IN ('2xx','3xx');
+";
+
+/// The schema 2 DDL as the read tests build it (schema-1 and schema-2
+/// seeded segments).
+#[cfg(test)]
+pub(crate) fn calls_v2_for_test() -> &'static str {
+    CALLS_V2
+}
 
 /// The segment this open writes: the newest existing `*.db` (segments are
 /// named by UTC date, so the lexicographically last; there is only one until
@@ -114,10 +137,22 @@ pub(crate) fn attach(conn: &Connection, segment: Option<&Path>) -> Result<(), St
             supported: CALLS_SCHEMA_VERSION,
         });
     }
-    if version < CALLS_SCHEMA_VERSION {
+    if version < 1 {
         conn.execute_batch(&format!(
-            "BEGIN IMMEDIATE;\n{CALLS_V1}\nPRAGMA calls.user_version = {CALLS_SCHEMA_VERSION};\n\
-             COMMIT;"
+            "BEGIN IMMEDIATE;\n{CALLS_V1}\nPRAGMA calls.user_version = 1;\nCOMMIT;"
+        ))
+        .map_err(|err| {
+            let _ = conn.execute_batch("ROLLBACK");
+            backend(err)
+        })?;
+    }
+    if version < CALLS_SCHEMA_VERSION {
+        // The read surface's step: two additive indexes, stamped in ONE
+        // crash-atomic transaction (a crash between the DDL and the stamp
+        // re-runs cleanly — every statement is IF NOT EXISTS).
+        conn.execute_batch(&format!(
+            "BEGIN IMMEDIATE;\n{CALLS_V2}\nPRAGMA calls.user_version = \
+             {CALLS_SCHEMA_VERSION};\nCOMMIT;"
         ))
         .map_err(|err| {
             let _ = conn.execute_batch("ROLLBACK");
@@ -286,9 +321,10 @@ impl super::SqliteStore {
                 call_id,
                 run_id: RunId::from_wire(run_id),
                 token_id,
-                control_depth: depth_str(&depth),
+                control_depth: depth_str(&depth).to_string(),
                 binding,
                 disposition: crate::domain::calls::CallDisposition::Pass,
+                hold_end: None,
                 outcome,
                 status: None,
                 status_class: StatusClass::TransportError,
@@ -380,9 +416,10 @@ mod tests {
             call_id: call.to_string(),
             run_id: RunId::from_wire("run_A"),
             token_id: Some("abcdef012345".to_string()),
-            control_depth: "wire",
+            control_depth: "wire".to_string(),
             binding: None,
             disposition: CallDisposition::Pass,
+            hold_end: None,
             outcome: CallOutcome::Completed,
             status: Some(200),
             status_class: StatusClass::Success,
@@ -481,19 +518,91 @@ mod tests {
         assert_eq!(segment_path(&dir).unwrap(), first);
         let conn = Connection::open_in_memory().unwrap();
         attach(&conn, Some(&first)).unwrap();
-        conn.execute_batch("PRAGMA calls.user_version = 2").unwrap();
+        conn.execute_batch("PRAGMA calls.user_version = 3").unwrap();
         conn.execute_batch("DETACH DATABASE calls").unwrap();
         let again = Connection::open_in_memory().unwrap();
         assert!(matches!(
             attach(&again, Some(&first)),
-            Err(StoreError::SchemaTooNew {
-                found: 2,
-                supported: 1
-            })
+            Err(StoreError::SchemaTooNew { found: 3, .. })
         ));
         // An in-memory segment works for stores without a state directory.
         let memory = Connection::open_in_memory().unwrap();
         attach(&memory, None).unwrap();
+    }
+
+    #[test]
+    fn a_schema_1_segment_migrates_to_2_in_one_step_and_a_crash_re_runs_cleanly() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let segment = tmp.path().join("calls").join("2026-11-01.db");
+        std::fs::create_dir_all(segment.parent().unwrap()).unwrap();
+        // Build a schema 1 segment: v1 tables, stamped 1 (the pre-read
+        // surface writer's shape).
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "ATTACH DATABASE '{}' AS calls;",
+                segment.to_string_lossy()
+            ))
+            .unwrap();
+            conn.execute_batch(&format!(
+                "BEGIN IMMEDIATE;\n{CALLS_V1}\nPRAGMA calls.user_version = 1;\nCOMMIT;"
+            ))
+            .unwrap();
+        }
+        // The proxy-owning engine's attach migrates it: both indexes exist
+        // and the stamp reads 2.
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            attach(&conn, Some(&segment)).unwrap();
+        }
+        {
+            let conn = Connection::open(&segment).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 2);
+            let indexes: Vec<String> = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                indexes.contains(&"idx_calls_run_call".to_string()),
+                "{indexes:?}"
+            );
+            assert!(
+                indexes.contains(&"idx_calls_problem".to_string()),
+                "{indexes:?}"
+            );
+            // The v1 index is untouched.
+            assert!(
+                indexes.contains(&"idx_calls_run".to_string()),
+                "{indexes:?}"
+            );
+        }
+        // A crash between the DDL and the stamp re-runs cleanly: apply the
+        // DDL without the stamp (the torn state), then a full attach again.
+        let torn = tmp.path().join("calls").join("2026-11-02.db");
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "ATTACH DATABASE '{}' AS calls;\nBEGIN IMMEDIATE;\n{CALLS_V1}\nCOMMIT;\n\
+                 BEGIN IMMEDIATE;\n{CALLS_V2}\nCOMMIT;",
+                torn.to_string_lossy()
+            ))
+            .unwrap();
+        }
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            attach(&conn, Some(&torn)).unwrap();
+        }
+        let conn = Connection::open(&torn).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2, "the stamp lands after the clean re-run");
     }
 
     #[test]

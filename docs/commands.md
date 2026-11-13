@@ -695,6 +695,33 @@ the Run has ended or the label cannot be removed, `2` for a malformed label
 or Selector, a Selector matching more than 1000 Runs, or several matches with
 no terminal and no `--yes`.
 
+## `hekma calls list|show`
+
+Read the [metering proxy's](metering-proxy.md#reading-the-records) per-call records. A read-only read, like `hekma ps`: it never starts a host and creates nothing.
+
+```bash
+hekma calls list
+hekma calls list --run run_01KD7Q3Z8X4W6YB2C9N5HJTM0R --problems
+hekma calls list --from 2026-11-13T09:00:00Z --to 2026-11-13T10:00:00Z --json
+hekma calls show call_01KD7Q4A2B3C4D5E6F7G8H9J0K
+```
+
+| Flag | Meaning |
+|---|---|
+| `--run <run-id>` | Only this Run's calls; a listing never includes its child Runs' calls |
+| `--token-id <id>` | Only calls that presented the Run Key with this 12-hex token id |
+| `--outcome`, `--disposition`, `--status-class`, `--depth` | Only calls with this value. A value this build does not know is refused |
+| `--model <name>`, `--binding <name>` | Only calls that named this model, or came through this binding |
+| `--from <time>`, `--to <time>` | Only calls that started in this window (RFC 3339): `--from` inclusive, `--to` exclusive |
+| `--problems` | Only the calls that did not pass cleanly |
+| `--limit <n>` | Page size: default 50, at most 1000; `0` means the maximum; above the cap it clamps with a note |
+| `--cursor <c>` | Continue after a previous page (stderr prints the exact command, every filter repeated) |
+| `--json` | Print the same document as `GET /v0/calls`: `{"schema_version": 1, "filters", "skipped_segments", "items", "next_cursor", "scan_limited", "searched_back_to"}`, plus `skipped_files` when a calls file was skipped |
+
+The table's columns are **CALL**, **RUN**, **OUTCOME** (with the disposition when the proxy did not pass the call, as in `refused (block)`), **STATUS**, **MODEL**, **TOKENS** (in/out, `?` when unknown) and **STARTED**. A page the scan budget stopped says so on stderr, with the command that continues the search. `hekma calls show <call-id>` prints one record field by field; `--json` prints the record as the listing's item.
+
+Exit codes: `2` an invalid flag, cursor, call id, Run id or time; `1` an unknown call id or a store failure; `0` otherwise, an empty listing included.
+
 ## `hekma binding create|list|show|set|delete` / `route add|remove` / `credential issue|revoke|list`
 
 Manage **endpoint bindings**, the routes the [metering proxy](metering-proxy.md) uses for clients Hekma did not start. A binding says: calls arriving on this path prefix forward to this upstream, and are charged to Runs that carry these labels. Reads open the state directory read-only and start nothing. Each change is one call to the local Service Host and one `binding` event.

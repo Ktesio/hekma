@@ -486,6 +486,30 @@ impl From<RunError> for ApiError {
     }
 }
 
+impl From<hekma_engine::CallError> for ApiError {
+    fn from(err: hekma_engine::CallError) -> Self {
+        use hekma_engine::CallError as C;
+        let message = err.to_string();
+        let kind = match &err {
+            // An unknown call id: 404 with the `call-not-found` code.
+            C::NotFound { .. } => ApiErrorKind::NotFound,
+            // The calls store could not be read (retryable): 503.
+            C::Unavailable { .. } => ApiErrorKind::Unavailable,
+            // The caller's values: 400, each with its own machine code
+            // (invalid-cursor, invalid-call-id, invalid-run, invalid-time,
+            // invalid-filter).
+            C::InvalidCursor { .. }
+            | C::InvalidCallId { .. }
+            | C::InvalidRun { .. }
+            | C::InvalidTime { .. }
+            | C::InvalidFilter { .. } => ApiErrorKind::InvalidBody,
+        };
+        let mut error = Self::new(kind, message);
+        error.code = Some(err.code());
+        error
+    }
+}
+
 impl From<hekma_engine::RunVerbError> for ApiError {
     fn from(err: hekma_engine::RunVerbError) -> Self {
         match err {

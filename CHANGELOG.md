@@ -4,6 +4,16 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — per-call records for Hosts: `hekma calls` and `/v0/calls` (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **Read the metering proxy's per-call records.** `hekma calls list` pages them newest first, filtered by Run (never its children), Run Key token id, outcome, disposition, status class, model, Control Depth, binding and a start-time window, with `--problems` for every call that did not pass cleanly; `hekma calls show <call-id>` prints one. The Control API serves the same document on `GET /v0/calls` and one record on `GET /v0/calls/{call_id}`, Operator bearer only, with typed refusals (`invalid-cursor`, `invalid-limit`, `invalid-run`, `invalid-time`, `invalid-view`, `invalid-filter`, `invalid-call-id`, `call-not-found`, `calls-unavailable`).
+> - **What a record carries:** the call and Run ids, the presenting key's token id, the Control Depth, the binding, the disposition and outcome, the status and its class, the model, the token counts (`null` when unknown, never `0`), and the timings. Never a prompt, response, header, key or upstream address; a credential-shaped model name reads back as `[redacted]`.
+> - **Bounded reads:** pages of at most 1,000 records with a cursor that never skips or repeats; a scan budget of 100,000 records a page, after which a page says `scan_limited` and how far back it searched; a calls file from a newer build, or one that cannot be read, is skipped, counted and named. Reads take no engine lock and work from a read-only open.
+> - **The calls store moves to its schema 2** (two additive indexes), applied in one step by the engine that owns the proxy. A Run listing cursor and a calls cursor are refused on each other's listing (`invalid-cursor`).
+> - **The perf harness gains `--calls-seed <N>`**, gating the unscoped, Run-scoped and problems first pages and the by-id probe at p99 < 1 s; CI runs it at 100,000 records.
+> - **Engine surface within the unreleased `hekma-engine` 0.12.0** (no version bump, additive): `Engine::list_calls`, `Engine::call` and their `Blocking` twins; `CallsQuery`, `CallView`, `CallListing`, `CallListingDocument`, `CallFilters`, `CallRecord`, `CallError` with `code()`, the forward-compatible `CallDisposition`, `CallOutcome` and `StatusClass`, the calls cursor codec and the shared constants.
+
 > **Unreleased — one shared metering proxy, endpoint bindings and `proxy-wire v1` (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >
