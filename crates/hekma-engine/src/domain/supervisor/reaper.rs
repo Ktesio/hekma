@@ -2046,7 +2046,11 @@ impl Supervisor {
     /// so it survives restarts until the Run ends. With more than one, no
     /// path can tell their calls apart, so NONE gets the route — named
     /// loudly, with the restart-each-agent remediation.
-    fn decide_legacy_root(&mut self, registry: &Registry, adoptions: &[(InstanceName, RunId)]) {
+    pub(super) fn decide_legacy_root(
+        &mut self,
+        registry: &Registry,
+        adoptions: &[(InstanceName, RunId)],
+    ) {
         let snapshot = registry.run_publisher().current();
         // Only agents whose Run recorded no upstream are pre-proxy ones; a
         // launch under the shared proxy always records it.

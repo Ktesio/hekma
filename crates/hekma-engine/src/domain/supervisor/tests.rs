@@ -10391,3 +10391,148 @@ fn an_exit_whose_key_revocation_cannot_be_written_is_not_recorded() {
     assert_eq!(key_state(&registry), TokenState::Revoked);
     assert!(!indexed(&registry));
 }
+
+/// Make an adopted engine-observed agent's Run look pre-proxy: drop the
+/// upstream its launch recorded (a pre-proxy launch job never wrote one).
+fn make_pre_proxy(registry: &Registry, name: &InstanceName) -> crate::domain::RunId {
+    let run = registry.instance_run(name.as_str()).unwrap().record.run_id;
+    let for_job = run.clone();
+    registry
+        .writer()
+        .call(move |ctx| ctx.store().record_run_upstream(&for_job, None))
+        .unwrap();
+    run
+}
+
+#[test]
+fn one_pre_proxy_adopted_agent_gets_the_legacy_root_route_until_its_run_ends() {
+    // Story 23-1 (Design Notes: Migration): exactly one adopted pre-proxy
+    // engine-observed agent gets the legacy root route; the decision is
+    // recorded (it stands across a reopen), `/` bindings are refused while
+    // it holds, and the note names the restart remediation.
+    let (state, _manifest, registry, rt, name) = setup_observed_crashed_engine("eoroot");
+    let run = make_pre_proxy(&registry, &name);
+
+    let mut sup2 = Supervisor::with_runtime(rt.handle().clone());
+    let buffer = install_capture_sink(&mut sup2);
+    sup2.set_serve_options(
+        Some("http://127.0.0.1:9".to_string()),
+        false,
+        LogCaptureMode::Full,
+    )
+    .unwrap();
+    assert_eq!(sup2.adopt_orphans(&registry), 1);
+    let text = wait_for_sink_line(
+        &buffer,
+        "legacy root route",
+        "the legacy-root adoption note",
+    );
+    assert!(text.contains("restart it"), "{text}");
+    assert_eq!(
+        registry.run_publisher().current().legacy_root.as_ref(),
+        Some(&run)
+    );
+    assert_eq!(registry.reader().legacy_run().unwrap().as_ref(), Some(&run));
+    // The adopted Run now records the upstream the route forwards to.
+    assert_eq!(
+        registry
+            .run_publisher()
+            .current()
+            .route_upstream(&run)
+            .as_deref(),
+        Some("http://127.0.0.1:1")
+    );
+    // A `/` binding is refused while the legacy route holds.
+    let err = registry
+        .run_binding(|job, legacy| {
+            crate::domain::runs::bindings::create(
+                job,
+                crate::domain::runs::bindings::BindingSpec {
+                    name: "all".into(),
+                    prefix: "/".into(),
+                    upstream: "https://example.com".into(),
+                    labels: Vec::new(),
+                    custodied_key: None,
+                },
+                legacy.map(|run| run.to_string()),
+                "t",
+            )
+        })
+        .unwrap_err();
+    assert_eq!(err.code(), "binding-legacy-route", "{err}");
+
+    // A later adoption pass keeps the recorded decision.
+    sup2.decide_legacy_root(&registry, &[]);
+    assert_eq!(
+        registry.run_publisher().current().legacy_root.as_ref(),
+        Some(&run)
+    );
+    let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
+    std::mem::forget(sup2);
+    drop(state);
+}
+
+#[test]
+fn two_pre_proxy_adopted_agents_get_no_legacy_route_and_are_named() {
+    let state = tempfile::tempdir().unwrap();
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut manifests = Vec::new();
+    let mut names = Vec::new();
+    for name in ["eoone", "eotwo"] {
+        let manifest = tempfile::tempdir().unwrap();
+        write_observed_manifest(manifest.path(), name, &["--linger-ms", "600000"]);
+        registry
+            .register_with_adapter(name, &AdapterRef::Manifest(manifest.path().to_path_buf()))
+            .unwrap();
+        let parsed = InstanceName::new(name).unwrap();
+        registry
+            .set_config(
+                &parsed,
+                crate::domain::METERING_UPSTREAM_BASE_URL_KEY,
+                "http://127.0.0.1:1",
+            )
+            .unwrap();
+        manifests.push(manifest);
+        names.push(parsed);
+    }
+    let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    sup.set_serve_options(
+        Some("http://127.0.0.1:9".to_string()),
+        false,
+        LogCaptureMode::Full,
+    )
+    .unwrap();
+    for name in &names {
+        sup.start(&registry, name.as_str()).unwrap();
+    }
+    std::mem::forget(sup);
+    for name in &names {
+        make_pre_proxy(&registry, name);
+    }
+
+    let mut sup2 = Supervisor::with_runtime(rt.handle().clone());
+    let buffer = install_capture_sink(&mut sup2);
+    sup2.set_serve_options(
+        Some("http://127.0.0.1:9".to_string()),
+        false,
+        LogCaptureMode::Full,
+    )
+    .unwrap();
+    assert_eq!(sup2.adopt_orphans(&registry), 2);
+    let text = wait_for_sink_line(&buffer, "none of them", "the several-pre-proxy-agents note");
+    assert!(
+        text.contains("eoone") && text.contains("eotwo"),
+        "the note names both: {text}"
+    );
+    assert!(registry.run_publisher().current().legacy_root.is_none());
+    for name in &names {
+        let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
+    }
+    std::mem::forget(sup2);
+    drop(manifests);
+    drop(state);
+}
