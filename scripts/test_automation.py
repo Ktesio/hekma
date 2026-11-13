@@ -1233,6 +1233,30 @@ class ReleaseDocsTests(unittest.TestCase):
             "PERF_BUDGETS_REPORT_PATH: perf-budgets-proxy-report.json",
             perf_job[proxy_step : perf_job.index("- name: Upload the measured report", proxy_step)],
         )
+        # Story 19-4: the per-call records listing scenario, after the proxy
+        # run, pinned the same way.
+        calls_step = perf_job.index("- name: Run the per-call records listing scenario")
+        self.assertGreater(calls_step, proxy_step, "the calls run follows the proxy run")
+        calls_text = perf_job[perf_job.index("run: |", calls_step) :]
+        next_calls_step = _re.search(r"\n      - name:", calls_text[1:])
+        calls_block = (
+            calls_text[: 1 + next_calls_step.start()] if next_calls_step else calls_text
+        )
+        calls_last_line = next(
+            line for line in reversed(calls_block.splitlines()) if line.strip()
+        )
+        self.assertEqual(
+            calls_last_line.strip(),
+            "target/release/examples/perf-budgets --calls-seed 100000",
+        )
+        self.assertIn("set -euo pipefail", calls_block)
+        self.assertNotIn("|| true", calls_block)
+        self.assertNotIn("--baseline", calls_block)
+        self.assertIn(
+            "PERF_BUDGETS_REPORT_PATH: perf-budgets-calls-report.json",
+            perf_job[calls_step : perf_job.index("- name: Upload the measured report", calls_step)],
+        )
+        self.assertIn("perf-budgets-calls-report.json", perf_job)
         ps_upload = perf_job.index("- name: Upload the measured report", ps_step)
         self.assertIn(
             "PERF_BUDGETS_REPORT_PATH: perf-budgets-ps-report.json",
