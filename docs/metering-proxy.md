@@ -181,7 +181,7 @@ Earlier releases gave each `engine-observed` agent its own listener on its own p
   - With an unpinned old host, their listeners died with it, as before. Restart them.
   - With a pinned port, one agent could have been listening on it. When the new host adopts exactly one such agent, its calls (which carry no Run route) reach its own Run through a **legacy root route** until that Run ends. `hekma ps` notes it, and creating a `/` binding meanwhile is refused.
   - When more than one such agent is adopted, none gets the route, and a diagnostic names them. Restart each one.
-- **An adopted agent's base URL stays live** across host restarts, because the port is sticky. `--detach` no longer strands an `engine-observed` agent.
+- **An adopted agent's base URL stays live** across host restarts, because the port is sticky. A detached start of an `engine-observed` instance is still refused (exit 5), because the proxy lives inside the host.
 
 ## What is still planned
 
