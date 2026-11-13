@@ -1269,6 +1269,12 @@ impl Supervisor {
     /// before any start): a custodied start seeds its resolved value here —
     /// the one in-memory home for provider cleartext outside the spawn
     /// environment's Run Key delivery.
+    /// The installed custody cache (cfg(test): the cache-miss tests).
+    #[cfg(test)]
+    pub(crate) fn custody_cache(&self) -> Option<Arc<crate::domain::custody::CustodyCache>> {
+        self.custody_cache.clone()
+    }
+
     pub(crate) fn install_custody_cache(
         &mut self,
         cache: std::sync::Arc<crate::domain::custody::CustodyCache>,

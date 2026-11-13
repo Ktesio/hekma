@@ -2208,6 +2208,20 @@ impl Engine {
         .await
     }
 
+    /// Empty the custody cache (cfg(test): the proxy's cache-miss tests).
+    #[cfg(test)]
+    pub(crate) fn clear_custody_cache_for_test(&self) {
+        if let Some(cache) = self
+            .inner
+            .supervisor
+            .lock()
+            .expect("supervisor mutex poisoned")
+            .custody_cache()
+        {
+            cache.clear();
+        }
+    }
+
     /// Record that an instance's custodied provider key is about to be
     /// revealed (story 22-2, P10): when the instance holds its provider key
     /// under custody (`provider.api_key` set, `provider.custody` not `off`),

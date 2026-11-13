@@ -9767,3 +9767,64 @@ env = "OPENAI_BASE_URL"
     );
     assert!(show.stdout.contains("registered"), "stdout={}", show.stdout);
 }
+
+#[test]
+fn revealing_a_custodied_key_notes_the_recorded_event_before_printing_it() {
+    // Story 22-2 (P10): `config get --reveal` of a custodied provider key
+    // asks the Service Host to record a `secret_revealed` event first and
+    // says so on stderr; the value still prints on stdout.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let env = [("HEKMA_CLI_REVEAL_KEY", "sk-cli-reveal-sentinel")];
+    let run = run_hekma_agent_with_env(
+        &["agent", "register", "revealer", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+        &env,
+    );
+    assert!(run.success, "stderr={}", run.stderr);
+    let run = run_hekma_agent_with_env(
+        &[
+            "agent",
+            "config",
+            "set",
+            "revealer",
+            "provider.api_key",
+            "secret:HEKMA_CLI_REVEAL_KEY",
+        ],
+        &ctx.project_dir,
+        state_dir,
+        &env,
+    );
+    assert!(run.success, "stderr={}", run.stderr);
+    let run = run_hekma_agent_with_env(
+        &[
+            "agent",
+            "config",
+            "get",
+            "revealer",
+            "provider.api_key",
+            "--reveal",
+        ],
+        &ctx.project_dir,
+        state_dir,
+        &env,
+    );
+    assert!(run.success, "stderr={}", run.stderr);
+    assert!(
+        run.stdout.contains("sk-cli-reveal-sentinel"),
+        "stdout={}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("secret_revealed") && run.stderr.contains("HEKMA_CLI_REVEAL_KEY"),
+        "the reveal is recorded first; stderr={}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("sk-cli-reveal-sentinel"),
+        "stderr={}",
+        run.stderr
+    );
+}

@@ -322,6 +322,46 @@ fn a_custodied_call_carries_the_held_key_only_to_its_pinned_origin_and_masks_it_
     assert!(raw.contains("hekma_bad_host"), "{raw}");
     assert_eq!(seen.lock().unwrap().len(), 1);
 
+    // A cache miss (a binding's key, or a custodied Run adopted after a
+    // restart) resolves once and the call still swaps.
+    engine.clear_custody_cache_for_test();
+    let (status, _, body) = send(
+        proxy_port,
+        "POST",
+        &format!("{route}/chat/completions"),
+        &[("authorization", &bearer)],
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    // A miss whose key no longer resolves: refused, never forwarded bare.
+    engine.clear_custody_cache_for_test();
+    std::env::remove_var(SECRET);
+    let (status, _, body) = send(
+        proxy_port,
+        "POST",
+        &format!("{route}/chat/completions"),
+        &[("authorization", &bearer)],
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("hekma_custody_unavailable"), "{body}");
+    // A held value that cannot travel in a header: refused, not mangled.
+    engine.clear_custody_cache_for_test();
+    std::env::set_var(SECRET, "bad\nkey");
+    let (status, _, body) = send(
+        proxy_port,
+        "POST",
+        &format!("{route}/chat/completions"),
+        &[("authorization", &bearer)],
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("hekma_bad_target"), "{body}");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "nothing more reached the provider"
+    );
+    std::env::set_var(SECRET, SENTINEL);
+
     // Fail closed: the Run Key dialled straight at the provider (around
     // the proxy) is not a provider key — the provider refuses it.
     let status = direct_call(provider_port, &root_copy, &run_key);

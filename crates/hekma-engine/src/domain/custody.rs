@@ -504,6 +504,15 @@ impl CustodyCache {
         self.get(name)
     }
 
+    /// Forget every entry (cfg(test): the cache-miss tests).
+    #[cfg(test)]
+    pub(crate) fn clear(&self) {
+        self.entries
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
     /// The cached entry for `name` (the hot path read; never resolves).
     pub(crate) fn get(&self, name: &str) -> Option<Arc<CustodyEntry>> {
         self.entries
@@ -828,6 +837,65 @@ mod tests {
             "a failed refresh keeps the last good value"
         );
         assert!(cache.get("NEVER-SEEDED").is_none());
+    }
+
+    #[test]
+    fn an_origin_that_is_not_http_or_https_or_not_a_url_never_compares_equal() {
+        assert_eq!(canonical_origin("ftp://files.example"), None);
+        assert_eq!(canonical_origin("not a url"), None);
+        assert!(!origins_equal("not a url", "https://api.openai.com"));
+        assert!(!origins_equal(
+            "https://api.openai.com",
+            "ftp://api.openai.com"
+        ));
+        assert!(origins_equal(
+            "HTTPS://API.openai.com.",
+            "https://api.openai.com:443/v1"
+        ));
+    }
+
+    #[test]
+    fn the_refresher_notes_a_key_it_cannot_re_resolve_and_keeps_serving_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.toml");
+        std::fs::write(&path, "OTHER = \"x\"\n").unwrap();
+        crate::backends::restrict_to_owner(&path).unwrap();
+        let cache = Arc::new(CustodyCache::new(path));
+        let notes: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&notes);
+        cache.install_diagnostics(Arc::new(move |line| sink.lock().unwrap().push(line)));
+        cache.seed(
+            "GONE_KEY_FOR_THE_REFRESHER",
+            SecretString::new("last-good"),
+            None,
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let task = cache.start_refresher(rt.handle(), Duration::from_millis(10));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while notes.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "no refresh note");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(notes.lock().unwrap()[0].contains("could not be re-resolved"));
+        assert_eq!(
+            cache
+                .get("GONE_KEY_FOR_THE_REFRESHER")
+                .unwrap()
+                .value
+                .expose_secret(),
+            "last-good"
+        );
+        // Dropping the last handle stops the refresher.
+        drop(cache);
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("the refresher stops")
+                .unwrap();
+        });
     }
 
     #[test]
