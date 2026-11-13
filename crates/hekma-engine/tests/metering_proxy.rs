@@ -1316,3 +1316,156 @@ fn a_calls_store_that_cannot_open_is_said_and_calls_still_meter() {
     let run = wait_for_usage(&engine, ("binding", "openai"), 10);
     assert_eq!(run.usage.output_tokens, 5);
 }
+
+/// Whether any file under `root` carries `needle`.
+fn files_carrying(root: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                if bytes.windows(needle.len()).any(|w| w == needle.as_bytes()) {
+                    found.push(path);
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn no_provider_key_or_run_key_leaks_into_state_responses_events_or_upstream() {
+    const PROVIDER_KEY: &str = "sk-SENTINEL-provider-key-7f3a9c";
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    let mut events = engine.subscribe();
+    engine
+        .blocking()
+        .create_policy(
+            PolicyChange {
+                name: "core-cap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits {
+                    tokens_per_run: Some(25),
+                    breach_action: Some(BreachAction::Block),
+                    ..PolicyLimits::default()
+                },
+                ..PolicyChange::default()
+            },
+            false,
+        )
+        .unwrap();
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let provider = format!("Bearer {PROVIDER_KEY}");
+    assert_eq!(
+        post(port, "/openai/chat", &[("authorization", &provider)]).status,
+        200
+    );
+    let parent = wait_for_usage(&engine, ("binding", "openai"), 10);
+    let mut request = hekma_engine::ChildRunRequest::under(hekma_engine::RunParent::Run(
+        parent.record.run_id.clone(),
+    ));
+    request.issue_credentials = true;
+    let opened = engine
+        .blocking()
+        .open_child_run_as(hekma_engine::RunActor::Operator, request)
+        .unwrap();
+    let run_key = opened
+        .credentials
+        .unwrap()
+        .run_key()
+        .expose_secret()
+        .to_string();
+
+    // Every path: a keyed call, hints, a refusal of each kind, the key in
+    // the API-key slot and in the URL, then the fence and a revocation.
+    let mut answers = Vec::new();
+    let keyed = [
+        ("authorization", provider.as_str()),
+        ("x-hekma-run-key", run_key.as_str()),
+    ];
+    answers.push(post(port, "/openai/chat", &keyed));
+    answers.push(post(
+        port,
+        "/openai/chat",
+        &[("authorization", &provider), ("x-hekma-run", "split-1")],
+    ));
+    answers.push(post(port, "/nowhere", &[("authorization", &provider)]));
+    answers.push(post(port, &format!("/openai/chat?k={run_key}"), &[]));
+    let in_slot = format!("Bearer {run_key}");
+    answers.push(post(port, "/openai/chat", &[("authorization", &in_slot)]));
+    answers.push(post(port, "/openai/chat", &[("x-api-key", &run_key)]));
+    for _ in 0..3 {
+        answers.push(post(port, "/openai/chat", &keyed));
+    }
+    engine
+        .blocking()
+        .revoke_run_keys(opened.view.record.run_id.as_str(), true)
+        .unwrap();
+    answers.push(post(port, "/openai/chat", &keyed));
+    std::thread::sleep(Duration::from_millis(600));
+
+    for answer in &answers {
+        assert!(
+            !answer.body.contains(&run_key),
+            "a response carries the Run Key"
+        );
+        assert!(
+            !answer.body.contains(PROVIDER_KEY),
+            "a response carries the provider key"
+        );
+        for (_, value) in &answer.headers {
+            assert!(!value.contains(&run_key) && !value.contains(PROVIDER_KEY));
+        }
+    }
+    // The upstream never saw the Run Key, in any header or path.
+    for seen in upstream.served() {
+        assert!(
+            !seen.request_line.contains(&run_key),
+            "{}",
+            seen.request_line
+        );
+        for (name, value) in &seen.headers {
+            assert!(
+                !value.contains(&run_key),
+                "the Run Key reached the upstream in {name}"
+            );
+        }
+    }
+    // No event carries either.
+    while let Ok(event) = events.try_recv() {
+        let text = format!("{event:?}");
+        assert!(
+            !text.contains(&run_key) && !text.contains(PROVIDER_KEY),
+            "{text}"
+        );
+    }
+    // Nothing under the state directory carries either, before and after
+    // the engine (and its WAL) closes.
+    for needle in [PROVIDER_KEY, run_key.as_str()] {
+        assert_eq!(
+            files_carrying(state.path(), needle),
+            Vec::<std::path::PathBuf>::new()
+        );
+    }
+    drop(engine);
+    for needle in [PROVIDER_KEY, run_key.as_str()] {
+        assert_eq!(
+            files_carrying(state.path(), needle),
+            Vec::<std::path::PathBuf>::new()
+        );
+    }
+}
