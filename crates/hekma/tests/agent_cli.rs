@@ -993,6 +993,118 @@ fn racing_first_writes_converge_on_one_auto_started_host() {
     assert!(helpers::process_alive(discovery.pid));
 }
 
+#[test]
+fn a_write_surfaces_the_state_dir_when_it_cannot_be_created() {
+    // A state root UNDER A FILE: discovery finds nothing (no control.json
+    // can exist there), the auto-start's create_dir_all fails, and the
+    // write surfaces the typed registry Io error naming '<state-dir>' —
+    // the state-dir creation refusal of the one-data-path-owner routing.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let blocker = state.project_dir.join("blocker");
+    std::fs::write(&blocker, b"").unwrap();
+    let under_file = blocker.join("state");
+    let run = run_hekma_agent(
+        &["agent", "register", "w", "--kind", "mock"],
+        &ctx.project_dir,
+        &under_file,
+    );
+    assert!(
+        !run.success,
+        "a state root under a file can never be served: stdout={}\nstderr={}",
+        run.stdout, run.stderr
+    );
+    // docs/testing.md pins this as the typed `<state-dir>` creation
+    // refusal, exit 1 (the IO/system class of the frozen exit table): a
+    // silent remap to a usage (2) or lock-refusal code would ship red
+    // here, not just drift the docs (exit_code.rs's own warning).
+    assert_eq!(run.code, Some(1), "stderr={}", run.stderr);
+    assert!(
+        run.stderr
+            .contains("Filesystem error for Agent Instance '<state-dir>'"),
+        "the typed registry Io error names the state dir: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains(&under_file.display().to_string()),
+        "the refusal names the unusable path: {}",
+        run.stderr
+    );
+    // The refusal took the TYPED `<state-dir>` registry-Io path, not
+    // host_client.rs's spawn-failure catch-all ("could not start a local
+    // Service Host", a different untyped surface) — the catch-all must NOT
+    // appear. (Replaces the former `under_file/host.lock` existence
+    // assert, which could never fail: `under_file` is `<regular
+    // file>/state`, so any path under it fails ENOTDIR — review nit.)
+    assert!(
+        !run.stderr.contains("could not start a local Service Host"),
+        "the typed `<state-dir>` refusal must not be the spawn-failure catch-all: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_write_waits_out_the_startup_bound_then_names_the_log_when_no_host_comes_up() {
+    // The test holds the single-writer host lock, so every auto-started
+    // serve refuses (StateDirLocked) and exits into serve.log: control.json
+    // NEVER appears, and the write waits out the full startup bound before
+    // surfacing the deadline diagnostic that points at serve.log.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.clone();
+    let _held = hekma_host::HostLock::acquire(&state_dir.join(hekma_engine::paths::HOST_LOCK_FILE))
+        .expect("the host lock");
+    let started = std::time::Instant::now();
+    let run = run_hekma_agent(
+        &["agent", "register", "w", "--kind", "mock"],
+        &ctx.project_dir,
+        &state_dir,
+    );
+    assert!(
+        !run.success,
+        "no host can come up under a held lock: stdout={}\nstderr={}",
+        run.stdout, run.stderr
+    );
+    assert!(
+        run.stderr.contains("did not come up within 10s"),
+        "the deadline diagnostic: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("serve.log"),
+        "the diagnostic points at the refused serve's log: {}",
+        run.stderr
+    );
+    // The deadline message names serve.log unconditionally, so that assert
+    // alone cannot show the timeout was caused by the held lock — any early
+    // serve exit (broken flag parse, bad state-dir hand-off) also leaves
+    // control.json absent. The refused serve's own log carries the
+    // StateDirLocked refusal (both holder variants name the wording below
+    // and the held host.lock path) — THAT ties this timeout to the lock.
+    let serve_log = std::fs::read_to_string(hekma_host::serve_log_file(&state_dir))
+        .expect("the refused serve's serve.log");
+    assert!(
+        serve_log.contains("the state directory is already served by another host"),
+        "the serve exited by the StateDirLocked refusal, not any other failure: {serve_log}"
+    );
+    assert!(
+        serve_log.contains(
+            &state_dir
+                .join(hekma_engine::paths::HOST_LOCK_FILE)
+                .display()
+                .to_string()
+        ),
+        "the refusal names the held host.lock path: {serve_log}"
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(9),
+        "the wait really spanned the startup bound (took {:?})",
+        started.elapsed()
+    );
+    // The refused serve left no discovery file behind (nothing binds).
+    assert!(hekma_host::read_discovery(&state_dir).is_err());
+}
+
 /// Whether a pid is alive — the data-driven, cfg-free liveness probe (the
 /// `adoption.rs` convention: branch on the runtime OS id and shell out; NO
 /// `#[cfg]` — this file is outside the engine-backends allowlist).
