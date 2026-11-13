@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{HeaderMap, Method, Request, Response, Uri};
@@ -55,6 +55,24 @@ pub(crate) struct RefusalCounters {
     pub busy: AtomicU64,
     pub ignored_hints: AtomicU64,
     pub capped_hints: AtomicU64,
+    /// Responses buffered past the byte budget: the provider had already
+    /// billed the call, so it is recorded and relayed, never refused.
+    pub relay_overshoot: AtomicU64,
+    /// The minute of the last capped-hint note.
+    pub hint_note_minute: AtomicU64,
+    /// The minute of the last over-budget relay note.
+    pub overshoot_note_minute: AtomicU64,
+}
+
+/// True at most once a minute per `last` (a rate limit for notes that
+/// must never be one per call).
+fn once_a_minute(last: &AtomicU64) -> bool {
+    let minute = crate::time::now_unix_secs() / 60;
+    let seen = last.load(Ordering::Relaxed);
+    seen != minute
+        && last
+            .compare_exchange(seen, minute, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
 }
 
 /// One pending Run creation per identity: concurrent first calls share it.
@@ -106,14 +124,7 @@ impl ProxyShared {
     /// At most one note a minute summarising the pre-identification
     /// refusals (never one per call: refused calls must not flood logs).
     fn note_refusals(&self) {
-        let minute = crate::time::now_unix_secs() / 60;
-        let last = self.last_note_minute.load(Ordering::Relaxed);
-        if last == minute
-            || self
-                .last_note_minute
-                .compare_exchange(last, minute, Ordering::AcqRel, Ordering::Relaxed)
-                .is_err()
-        {
+        if !once_a_minute(&self.last_note_minute) {
             return;
         }
         let c = &self.counters;
@@ -130,6 +141,37 @@ impl ProxyShared {
             c.bad_target.load(Ordering::Relaxed),
             c.busy.load(Ordering::Relaxed),
         ));
+    }
+
+    /// A hint that could not open its Run (a breadth or nesting cap, or the
+    /// parent ended): the call stays on the parent, attributed, and this
+    /// says so at most once a minute.
+    fn note_capped_hint(&self) {
+        let total = self.counters.capped_hints.fetch_add(1, Ordering::Relaxed) + 1;
+        if once_a_minute(&self.counters.hint_note_minute) {
+            (self.diagnostics)(format!(
+                "metering proxy: a split or child hint could not open its own Run (1,000 Runs \
+                 are already open beneath its parent, it is 8 levels deep, or the parent \
+                 ended), so the call was counted on the parent Run ({total} such calls so far)"
+            ));
+        }
+    }
+
+    /// A response buffered past the byte budget: recorded and relayed,
+    /// because the provider already billed it; said at most once a minute.
+    fn note_relay_overshoot(&self) {
+        let total = self
+            .counters
+            .relay_overshoot
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if once_a_minute(&self.counters.overshoot_note_minute) {
+            (self.diagnostics)(format!(
+                "metering proxy: a response was buffered past the buffered-byte budget and \
+                 relayed anyway, because the provider had already billed the call ({total} \
+                 such responses so far)"
+            ));
+        }
     }
 }
 
@@ -289,11 +331,8 @@ impl Drop for CloseGuard {
 /// identity. `Err(())` → the writer did not take it within the ack bound.
 async fn ensure(shared: &ProxyShared, identity: WireIdentity) -> Result<Ensured, ()> {
     let key = identity.key();
-    let gate = {
-        let mut pending = shared.pending.lock().unwrap_or_else(|p| p.into_inner());
-        Arc::clone(pending.entry(key.clone()).or_default())
-    };
-    let _held = gate.lock().await;
+    let gate = PendingGate::join(&shared.pending, key.clone());
+    let _held = gate.gate.lock().await;
     // A concurrent first call may have created it while this one waited.
     if let Some(run) = shared.snapshot.current().identities.get(&key) {
         return Ok(Ensured::Run(run.clone()));
@@ -325,12 +364,6 @@ async fn ensure(shared: &ProxyShared, identity: WireIdentity) -> Result<Ensured,
             Ok((ensured, committed))
         })
         .await;
-    {
-        let mut pending = shared.pending.lock().unwrap_or_else(|p| p.into_inner());
-        if Arc::strong_count(&gate) <= 2 {
-            pending.remove(&key);
-        }
-    }
     match result {
         // The created events are durable in the outbox; they reach the bus
         // through the Supervisor's inbox like the proxied evaluations.
@@ -339,6 +372,35 @@ async fn ensure(shared: &ProxyShared, identity: WireIdentity) -> Result<Ensured,
             Ok(ensured)
         }
         Err(_) => Err(()),
+    }
+}
+
+/// One call's share of an identity's pending-creation gate. Dropping it, on
+/// every return of [`ensure`], removes the map's entry once no other call
+/// still holds the gate.
+struct PendingGate<'a> {
+    pending: &'a PendingCreations,
+    key: (String, String),
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> PendingGate<'a> {
+    fn join(pending: &'a PendingCreations, key: (String, String)) -> Self {
+        let gate = {
+            let mut map = pending.lock().unwrap_or_else(|p| p.into_inner());
+            Arc::clone(map.entry(key.clone()).or_default())
+        };
+        Self { pending, key, gate }
+    }
+}
+
+impl Drop for PendingGate<'_> {
+    fn drop(&mut self) {
+        let mut map = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        // The map's handle and this one: no other call is waiting.
+        if Arc::strong_count(&self.gate) <= 2 {
+            map.remove(&self.key);
+        }
     }
 }
 
@@ -353,7 +415,7 @@ async fn resolve(shared: &ProxyShared, attribution: Attribution) -> Result<Optio
         } => match ensure(shared, identity).await? {
             Ensured::Run(run) => Ok(Some(run)),
             Ensured::Capped | Ensured::ParentGone => {
-                shared.counters.capped_hints.fetch_add(1, Ordering::Relaxed);
+                shared.note_capped_hint();
                 if let Some(run) = fallback {
                     return Ok(Some(run));
                 }
@@ -558,43 +620,44 @@ async fn serve_admitted(
         return WireError::BodyTooLarge.response();
     }
     let (mut parts, body) = req.into_parts();
-    let collected = match Limited::new(body, MAX_RELAY_BODY_BYTES).collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => {
-            let too_large = err
-                .downcast_ref::<http_body_util::LengthLimitError>()
-                .is_some();
-            let (outcome, error) = if too_large {
-                (CallOutcome::Refused, WireError::BodyTooLarge)
-            } else {
-                (CallOutcome::ClientDisconnect, WireError::UpstreamError)
-            };
+    // The budget is taken as the bytes arrive, so a body the budget cannot
+    // hold is refused before it is buffered, and before any dial.
+    let (collected, request_budget) = match collect_budgeted(body, shared, false).await {
+        Ok(Budgeted { bytes, permit, .. }) => (bytes, permit),
+        Err(CollectError::Busy) => {
             guard.close(
                 CallDisposition::Pass,
-                outcome,
-                None,
-                if too_large {
-                    StatusClass::Refused
-                } else {
-                    StatusClass::TransportError
-                },
+                CallOutcome::Refused,
+                Some(503),
+                StatusClass::Refused,
                 None,
                 None,
             );
-            return error.response();
+            shared.counters.busy.fetch_add(1, Ordering::Relaxed);
+            return WireError::ProxyBusy.response();
         }
-    };
-    let Some(request_budget) = take_budget(shared, collected.len()) else {
-        guard.close(
-            CallDisposition::Pass,
-            CallOutcome::Refused,
-            Some(503),
-            StatusClass::Refused,
-            None,
-            None,
-        );
-        shared.counters.busy.fetch_add(1, Ordering::Relaxed);
-        return WireError::ProxyBusy.response();
+        Err(CollectError::TooLarge) => {
+            guard.close(
+                CallDisposition::Pass,
+                CallOutcome::Refused,
+                None,
+                StatusClass::Refused,
+                None,
+                None,
+            );
+            return WireError::BodyTooLarge.response();
+        }
+        Err(CollectError::Body) => {
+            guard.close(
+                CallDisposition::Pass,
+                CallOutcome::ClientDisconnect,
+                None,
+                StatusClass::TransportError,
+                None,
+                None,
+            );
+            return WireError::UpstreamError.response();
+        }
     };
     let request_model = serde_json::from_slice::<serde_json::Value>(&collected)
         .ok()
@@ -667,8 +730,20 @@ async fn serve_admitted(
     drop(request_budget);
     let (mut res_parts, res_body) = upstream.into_parts();
     let status = res_parts.status.as_u16();
-    let res_bytes = match Limited::new(res_body, MAX_RELAY_BODY_BYTES).collect().await {
-        Ok(collected) => collected.to_bytes(),
+    // The provider has billed the call by now: a response the budget cannot
+    // hold is still buffered (up to the body cap), recorded and relayed, and
+    // the overshoot is said, never a refusal that drops the usage.
+    let (res_bytes, _response_budget) = match collect_budgeted(res_body, shared, true).await {
+        Ok(Budgeted {
+            bytes,
+            permit,
+            overshot,
+        }) => {
+            if overshot {
+                shared.note_relay_overshoot();
+            }
+            (bytes, permit)
+        }
         Err(_) => {
             guard.close(
                 CallDisposition::Pass,
@@ -680,18 +755,6 @@ async fn serve_admitted(
             );
             return WireError::UpstreamError.response();
         }
-    };
-    let Some(_response_budget) = take_budget(shared, res_bytes.len()) else {
-        guard.close(
-            CallDisposition::Pass,
-            CallOutcome::UpstreamError,
-            Some(status),
-            StatusClass::TransportError,
-            None,
-            None,
-        );
-        shared.counters.busy.fetch_add(1, Ordering::Relaxed);
-        return WireError::ProxyBusy.response();
     };
     let usage = if is_sse(&res_parts.headers) {
         parse_openai_sse_usage(&res_bytes)
@@ -734,9 +797,84 @@ async fn serve_admitted(
     response
 }
 
-/// Take `len` bytes from the buffered-byte budget (KiB granularity).
-fn take_budget(shared: &ProxyShared, len: usize) -> Option<OwnedSemaphorePermit> {
-    let kib = len.div_ceil(1024).max(1);
+/// A body collected under the buffered-byte budget.
+struct Budgeted {
+    bytes: Bytes,
+    /// The budget the bytes hold (`None` only for an overshot response
+    /// whose first frame already found the budget full).
+    permit: Option<OwnedSemaphorePermit>,
+    /// Some of the bytes are buffered past the budget (responses only).
+    overshot: bool,
+}
+
+enum CollectError {
+    /// The budget cannot hold the next frame (requests only).
+    Busy,
+    /// Over the relay body cap.
+    TooLarge,
+    /// The body failed (the peer went away or broke the framing).
+    Body,
+}
+
+/// Collect `body` up to [`MAX_RELAY_BODY_BYTES`], taking the buffered-byte
+/// budget (KiB permits) as each frame arrives, never after the bytes are
+/// already held. A request (`overshoot` false) that finds the budget full
+/// fails with [`CollectError::Busy`]; a response (`overshoot` true) keeps
+/// buffering past it and reports that it did.
+async fn collect_budgeted<B>(
+    body: B,
+    shared: &ProxyShared,
+    overshoot: bool,
+) -> Result<Budgeted, CollectError>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
+    let mut body = body;
+    let mut buf = bytes::BytesMut::new();
+    let mut permit: Option<OwnedSemaphorePermit> = None;
+    let mut held_kib: usize = 0;
+    let mut overshot = false;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| CollectError::Body)?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if buf.len() + data.len() > MAX_RELAY_BODY_BYTES {
+            return Err(CollectError::TooLarge);
+        }
+        buf.extend_from_slice(&data);
+        let want_kib = buf.len().div_ceil(1024).max(1);
+        if !overshot && want_kib > held_kib {
+            match take_budget(shared, want_kib - held_kib) {
+                Some(more) => {
+                    held_kib = want_kib;
+                    match &mut permit {
+                        Some(held) => held.merge(more),
+                        None => permit = Some(more),
+                    }
+                }
+                None if overshoot => overshot = true,
+                None => return Err(CollectError::Busy),
+            }
+        }
+    }
+    if permit.is_none() && !overshot {
+        // An empty body still holds one KiB, like any other call.
+        match take_budget(shared, 1) {
+            Some(one) => permit = Some(one),
+            None if overshoot => overshot = true,
+            None => return Err(CollectError::Busy),
+        }
+    }
+    Ok(Budgeted {
+        bytes: buf.freeze(),
+        permit,
+        overshot,
+    })
+}
+
+/// Take `kib` KiB permits from the buffered-byte budget.
+fn take_budget(shared: &ProxyShared, kib: usize) -> Option<OwnedSemaphorePermit> {
     let kib = u32::try_from(kib).ok()?;
     Arc::clone(&shared.buffered_kib)
         .try_acquire_many_owned(kib)

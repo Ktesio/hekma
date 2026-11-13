@@ -55,6 +55,8 @@ enum Reply {
     Truncated,
     /// [`COMPLETION`] after a pause.
     Slow(Duration),
+    /// A completion padded to about this many bytes (its usage intact).
+    Padded(usize),
 }
 
 const SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
@@ -75,6 +77,18 @@ fn reply_bytes(reply: Reply) -> Vec<u8> {
             SSE.len()
         )
         .into_bytes(),
+        Reply::Padded(len) => {
+            let body = format!(
+                r#"{{"model":"gpt-demo","pad":"{}","usage":{{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}}}"#,
+                "x".repeat(len)
+            );
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes()
+        }
         Reply::Truncated => b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
             content-length: 500\r\nconnection: close\r\n\r\n{\"partial\""
             .to_vec(),
@@ -1248,7 +1262,18 @@ fn a_wire_runs_usage_and_breach_reach_the_event_bus() {
 fn past_the_breadth_cap_a_split_hint_stays_on_the_bindings_run_attributed_never_refused() {
     let state = TempDir::new().unwrap();
     let upstream = Upstream::start();
-    let (engine, port) = open(&state, true);
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let engine = Engine::open_with_options(
+        Some(state.path().to_path_buf()),
+        EngineOptions {
+            diagnostics: Some(Arc::new(Mutex::new(Box::new(Capture(Arc::clone(
+                &captured,
+            )))))),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let port = engine.metering_proxy().unwrap().port;
     bind(
         &engine,
         "openai",
@@ -1287,6 +1312,13 @@ fn past_the_breadth_cap_a_split_hint_stays_on_the_bindings_run_attributed_never_
         assert!(Instant::now() < deadline, "the capped call was not charged");
         std::thread::sleep(Duration::from_millis(50));
     }
+    // And it is said, once (rate-limited), never per call.
+    let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        text.matches("could not open its own Run").count(),
+        1,
+        "the capped hint is said once: {text}"
+    );
 }
 
 #[test]
@@ -1613,4 +1645,100 @@ fn concurrent_first_calls_for_one_identity_converge_on_one_run() {
     };
     assert_eq!(count("binding", "openai"), 1);
     assert_eq!(count("binding:openai", "team-a"), 1);
+}
+
+#[test]
+fn a_billed_response_over_the_byte_budget_is_recorded_and_relayed_not_refused() {
+    // Review round 1, finding 1: the provider billed the call once it
+    // answered, so a response the budget cannot hold is still metered and
+    // relayed (a 503 would drop the usage and invite a second, billed retry).
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start_with(Reply::Padded(8 * 1024));
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let engine = Engine::open_with_options(
+        Some(state.path().to_path_buf()),
+        EngineOptions {
+            metering_proxy: MeteringProxyOptions {
+                max_buffered_bytes: 1024,
+                ..MeteringProxyOptions::default()
+            },
+            diagnostics: Some(Arc::new(Mutex::new(Box::new(Capture(Arc::clone(
+                &captured,
+            )))))),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let port = engine.metering_proxy().unwrap().port;
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    for _ in 0..2 {
+        let answer = post(port, "/openai/chat", &[]);
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert!(answer.body.contains("prompt_tokens"), "relayed whole");
+    }
+    let run = wait_for_usage(&engine, ("binding", "openai"), 20);
+    assert_eq!(run.usage.output_tokens, 10);
+    let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        text.matches("buffered past the buffered-byte budget")
+            .count(),
+        1,
+        "the overshoot is said once a minute: {text}"
+    );
+}
+
+#[test]
+fn a_streamed_request_body_over_the_budget_is_refused_before_it_is_buffered() {
+    // Review round 1, finding 2: the budget is taken as the body arrives.
+    // A chunked body larger than the whole budget is refused at its first
+    // chunk, without waiting for (or holding) the rest, and nothing is dialled.
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let engine = Engine::open_with_options(
+        Some(state.path().to_path_buf()),
+        EngineOptions {
+            metering_proxy: MeteringProxyOptions {
+                max_buffered_bytes: 1024,
+                ..MeteringProxyOptions::default()
+            },
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let port = engine.metering_proxy().unwrap().port;
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let chunk = "x".repeat(4096);
+    // The body never ends: no terminating zero-length chunk is sent.
+    stream
+        .write_all(
+            format!(
+                "POST /openai/chat HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+                 transfer-encoding: chunked\r\n\r\n{:x}\r\n{chunk}\r\n",
+                chunk.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut head = [0u8; 12];
+    stream
+        .read_exact(&mut head)
+        .expect("answered before the body ends");
+    assert_eq!(&head, b"HTTP/1.1 503");
+    assert!(upstream.served().is_empty());
 }

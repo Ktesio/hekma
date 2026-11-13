@@ -732,4 +732,50 @@ mod seams {
         shared.pump.fail_closes.store(0, Ordering::SeqCst);
         assert_eq!(input_tokens(&engine), 10, "a skipped close counted");
     }
+
+    #[test]
+    fn concurrent_first_calls_leave_no_pending_creation_gate_behind() {
+        // Review round 1, finding 6: the calls that wait on a creation and
+        // then find the Run published return early; they must still release
+        // the identity's gate, or one entry leaks per raced identity.
+        let (_state, engine, port, _served) = engine_with_binding(&[("team", "core")]);
+        let shared = engine.proxy_shared_for_tests().unwrap();
+        *shared.ensure_delay.lock().unwrap() = Some(Duration::from_millis(200));
+        let calls: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(move || post(port, "/gw/chat", "x-hekma-run: raced\r\n")))
+            .collect();
+        for call in calls {
+            assert_eq!(call.join().unwrap().0, 200);
+        }
+        *shared.ensure_delay.lock().unwrap() = None;
+        assert!(
+            shared.pending.lock().unwrap().is_empty(),
+            "a pending-creation gate leaked"
+        );
+    }
+
+    #[test]
+    fn a_close_whose_calls_record_outlived_a_state_rollback_still_counts_its_usage() {
+        // Review round 1, finding 5: the calls store is its own file, so a
+        // commit can keep its record while state.db rolls back. The retry
+        // then finds the record; the usage must still land, once.
+        let (_state, engine, port, _served) = engine_with_binding(&[("team", "core")]);
+        let shared = engine.proxy_shared_for_tests().unwrap();
+        shared.pump.prerecord_closes.store(1, Ordering::SeqCst);
+        assert_eq!(post(port, "/gw/chat", "").0, 200);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while input_tokens(&engine) < 10 {
+            assert!(Instant::now() < deadline, "the usage was dropped on replay");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(shared.pump.prerecord_closes.load(Ordering::SeqCst), 0);
+        assert_eq!(post(port, "/gw/chat", "").0, 200);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while input_tokens(&engine) < 20 {
+            assert!(Instant::now() < deadline, "the next call never landed");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(input_tokens(&engine), 20, "each call counted exactly once");
+    }
 }
