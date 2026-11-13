@@ -5,6 +5,7 @@
 //! types (AD-1). Nothing outside the engine sees this — the registry service is
 //! the public surface, the store is an internal collaborator.
 
+pub(crate) mod calls_read;
 pub(crate) mod calls_sqlite;
 pub(crate) mod proxy_sqlite;
 mod run_store_sqlite;

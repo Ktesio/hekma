@@ -152,9 +152,19 @@ pub use domain::{
     ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument, RunSummary,
     ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
 };
+// The per-call read surface over the calls store: the query, the record,
+// the listing and its document, the forward-compatible enums, the cursor
+// wrappers, the error surface, and the helpers the surfaces share.
+pub use domain::calls::{
+    decode_call_cursor, encode_call_cursor, expose_model, is_call_id, is_run_id, CallDisposition,
+    CallError, CallFilters, CallListing, CallListingDocument, CallOutcome, CallRecord, CallView,
+    CallsQuery, StatusClass, CALLS_DEFAULT_LIMIT, CALLS_LISTING_SCHEMA_VERSION, CALLS_MAX_LIMIT,
+    CALLS_SCAN_BUDGET, MAX_MODEL_CHARS, MODEL_REDACTED,
+};
 // The RFC 3339 formatters behind the window arithmetic (story 21-5: the
-// bench seeds ended rows at fixed distances from now).
-pub use crate::time::{format_rfc3339, now_unix_secs};
+// bench seeds ended rows at fixed distances from now). The parser and the
+// microsecond formatter serve the per-call read surface's time window.
+pub use crate::time::{format_rfc3339, format_rfc3339_micros, now_unix_secs, parse_rfc3339};
 // Story 21-3: Policies — the request and outcome of a Policy change, the
 // stored Policy, its limits and events, and the resolution a Run carries.
 pub use domain::{

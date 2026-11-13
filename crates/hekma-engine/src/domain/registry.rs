@@ -2387,6 +2387,13 @@ impl Registry {
         &self.paths
     }
 
+    /// The calls store's directory (the per-call records' segment files).
+    /// Held out of every lock: the calls reader opens its own read-only
+    /// connections per segment and never touches the registry.
+    pub(crate) fn calls_dir(&self) -> std::path::PathBuf {
+        self.paths.calls_dir()
+    }
+
     /// The engine STATE DB path — the `usage_events` ledger's home. Names the
     /// ledger family's record location in errors that need it (the story-10-3
     /// resync helper's truncation guard).
