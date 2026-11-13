@@ -2595,8 +2595,9 @@ impl Engine {
     /// Trade a Run's active refresh credential for a new Run Key and refresh
     /// credential, once (story 22-1). The old Run Key is refused from the
     /// next request on. Presenting a USED refresh credential again revokes
-    /// the Run's current credentials, raises the `credential-reuse` Anomaly
-    /// and answers [`RunError::CredentialRevoked`].
+    /// the Run's current credentials of that credential's own launch
+    /// generation, raises the `credential-reuse` Anomaly and answers
+    /// [`RunError::CredentialRevoked`].
     pub async fn refresh_credentials(
         &self,
         presented: &crate::domain::SecretString,
@@ -2647,11 +2648,12 @@ impl Engine {
     }
 
     /// Revoke credentials seen in a URL (story 22-1): an active one among
-    /// `presented` is revoked (`exposed-in-url`) — it has reached an access
-    /// log. Returns how many were revoked. Each value is resolved first —
-    /// the lock-free snapshot, then the credential reader — and only one that
-    /// resolves to an active credential takes the engine's locks and a writer
-    /// job: a URL full of token-shaped noise costs reads, never a write.
+    /// `presented`, or a used refresh credential, is revoked
+    /// (`exposed-in-url`) — it has reached an access log. Returns how many
+    /// were revoked. Each value is resolved first — the lock-free snapshot,
+    /// then the credential reader — and only one that resolves to an active
+    /// or used credential takes the engine's locks and a writer job: a URL
+    /// full of token-shaped noise costs reads, never a write.
     pub async fn revoke_exposed(
         &self,
         presented: Vec<crate::domain::SecretString>,
@@ -2666,6 +2668,7 @@ impl Engine {
                     ))
                     .await?,
                     crate::domain::PresentedState::Active(_)
+                        | crate::domain::PresentedState::Used(_)
                 )
             {
                 resolved.push(secret);

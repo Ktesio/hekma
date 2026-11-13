@@ -13,7 +13,7 @@ A **Run Key** is a [Run](runs.md)'s own credential. Whoever holds it can act on 
 
 A Run Key is not yet a replacement for your provider key: today the agent still holds the provider key you configured. Key custody, which puts the Run Key in the agent's API-key slot and keeps the real key inside Hekma, is planned (below).
 
-## What works today
+## What works on main
 
 | Area | What you get now |
 |---|---|
@@ -21,7 +21,7 @@ A Run Key is not yet a replacement for your provider key: today the agent still 
 | A pair per child Run | `POST /v0/runs` (and `hekma run open --print-key`) returns the child's Run Key and a refresh credential, once. |
 | Hash-only storage | Hekma stores the SHA-256 of each credential, never the value. A short **token id** (12 hex characters) labels it in records and reports. |
 | Revocation | A key is revoked when its process exits, when its Run ends, after a refresh, when it shows up in a URL, and on demand with `hekma run revoke-keys`. The next request presenting it is refused. |
-| Refresh with reuse detection | A refresh credential trades itself once for a new pair. Presenting a used one again revokes the Run's current pair and raises the `credential-reuse` Anomaly. |
+| Refresh with reuse detection | A refresh credential trades itself once for a new pair. Presenting a used one again — or seeing one in a URL — revokes the Run's current pair and raises the `credential-reuse` Anomaly. |
 | Secret references | `secret:NAME` keeps a provider key out of Hekma's config and output, but the agent receives the real key. See [Secrets](https://hekma.ktesio.dev/docs/config-secrets-memory/#secrets). |
 
 ### The format
@@ -70,7 +70,7 @@ A Run Key does not expire on a timer: agents do not refresh an API key mid-run, 
 curl -s -X POST -H "Authorization: Bearer $REFRESH_CREDENTIAL" http://127.0.0.1:<port>/v0/runs/refresh
 ```
 
-A refresh retires the presented credential, revokes its Run Key at once, and returns a new Run Key and refresh credential for the same Run. Possession is the binding: Hekma does not check which process presents it. A used refresh credential presented again revokes the Run's current pair, raises the `credential-reuse` Anomaly (listed by `hekma ps`), and answers `401 credential-revoked`, so a silent takeover becomes a visible one. It also revokes every used refresh credential of the Run. `hekma run revoke-keys` on the Run acknowledges and clears the Anomaly, and revokes the Run's used refresh credentials too, so an old one found later in a log is a plain `401 credential-revoked` that changes nothing.
+A refresh retires the presented credential, revokes its Run Key at once, and returns a new Run Key and refresh credential for the same Run. Possession is the binding: Hekma does not check which process presents it. A used refresh credential presented again revokes the current pair of its own launch (for a Run opened over the Control API, the Run's current pair), raises the `credential-reuse` Anomaly (listed by `hekma ps`), and answers `401 credential-revoked`, so a silent takeover becomes a visible one. It also revokes every used refresh credential of the Run. A credential from an earlier launch never revokes a later launch's key. A used refresh credential also leaves service wherever the credentials it belonged to do: at its launch's exit, at its Run's end, and under a `revoke-keys` cascade. Seen in a URL it is reuse evidence — only a holder of the value can put it there — and takes the same response as presenting it: the current pair of its own launch is revoked, every used refresh credential of the Run is revoked, and the `credential-reuse` Anomaly is raised, so one unauthenticated request cannot quietly disarm the detection. `hekma run revoke-keys` on the Run acknowledges and clears the Anomaly, and revokes the Run's used refresh credentials too, so an old one found later in a log is a plain `401 credential-revoked` that changes nothing.
 
 ### Revocation
 
@@ -82,11 +82,11 @@ hekma run revoke-keys run_01JZ6Q9G3S8V2X7K4M1N5P0R2T --no-cascade
 
 A revocation is committed and published before the command returns, so the very next request presenting the key is refused, and a hard kill of the Service Host cannot undo it. Like every write to `state.db`, it is not forced to disk on each commit: an operating-system crash or a power loss can lose the last moment of writes, a revocation included. After one, check with `hekma run keys` and revoke again if needed. By default it cascades: keys of child Runs opened with the revoked keys, and their refresh chains, are revoked too. Revocation never ends a Run; children opened under a revoked key stay open.
 
-A Run that ends revokes its own keys; its child Runs that outlive it keep theirs. Removing an instance (`hekma rm --force`) removes its Runs and their keys with it.
+A Run that ends revokes its own keys; its child Runs that outlive it keep theirs. When a supervised agent's process exits and its Run ends, the in-process child Runs that end with it lose their keys in the same write as the exit. Removing an instance (`hekma rm --force`) removes its Runs and their keys with it.
 
 ### Never in a URL
 
-Credentials go in the `Authorization` header. A request whose path or query carries one, raw or percent-encoded, is refused with `400 credential-in-url` before it is authenticated, and the exposed credential is revoked: it has reached someone's access log. Only a credential Hekma issued and still honours is revoked; anything else in the URL is just refused. The [metering proxy](metering-proxy.md) refuses a credential in a URL too, with a typed `400 hekma_credential_in_url`, and forwards nothing. It does not revoke the credential, because anyone on loopback could have sent that request, and revoking would let any local process cancel any Run's key.
+Credentials go in the `Authorization` header. A request whose path or query carries one, raw or percent-encoded, is refused with `400 credential-in-url` before it is authenticated, and the exposed credential is revoked: it has reached someone's access log. An active credential Hekma still honours is revoked. A used refresh credential is reuse evidence — only a holder of the value can put it in a URL — so it takes the same response as presenting it: the current pair of its own launch is revoked, every used refresh credential of the Run is revoked, and the `credential-reuse` Anomaly is raised. A value that was never issued, or is already revoked, is just refused. The scan keeps at most 16 distinct tokens per URL; a request carrying more is refused all the same, and a rate-limited diagnostic says how many could not be revoked. The [metering proxy](metering-proxy.md) refuses a credential in a URL too, with a typed `400 hekma_credential_in_url`, and forwards nothing. It does not revoke the credential, because anyone on loopback could have sent that request, and revoking would let any local process cancel any Run's key.
 
 ### On the wire
 

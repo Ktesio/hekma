@@ -222,23 +222,55 @@ pub(crate) fn revoke_used<S: RunRecords + ?Sized>(
     cause: &str,
     at: &str,
 ) -> Result<(), StoreError> {
+    revoke_used_where(store, changes, run_id, |_| true, cause, at)
+}
+
+/// [`revoke_used`] for the used refresh credentials `which` selects (a
+/// launch's exit takes only its launch-issued ones). Wherever a set of a
+/// Run's credentials leaves service, its used refresh credentials leave
+/// with it: a retired one left behind would stay a kill switch — presented
+/// again, it is reuse, which revokes the Run's live pair.
+pub(crate) fn revoke_used_where<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    run_id: &RunId,
+    which: impl Fn(&TokenRow) -> bool,
+    cause: &str,
+    at: &str,
+) -> Result<(), StoreError> {
     for row in store.run_tokens(run_id)? {
-        if row.state == TokenState::Retired && store.revoke_retired(&row.hash, at, cause)? {
-            changes.credentials.push(CredentialEvent {
-                schema_version: CREDENTIAL_EVENT_SCHEMA_VERSION,
-                change: CredentialChange::Revoked,
-                class: row.class,
-                token_id: row.token_id.clone(),
-                run_id: row.run_id.clone(),
-                launch_generation: row.launch_generation,
-                issued_by: None,
-                prior_token_id: None,
-                cause: Some(cause.to_string()),
-                at: at.to_string(),
-            });
+        if row.state == TokenState::Retired && which(&row) {
+            revoke_retired_row(store, changes, &row, cause, at)?;
         }
     }
     Ok(())
+}
+
+/// Move one used (`retired`) refresh credential to `revoked` and note its
+/// `revoked` event. Nothing when it is no longer retired.
+fn revoke_retired_row<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    row: &TokenRow,
+    cause: &str,
+    at: &str,
+) -> Result<bool, StoreError> {
+    if !store.revoke_retired(&row.hash, at, cause)? {
+        return Ok(false);
+    }
+    changes.credentials.push(CredentialEvent {
+        schema_version: CREDENTIAL_EVENT_SCHEMA_VERSION,
+        change: CredentialChange::Revoked,
+        class: row.class,
+        token_id: row.token_id.clone(),
+        run_id: row.run_id.clone(),
+        launch_generation: row.launch_generation,
+        issued_by: None,
+        prior_token_id: None,
+        cause: Some(cause.to_string()),
+        at: at.to_string(),
+    });
+    Ok(true)
 }
 
 /// Revoke every active token of `run_id` that `which` selects; returns the
@@ -270,6 +302,24 @@ pub(crate) fn caller_check<S: RunRecords + ?Sized>(
     actor: &RunActor,
     target: &RunId,
 ) -> Result<Option<TokenRow>, RunError> {
+    let Some(row) = caller_key(store, actor)? else {
+        return Ok(None);
+    };
+    if !within(store, &row.run_id, target)? {
+        return Err(RunError::RunOutOfScope {
+            run_id: target.as_str().to_string(),
+        });
+    }
+    Ok(Some(row))
+}
+
+/// The key half of [`caller_check`]: a Caller's presenting Run Key is still
+/// an `active` Run Key of its Run, read inside the job. Returns its row for
+/// a Caller, `None` for the Operator or a Host.
+pub(crate) fn caller_key<S: RunRecords + ?Sized>(
+    store: &S,
+    actor: &RunActor,
+) -> Result<Option<TokenRow>, RunError> {
     let RunActor::Caller { run_id, token_hash } = actor else {
         return Ok(None);
     };
@@ -282,11 +332,6 @@ pub(crate) fn caller_check<S: RunRecords + ?Sized>(
         || &row.run_id != run_id
     {
         return Err(RunError::CredentialRevoked);
-    }
-    if !within(store, run_id, target)? {
-        return Err(RunError::RunOutOfScope {
-            run_id: target.as_str().to_string(),
-        });
     }
     Ok(Some(row))
 }
@@ -309,8 +354,9 @@ pub(crate) fn within<S: RunRecords + ?Sized>(
         .any(|record| &record.run_id == root))
 }
 
-/// Revoke every remaining active token of a Run that just ended (story
-/// 22-1: `run-ended`, no cascade — children outlive their parent's end).
+/// Revoke every remaining active token of a Run that just ended, and its
+/// used refresh credentials (story 22-1: `run-ended`, no cascade —
+/// children outlive their parent's end).
 pub(crate) fn on_run_ended<S: RunRecords + ?Sized>(
     store: &S,
     changes: &mut RunChanges,
@@ -318,26 +364,73 @@ pub(crate) fn on_run_ended<S: RunRecords + ?Sized>(
     at: &str,
 ) -> Result<(), StoreError> {
     revoke_run_tokens(store, changes, run_id, |_| true, cause::RUN_ENDED, at)?;
-    Ok(())
+    revoke_used(store, changes, run_id, cause::RUN_ENDED, at)
 }
 
 /// Revoke a supervised launch's credentials once its process is confirmed
 /// exited (story 22-1, P1: a key lives exactly as long as its process, and
-/// the previous generation is revoked before any relaunch spawns).
+/// the previous generation is revoked before any relaunch spawns) — its
+/// used refresh credentials too, so none can trigger a reuse against the
+/// next launch.
 pub(crate) fn on_process_exited<S: RunRecords + ?Sized>(
     store: &S,
     changes: &mut RunChanges,
     run_id: &RunId,
     at: &str,
 ) -> Result<(), StoreError> {
+    let launched = |row: &TokenRow| row.launch_generation.is_some();
+    revoke_run_tokens(store, changes, run_id, launched, cause::PROCESS_EXITED, at)?;
+    revoke_used_where(store, changes, run_id, launched, cause::PROCESS_EXITED, at)
+}
+
+/// The response to a used (`retired`) refresh credential presented again,
+/// whether on the refresh route or seen in a URL: one `reuse-detected`
+/// event names it, the Run's current credentials of the credential's own
+/// launch generation are revoked (its refresh chain; a later launch's key
+/// was issued by the engine, never through this chain, so a stale
+/// credential of an exited launch is no kill switch for the live one), the
+/// Run's used credentials leave for good (presenting this one or an older
+/// one again is a plain refusal, not a second reuse), and a non-ended Run
+/// gains the `credential-reuse` Anomaly. A silent takeover becomes a
+/// visible one.
+fn respond_to_reuse<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    row: &TokenRow,
+    record: RunRecord,
+    cause: &str,
+    at: &str,
+) -> Result<(), StoreError> {
+    changes.credentials.push(CredentialEvent {
+        schema_version: CREDENTIAL_EVENT_SCHEMA_VERSION,
+        change: CredentialChange::ReuseDetected,
+        class: row.class,
+        token_id: row.token_id.clone(),
+        run_id: row.run_id.clone(),
+        launch_generation: row.launch_generation,
+        issued_by: None,
+        prior_token_id: None,
+        cause: Some(cause.to_string()),
+        at: at.to_string(),
+    });
     revoke_run_tokens(
         store,
         changes,
-        run_id,
-        |row| row.launch_generation.is_some(),
-        cause::PROCESS_EXITED,
+        &row.run_id,
+        |active| {
+            active.class != TokenClass::Announce
+                && active.launch_generation == row.launch_generation
+        },
+        cause,
         at,
     )?;
+    revoke_used(store, changes, &row.run_id, cause, at)?;
+    if !record.is_ended() && !record.anomalies.contains(&Anomaly::CredentialReuse) {
+        let mut anomalies = record.anomalies.clone();
+        anomalies.push(Anomaly::CredentialReuse);
+        let status = record.status;
+        super::ops::move_to(store, changes, record, status, anomalies, None, at)?;
+    }
     Ok(())
 }
 
@@ -347,8 +440,10 @@ pub(crate) fn on_process_exited<S: RunRecords + ?Sized>(
 /// * Active: the used credential is retired, its paired Run Key revoked at
 ///   once, and `pair` issued on the same Run, launch generation and custody
 ///   flag, `issued_by` = the used credential.
-/// * Retired (presented again): the Run's current credentials are revoked
-///   (`refresh-reuse`), the `credential-reuse` Anomaly is raised, one
+/// * Retired (presented again): the Run's current credentials of the
+///   credential's own launch generation are revoked (`refresh-reuse`; a
+///   later launch's credentials were never reachable from it), the
+///   `credential-reuse` Anomaly is raised, one
 ///   `reuse-detected` event names the presented credential — and the answer
 ///   is `credential-revoked`. These changes COMMIT with the refusal (the
 ///   value's `Err`), so a silent takeover becomes a visible one.
@@ -368,39 +463,10 @@ pub(crate) fn refresh<S: RunRecords + ?Sized>(
     match row.state {
         TokenState::Revoked => return Err(RunError::CredentialRevoked),
         TokenState::Retired => {
-            // Reuse: revoke what the Run holds now, raise the Anomaly.
             let record = store
                 .run_record(&row.run_id)?
                 .ok_or(RunError::CredentialRevoked)?;
-            changes.credentials.push(CredentialEvent {
-                schema_version: CREDENTIAL_EVENT_SCHEMA_VERSION,
-                change: CredentialChange::ReuseDetected,
-                class: row.class,
-                token_id: row.token_id.clone(),
-                run_id: row.run_id.clone(),
-                launch_generation: row.launch_generation,
-                issued_by: None,
-                prior_token_id: None,
-                cause: Some(cause::REFRESH_REUSE.to_string()),
-                at: at.to_string(),
-            });
-            revoke_run_tokens(
-                store,
-                &mut changes,
-                &row.run_id,
-                |active| active.class != TokenClass::Announce,
-                cause::REFRESH_REUSE,
-                at,
-            )?;
-            // The used credentials leave for good: presenting this one (or an
-            // older one) again is a plain refusal, not a second reuse.
-            revoke_used(store, &mut changes, &row.run_id, cause::REFRESH_REUSE, at)?;
-            if !record.is_ended() && !record.anomalies.contains(&Anomaly::CredentialReuse) {
-                let mut anomalies = record.anomalies.clone();
-                anomalies.push(Anomaly::CredentialReuse);
-                let status = record.status;
-                super::ops::move_to(store, &mut changes, record, status, anomalies, None, at)?;
-            }
+            respond_to_reuse(store, &mut changes, &row, record, cause::REFRESH_REUSE, at)?;
             return Ok((Err(RunError::CredentialRevoked), changes));
         }
         TokenState::Active => {}
@@ -497,6 +563,11 @@ pub(crate) fn revoke_keys<S: RunRecords + ?Sized>(
                 });
             }
         }
+        // The descendants' used refresh credentials leave with them (out of
+        // service already, so the report lists only what was active).
+        for row in store.retired_issued_under(&roots)? {
+            revoke_retired_row(store, &mut changes, &row, cause::CASCADE, at)?;
+        }
     }
     let reuse_cleared = record.anomalies.contains(&Anomaly::CredentialReuse);
     if reuse_cleared {
@@ -521,8 +592,12 @@ pub(crate) fn revoke_keys<S: RunRecords + ?Sized>(
 }
 
 /// Revoke credentials seen in a URL (story 22-1, Ask First 6): they have
-/// reached someone's access log. Only active tokens change; an unknown
-/// value changes nothing.
+/// reached someone's access log. An active token is revoked. A used refresh
+/// credential so seen is reuse evidence (only a holder of the value can put
+/// it there, and the value has been traded already): it takes
+/// [`respond_to_reuse`], exactly as the refresh route would, so the
+/// exposure cannot be used to disarm the detection quietly. A revoked or
+/// unknown value changes nothing.
 pub(crate) fn revoke_exposed<S: RunRecords + ?Sized>(
     store: &S,
     hashes: &[TokenHash],
@@ -531,8 +606,27 @@ pub(crate) fn revoke_exposed<S: RunRecords + ?Sized>(
     let mut changes = RunChanges::default();
     for hash in hashes {
         if let Some(row) = store.token(hash)? {
-            if row.state == TokenState::Active && row.hash.ct_eq(hash) {
-                revoke(store, &mut changes, &row, cause::EXPOSED_IN_URL, at)?;
+            if !row.hash.ct_eq(hash) {
+                continue;
+            }
+            match row.state {
+                TokenState::Active => {
+                    revoke(store, &mut changes, &row, cause::EXPOSED_IN_URL, at)?;
+                }
+                TokenState::Retired => match (row.class, store.run_record(&row.run_id)?) {
+                    (TokenClass::Refresh, Some(record)) => respond_to_reuse(
+                        store,
+                        &mut changes,
+                        &row,
+                        record,
+                        cause::EXPOSED_IN_URL,
+                        at,
+                    )?,
+                    _ => {
+                        revoke_retired_row(store, &mut changes, &row, cause::EXPOSED_IN_URL, at)?;
+                    }
+                },
+                TokenState::Revoked => {}
             }
         }
     }
@@ -573,7 +667,8 @@ pub(crate) fn open_keys<S: RunRecords + ?Sized>(store: &S) -> Result<Vec<KeyChan
 }
 
 /// The child open as `actor` (story 22-1): a Caller's open is checked inside
-/// the job — its key still active, the parent within its subtree, and fewer
+/// the job — its key still active (first, on every path), the parent within
+/// its subtree, and fewer
 /// than [`super::MAX_CALLER_OPEN_CHILDREN`] open children under the parent —
 /// then the child opens as [`super::ops::open_child`] opens it (its labels
 /// are Caller labels through the Caller guard), and `credentials`, when
@@ -590,39 +685,40 @@ pub(crate) fn open_child_as<S: RunRecords + crate::ports::RunStore + ?Sized>(
     credentials: Option<(TokenStub, TokenStub)>,
     at: &str,
 ) -> Result<((RunId, bool), RunChanges), RunError> {
-    let caller = match actor {
-        RunActor::Caller { .. } => {
-            let parent_id = match &request.parent {
-                super::RunParent::Run(id) => Some(id.clone()),
-                super::RunParent::Instance(name) => crate::domain::InstanceName::new(name)
-                    .ok()
-                    .map(|name| store.open_process_run(&name))
-                    .transpose()?
-                    .flatten()
-                    .map(|record| record.run_id),
-            };
-            match parent_id {
-                Some(parent_id) => {
-                    if store.run_record(&parent_id)?.is_none() {
-                        return Err(RunError::NotFound {
-                            run_id: parent_id.as_str().to_string(),
-                        });
-                    }
-                    let row = caller_check(store, actor, &parent_id)?;
-                    if store.open_children(&parent_id)? >= super::MAX_CALLER_OPEN_CHILDREN {
-                        return Err(RunError::TooManyChildren {
-                            parent: parent_id.as_str().to_string(),
-                            max: super::MAX_CALLER_OPEN_CHILDREN,
-                        });
-                    }
-                    row
-                }
-                // No parent resolves: the open's own refusal names it.
-                None => None,
+    // A Caller's key is re-read FIRST, on every path: a key revoked between
+    // authentication and this job is refused here whatever the request
+    // names — an unresolvable parent or a retried external id included.
+    let caller = caller_key(store, actor)?;
+    if let Some(row) = &caller {
+        let parent_id = match &request.parent {
+            super::RunParent::Run(id) => Some(id.clone()),
+            super::RunParent::Instance(name) => crate::domain::InstanceName::new(name)
+                .ok()
+                .map(|name| store.open_process_run(&name))
+                .transpose()?
+                .flatten()
+                .map(|record| record.run_id),
+        };
+        // No parent resolves: the open's own refusal names it.
+        if let Some(parent_id) = parent_id {
+            if store.run_record(&parent_id)?.is_none() {
+                return Err(RunError::NotFound {
+                    run_id: parent_id.as_str().to_string(),
+                });
+            }
+            if !within(store, &row.run_id, &parent_id)? {
+                return Err(RunError::RunOutOfScope {
+                    run_id: parent_id.as_str().to_string(),
+                });
+            }
+            if store.open_children(&parent_id)? >= super::MAX_CALLER_OPEN_CHILDREN {
+                return Err(RunError::TooManyChildren {
+                    parent: parent_id.as_str().to_string(),
+                    max: super::MAX_CALLER_OPEN_CHILDREN,
+                });
             }
         }
-        RunActor::Operator | RunActor::Host => None,
-    };
+    }
     let minted = run_id.clone();
     let caller_inputs = inputs.clone();
     // A Caller's external ids are its own Run's namespace: a retry by the

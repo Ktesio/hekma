@@ -141,6 +141,24 @@ impl ApiError {
         self.kind == ApiErrorKind::Unauthorized
     }
 
+    /// Whether this is a store failure (the `store` code) — an error whose
+    /// message is the store backend's own text.
+    fn is_store(&self) -> bool {
+        self.code == Some("store")
+    }
+
+    /// A Caller-reachable surface's engine error, surfaced to `authority`
+    /// (story 22-1, review round 3, I-4): the Operator keeps the engine's
+    /// surfaced reason; any other authority's store failure becomes the
+    /// fixed [`Self::store_unreachable`] body, never the backend's text.
+    pub(crate) fn for_authority(authority: &super::auth::Authority, err: RunError) -> Self {
+        let error = Self::from(err);
+        if matches!(authority, super::auth::Authority::Operator) || !error.is_store() {
+            return error;
+        }
+        Self::store_unreachable()
+    }
+
     /// Whether this is the credential-class refusal (`403 forbidden`).
     #[cfg(test)]
     pub(crate) fn is_forbidden(&self) -> bool {
@@ -173,6 +191,33 @@ impl ApiError {
             "the presented credential has been revoked",
         );
         error.code = Some("credential-revoked");
+        error
+    }
+
+    /// Story 22-1: the engine could not check a presented credential (a
+    /// store failure before authentication). Static: an unauthenticated
+    /// client never sees the store's text, which goes to the Operator's
+    /// diagnostic instead.
+    pub(crate) fn credential_check_failed() -> Self {
+        let mut error = Self::new(
+            ApiErrorKind::Internal,
+            "the presented credential could not be checked; try again later",
+        );
+        error.code = Some("store");
+        error
+    }
+
+    /// Story 22-1 (review round 3, I-4): the store failed under an
+    /// authenticated Caller. The same fixed treatment the unauthenticated
+    /// path gives a store failure — a static body with the `store` code —
+    /// because the store's own text (a table name, an instance name) is the
+    /// Operator's, never a Caller's.
+    pub(crate) fn store_unreachable() -> Self {
+        let mut error = Self::new(
+            ApiErrorKind::Internal,
+            "the run store could not be reached; try again later",
+        );
+        error.code = Some("store");
         error
     }
 
