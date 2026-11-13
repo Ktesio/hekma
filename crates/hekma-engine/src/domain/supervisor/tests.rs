@@ -10536,3 +10536,48 @@ fn two_pre_proxy_adopted_agents_get_no_legacy_route_and_are_named() {
     drop(manifests);
     drop(state);
 }
+
+#[test]
+fn a_failed_observed_start_retires_its_pending_run_route() {
+    // Review round 1, finding 4 (story 23-1): the pending Run route is
+    // published before the spawn and the readiness watch. A start that fails
+    // after that point must retire it, or the route keeps forwarding calls
+    // for a Run that never got its row (unmetered, and one leaked entry per
+    // failed start).
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_observed_manifest(manifest.path(), "obsfail", &["--exit-fast", "3"]);
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "obsfail",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("obsfail").unwrap();
+    registry
+        .set_config(
+            &name,
+            crate::domain::METERING_UPSTREAM_BASE_URL_KEY,
+            "http://127.0.0.1:9",
+        )
+        .unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    sup.set_serve_options(
+        Some("http://127.0.0.1:9".to_string()),
+        false,
+        LogCaptureMode::Full,
+    )
+    .unwrap();
+    for _ in 0..2 {
+        assert!(sup.start(&registry, "obsfail").is_err(), "the start fails");
+        assert!(
+            registry.run_publisher().current().pending_routes.is_empty(),
+            "no pending route survives a failed start"
+        );
+    }
+}

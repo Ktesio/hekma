@@ -60,6 +60,11 @@ pub(crate) struct RecordPump {
     /// cfg(test) seam: fail the next N close jobs before they write.
     #[cfg(test)]
     pub fail_closes: Arc<AtomicU64>,
+    /// cfg(test) seam: the next N close jobs find their calls-store record
+    /// already written (the state a commit that persisted the calls file
+    /// but not state.db leaves for the retry).
+    #[cfg(test)]
+    pub prerecord_closes: Arc<AtomicU64>,
 }
 
 impl RecordPump {
@@ -128,7 +133,10 @@ fn submit_close(
     let inbox = Arc::clone(&pump.inbox);
     #[cfg(test)]
     let fail = Arc::clone(&pump.fail_closes);
+    #[cfg(test)]
+    let prerecord = Arc::clone(&pump.prerecord_closes);
     let retry_pump = Arc::clone(&pump);
+    let (call_id, run_id) = (close.record.call_id.clone(), close.record.run_id.clone());
     let sent = handle.submit_then(
         move |ctx| {
             #[cfg(test)]
@@ -136,6 +144,10 @@ fn submit_close(
                 return Err(StoreError::Backend(
                     "test seam: the close job fails".to_string(),
                 ));
+            }
+            #[cfg(test)]
+            if take_one(&prerecord) {
+                ctx.store().insert_call_record(&job_close.record)?;
             }
             pipeline::commit_proxied_call(ctx, job_close, &runs, &inbox)
         },
@@ -164,7 +176,13 @@ fn submit_close(
         },
     );
     if sent.is_err() {
-        // The writer is gone: nothing more can be recorded.
+        // The writer is gone: nothing more can be recorded, loudly.
+        (pump.diagnostics)(format!(
+            "the store writer closed before call {} (Run {}) was recorded; its usage, if any, \
+             was not counted",
+            call_id,
+            run_id.as_str()
+        ));
         pump.stats.skipped.fetch_add(1, Ordering::Relaxed);
     }
 }

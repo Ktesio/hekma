@@ -57,7 +57,7 @@ Two request headers refine the Run. Neither is ever an identity on its own.
 | A binding with labels | **Splits** the binding: each id gets its own top-level Run carrying the binding's labels, so a per-run budget caps each split Run, not their sum. | The same. |
 | The unattributed Run | Nothing. The hint is ignored and counted, so nobody on loopback can mint Runs without your setup. | Ignored. |
 
-An id is at most 128 visible ASCII characters, and a hint carries at most 16 labels, each checked like any label. A hint's labels apply when it creates the Run; later different labels are ignored. Each parent or binding holds at most 1,000 open hint Runs. Past that, calls stay on the parent, still attributed, with a diagnostic.
+An id is at most 128 visible ASCII characters, and a hint carries at most 16 labels, each checked like any label. A hint's labels apply when it creates the Run; later different labels are ignored. Each parent or binding holds at most 1,000 open hint Runs. Past that, or past 8 levels of nesting, calls stay on the parent, still attributed, and a diagnostic says so at most once a minute.
 
 The first call for a new Run waits up to one second for the Run to be created. Past that it is refused with `503 hekma_run_unavailable` (retryable) and not forwarded.
 
@@ -126,7 +126,7 @@ Bindings are managed by the Operator only: through `hekma binding` (see [Command
 |---|---|---|
 | A request or response body | 64 MiB | `413 hekma_body_too_large` for a request, `502 hekma_upstream_error` for a response |
 | Concurrent calls | 512 | `503 hekma_proxy_busy` |
-| Buffered bytes across calls | 512 MiB | `503 hekma_proxy_busy` |
+| Buffered bytes across calls | 512 MiB | `503 hekma_proxy_busy` for a request, refused as its body arrives and before anything is sent upstream. A response is never refused for it: the provider has already billed the call, so the response is recorded and relayed, and a diagnostic (at most once a minute) says the budget was exceeded |
 | Reading request headers | 30 seconds | The connection closes |
 | Connecting upstream | 10 seconds | `502 hekma_upstream_error` |
 | A whole call | No limit | The client's own timeout ends a long completion |

@@ -707,8 +707,11 @@ fn proxied_row_rate(
 /// over the Run's ancestor chain, all in this job's SAVEPOINT. The
 /// evaluator's inputs come from state the writer owns (D2): the process-
 /// owning ancestor's stored resolution for the process level, each level's
-/// own stored resolution for its own. A replayed close (the record already
-/// exists) changes nothing. The post-commit hooks republish the changed
+/// own stored resolution for its own. A replayed close changes nothing: the
+/// usage row's (run, call id) key dedups it. An existing calls-store record
+/// alone does not prove the usage landed, because the calls store is its
+/// own file and a commit is atomic per file, so the job goes on to the
+/// usage row either way. The post-commit hooks republish the changed
 /// entries (the `block` reasons ride them) and push the committed
 /// evaluation into the Supervisor's inbox.
 pub(crate) fn commit_proxied_call(
@@ -719,9 +722,7 @@ pub(crate) fn commit_proxied_call(
 ) -> Result<(), StoreError> {
     use crate::ports::PolicyRecords as _;
     let store = ctx.store();
-    if !store.insert_call_record(&close.record)? {
-        return Ok(());
-    }
+    store.insert_call_record(&close.record)?;
     let Some(usage) = close.usage else {
         return Ok(());
     };

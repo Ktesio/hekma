@@ -424,12 +424,16 @@ impl Supervisor {
         let upstream = observed_route
             .as_ref()
             .map(|(_, upstream)| upstream.clone());
-        if let Some(upstream) = &upstream {
-            registry.run_publisher().publish_pending_route(
+        // The guard retires the route on every return below, so a start that
+        // fails after this point never leaves its route answering.
+        let pending_route = upstream.as_ref().map(|upstream| {
+            PendingRouteGuard::publish(
+                registry.run_publisher(),
                 run_id.clone(),
-                Some((std::sync::Arc::from(upstream.as_str()), start_fence)),
-            );
-        }
+                std::sync::Arc::from(upstream.as_str()),
+                start_fence,
+            )
+        });
         // The effective config the MAPPING applies: for an observed instance it
         // carries the engine-injected loopback base_url (story 3-4), and for a
         // filesystem-backed instance the engine-computed managed memory dir at the
@@ -1399,11 +1403,7 @@ impl Supervisor {
         }
         // Story 23-1: the latch (and the launch job's upstream) now ride the
         // Run's own entry; the pending route retires.
-        if upstream.is_some() {
-            registry
-                .run_publisher()
-                .publish_pending_route(fence_run_id.clone(), None);
-        }
+        drop(pending_route);
         // Story 21-2: a relaunch keeps the Run and its spent latch, so a
         // `pause` or `stop` the Run had already fired is re-applied here.
         if restart.is_some() && kept_run_id.is_some() {
@@ -1481,5 +1481,34 @@ impl Supervisor {
             }
             std::thread::sleep(READINESS_POLL);
         }
+    }
+}
+
+/// A published pending Run route (story 23-1), retired when dropped: on the
+/// success path once the Run's own entry carries the route, and on every
+/// failure return between publishing it and that point.
+struct PendingRouteGuard {
+    publisher: std::sync::Arc<crate::domain::runs::snapshot::SnapshotPublisher>,
+    run: RunId,
+}
+
+impl PendingRouteGuard {
+    fn publish(
+        publisher: &std::sync::Arc<crate::domain::runs::snapshot::SnapshotPublisher>,
+        run: RunId,
+        upstream: std::sync::Arc<str>,
+        start_fence: u8,
+    ) -> Self {
+        publisher.publish_pending_route(run.clone(), Some((upstream, start_fence)));
+        Self {
+            publisher: std::sync::Arc::clone(publisher),
+            run,
+        }
+    }
+}
+
+impl Drop for PendingRouteGuard {
+    fn drop(&mut self) {
+        self.publisher.publish_pending_route(self.run.clone(), None);
     }
 }

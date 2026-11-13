@@ -82,9 +82,9 @@ pub(crate) fn calls_v2_for_test() -> &'static str {
     CALLS_V2
 }
 
-/// The segment this open writes: the existing one (the lexicographically
-/// first `*.db` — there is only one until rotation exists), else a new one
-/// named by today's UTC date.
+/// The segment this open writes: the newest existing `*.db` (segments are
+/// named by UTC date, so the lexicographically last; there is only one until
+/// rotation exists), else a new one named by today's UTC date.
 pub(crate) fn segment_path(calls_dir: &Path) -> Result<PathBuf, StoreError> {
     std::fs::create_dir_all(calls_dir).map_err(|err| {
         StoreError::Backend(format!(
@@ -104,7 +104,7 @@ pub(crate) fn segment_path(calls_dir: &Path) -> Result<PathBuf, StoreError> {
         .filter(|path| path.extension().is_some_and(|ext| ext == "db"))
         .collect();
     segments.sort();
-    Ok(match segments.into_iter().next() {
+    Ok(match segments.pop() {
         Some(existing) => existing,
         None => {
             let today = crate::time::now_rfc3339();
