@@ -1,11 +1,11 @@
 ---
 title: "Attach and wire control"
-description: "Bring agents Hekma does not launch under control with little or no code, and hold, release, reroute or reject their model calls. Planned."
+description: "Bring agents Hekma does not launch under control with little or no code, and hold, release, reroute or reject their model calls. Partly on main."
 ---
 
 # Attach and wire control
 
-> **Planned.** Nothing on this page is in Hekma 0.11.0 or on main yet. It describes the design being built in the open, and names, commands and defaults may change before it ships. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **Partly on main.** The shared metering proxy, endpoint bindings, wire Runs, announce, Leases and inbound OTLP are on main and ship in the next release. Wire hold, reroute and reject, and the CrewAI and LangGraph helpers, are still planned, and their names, commands and defaults may change before they ship. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 > This page mirrors [hekma.ktesio.dev/docs/attach/](https://hekma.ktesio.dev/docs/attach/), where it is kept current.
 
@@ -28,12 +28,12 @@ Every Run will have a **Control Depth**, a ladder in which each rung includes th
 | `announced` | `wire`, and it declared itself and keeps a Lease | As `wire`, known before its first call |
 | `supervised` | Hekma owns its process | Everything, including process pause and stop |
 
-- **One shared Metering Proxy per host.** The **Metering Proxy** is where Hekma meets model traffic. It will replace today's per-agent proxy with one listener per host on a fixed port, loopback by default.
-- **Endpoint bindings.** You will create bindings with `hekma binding`: a path prefix, the upstream origin it forwards to, labels bound to it and optional routes to reroute to.
-- **Wire Runs from traffic.** The first call through a binding creates a `wire` Run, carrying the binding's labels with no code change.
-- **Self-announce.** A flow can declare itself through a header on its first call, one call to an announce endpoint, or a helper for CrewAI and LangGraph. The helpers will be documented as supported only once they are validated against real flows. Announcing returns a [Run Key](run-keys.md).
-- **Leases.** An announced Run keeps a **Lease** alive by heartbeat or by its own traffic. An expired Lease shows the Run's **Run Status** as `silent`. It never stops the Run.
-- **Inbound OTLP.** Hekma will accept OTLP/HTTP+JSON metrics at `/v1/metrics`. Telemetry that names a Run creates an `observed` Run, with usage marked estimated.
+- **One shared Metering Proxy per host.** On main: one listener per state directory on a sticky port, loopback only. See [The metering proxy](metering-proxy.md).
+- **Endpoint bindings.** On main, through `hekma binding`: a path prefix, the upstream origin it forwards to, labels bound to it and optional reroute routes.
+- **Wire Runs from traffic.** On main: the first call through a binding creates a `wire` Run, carrying the binding's labels with no code change.
+- **Self-announce.** On main: a flow declares itself through the `x-hekma-announce` header on a call, or one call to `POST /v0/runs/announce`, and gets a [Run Key](run-keys.md) once. See [Announce and Leases](announce.md). Helpers for CrewAI and LangGraph are still planned, and will be documented as supported only once they are validated against real flows.
+- **Leases.** On main: an announced Run keeps a **Lease** alive by heartbeat or by its own traffic. An expired Lease shows the Run's **Run Status** as `silent`, which never stops the Run.
+- **Inbound OTLP.** On main: Hekma accepts OTLP/HTTP+JSON metrics at `/v1/metrics` under a binding's announce credential. Telemetry that names a Run creates or renews an `observed` Run, with usage marked estimated, and never issues a Run Key. See [Inbound telemetry](telemetry.md#inbound-telemetry-v1metrics).
 - **In front of a gateway.** Hekma is not a model gateway. It will add identity headers (run id and labels, never content) so LiteLLM, Portkey or a similar gateway behind it can attribute calls.
 
 ## How it will work
