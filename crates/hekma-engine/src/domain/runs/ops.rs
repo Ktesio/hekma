@@ -827,6 +827,24 @@ fn write_labels<S: RunRecords + ?Sized>(
     Ok(())
 }
 
+/// Note a disposition change on `record` (story 23-4): one
+/// `disposition-changed` event whose cause names the reason and the change.
+pub(crate) fn note_disposition<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    record: &RunRecord,
+    cause: String,
+) -> Result<(), StoreError> {
+    note(
+        store,
+        changes,
+        record,
+        RunEventKind::DispositionChanged,
+        Prior::default(),
+        Some(cause),
+    )
+}
+
 /// Note a Caller-label change on `record` (already saved; story 23-2: a
 /// re-announce upserts its Caller labels): one `labels-changed` event with
 /// `cause`. Caller labels never select a Policy (FR-60), so nothing

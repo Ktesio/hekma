@@ -200,6 +200,8 @@ pub use domain::{
 };
 // Story 23-3: inbound telemetry (the Control API's `/v1/metrics`).
 pub use domain::{TelemetryOutcome, TelemetryPoint, TelemetryReport, TelemetryTokenType};
+// Story 23-4: wire dispositions (hold, release, reroute, reject).
+pub use domain::{DispositionOutcome, DispositionVerb};
 // Story 23-1: the shared Metering Proxy's endpoint bindings.
 pub use domain::{
     Binding, BindingChange, BindingCredential, BindingCredentialClass, BindingError, BindingEvent,

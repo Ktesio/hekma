@@ -31,6 +31,7 @@ use super::usage::RunId;
 use crate::ports::StoreError;
 
 pub mod announce;
+pub mod dispositions;
 pub mod bindings;
 pub(crate) mod keys;
 pub(crate) mod labels;
@@ -667,6 +668,10 @@ pub enum RunEventKind {
     LimitsChanged,
     /// It ended.
     Ended,
+    /// An Operator or Host set or cleared one of its wire disposition
+    /// reasons (story 23-4): `hold`, `reject` or `reroute`; the cause names
+    /// which.
+    DispositionChanged,
 }
 
 impl RunEventKind {
@@ -680,6 +685,7 @@ impl RunEventKind {
             RunEventKind::LabelsChanged => "labels-changed",
             RunEventKind::LimitsChanged => "limits-changed",
             RunEventKind::Ended => "ended",
+            RunEventKind::DispositionChanged => "disposition-changed",
         }
     }
 }

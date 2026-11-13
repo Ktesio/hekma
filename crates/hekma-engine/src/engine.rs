@@ -2780,6 +2780,30 @@ impl Engine {
         .await
     }
 
+    /// Hold, release, reroute or reject one Run's model calls at the shared
+    /// Metering Proxy (story 23-4). Each verb sets or clears only its own
+    /// reason; the proxy acts on the strongest over the Run's ancestor chain
+    /// (reject > hold > reroute > pass) from the next published snapshot.
+    /// A Run with no wire path fails fast naming its depth or Metering
+    /// Source. `set_by` is recorded (`operator`, `host`).
+    pub async fn set_disposition(
+        &self,
+        run_id: &str,
+        verb: crate::domain::DispositionVerb,
+        set_by: &str,
+    ) -> Result<crate::domain::DispositionOutcome, RunError> {
+        self.refuse_if_read_only().map_err(RunError::Store)?;
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        let set_by = set_by.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.set_disposition(&registry, &run_id, verb, &set_by)
+        })
+        .await
+    }
+
     /// Heartbeat a Run (story 23-2, `POST /v0/runs/{id}/heartbeat`): extend
     /// its Lease (granting one when it held none) and return a `silent` Run
     /// to `active`. A Caller only within its own subtree; an announcer only
@@ -4146,6 +4170,18 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.ingest_telemetry(report))
+    }
+
+    /// Blocking twin of [`Engine::set_disposition`].
+    pub fn set_disposition(
+        &self,
+        run_id: &str,
+        verb: crate::domain::DispositionVerb,
+        set_by: &str,
+    ) -> Result<crate::domain::DispositionOutcome, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.set_disposition(run_id, verb, set_by))
     }
 
     /// Blocking twin of [`Engine::heartbeat`].
