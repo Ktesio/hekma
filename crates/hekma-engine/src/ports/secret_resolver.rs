@@ -36,8 +36,8 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::domain::SecretString;
 use crate::domain::custody::CustodyPin;
+use crate::domain::SecretString;
 
 /// The secret-resolution port (spine AD-10). Given a `NAME` (the lookup key after
 /// the `secret:` prefix), a resolver either HOLDS the secret, does not, or fails
@@ -234,9 +234,7 @@ impl SecretResolver for FileSecretResolver {
                         let toml::Value::String(value) = item else {
                             return Err(SecretError::FileUnreadable {
                                 path: self.path.to_string_lossy().into_owned(),
-                                detail: format!(
-                                    "[custody.{name}].{key} must be a list of strings"
-                                ),
+                                detail: format!("[custody.{name}].{key} must be a list of strings"),
                             });
                         };
                         values.push(value.clone());

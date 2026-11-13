@@ -910,9 +910,15 @@ impl Engine {
             .expect("registry mutex poisoned")
             .custody_pin(name)
             .map_err(|err| invalid(err.to_string()))?;
-        crate::domain::custody::resolve_origin(name, key_ref, declared.as_ref(), Some(upstream), None)
-            .map(|_| ())
-            .map_err(|err| invalid(err.to_string()))
+        crate::domain::custody::resolve_origin(
+            name,
+            key_ref,
+            declared.as_ref(),
+            Some(upstream),
+            None,
+        )
+        .map(|_| ())
+        .map_err(|err| invalid(err.to_string()))
     }
 
     /// Create an endpoint binding (story 23-1, D3): the Operator surface the

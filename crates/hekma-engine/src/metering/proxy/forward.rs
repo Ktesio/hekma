@@ -787,11 +787,8 @@ async fn serve_admitted(
             return WireError::CustodyUnavailable.response();
         };
         let scheme_https = uri.scheme_str() == Some("https");
-        let origin_pinned = scheme_https
-            && crate::domain::custody::origins_equal(
-                &uri.to_string(),
-                &info.origin,
-            );
+        let origin_pinned =
+            scheme_https && crate::domain::custody::origins_equal(&uri.to_string(), &info.origin);
         if !origin_pinned {
             drain_request_body(req.into_body()).await;
             guard.close(

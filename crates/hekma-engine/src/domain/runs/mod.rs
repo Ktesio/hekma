@@ -48,9 +48,10 @@ pub use limits::{
     RunLimitsView,
 };
 pub use listing::{
-    decode_cursor, encode_cursor, ended_run_cutoff, LatchedBreach, ListRunsQuery, ListingCounts,
-    ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument, RunSummary,
-    ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
+    decode_cursor, encode_cursor, ended_run_cutoff, CustodyView, LatchedBreach, ListRunsQuery,
+    ListingCounts, ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument,
+    RunSummary, ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT,
+    RUN_LISTING_SCHEMA_VERSION,
 };
 pub use policy::{
     BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyEvent, PolicyEventKind,
@@ -562,6 +563,11 @@ pub struct RunView {
     pub usage: RunUsage,
     /// How many of its children have not ended.
     pub open_children: u64,
+    /// Story 22-2: its custody, when it owns a supervised process (the
+    /// listing's same slice: `on`, or `off` with the reason). Absent on a
+    /// Run that owns no process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custody: Option<listing::CustodyView>,
 }
 
 /// Where a child Run is opened.

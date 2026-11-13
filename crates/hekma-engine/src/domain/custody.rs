@@ -174,11 +174,7 @@ const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
     BuiltinProvider {
         host: "router.huggingface.co",
         origin: "https://router.huggingface.co",
-        paths: &[
-            "/v1/chat/completions",
-            "/v1/completions",
-            "/v1/embeddings",
-        ],
+        paths: &["/v1/chat/completions", "/v1/completions", "/v1/embeddings"],
         scheme: CredentialScheme::Bearer,
     },
     BuiltinProvider {
@@ -231,9 +227,9 @@ pub(crate) fn origins_equal(a: &str, b: &str) -> bool {
 /// beginning with it followed by a `/` segment (so `/v1beta/models` covers
 /// `/v1beta/models/gemini:generateContent` but never `/v1beta/modelsx`).
 pub(crate) fn path_allowed(prefixes: &[String], path: &str) -> bool {
-    prefixes.iter().any(|prefix| {
-        path == prefix || path.starts_with(&format!("{prefix}/"))
-    })
+    prefixes
+        .iter()
+        .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
 }
 
 /// The built-in paths for `origin`'s host, when one is tabled.
@@ -479,10 +475,7 @@ impl CustodyCache {
     /// first tick.
     pub(crate) fn seed(&self, name: &str, value: SecretString, declared: Option<CustodyPin>) {
         let mut guard = self.entries.write().unwrap_or_else(|p| p.into_inner());
-        guard.insert(
-            name.to_string(),
-            Arc::new(CustodyEntry { value, declared }),
-        );
+        guard.insert(name.to_string(), Arc::new(CustodyEntry { value, declared }));
     }
 
     /// Resolve `name` now and cache it (blocking: environment and file
@@ -527,11 +520,12 @@ impl CustodyCache {
         let resolver = CompositeSecretResolver::env_then_file(&self.secrets_path);
         let mut failed = 0usize;
         for name in self.held_names() {
-            let refreshed = (|| -> Result<Option<(SecretString, Option<CustodyPin>)>, SecretError> {
-                let value = resolver.require(&name)?;
-                let pin = resolver.custody_pin(&name)?;
-                Ok(Some((value, pin)))
-            })();
+            let refreshed =
+                (|| -> Result<Option<(SecretString, Option<CustodyPin>)>, SecretError> {
+                    let value = resolver.require(&name)?;
+                    let pin = resolver.custody_pin(&name)?;
+                    Ok(Some((value, pin)))
+                })();
             match refreshed {
                 Ok(Some((value, declared))) => self.seed(&name, value, declared),
                 Ok(None) | Err(_) => failed += 1,
@@ -563,9 +557,7 @@ impl CustodyCache {
                 let failed = tokio::task::spawn_blocking(move || refreshing.refresh())
                     .await
                     .unwrap_or(0);
-                if failed > 0
-                    && last_note.elapsed() >= Duration::from_secs(60)
-                {
+                if failed > 0 && last_note.elapsed() >= Duration::from_secs(60) {
                     last_note = std::time::Instant::now();
                     cache.note(format!(
                         "custody cache: {failed} held provider key(s) could not be \
@@ -584,12 +576,10 @@ mod tests {
 
     fn pin(origins: &[&str], paths: &[&str]) -> CustodyPin {
         CustodyPin {
-            origins: (!origins.is_empty()).then(|| {
-                origins.iter().map(|o| o.to_string()).collect::<Vec<_>>()
-            }),
-            paths: (!paths.is_empty()).then(|| {
-                paths.iter().map(|p| p.to_string()).collect::<Vec<_>>()
-            }),
+            origins: (!origins.is_empty())
+                .then(|| origins.iter().map(|o| o.to_string()).collect::<Vec<_>>()),
+            paths: (!paths.is_empty())
+                .then(|| paths.iter().map(|p| p.to_string()).collect::<Vec<_>>()),
         }
     }
 
@@ -603,12 +593,15 @@ mod tests {
             "https://API.OpenAI.com.",
             "https://api.openai.com"
         ));
-        assert!(!origins_equal("https://api.openai.com", "https://api.openai.com:8443"));
-        assert!(!origins_equal("https://api.openai.com", "http://api.openai.com"));
         assert!(!origins_equal(
             "https://api.openai.com",
-            "https://evil.com"
+            "https://api.openai.com:8443"
         ));
+        assert!(!origins_equal(
+            "https://api.openai.com",
+            "http://api.openai.com"
+        ));
+        assert!(!origins_equal("https://api.openai.com", "https://evil.com"));
         // A path on one side never defeats origin equality.
         assert!(origins_equal(
             "https://api.groq.com/openai/v1",
@@ -622,8 +615,14 @@ mod tests {
         assert!(builtin_by_host("API.OPENAI.COM.").is_some());
         assert!(builtin_by_host("my-resource.openai.azure.com").is_some());
         assert!(builtin_by_host("api.openai.example.com").is_none());
-        assert_eq!(builtin_by_host("api.anthropic.com").unwrap().scheme, CredentialScheme::XApiKey);
-        assert_eq!(builtin_by_host("api.openai.com").unwrap().scheme, CredentialScheme::Bearer);
+        assert_eq!(
+            builtin_by_host("api.anthropic.com").unwrap().scheme,
+            CredentialScheme::XApiKey
+        );
+        assert_eq!(
+            builtin_by_host("api.openai.com").unwrap().scheme,
+            CredentialScheme::Bearer
+        );
         // Every non-suffix entry carries a canonical origin.
         for provider in BUILTIN_PROVIDERS {
             if provider.host.starts_with('.') {
@@ -723,7 +722,8 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, CustodyError::NoPinnableOrigin { .. }));
         assert!(
-            err.to_string().contains("Declare its origins beside the key"),
+            err.to_string()
+                .contains("Declare its origins beside the key"),
             "{}",
             err
         );
@@ -731,8 +731,7 @@ mod tests {
         assert!(resolve_origin("P", "secret:P", None, None, None).is_err());
         // Declared origins with no upstream: the first declared origin.
         let declared = pin(&["https://api.example-vendor.com"], &[]);
-        let resolved =
-            resolve_origin("P", "secret:P", Some(&declared), None, None).unwrap();
+        let resolved = resolve_origin("P", "secret:P", Some(&declared), None, None).unwrap();
         assert_eq!(resolved.origin, "https://api.example-vendor.com");
     }
 
@@ -760,11 +759,9 @@ mod tests {
             allowed_paths(Some(&declared), "https://api.openai.com"),
             vec!["/custom/path".to_string()]
         );
-        assert!(allowed_paths(None, "https://api.openai.com").contains(
-            &"/v1/chat/completions".to_string()
-        ));
-        assert!(!allowed_paths(None, "https://api.openai.com")
-            .contains(&"/v1/files".to_string()));
+        assert!(allowed_paths(None, "https://api.openai.com")
+            .contains(&"/v1/chat/completions".to_string()));
+        assert!(!allowed_paths(None, "https://api.openai.com").contains(&"/v1/files".to_string()));
         // An origin with no builtin entry and no declared list allows
         // nothing (the operator widens deliberately).
         assert!(allowed_paths(None, "https://api.example-vendor.com").is_empty());

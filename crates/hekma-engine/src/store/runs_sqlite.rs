@@ -1503,25 +1503,14 @@ impl RunRecords for SqliteStore {
         custody: Option<crate::ports::RunCustodyRow>,
     ) -> Result<(), StoreError> {
         let (state, reason, origin, key_ref) = match custody {
-            Some(row) => (
-                Some(row.state),
-                Some(row.reason),
-                row.origin,
-                row.key_ref,
-            ),
+            Some(row) => (Some(row.state), Some(row.reason), row.origin, row.key_ref),
             None => (None, None, None, None),
         };
         self.conn()
             .execute(
                 "UPDATE runs SET custody_state = ?2, custody_reason = ?3, custody_origin = ?4, \
                  custody_key_ref = ?5 WHERE run_id = ?1",
-                rusqlite::params![
-                    run_id.as_str(),
-                    state,
-                    reason,
-                    origin,
-                    key_ref
-                ],
+                rusqlite::params![run_id.as_str(), state, reason, origin, key_ref],
             )
             .map_err(backend)?;
         Ok(())

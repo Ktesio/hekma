@@ -510,6 +510,9 @@ fn render_text(view: &RunView, verb: &str) -> String {
         "CONTROL",
         record.control_depth.display_with_wire(record.wire_path),
     );
+    if let Some(custody) = &view.custody {
+        row("CUSTODY", crate::cli::ps::custody_cell(Some(custody)));
+    }
     row("STATUS", record.status.as_str().to_string());
     row(
         "ANOMALIES",

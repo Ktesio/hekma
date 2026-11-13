@@ -1248,6 +1248,11 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
         cost_micros: rollup.cost,
         estimate: EstimateLabel::Estimated,
     };
+    let custody = if record.process_owner {
+        Some(super::listing::CustodyView::of(store.run_custody(run_id)?))
+    } else {
+        None
+    };
     Ok(RunView {
         labels: store.run_labels(run_id)?,
         limits: store.run_limits(run_id)?,
@@ -1255,6 +1260,7 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
         open_children: store.open_children(run_id)?,
         usage,
         record,
+        custody,
     })
 }
 

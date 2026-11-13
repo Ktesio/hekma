@@ -848,8 +848,10 @@ impl Registry {
         &self,
         event: crate::domain::bus::EngineEvent,
     ) -> Result<crate::ports::OutboxAppend, StoreError> {
-        self.writer
-            .call(move |ctx| ctx.store().append_outbox(&event, crate::domain::OUTBOX_MAX_BYTES))
+        self.writer.call(move |ctx| {
+            ctx.store()
+                .append_outbox(&event, crate::domain::OUTBOX_MAX_BYTES)
+        })
     }
 
     pub(crate) fn writer(&self) -> &StoreWriter {

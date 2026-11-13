@@ -158,9 +158,10 @@ pub use domain::{
 };
 // Story 21-5: the Run listing — `hekma ps` and `GET /v0/runs`'s read model.
 pub use domain::{
-    decode_cursor, encode_cursor, ended_run_cutoff, LatchedBreach, ListRunsQuery, ListingCounts,
-    ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument, RunSummary,
-    ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
+    decode_cursor, encode_cursor, ended_run_cutoff, CustodyView, LatchedBreach, ListRunsQuery,
+    ListingCounts, ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument,
+    RunSummary, ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT,
+    RUN_LISTING_SCHEMA_VERSION,
 };
 // The per-call read surface over the calls store: the query, the record,
 // the listing and its document, the forward-compatible enums, the cursor

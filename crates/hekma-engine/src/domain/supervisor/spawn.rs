@@ -441,8 +441,14 @@ impl Supervisor {
         // cannot be pinned) rejects the start with NO state change, no
         // spawn, nothing seeded. The one side effect on the SUCCESS path is
         // the custody-cache seed below (in-memory only).
-        let custody =
-            self.custody_start(registry, &name, &effective, &metering_source, &launch, &run_id)?;
+        let custody = self.custody_start(
+            registry,
+            &name,
+            &effective,
+            &metering_source,
+            &launch,
+            &run_id,
+        )?;
         let start_fence = if metering_source == "engine-observed" {
             self.run_start_fence(registry, &name, kept_run_id.as_ref())
         } else {
@@ -925,9 +931,7 @@ impl Supervisor {
             // Run's life.
             custody: Some(match &custody {
                 CustodyStart::On {
-                    key_ref,
-                    origin,
-                    ..
+                    key_ref, origin, ..
                 } => crate::ports::RunCustodyRow {
                     state: "on".to_string(),
                     reason: "held".to_string(),
@@ -1548,7 +1552,9 @@ impl Supervisor {
             ));
         }
         let custody_on = provider_ref.is_some()
-            && effective.value(PROVIDER_CUSTODY_KEY).and_then(toml::Value::as_str)
+            && effective
+                .value(PROVIDER_CUSTODY_KEY)
+                .and_then(toml::Value::as_str)
                 != Some("off");
         let Some(key_name) = provider_ref else {
             return Ok(CustodyStart::Off {

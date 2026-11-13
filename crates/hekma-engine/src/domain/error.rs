@@ -454,9 +454,7 @@ pub enum EngineError {
     /// PRE-TRANSITION: no state change, no spawn, nothing seeded — the
     /// instance keeps its prior state. `detail` carries the exact
     /// remediation and never a secret value.
-    #[error(
-        "Agent Instance '{name}' cannot start under key custody: {detail}"
-    )]
+    #[error("Agent Instance '{name}' cannot start under key custody: {detail}")]
     Custody {
         /// The instance whose start was refused.
         name: String,

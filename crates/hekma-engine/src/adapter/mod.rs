@@ -2196,7 +2196,10 @@ flag = "--model"
         // `refuse_credential_targets` gate) naming the key and the
         // remediation, mirroring `run.key`.
         let tmp = TempDir::new().unwrap();
-        for target in ["flag = \"--api-key\"", "file = { path = \"key.txt\", key = \"k\" }"] {
+        for target in [
+            "flag = \"--api-key\"",
+            "file = { path = \"key.txt\", key = \"k\" }",
+        ] {
             let body = format!(
                 "contract_version = \"1.0.0\"\n[adapter]\nkind = \"demo\"\n[lifecycle.start]\n\
                  exec = \"the-agent\"\n[capabilities.interaction]\nlinux = \"guaranteed\"\n\

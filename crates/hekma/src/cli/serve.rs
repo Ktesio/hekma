@@ -178,14 +178,12 @@ fn proxy_allowed_origins(values: Vec<String>) -> Result<Vec<String>, String> {
         if value.is_empty() {
             continue;
         }
-        let valid = value
-            .split_once("://")
-            .is_some_and(|(scheme, rest)| {
-                matches!(scheme, "http" | "https")
-                    && !rest.is_empty()
-                    && !rest.contains('/')
-                    && !rest.chars().any(|c| c.is_whitespace() || c.is_control())
-            });
+        let valid = value.split_once("://").is_some_and(|(scheme, rest)| {
+            matches!(scheme, "http" | "https")
+                && !rest.is_empty()
+                && !rest.contains('/')
+                && !rest.chars().any(|c| c.is_whitespace() || c.is_control())
+        });
         if !valid {
             return Err(format!(
                 "--proxy-allowed-origins takes origins as a browser sends them (for example \
@@ -213,7 +211,13 @@ mod tests {
             proxy_allowed_origins(vec!["https://App.Example/".into(), " ".into()]),
             Ok(vec!["https://app.example".to_string()])
         );
-        for bad in ["app.example", "ftp://x", "https://x/path", "https://", "null"] {
+        for bad in [
+            "app.example",
+            "ftp://x",
+            "https://x/path",
+            "https://",
+            "null",
+        ] {
             assert!(proxy_allowed_origins(vec![bad.into()]).is_err(), "{bad}");
         }
     }

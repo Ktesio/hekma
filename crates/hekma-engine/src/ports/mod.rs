@@ -36,8 +36,7 @@ pub use process_backend::{
 };
 pub(crate) use run_store::{
     clamp_page, NewRun, OutboxAppend, OutboxBounds, Page, Rollup, RunCustodyRow, RunRecords,
-    RunStore, TokenRow,
-    PAGE_MAX,
+    RunStore, TokenRow, PAGE_MAX,
 };
 pub use secret_resolver::{
     file_permissions_error, mode_is_owner_only, CompositeSecretResolver, EnvSecretResolver,

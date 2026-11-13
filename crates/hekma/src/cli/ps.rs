@@ -139,6 +139,8 @@ fn render(
         ui::TableColumn::new("RUN", 10, 32),
         // 20: `supervised (no wire)` renders whole.
         ui::TableColumn::new("CONTROL", 8, 20),
+        // 17: `off (no-held-key)` renders whole.
+        ui::TableColumn::new("CUSTODY", 7, 17),
         ui::TableColumn::new("STATUS", 6, 6),
         ui::TableColumn::new("ANOMALIES", 9, 24),
         ui::TableColumn::new("LABELS", 6, 24),
@@ -158,6 +160,7 @@ fn render(
                         .control_depth
                         .display_with_wire(item.record.wire_path),
                 ),
+                ui::TableCell::plain(custody_cell(item.custody.as_ref())),
                 ui::TableCell::status(item.record.status.as_str()),
                 ui::TableCell::plain(anomalies_cell(item)),
                 ui::TableCell::plain(labels_cell(item)),
@@ -169,6 +172,16 @@ fn render(
     ui::print_table("Runs", &columns, &rows);
     footer(listing, all, next_page);
     Ok(())
+}
+
+/// A Run's custody (story 22-2): `on`, `off (<reason>)`, or `-` for a Run
+/// that owns no process.
+pub(crate) fn custody_cell(custody: Option<&hekma_engine::CustodyView>) -> String {
+    match custody {
+        Some(view) if view.state == "on" => "on".to_string(),
+        Some(view) => format!("{} ({})", view.state, view.reason),
+        None => "-".to_string(),
+    }
 }
 
 /// The empty page's note, worded for what was asked: a later page, a
