@@ -600,6 +600,10 @@ pub(crate) struct ProxiedUsage {
 pub(crate) struct ProxiedClose {
     pub record: crate::domain::calls::CallRecord,
     pub usage: Option<ProxiedUsage>,
+    /// Story 22-3: the call was attributed without a credential Hekma
+    /// issued while its Run's chain resolved `shadow` — the close raises
+    /// the `unscented` Anomaly on the attributed Run (set once).
+    pub unscented: bool,
 }
 
 /// What one committed proxied close hands the Supervisor (through the
@@ -723,6 +727,34 @@ pub(crate) fn commit_proxied_call(
     use crate::ports::PolicyRecords as _;
     let store = ctx.store();
     store.insert_call_record(&close.record)?;
+    // Story 22-3: the first unscented call under `shadow` raises the
+    // `unscented` Anomaly on the attributed Run, in this transaction (one
+    // `anomalies-changed` event; further calls are no-ops).
+    if close.unscented {
+        let mut changes = RunChanges::default();
+        if let Some(record) = store.run_chain(&close.record.run_id)?.first().cloned() {
+            if !record.is_ended() && !record.anomalies.contains(&runs::Anomaly::UnscentedCall) {
+                let mut anomalies = record.anomalies.clone();
+                anomalies.push(runs::Anomaly::UnscentedCall);
+                let status = record.status;
+                runs::ops::move_to(
+                    store,
+                    &mut changes,
+                    record,
+                    status,
+                    anomalies,
+                    None,
+                    &crate::time::now_rfc3339(),
+                )?;
+            }
+        }
+        if !changes.events.is_empty() || !changes.entries.is_empty() {
+            let events = runs::ops::commit(ctx, runs, changes)?;
+            let inbox = Arc::clone(inbox);
+            ctx.after_commit(move || inbox.push_run_events(events));
+        }
+    }
+    let store = ctx.store();
     let Some(usage) = close.usage else {
         return Ok(());
     };

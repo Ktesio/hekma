@@ -42,6 +42,7 @@ pub(crate) enum WireError {
     BadTarget,
     BadHost,
     PathNotAllowed,
+    UnscentedCall,
     UnknownCredential,
     CredentialRevoked,
     RunOutOfScope,
@@ -56,12 +57,13 @@ pub(crate) enum WireError {
 impl WireError {
     /// Every row (the table tests walk it).
     #[cfg(test)]
-    pub(crate) const ALL: [WireError; 14] = [
+    pub(crate) const ALL: [WireError; 15] = [
         WireError::CredentialInUrl,
         WireError::CustodyUnavailable,
         WireError::BadTarget,
         WireError::BadHost,
         WireError::PathNotAllowed,
+        WireError::UnscentedCall,
         WireError::UnknownCredential,
         WireError::CredentialRevoked,
         WireError::RunOutOfScope,
@@ -115,6 +117,14 @@ impl WireError {
                 "path_not_allowed",
                 "This path is outside the endpoints allowed for the held provider key. Ask the \
                  operator to widen the key's path list if this endpoint is genuinely needed.",
+                Some(false),
+            ),
+            WireError::UnscentedCall => (
+                401,
+                "hekma_unscented_call",
+                "unscented_call",
+                "This call carries no credential Hekma issued, and its Run's Scent-Check Mode is \
+                 enforce. Send the Run Key in x-hekma-run-key, or use key custody.",
                 Some(false),
             ),
             WireError::UnknownCredential => (

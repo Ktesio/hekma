@@ -1395,6 +1395,17 @@ fn limit_change(patch: &dto::RunLimitsPatch) -> ApiResult<hekma_engine::RunLimit
         .map(str::parse::<BreachAction>)
         .transpose()
         .map_err(|err| ApiError::invalid_body(format!("breach_action: {err}")))?;
+    let scent_check = patch
+        .scent_check
+        .as_deref()
+        .map(|raw| {
+            hekma_engine::ScentCheckMode::from_wire(raw).ok_or_else(|| {
+                ApiError::invalid_body(format!(
+                    "scent_check: `{raw}` is not a Scent-Check Mode — use off, shadow or enforce"
+                ))
+            })
+        })
+        .transpose()?;
     let mut clear = Vec::with_capacity(patch.clear.len());
     for raw in &patch.clear {
         let field = hekma_engine::RunLimitField::from_wire(raw).ok_or_else(|| {
@@ -1414,6 +1425,7 @@ fn limit_change(patch: &dto::RunLimitsPatch) -> ApiResult<hekma_engine::RunLimit
             token_cumulative: patch.tokens_cumulative,
             dollar_cumulative_micros: dollars("dollars_cumulative", &patch.dollars_cumulative)?,
             breach_action,
+            scent_check,
         },
         clear,
     };

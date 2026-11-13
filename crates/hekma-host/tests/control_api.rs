@@ -3752,19 +3752,20 @@ fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_eq!(json_body(&mut response)["error"]["code"], "policy-default");
 
-    // A Scent-Check Mode before Scent-Check ships is 400
-    // scent-unavailable (never stored-and-ignored).
-    let mut response = call(
-        &client,
-        "PATCH",
-        &format!("{base}/default"),
-        Some(serde_json::json!({"set": {"scent_check": "enforce"}})),
-    );
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        json_body(&mut response)["error"]["code"],
-        "scent-unavailable"
-    );
+    // Story 22-3: every Scent-Check Mode is accepted and stored (no more
+    // scent-unavailable); the default goes back to `off` for the steps
+    // below.
+    for mode in ["enforce", "shadow", "off"] {
+        let mut response = call(
+            &client,
+            "PATCH",
+            &format!("{base}/default"),
+            Some(serde_json::json!({"set": {"scent_check": mode}})),
+        );
+        assert_eq!(response.status(), StatusCode::OK, "{mode}");
+        let body = json_body(&mut response);
+        assert_eq!(body["policy"]["limits"]["scent_check"], mode, "{body}");
+    }
 
     // The Rate table edits through PATCH's `rates`: set, read back, remove.
     let response = call(

@@ -103,9 +103,19 @@ impl RecordPump {
         self: &Arc<Self>,
         record: CallRecord,
         usage: Option<ProxiedUsage>,
+        unscented: bool,
         permit: Option<OwnedSemaphorePermit>,
     ) {
-        submit_close(Arc::clone(self), ProxiedClose { record, usage }, permit, 0);
+        submit_close(
+            Arc::clone(self),
+            ProxiedClose {
+                record,
+                usage,
+                unscented,
+            },
+            permit,
+            0,
+        );
     }
 }
 

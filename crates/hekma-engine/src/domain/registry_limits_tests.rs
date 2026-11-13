@@ -1381,6 +1381,7 @@ fn the_budget_jobs_edges_mixed_moves_stored_inputs_and_runs_without_an_agent() {
         token_cumulative: Some(3),
         dollar_cumulative_micros: Some(Micros(4)),
         breach_action: Some(BreachAction::Stop),
+        scent_check: None,
     };
     for field in RunLimitField::ALL {
         assert_eq!(RunLimitField::from_wire(field.as_str()), Some(field));

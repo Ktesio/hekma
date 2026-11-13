@@ -469,8 +469,6 @@ impl From<RunError> for ApiError {
             RunError::NestingTooDeep { .. }
             | RunError::ActionUnavailable { .. }
             | RunError::TooManyRuns { .. }
-            // Story 21-3: a Scent-Check Mode before Scent-Check ships.
-            | RunError::ScentUnavailable { .. }
             // Story 21-6: a limit scope the Run cannot carry.
             | RunError::ScopeUnavailable { .. }
             | RunError::Invalid { .. } => ApiErrorKind::InvalidBody,
