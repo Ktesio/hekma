@@ -439,3 +439,151 @@ fn a_credential_is_printed_once_rotates_on_reissue_and_is_never_stored() {
         assert_no_sentinel(state_dir, token);
     }
 }
+
+#[test]
+fn every_verb_has_a_json_document() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    drop(hekma_engine::Engine::open(Some(state_dir.to_path_buf())).unwrap());
+    let _host = HostGuard(state_dir);
+    let json = |args: &[&str]| -> serde_json::Value {
+        let run = run_hekma_agent(args, &ctx.project_dir, state_dir);
+        assert!(run.success, "{args:?}: {}", run.stderr);
+        serde_json::from_str(&run.stdout).unwrap_or_else(|_| panic!("{args:?}: {}", run.stdout))
+    };
+    let created = json(&[
+        "binding",
+        "create",
+        "gw",
+        "--prefix",
+        "/gw",
+        "--upstream",
+        "http://127.0.0.1:9",
+        "--label",
+        "team=core",
+        "--json",
+    ]);
+    assert_eq!(created["schema_version"], 1);
+    assert_eq!(created["binding"]["name"], "gw");
+    let listed = json(&["binding", "list", "--json"]);
+    assert_eq!(listed["bindings"][0]["name"], "gw");
+    // The human listing of a non-empty table names each binding.
+    let run = run_hekma_agent(&["binding", "list"], &ctx.project_dir, state_dir);
+    assert!(
+        run.stdout
+            .contains("gw: /gw -> http://127.0.0.1:9 [team=core]"),
+        "{}",
+        run.stdout
+    );
+    let set = json(&[
+        "binding",
+        "set",
+        "gw",
+        "--upstream",
+        "http://127.0.0.1:10",
+        "--json",
+    ]);
+    assert_eq!(set["binding"]["upstream"], "http://127.0.0.1:10");
+    let set = json(&[
+        "binding", "set", "gw", "--prefix", "/gw2", "--label", "team=x", "--json",
+    ]);
+    assert_eq!(set["binding"]["prefix"], "/gw2");
+    let added = json(&[
+        "binding",
+        "route",
+        "add",
+        "gw",
+        "backup",
+        "--upstream",
+        "https://b.example.com",
+        "--custodied-key",
+        "secret:B",
+        "--json",
+    ]);
+    assert_eq!(added["binding"]["routes"][0]["custodied_key"], "secret:B");
+    let run = run_hekma_agent(&["binding", "show", "gw"], &ctx.project_dir, state_dir);
+    assert!(
+        run.stdout
+            .contains("route backup -> https://b.example.com (custodied key secret:B)"),
+        "{}",
+        run.stdout
+    );
+    let removed = json(&["binding", "route", "remove", "gw", "backup", "--json"]);
+    assert_eq!(removed["binding"]["routes"].as_array().unwrap().len(), 0);
+    let run = run_hekma_agent(
+        &["binding", "route", "remove", "gw", "backup"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(3), "{}", run.stderr);
+    let issued = json(&[
+        "binding",
+        "credential",
+        "issue",
+        "gw",
+        "--class",
+        "announce",
+        "--json",
+    ]);
+    assert_eq!(issued["schema_version"], 1);
+    let token = issued["token"].as_str().unwrap().to_string();
+    assert!(token.starts_with("hk_ann_"));
+    let listed = json(&["binding", "credential", "list", "gw", "--json"]);
+    assert_eq!(listed["credentials"][0]["class"], "announce");
+    assert!(!listed.to_string().contains(&token));
+    let run = run_hekma_agent(
+        &["binding", "credential", "revoke", "gw", "--class", "nope"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(run.code, Some(2), "{}", run.stderr);
+    let run = run_hekma_agent(
+        &[
+            "binding",
+            "credential",
+            "revoke",
+            "gw",
+            "--class",
+            "announce",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(run.success, "{}", run.stderr);
+    let run = run_hekma_agent(
+        &["binding", "credential", "list", "gw"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(run.stdout.contains(", revoked "), "{}", run.stdout);
+    let run = run_hekma_agent(
+        &["binding", "credential", "list", "gw"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        run.stdout.contains("no token is shown again"),
+        "{}",
+        run.stdout
+    );
+    // A label that is not key=value is refused before anything is routed.
+    for args in [
+        &[
+            "binding",
+            "create",
+            "x",
+            "--prefix",
+            "/x",
+            "--upstream",
+            "http://e",
+            "--label",
+            "novalue",
+        ][..],
+        &["binding", "set", "gw", "--label", "=v"][..],
+    ] {
+        let run = run_hekma_agent(args, &ctx.project_dir, state_dir);
+        assert_eq!(run.code, Some(2), "{args:?}: {}", run.stderr);
+        assert!(run.stderr.contains("key=value"), "{}", run.stderr);
+    }
+}
