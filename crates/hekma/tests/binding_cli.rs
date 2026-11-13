@@ -587,3 +587,38 @@ fn every_verb_has_a_json_document() {
         assert!(run.stderr.contains("key=value"), "{}", run.stderr);
     }
 }
+
+#[test]
+fn show_names_the_remediation_before_any_host_recorded_a_proxy_port() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    // An embedder's open: its proxy port is ephemeral and never recorded.
+    let engine = hekma_engine::Engine::open(Some(state_dir.to_path_buf())).unwrap();
+    engine
+        .blocking()
+        .create_binding(hekma_engine::BindingSpec {
+            name: "gw".into(),
+            prefix: "/gw".into(),
+            upstream: "http://127.0.0.1:9".into(),
+            labels: Vec::new(),
+            custodied_key: None,
+        })
+        .unwrap();
+    drop(engine);
+    let run = run_hekma_agent(&["binding", "show", "gw"], &ctx.project_dir, state_dir);
+    assert!(run.success, "{}", run.stderr);
+    assert!(
+        run.stdout.contains("no metering proxy port is recorded"),
+        "{}",
+        run.stdout
+    );
+    let run = run_hekma_agent(
+        &["binding", "show", "gw", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+    assert!(json["client_base_url"].is_null());
+    assert!(host_pid(state_dir).is_none(), "show started a host");
+}

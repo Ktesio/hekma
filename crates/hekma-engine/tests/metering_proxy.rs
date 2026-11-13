@@ -1288,3 +1288,31 @@ fn past_the_breadth_cap_a_split_hint_stays_on_the_bindings_run_attributed_never_
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn a_calls_store_that_cannot_open_is_said_and_calls_still_meter() {
+    let state = TempDir::new().unwrap();
+    // A plain file where the calls directory belongs.
+    std::fs::write(state.path().join("calls"), b"not a directory").unwrap();
+    let upstream = Upstream::start();
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let sink: hekma_engine::DiagnosticSink =
+        Arc::new(Mutex::new(Box::new(Capture(Arc::clone(&captured)))));
+    let engine = Engine::open_with_diagnostics(Some(state.path().to_path_buf()), sink).unwrap();
+    let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(
+        text.contains("the per-call records store could not be opened"),
+        "{text}"
+    );
+    let port = engine.metering_proxy().expect("the proxy still runs").port;
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    let run = wait_for_usage(&engine, ("binding", "openai"), 10);
+    assert_eq!(run.usage.output_tokens, 5);
+}
