@@ -114,6 +114,15 @@ pub use adapter::{AdapterRef, ResolvedAdapter};
 /// Service Host (the engine owns process control; the OS parts live in
 /// `backends/`).
 pub use backends::spawn_detached_process;
+
+/// Story 22-2 (P10): harden the calling process's memory — on Linux it
+/// becomes non-dumpable (no core dump, no same-user `ptrace` or
+/// `/proc/<pid>/mem` read) with `RLIMIT_CORE` 0; on other systems nothing
+/// changes. The Service Host calls it once at start, because its custody
+/// cache holds provider keys in memory. An embedding host may call it too.
+pub fn harden_host_memory() -> Result<(), String> {
+    backends::harden_host_memory()
+}
 pub use domain::{
     broadcast, is_pass_through, render_dollars, render_dollars_bare, resolve, AcpContextCostView,
     AcpContextUsageView, AgentInstance, BreachAction, BreachDimension, BreachScope,

@@ -74,6 +74,13 @@ pub use unix::isolated_home_env_vars;
 #[cfg(windows)]
 pub use windows::isolated_home_env_vars;
 
+/// Story 22-2 (P10): the Service Host's memory hardening — non-dumpable
+/// and `RLIMIT_CORE` 0 on Linux, nothing elsewhere.
+#[cfg(unix)]
+pub use unix::harden_host_memory;
+#[cfg(windows)]
+pub use windows::harden_host_memory;
+
 // ---- Story 11-2 review-1: atomic-write filesystem glue (the cfg home) ----
 // The per-OS bits of `paths::write_atomically` (permission preservation and
 // the rename with the Windows sharing-retry), cfg-selected exactly like the

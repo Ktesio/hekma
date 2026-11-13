@@ -173,12 +173,14 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
         .and_then(bearer)
         .filter(|value| looks_like_token(value))
         .or(facts.api_key.map(str::trim).filter(|v| looks_like_token(v)));
+    // `(run, token id, custody-eligible)` of the key that identifies the
+    // call.
     let mut custody_slot = false;
     let key = if let Some(raw) = slot {
         match verdict(snapshot, raw) {
-            KeyVerdict::Run(run, token_id, eligible) if eligible => {
+            KeyVerdict::Run(run, token_id, true) => {
                 custody_slot = true;
-                Some((run, token_id))
+                Some((run, token_id, true))
             }
             KeyVerdict::Run(..) => {
                 return Identified::Refused(Refusal::CustodyUnavailable);
@@ -191,24 +193,29 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
     };
     let key = match facts.run_key.map(str::trim).filter(|v| !v.is_empty()) {
         Some(raw) => match verdict(snapshot, raw) {
-            KeyVerdict::Run(run, token_id, _) => Some((run, token_id)),
+            KeyVerdict::Run(run, token_id, eligible) => Some((run, token_id, eligible)),
             KeyVerdict::Unknown => return Identified::Refused(Refusal::UnknownCredential),
             KeyVerdict::Revoked => return Identified::Refused(Refusal::CredentialRevoked),
         },
         None => key,
     };
 
-    // Story 22-2: an eligible Run Key (the slot above, or `x-hekma-run-key`)
-    // draws on the custody its Run's chain holds — decided HERE, before the
-    // route, so a key in the API-key slot whose Run holds no key keeps the
-    // same `custody_unavailable` answer whatever the path. A call with no
-    // eligible credential NEVER draws custody (a labelled binding's Run
-    // reached bare, the unattributed Run, a header-announced Run): it is
-    // forwarded with whatever key the client sent.
-    let custody = key.as_ref().and_then(|(run, _)| snapshot.custody_of(run));
+    // Story 22-2: ONLY a custody-eligible Run Key (the slot above, or
+    // `x-hekma-run-key`) draws on the custody its Run holds — decided HERE,
+    // before the route, so a key in the API-key slot whose Run holds no key
+    // keeps the same `custody_unavailable` answer whatever the path. A call
+    // with no eligible credential NEVER draws custody (an ineligible key in
+    // `x-hekma-run-key`, a labelled binding's Run reached bare, the
+    // unattributed Run, a header-announced Run): it is forwarded with
+    // whatever key the client sent.
+    let custody = key
+        .as_ref()
+        .filter(|(_, _, eligible)| *eligible)
+        .and_then(|(run, _, _)| snapshot.custody_of(run));
     if custody_slot && custody.is_none() {
         return Identified::Refused(Refusal::CustodyUnavailable);
     }
+    let key = key.map(|(run, token_id, _)| (run, token_id));
 
     // 3–5. The route.
     enum Route {

@@ -271,6 +271,12 @@ const ENV_FLOOR: &[&str] = &[
     "HOME",
 ];
 
+/// Story 22-2: Windows — nothing is changed (crash-report behaviour is
+/// documented per OS in the hosting docs).
+pub fn harden_host_memory() -> Result<(), String> {
+    Ok(())
+}
+
 /// The home-pointing variables home isolation rewrites (story 22-2; see
 /// `backends::isolated_home_env_vars`). The profile variables, matched
 /// case-insensitively by the spawn (like the floor itself); tools that

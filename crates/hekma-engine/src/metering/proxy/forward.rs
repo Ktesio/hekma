@@ -204,13 +204,27 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+/// A `Host` header value without its port (`[::1]:80` → `::1`,
+/// `name:8478` → `name`, `name` → `name`).
+fn host_name_part(host: &str) -> &str {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split_once(']').map_or(rest, |(inside, _)| inside);
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if !name.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => {
+            name
+        }
+        _ => host,
+    }
+}
+
 /// Whether a `Host` header value names a loopback literal (`127.0.0.0/8`,
 /// `::1`, `localhost` — the port stripped, brackets kept honest) — the DNS
 /// rebinding half of the boundary: only the proxy's own loopback addresses
 /// are ever acceptable by default.
 fn host_is_loopback_literal(host: &str) -> bool {
-    let hostname = host.rsplit_once(':').map_or(host, |(name, _)| name);
-    let hostname = hostname.trim_start_matches('[').trim_end_matches(']');
+    let hostname = host_name_part(host);
     if hostname.eq_ignore_ascii_case("localhost") {
         return true;
     }
@@ -237,7 +251,9 @@ fn host_origin_ok(
     };
     let host_ok = match header(headers, hyper::header::HOST.as_str()) {
         Some(host) => {
-            host_is_loopback_literal(host) || listed(host, allowed_hosts)
+            host_is_loopback_literal(host)
+                || listed(host, allowed_hosts)
+                || listed(host_name_part(host), allowed_hosts)
         }
         None => false,
     };
@@ -247,6 +263,61 @@ fn host_origin_ok(
     match header(headers, "origin") {
         Some(origin) => listed(origin, allowed_origins),
         None => true,
+    }
+}
+
+/// Replace every exact occurrence of `needle` in `haystack`, or `None`
+/// when there is none (byte-wise: a body need not be UTF-8).
+fn replace_bytes(haystack: &[u8], needle: &[u8], mask: &[u8]) -> Option<Vec<u8>> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut index = 0;
+    let mut found = false;
+    while index < haystack.len() {
+        if haystack[index..].starts_with(needle) {
+            out.extend_from_slice(mask);
+            index += needle.len();
+            found = true;
+        } else {
+            out.push(haystack[index]);
+            index += 1;
+        }
+    }
+    found.then_some(out)
+}
+
+/// Response redaction (story 22-2): every exact occurrence of the custodied
+/// key in the relayed headers and the buffered body becomes the fixed mask.
+/// A header whose value cannot hold the masked text is dropped rather than
+/// relayed with the key; a changed body gets its `content-length` rewritten.
+fn redact_response(headers: &mut HeaderMap, body: Bytes, needle: &[u8]) -> Bytes {
+    let mask = wire::REDACTION_MASK.as_bytes();
+    let mut drop: Vec<HeaderName> = Vec::new();
+    for (name, value) in headers.iter_mut() {
+        if let Some(replaced) = replace_bytes(value.as_bytes(), needle, mask) {
+            match HeaderValue::from_bytes(&replaced) {
+                Ok(mut masked) => {
+                    masked.set_sensitive(value.is_sensitive());
+                    *value = masked;
+                }
+                Err(_) => drop.push(name.clone()),
+            }
+        }
+    }
+    for name in drop {
+        headers.remove(name);
+    }
+    match replace_bytes(&body, needle, mask) {
+        Some(masked) => {
+            headers.insert(
+                hyper::header::CONTENT_LENGTH,
+                HeaderValue::from(masked.len()),
+            );
+            Bytes::from(masked)
+        }
+        None => body,
     }
 }
 
@@ -689,7 +760,20 @@ async fn serve_admitted(
         let name = crate::domain::config::secret_name(&info.key_ref)
             .unwrap_or_default()
             .to_string();
-        let Some(entry) = shared.custody.get(&name) else {
+        let entry = match shared.custody.get(&name) {
+            Some(entry) => Some(entry),
+            // A miss (a binding's key, a custodied Run adopted after a
+            // restart): resolve once, off the async threads.
+            None => {
+                let cache = Arc::clone(&shared.custody);
+                let lookup = name.clone();
+                tokio::task::spawn_blocking(move || cache.resolve_now(&lookup))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        };
+        let Some(entry) = entry else {
             drain_request_body(req.into_body()).await;
             guard.close(
                 CallDisposition::Pass,
@@ -838,6 +922,13 @@ async fn serve_admitted(
         ] {
             parts.headers.remove(&name);
         }
+        // The response must be readable to be redacted: ask for it
+        // uncompressed (a key echoed inside a gzip body would pass the
+        // byte scan unseen).
+        parts.headers.insert(
+            hyper::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
         let scheme = crate::domain::custody::scheme_for(&info.origin);
         match scheme.header_value(&entry.value) {
             Some((name, value)) => {
@@ -964,32 +1055,13 @@ async fn serve_admitted(
     // the agent reads must not carry the real key back into everything the
     // agent prints or writes). Responses are buffered whole today; when
     // incremental relay lands the redaction moves to a sliding window.
-    let relay_bytes = if let Some((_, entry)) = &custody {
-        let needle = entry.value.expose_secret();
-        for value in res_parts.headers.values_mut() {
-            if let Ok(text) = value.to_str() {
-                if text.contains(needle) {
-                    if let Ok(replaced) =
-                        HeaderValue::from_str(&text.replace(needle, wire::REDACTION_MASK))
-                    {
-                        let mut replaced = replaced;
-                        replaced.set_sensitive(value.is_sensitive());
-                        *value = replaced;
-                    }
-                }
-            }
-        }
-        if res_bytes.windows(needle.len()).any(|window| window == needle.as_bytes()) {
-            Bytes::from(
-                String::from_utf8_lossy(&res_bytes)
-                    .replace(needle, wire::REDACTION_MASK)
-                    .into_bytes(),
-            )
-        } else {
-            res_bytes
-        }
-    } else {
-        res_bytes
+    let relay_bytes = match &custody {
+        Some((_, entry)) => redact_response(
+            &mut res_parts.headers,
+            res_bytes,
+            entry.value.expose_secret().as_bytes(),
+        ),
+        None => res_bytes,
     };
     let latched = shared.snapshot.current().disposition_over(&run_id);
     if let Some(value) = wire::breach_header_value(&Disposition::reasons(latched.breach_latched)) {

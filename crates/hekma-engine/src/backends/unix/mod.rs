@@ -182,6 +182,44 @@ pub fn isolated_home_env_vars() -> &'static [&'static str] {
     ]
 }
 
+/// Story 22-2 (P10): keep the Service Host's memory — which holds custodied
+/// provider keys in its custody cache — out of core dumps, and on Linux
+/// out of same-user `ptrace` and `/proc/<pid>/mem` reads, by clearing the
+/// process's dumpable flag and setting `RLIMIT_CORE` to 0. Linux only;
+/// elsewhere it changes nothing (the docs state each OS's behaviour).
+#[cfg(target_os = "linux")]
+pub fn harden_host_memory() -> Result<(), String> {
+    use nix::libc;
+    // SAFETY: two plain syscalls with constant arguments; `limit` is a
+    // stack value the kernel only reads.
+    let dumpable = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    if dumpable != 0 {
+        return Err(format!(
+            "could not mark the process non-dumpable ({})",
+            io::Error::last_os_error()
+        ));
+    }
+    let limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: as above.
+    let core = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
+    if core != 0 {
+        return Err(format!(
+            "could not set the core-dump limit to 0 ({})",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// Story 22-2: not Linux — nothing is changed (see the Linux variant).
+#[cfg(not(target_os = "linux"))]
+pub fn harden_host_memory() -> Result<(), String> {
+    Ok(())
+}
+
 impl ProcessBackend for UnixBackend {
     type Handle = UnixProcess;
 

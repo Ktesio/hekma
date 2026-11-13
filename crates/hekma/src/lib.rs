@@ -343,6 +343,15 @@ enum Commands {
         /// provider (identity headers are on by default)
         #[arg(long)]
         no_identity_headers: bool,
+        /// Host header values the metering proxy accepts besides 127.0.0.1,
+        /// ::1 and localhost (comma-separated; any other Host is refused)
+        #[arg(long, value_name = "NAME,...", value_delimiter = ',')]
+        proxy_allowed_hosts: Vec<String>,
+        /// Origin header values the metering proxy accepts (comma-separated
+        /// origins such as https://app.example; by default a request with
+        /// any Origin is refused, since browser pages send one)
+        #[arg(long, value_name = "ORIGIN,...", value_delimiter = ',')]
+        proxy_allowed_origins: Vec<String>,
         /// Serve this state directory instead of the resolved default
         /// (HEKMA_STATE_DIR, the legacy KTESIO_STATE_DIR, or the platform data dir)
         #[arg(long, value_name = "DIR")]
@@ -1197,6 +1206,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             stop_window,
             metering_listen,
             no_identity_headers,
+            proxy_allowed_hosts,
+            proxy_allowed_origins,
             state_dir,
             listen,
             bearer_secret,
@@ -1212,6 +1223,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             stop_window,
             metering_listen,
             no_identity_headers,
+            proxy_allowed_hosts,
+            proxy_allowed_origins,
             state_dir,
             listen,
             bearer_secret,

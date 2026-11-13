@@ -403,6 +403,7 @@ mod tests {
             kept_on_pause: false,
             identity: None,
             before_shared_proxy: false,
+            custody: None,
         }
     }
 

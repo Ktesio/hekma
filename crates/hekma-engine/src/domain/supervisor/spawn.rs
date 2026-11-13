@@ -1509,12 +1509,6 @@ impl Supervisor {
         registry.lookup(&name).map_err(registry_to_engine)
     }
 
-    /// The shared Metering Proxy route for an `engine-observed` instance
-    /// (story 23-1), or `Ok(None)` for a `self-reported` instance (whose start
-    /// path is unchanged): `(<proxy url>/_hekma/runs/<run id>, <upstream>)`.
-    /// Runs at `starting`, BEFORE any persisted state change, so a failure
-    /// rejects the start cleanly. Refused (typed, traffic-free) when the
-    /// upstream is not configured or this engine runs no metering proxy.
     /// The (2b-custody) resolution (story 22-2): read the `provider.*`
     /// leaves, refuse every custody-breaking configuration, resolve and
     /// freeze the origin, validate the real key fail-closed, and seed the
@@ -1653,6 +1647,12 @@ impl Supervisor {
         })
     }
 
+    /// The shared Metering Proxy route for an `engine-observed` instance
+    /// (story 23-1), or `Ok(None)` for a `self-reported` instance (whose start
+    /// path is unchanged): `(<proxy url>/_hekma/runs/<run id>, <upstream>)`.
+    /// Runs at `starting`, BEFORE any persisted state change, so a failure
+    /// rejects the start cleanly. Refused (typed, traffic-free) when the
+    /// upstream is not configured or this engine runs no metering proxy.
     pub(super) fn observed_route(
         &self,
         name: &InstanceName,

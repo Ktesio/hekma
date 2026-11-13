@@ -466,6 +466,19 @@ impl CustodyCache {
         );
     }
 
+    /// Resolve `name` now and cache it (blocking: environment and file
+    /// reads — the proxy calls it through `spawn_blocking` on a cache
+    /// miss, which is how a binding's key, or a custodied Run adopted
+    /// after a restart, reaches the cache). `None` when it does not
+    /// resolve: the call is then refused, never forwarded bare.
+    pub(crate) fn resolve_now(&self, name: &str) -> Option<Arc<CustodyEntry>> {
+        let resolver = CompositeSecretResolver::env_then_file(&self.secrets_path);
+        let value = resolver.require(name).ok()?;
+        let declared = resolver.custody_pin(name).ok()?;
+        self.seed(name, value, declared);
+        self.get(name)
+    }
+
     /// The cached entry for `name` (the hot path read; never resolves).
     pub(crate) fn get(&self, name: &str) -> Option<Arc<CustodyEntry>> {
         self.entries
@@ -525,7 +538,12 @@ impl CustodyCache {
                 let Some(cache) = cache.upgrade() else {
                     break;
                 };
-                let failed = cache.refresh();
+                // The re-resolve reads the environment and the secrets
+                // file: blocking work, off the runtime's async threads.
+                let refreshing = Arc::clone(&cache);
+                let failed = tokio::task::spawn_blocking(move || refreshing.refresh())
+                    .await
+                    .unwrap_or(0);
                 if failed > 0
                     && last_note.elapsed() >= Duration::from_secs(60)
                 {

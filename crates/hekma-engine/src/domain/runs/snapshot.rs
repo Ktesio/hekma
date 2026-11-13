@@ -215,8 +215,7 @@ impl BindingTable {
             .find_map(|entry| entry.strip(path).map(|rest| (entry, rest)))
     }
 
-    /// The binding named `name` (the tests' lookup).
-    #[cfg(test)]
+    /// The binding named `name` (the custody lookup and the tests').
     pub(crate) fn by_name(&self, name: &str) -> Option<&Arc<BindingEntry>> {
         self.entries.iter().find(|entry| entry.name == name)
     }
@@ -383,14 +382,31 @@ impl RunSnapshot {
     /// The custody a call attributed to `run_id` may draw on (story 22-2):
     /// the FIRST held-key custody up the Run's chain — a supervised Run's
     /// own, or the process-owning ancestor's for its in-process children
-    /// (a child of a custodied supervised Run keeps custody). A binding's
-    /// Run has no process-owning ancestor and no chain custody: on
-    /// loopback its key is drawn ONLY through an eligible credential, so
-    /// nothing else is needed.
+    /// (a child of a custodied supervised Run keeps custody) — else, for a
+    /// binding's Run, a split beneath it or a Run beneath either, the
+    /// binding's custodied key, pinned to the binding's upstream. The
+    /// caller draws on it ONLY for a call authenticated by a
+    /// custody-eligible Run Key (P4): a binding's Run reached with no
+    /// credential never does.
     pub(crate) fn custody_of(&self, run_id: &RunId) -> Option<crate::domain::custody::CustodyInfo> {
-        self.chain(run_id)
-            .iter()
-            .find_map(|entry| entry.custody.clone())
+        let chain = self.chain(run_id);
+        if let Some(found) = chain.iter().find_map(|entry| entry.custody.clone()) {
+            return Some(found);
+        }
+        chain.iter().find_map(|entry| {
+            let (namespace, external) = entry.identity.as_ref()?;
+            let binding = if namespace == super::bindings::BINDING_NAMESPACE {
+                external.as_str()
+            } else {
+                namespace.strip_prefix("binding:")?
+            };
+            let binding = self.bindings.by_name(binding)?;
+            let key_ref = binding.custodied_key.as_deref()?;
+            Some(crate::domain::custody::CustodyInfo {
+                key_ref: Arc::from(key_ref),
+                origin: Arc::clone(&binding.upstream),
+            })
+        })
     }
 
     /// The next snapshot with `changes` applied: an ended entry leaves the

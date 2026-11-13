@@ -875,11 +875,52 @@ impl Engine {
             })
     }
 
+    /// Story 22-2 (P7): a binding naming a custodied key must send it only
+    /// where the key is pinned — its upstream over `https`, and on the
+    /// key's declared origins or the built-in provider table. Checked on
+    /// the Operator's create and change, before the write.
+    fn check_binding_pin(
+        inner: &Arc<EngineInner>,
+        key_ref: Option<&str>,
+        upstream: &str,
+    ) -> Result<(), BindingError> {
+        let Some(key_ref) = key_ref else {
+            return Ok(());
+        };
+        let Some(name) = crate::domain::config::secret_name(key_ref) else {
+            // The reference's own shape is refused by the spec validation.
+            return Ok(());
+        };
+        let invalid = |reason: String| BindingError::Invalid {
+            field: "custodied_key".to_string(),
+            reason,
+        };
+        if crate::domain::custody::canonical_origin(upstream)
+            .is_none_or(|(scheme, _, _)| scheme != "https")
+        {
+            return Err(invalid(
+                "a custodied key is sent only over https: give the binding an https upstream, \
+                 or clear its custodied key"
+                    .to_string(),
+            ));
+        }
+        let declared = inner
+            .registry
+            .lock()
+            .expect("registry mutex poisoned")
+            .custody_pin(name)
+            .map_err(|err| invalid(err.to_string()))?;
+        crate::domain::custody::resolve_origin(name, key_ref, declared.as_ref(), Some(upstream), None)
+            .map(|_| ())
+            .map_err(|err| invalid(err.to_string()))
+    }
+
     /// Create an endpoint binding (story 23-1, D3): the Operator surface the
     /// shared Metering Proxy routes on. One `binding` event.
     pub async fn create_binding(&self, spec: BindingSpec) -> Result<Binding, BindingError> {
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
+            Self::check_binding_pin(&inner, spec.custodied_key.as_deref(), &spec.upstream)?;
             Self::binding_write(&inner, move |job, legacy| {
                 let at = crate::time::now_rfc3339();
                 crate::domain::runs::bindings::create(
@@ -904,6 +945,25 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
+            // The binding as it will be after the patch, when the patch
+            // touches its key or its upstream.
+            if patch.custodied_key.is_some() || patch.upstream.is_some() {
+                let current = {
+                    let registry = inner.registry.lock().expect("registry mutex poisoned");
+                    registry.reader().binding(&name)?
+                };
+                if let Some(current) = current {
+                    let key = match &patch.custodied_key {
+                        Some(next) => next.clone(),
+                        None => current.custodied_key.clone(),
+                    };
+                    let upstream = patch
+                        .upstream
+                        .clone()
+                        .unwrap_or_else(|| current.upstream.clone());
+                    Self::check_binding_pin(&inner, key.as_deref(), &upstream)?;
+                }
+            }
             Self::binding_write(&inner, move |job, legacy| {
                 let at = crate::time::now_rfc3339();
                 crate::domain::runs::bindings::update(

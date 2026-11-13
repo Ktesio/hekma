@@ -3367,6 +3367,13 @@ pub(crate) fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
         // detached start would strand the agent's model traffic on a dead port.
         // The engine refused BEFORE any side effect (the instance keeps its prior
         // state); the detail carries the why + the remediation.
+        EngineError::Custody { name, detail } => AgentConfig {
+            message: format!(
+                "Agent Instance '{name}' cannot start under key custody: {detail}. Nothing was \
+                 changed."
+            ),
+        }
+        .into(),
         EngineError::DetachRefused { name, detail } => AgentDetachRefused {
             message: format!(
                 "Agent Instance '{name}' cannot be started with --detach: {detail}. Nothing \

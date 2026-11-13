@@ -1265,6 +1265,17 @@ impl Supervisor {
         self.events.publish(seq, event);
     }
 
+    /// Install the engine's custody cache (story 22-2, open-time only,
+    /// before any start): a custodied start seeds its resolved value here —
+    /// the one in-memory home for provider cleartext outside the spawn
+    /// environment's Run Key delivery.
+    pub(crate) fn install_custody_cache(
+        &mut self,
+        cache: std::sync::Arc<crate::domain::custody::CustodyCache>,
+    ) {
+        self.custody_cache = Some(cache);
+    }
+
     /// Install (or replace) the host-provided diagnostic sink (story 10-2).
     /// Crate-internal: hosts reach it through
     /// [`Engine::open_with_diagnostics`](crate::Engine::open_with_diagnostics)
@@ -1283,17 +1294,6 @@ impl Supervisor {
     /// is best-effort (an error or a panic in the outgoing writer's flush is
     /// swallowed, exactly like an emission write — never fails or crashes
     /// the rotation).
-    /// Install the engine's custody cache (story 22-2, open-time only,
-    /// before any start): a custodied start seeds its resolved value here —
-    /// the one in-memory home for provider cleartext outside the spawn
-    /// environment's Run Key delivery.
-    pub(crate) fn install_custody_cache(
-        &mut self,
-        cache: std::sync::Arc<crate::domain::custody::CustodyCache>,
-    ) {
-        self.custody_cache = Some(cache);
-    }
-
     pub(crate) fn install_diagnostics(&mut self, sink: DiagnosticSink) {
         if let Some(previous) = self.diagnostics.take() {
             let mut writer = previous

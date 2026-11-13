@@ -107,6 +107,10 @@ fn engine_variants() -> Vec<EngineError> {
             name: "a".into(),
             detail: "bind".into(),
         },
+        EngineError::Custody {
+            name: "a".into(),
+            detail: "second delivery".into(),
+        },
         EngineError::DetachRefused {
             name: "a".into(),
             detail: "observed".into(),
