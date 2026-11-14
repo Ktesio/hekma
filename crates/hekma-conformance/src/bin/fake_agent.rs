@@ -419,6 +419,10 @@ struct Opts {
     /// observe the exit (crash path) long before this sleep ends. `None` =
     /// announce readiness normally (the default).
     never_ready: Option<Duration>,
+    /// Open a TCP connection to `<host:port>` at startup and hold it for
+    /// the process's life (bypass detection's subject: a direct connection
+    /// from the supervised tree).
+    hold_tcp: Option<String>,
     /// Beat a heartbeat file every `<interval_ms>` (the liveness story, 18-2):
     /// rewrite the file (its MTIME is the liveness signal a manifest's
     /// `[liveness.heartbeat_file]` check reads) on a loop until
@@ -570,6 +574,7 @@ fn parse() -> Opts {
     let mut ready_file: Option<(PathBuf, u64)> = None;
     let mut ready_line: Option<(String, u64)> = None;
     let mut never_ready: Option<Duration> = None;
+    let mut hold_tcp: Option<String> = None;
     let mut exit_with: Option<(i32, Duration)> = None;
     let mut touch: Option<PathBuf> = None;
     let mut hang_before: Option<Duration> = None;
@@ -700,6 +705,13 @@ fn parse() -> Opts {
                         "fake_agent: --ready-line requires LINE:DELAY_MS (got missing or \
                          malformed value)"
                     );
+                    std::process::exit(2);
+                }
+            },
+            "--hold-tcp" => match args.next() {
+                Some(addr) => hold_tcp = Some(addr),
+                None => {
+                    eprintln!("fake_agent: --hold-tcp requires a HOST:PORT value");
                     std::process::exit(2);
                 }
             },
@@ -1207,6 +1219,7 @@ fn parse() -> Opts {
         ready_file,
         ready_line,
         never_ready,
+        hold_tcp,
         heartbeat_file,
         heartbeat_stop_after,
         heartbeat_stop_on_pause,
@@ -1271,6 +1284,17 @@ fn main() {
     if opts.sniff_stdin_at_startup {
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
+    }
+
+    // `--hold-tcp`: one direct connection, held until the process exits.
+    if let Some(addr) = &opts.hold_tcp {
+        match std::net::TcpStream::connect(addr) {
+            Ok(stream) => std::mem::forget(stream),
+            Err(err) => {
+                eprintln!("fake_agent: --hold-tcp {addr}: {err}");
+                std::process::exit(2);
+            }
+        }
     }
 
     // Immediate-exit path (AC2): exit before doing anything else.

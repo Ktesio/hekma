@@ -281,6 +281,11 @@ impl Default for BindingTable {
 }
 
 impl BindingTable {
+    /// Story 22-4: every binding's upstream (the provider-host list).
+    pub(crate) fn upstreams(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.entries.iter().map(|entry| &entry.upstream)
+    }
+
     /// A table from `entries` in any order, the root setting on.
     pub(crate) fn new(mut entries: Vec<BindingEntry>) -> Self {
         entries.sort_by(|a, b| {

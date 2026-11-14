@@ -75,6 +75,9 @@ struct Inner {
     controller: Option<Box<dyn ShimStream>>,
     exit_seen: Option<Instant>,
     acknowledged: bool,
+    /// Story 22-4: what to compare the tree against, and when next.
+    bypass: Option<super::proto::BypassConfig>,
+    next_bypass: Option<Instant>,
 }
 
 impl Inner {
@@ -119,6 +122,50 @@ impl Inner {
         }
     }
 
+    /// Story 22-4: the child's pid and the list, when a check is due (and
+    /// the next one is scheduled).
+    fn bypass_due(&mut self) -> Option<(u32, Vec<crate::domain::bypass::ProviderHost>)> {
+        let config = self.bypass.as_ref()?;
+        let (pid, _) = self.status.child?;
+        if self.status.exit.is_some() || self.next_bypass.is_some_and(|at| Instant::now() < at) {
+            return None;
+        }
+        self.next_bypass = Some(Instant::now() + Duration::from_millis(config.interval_ms.max(1)));
+        Some((pid, config.hosts.clone()))
+    }
+
+    /// Story 22-4: fold one check into the report; push it when it changed.
+    fn apply_bypass(
+        &mut self,
+        result: Result<Vec<std::net::SocketAddr>, String>,
+        hosts: &[crate::domain::bypass::ProviderHost],
+    ) {
+        let before = self.status.bypass.clone();
+        let report = &mut self.status.bypass;
+        match result {
+            Ok(addrs) => {
+                report.state = "active".to_string();
+                report.reason = None;
+                for host in crate::domain::bypass::matching_hosts(hosts, &addrs) {
+                    if !report.hosts.contains(&host)
+                        && report.hosts.len() < crate::domain::bypass::MAX_BYPASS_HOSTS_PER_RUN
+                    {
+                        report.hosts.push(host);
+                    }
+                }
+                report.hosts.sort();
+            }
+            Err(reason) => {
+                report.state = "unavailable".to_string();
+                report.reason = Some(reason);
+            }
+        }
+        if self.status.bypass != before {
+            let report = self.status.bypass.clone();
+            self.send(&ShimFrame::Bypass { report });
+        }
+    }
+
     fn dispatch(&mut self, op: Op) -> Outcome {
         match op {
             Op::Hello { .. } => Outcome::error(ErrorCode::WrongState),
@@ -126,6 +173,7 @@ impl Inner {
                 if self.status.launched {
                     return Outcome::error(ErrorCode::WrongState);
                 }
+                let bypass = spec.bypass.clone().map(|config| *config);
                 let Some(spec) = spec.spec() else {
                     return Outcome::error(ErrorCode::BadFrame);
                 };
@@ -141,6 +189,10 @@ impl Inner {
                         self.status.child = Some((print.pid, print.start_time));
                         self.status.has_stdin = self.backend.has_stdin(&handle);
                         self.handle = Some(handle);
+                        // Story 22-4: detection starts with the child.
+                        self.status.bypass.state = "unreported".to_string();
+                        self.next_bypass = bypass.as_ref().map(|_| Instant::now());
+                        self.bypass = bypass;
                         Outcome::Spawned {
                             pid: print.pid,
                             start_time: print.start_time,
@@ -213,6 +265,15 @@ impl Inner {
                     return Outcome::error(ErrorCode::WrongState);
                 }
                 self.acknowledged = true;
+                Outcome::Done
+            }
+            Op::BypassHosts { bypass } => {
+                // The whole set is replaced; a Shim checking for the first
+                // time checks at once.
+                if self.bypass.is_none() {
+                    self.next_bypass = Some(Instant::now());
+                }
+                self.bypass = Some(bypass);
                 Outcome::Done
             }
         }
@@ -341,6 +402,8 @@ pub fn serve(listener: &dyn ShimListener, config: ShimConfig) -> ShimExit {
         controller: None,
         exit_seen: None,
         acknowledged: false,
+        bypass: None,
+        next_bypass: None,
     }));
     let started = Instant::now();
     loop {
@@ -362,6 +425,15 @@ pub fn serve(listener: &dyn ShimListener, config: ShimConfig) -> ShimExit {
             {
                 return ShimExit::Unacknowledged;
             }
+        }
+        // Story 22-4: a due bypass check enumerates OUTSIDE the lock.
+        let due = inner.lock().unwrap_or_else(|p| p.into_inner()).bypass_due();
+        if let Some((pid, hosts)) = due {
+            let result = crate::backends::tree_remote_addrs(pid);
+            inner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .apply_bypass(result, &hosts);
         }
         match listener.accept_pending() {
             Ok(Some((stream, owner))) => admit(&inner, &config, stream, owner),

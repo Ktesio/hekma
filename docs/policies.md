@@ -84,7 +84,7 @@ Each Run has a **Control Depth**, how far Hekma controls it. Where a Policy's Br
 
 ## `block`, the wire fence
 
-`block` is never a default. On a breach, the [metering proxy](metering-proxy.md) refuses further model calls of the Run, and of every Run beneath it, with HTTP 402 and a typed, non-retryable error. It works at every depth with a wire path, not only for supervised agents. The fence lifts when the Run ends, or when the ceiling is raised above the Run's usage — by a Policy change, `hekma budget set` or an agent configuration write — reason by reason. An agent that bypasses the proxy bypasses the fence too.
+`block` is never a default. On a breach, the [metering proxy](metering-proxy.md) refuses further model calls of the Run, and of every Run beneath it, with HTTP 402 and a typed, non-retryable error. It works at every depth with a wire path, not only for supervised agents. The fence lifts when the Run ends, or when the ceiling is raised above the Run's usage — by a Policy change, `hekma budget set` or an agent configuration write — reason by reason. An agent that bypasses the proxy bypasses the fence too; for an agent in its own Shim, [bypass detection](run-keys.md#bypass-detection-preview) notices such a connection.
 
 ## Not yet
 

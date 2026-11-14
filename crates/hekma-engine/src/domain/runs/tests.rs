@@ -1313,3 +1313,198 @@ fn the_listing_assembles_each_row_from_its_stored_facts() {
     assert_eq!(child_row.usage.input_tokens, 0);
     assert!(child_row.latched.is_empty());
 }
+
+/// Story 22-4: a Shim report folded into a Run, under each verdict.
+fn report(detection: &str, reason: Option<&str>, hosts: &[&str]) -> crate::ports::RunBypassRow {
+    crate::ports::RunBypassRow {
+        detection: detection.to_string(),
+        reason: reason.map(str::to_string),
+        hosts: hosts.iter().map(|host| host.to_string()).collect(),
+    }
+}
+
+fn fold(store: &SqliteStore, id: &RunId, row: &crate::ports::RunBypassRow) -> ops::RunChanges {
+    let listed: std::collections::BTreeSet<String> = ["api.a.com", "api.b.com", "127.0.0.1"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let record = store.run_record(id).unwrap().unwrap();
+    let mut changes = ops::RunChanges::default();
+    ops::record_bypass(store, &mut changes, record, row, &listed, AT).unwrap();
+    changes
+}
+
+fn custody(store: &SqliteStore, id: &RunId, on: bool) {
+    store
+        .set_run_custody(
+            id,
+            Some(crate::ports::RunCustodyRow {
+                state: if on { "on" } else { "off" }.into(),
+                reason: if on { "held" } else { "opted-out" }.into(),
+                origin: None,
+                key_ref: None,
+            }),
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_bypass_with_custody_on_is_the_anomaly_and_each_host_is_reported_once() {
+    let (_tmp, store) = store();
+    let id = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&id, true, true), AT).unwrap();
+    custody(&store, &id, true);
+    // A new Run reads `unreported`, with no hosts.
+    let view = ops::view(&store, &id).unwrap();
+    let bypass = view.bypass.expect("a process-owning Run has a slice");
+    assert_eq!(bypass.detection, "unreported");
+    assert!(bypass.hosts.is_empty() && bypass.informational.is_none());
+
+    // The first check: active, nothing reached.
+    let changes = fold(&store, &id, &report("active", None, &[]));
+    let kinds: Vec<RunEventKind> = changes.events.iter().map(|e| e.change).collect();
+    assert_eq!(kinds, vec![RunEventKind::BypassDetectionChanged]);
+    assert_eq!(changes.events[0].cause.as_deref(), Some("active"));
+    // The same report again changes nothing.
+    assert!(fold(&store, &id, &report("active", None, &[]))
+        .events
+        .is_empty());
+
+    // A listed host: the Anomaly, then one detection naming the host; a
+    // host not on the list is dropped.
+    let changes = fold(
+        &store,
+        &id,
+        &report("active", None, &["api.a.com", "evil.example"]),
+    );
+    let kinds: Vec<RunEventKind> = changes.events.iter().map(|e| e.change).collect();
+    assert_eq!(
+        kinds,
+        vec![RunEventKind::AnomaliesChanged, RunEventKind::BypassDetected]
+    );
+    assert_eq!(changes.events[1].cause.as_deref(), Some("api.a.com"));
+    assert!(changes.events[1].anomalies.contains(&Anomaly::Bypass));
+    let (status_now, anomalies, _) = status(&store, &id);
+    assert_eq!(
+        status_now,
+        RunStatus::Active,
+        "detection never acts on the Run"
+    );
+    assert_eq!(anomalies, vec![Anomaly::Bypass]);
+    assert_eq!(
+        store.run_bypass(&id).unwrap().unwrap().hosts,
+        vec!["api.a.com"]
+    );
+
+    // Set-once: the same host again is nothing; a second host is one more
+    // detection and no second Anomaly change.
+    assert!(fold(&store, &id, &report("active", None, &["api.a.com"]))
+        .events
+        .is_empty());
+    let changes = fold(
+        &store,
+        &id,
+        &report("active", None, &["api.a.com", "api.b.com"]),
+    );
+    let kinds: Vec<RunEventKind> = changes.events.iter().map(|e| e.change).collect();
+    assert_eq!(kinds, vec![RunEventKind::BypassDetected]);
+    let view = ops::view(&store, &id).unwrap().bypass.unwrap();
+    assert_eq!(view.hosts, vec!["api.a.com", "api.b.com"]);
+    assert_eq!(view.informational, None, "the Anomaly is not informational");
+
+    // A tree that can no longer be read says so, with its reason.
+    let changes = fold(&store, &id, &report("unavailable", Some("no /proc"), &[]));
+    assert_eq!(changes.events.len(), 1);
+    assert_eq!(
+        changes.events[0].cause.as_deref(),
+        Some("unavailable: no /proc")
+    );
+    let view = ops::view(&store, &id).unwrap().bypass.unwrap();
+    assert_eq!(view.detection, "unavailable");
+    assert_eq!(view.reason.as_deref(), Some("no /proc"));
+    assert_eq!(view.hosts.len(), 2, "hosts stay with the Run");
+}
+
+#[test]
+fn a_bypass_without_custody_or_without_a_wire_path_is_informational() {
+    let (_tmp, store) = store();
+    // Custody off on a wire-path Run.
+    let off = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&off, true, true), AT).unwrap();
+    custody(&store, &off, false);
+    let changes = fold(&store, &off, &report("active", None, &["api.a.com"]));
+    let detected: Vec<&RunEvent> = changes
+        .events
+        .iter()
+        .filter(|e| e.change == RunEventKind::BypassDetected)
+        .collect();
+    assert_eq!(
+        detected[0].cause.as_deref(),
+        Some("api.a.com (informational: custody-off)")
+    );
+    assert!(status(&store, &off).1.is_empty(), "no Anomaly");
+    let view = ops::view(&store, &off).unwrap().bypass.unwrap();
+    assert_eq!(view.informational.as_deref(), Some("custody-off"));
+
+    // No wire path (and no custody row: a Run before custody).
+    store.execute_batch_for_test(
+        "INSERT INTO agent_instances (name, kind, state, agent_home, created_at, updated_at) \
+         VALUES ('b', 'mock', 'running', '/h', 't', 't')",
+    );
+    let nowire = RunId::mint();
+    let mut run = supervised(&nowire, false, true);
+    run.instance = name("b");
+    ops::ensure_supervised(&store, &run, AT).unwrap();
+    let changes = fold(&store, &nowire, &report("active", None, &["127.0.0.1"]));
+    assert!(changes
+        .events
+        .iter()
+        .any(|e| e.change == RunEventKind::BypassDetected
+            && e.cause.as_deref() == Some("127.0.0.1 (informational: no-wire)")));
+    assert!(status(&store, &nowire).1.is_empty());
+    let view = ops::view(&store, &nowire).unwrap().bypass.unwrap();
+    assert_eq!(view.informational.as_deref(), Some("no-wire"));
+}
+
+#[test]
+fn a_run_keeps_at_most_eight_hosts_and_an_ended_run_is_left_alone() {
+    let (_tmp, store) = store();
+    let id = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&id, true, true), AT).unwrap();
+    let many: Vec<String> = (0..12).map(|n| format!("h{n:02}.example")).collect();
+    let listed: std::collections::BTreeSet<String> = many.iter().cloned().collect();
+    let record = store.run_record(&id).unwrap().unwrap();
+    let mut changes = ops::RunChanges::default();
+    let row = crate::ports::RunBypassRow {
+        detection: "active".into(),
+        reason: None,
+        hosts: many.clone(),
+    };
+    ops::record_bypass(&store, &mut changes, record, &row, &listed, AT).unwrap();
+    let stored = store.run_bypass(&id).unwrap().unwrap();
+    assert_eq!(
+        stored.hosts.len(),
+        crate::domain::bypass::MAX_BYPASS_HOSTS_PER_RUN
+    );
+    let detected = changes
+        .events
+        .iter()
+        .filter(|e| e.change == RunEventKind::BypassDetected)
+        .count();
+    assert_eq!(detected, 8);
+
+    // Once ended, a late report records nothing.
+    let mut ended = store.run_record(&id).unwrap().unwrap();
+    ended.status = RunStatus::Ended;
+    ended.ended_at = Some(AT.to_string());
+    store.save_run(&ended).unwrap();
+    let mut changes = ops::RunChanges::default();
+    let late = crate::ports::RunBypassRow {
+        detection: "unavailable".into(),
+        reason: Some("gone".into()),
+        hosts: Vec::new(),
+    };
+    ops::record_bypass(&store, &mut changes, ended, &late, &listed, AT).unwrap();
+    assert!(changes.events.is_empty());
+    assert_eq!(store.run_bypass(&id).unwrap().unwrap().detection, "active");
+}

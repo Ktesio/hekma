@@ -34,6 +34,8 @@ pub struct ShimClient {
     reader: BufReader<Box<dyn ShimStream>>,
     next_id: u64,
     pushed: Option<ExitRecord>,
+    /// Story 22-4: the newest bypass report the Shim pushed.
+    pushed_bypass: Option<Box<super::proto::BypassReport>>,
 }
 
 impl std::fmt::Debug for ShimClient {
@@ -60,6 +62,7 @@ impl ShimClient {
             reader,
             next_id: 1,
             pushed: None,
+            pushed_bypass: None,
         };
         let outcome = client.call(Op::Hello {
             v: Version::CURRENT,
@@ -93,6 +96,7 @@ impl ShimClient {
             }
             match serde_json::from_str::<ShimFrame>(text.trim()) {
                 Ok(ShimFrame::Exit { exit }) => self.pushed = Some(exit),
+                Ok(ShimFrame::Bypass { report }) => self.pushed_bypass = Some(Box::new(report)),
                 Ok(ShimFrame::Reply {
                     outcome: Outcome::Error { code, .. },
                     ..
@@ -158,6 +162,27 @@ impl ShimClient {
     /// An exit the Shim pushed, once.
     pub fn take_pushed_exit(&mut self) -> Option<ExitRecord> {
         self.pushed.take()
+    }
+
+    /// Story 22-4: replace the Shim's provider-host list.
+    pub fn set_bypass_hosts(
+        &mut self,
+        bypass: super::proto::BypassConfig,
+    ) -> Result<(), ShimClientError> {
+        self.done(Op::BypassHosts { bypass })
+    }
+
+    /// Story 22-4: the newest bypass report the Shim pushed, once.
+    pub fn take_pushed_bypass(&mut self) -> Option<super::proto::BypassReport> {
+        self.pushed_bypass.take().map(|report| *report)
+    }
+
+    /// Story 22-4: hold `report` as if pushed (the report a reconnect read
+    /// from `status`), unless a newer push is already held.
+    pub fn hold_bypass(&mut self, report: super::proto::BypassReport) {
+        if self.pushed_bypass.is_none() {
+            self.pushed_bypass = Some(Box::new(report));
+        }
     }
 
     fn done(&mut self, op: Op) -> Result<(), ShimClientError> {

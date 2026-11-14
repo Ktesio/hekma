@@ -219,6 +219,9 @@ impl Supervisor {
         // the queue cap per instance.
         self.drain_acp_notices_all();
 
+        // Story 22-4: record each Shim's new bypass report on its Run.
+        self.record_bypass_reports(registry);
+
         // Snapshot the currently-held names (we mutate self.running as we react).
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
         let mut plans = Vec::new();

@@ -57,10 +57,10 @@ pub use limits::{
     RunLimitsView,
 };
 pub use listing::{
-    decode_cursor, encode_cursor, ended_run_cutoff, CustodyView, LatchedBreach, ListRunsQuery,
-    ListingCounts, ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument,
-    RunSummary, ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT,
-    RUN_LISTING_SCHEMA_VERSION,
+    decode_cursor, encode_cursor, ended_run_cutoff, BypassView, CustodyView, LatchedBreach,
+    ListRunsQuery, ListingCounts, ListingView, PerfRunRow, RunBudgetView, RunListing,
+    RunListingDocument, RunSummary, ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT,
+    LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
 };
 pub use policy::{
     BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyEvent, PolicyEventKind,
@@ -277,16 +277,22 @@ pub enum Anomaly {
     /// Set by the first such call; cleared when a re-resolution moves the
     /// Run off `shadow`. It never acts — `enforce` refuses, this records.
     UnscentedCall,
+    /// The Run's process tree reached a listed provider host directly
+    /// while its calls go through Hekma with key custody on (story 22-4).
+    /// The hosts are on the Run's bypass slice; it never acts, and it is
+    /// kept until the Run ends.
+    Bypass,
 }
 
 impl Anomaly {
-    const ALL: [Anomaly; 6] = [
+    const ALL: [Anomaly; 7] = [
         Anomaly::Breach,
         Anomaly::Failed,
         Anomaly::DepthFallback,
         Anomaly::UnpricedModel,
         Anomaly::CredentialReuse,
         Anomaly::UnscentedCall,
+        Anomaly::Bypass,
     ];
 
     /// The stable wire form.
@@ -298,6 +304,7 @@ impl Anomaly {
             Anomaly::UnpricedModel => "unpriced-model",
             Anomaly::CredentialReuse => "credential-reuse",
             Anomaly::UnscentedCall => "unscented",
+            Anomaly::Bypass => "bypass",
         }
     }
 
@@ -624,6 +631,10 @@ pub struct RunView {
     /// (`disconnect`, `shutdown`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_hold_end: Option<String>,
+    /// Story 22-4: its bypass detection, when it owns a supervised process
+    /// (the listing's same slice). Absent on a Run that owns no process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass: Option<listing::BypassView>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -704,6 +715,13 @@ pub enum RunEventKind {
     /// A Host or the Operator submitted confirmed usage for it (story
     /// 19-5); the cause names the source and the reference.
     Reconciled,
+    /// Its process tree reached a listed provider host directly (story
+    /// 22-4); the cause names the host, and `(informational: no-wire)` or
+    /// `(informational: custody-off)` when direct calls are expected.
+    BypassDetected,
+    /// Its bypass detection state changed (story 22-4): the cause is
+    /// `active`, or `unavailable: <reason>`.
+    BypassDetectionChanged,
 }
 
 impl RunEventKind {
@@ -719,6 +737,8 @@ impl RunEventKind {
             RunEventKind::Ended => "ended",
             RunEventKind::DispositionChanged => "disposition-changed",
             RunEventKind::Reconciled => "reconciled",
+            RunEventKind::BypassDetected => "bypass-detected",
+            RunEventKind::BypassDetectionChanged => "bypass-detection-changed",
         }
     }
 }

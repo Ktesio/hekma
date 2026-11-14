@@ -789,6 +789,8 @@ pub(crate) enum ServeOptionsRefused {
 /// (production 1s×2 cap 60s; tests inject a scaled one).
 pub struct Supervisor {
     backend: proc::ProcBackend,
+    /// Story 22-4: the provider-host list (set when Shim launches are on).
+    bypass_feed: Option<std::sync::Arc<crate::domain::bypass::BypassFeed>>,
     running: HashMap<InstanceName, Supervised>,
     usage_source: SelfReportedUsageSource,
     backoff: BackoffSchedule,
@@ -1071,6 +1073,69 @@ impl Supervisor {
         self.backend.set_shim(launcher);
     }
 
+    /// Story 22-4: the provider-host list Shim launches start with, and the
+    /// list a report is checked against.
+    pub(crate) fn set_bypass_feed(
+        &mut self,
+        feed: Option<std::sync::Arc<crate::domain::bypass::BypassFeed>>,
+    ) {
+        self.bypass_feed = feed.clone();
+        self.backend.set_bypass_feed(feed);
+    }
+
+    /// Story 22-4: hand a refreshed provider-host list to every live Shim.
+    pub(crate) fn push_bypass_hosts(&mut self, config: &crate::shim::proto::BypassConfig) {
+        for supervised in self.running.values_mut() {
+            let _ = self
+                .backend
+                .push_bypass_hosts(&mut supervised.handle, config);
+        }
+    }
+
+    /// Story 22-4: record every Shim's new bypass report on its Run (one
+    /// writer job per changed report; nothing to do while none changed).
+    pub(crate) fn record_bypass_reports(&mut self, registry: &Registry) {
+        let Some(feed) = self.bypass_feed.clone() else {
+            return;
+        };
+        let mut reports = Vec::new();
+        for supervised in self.running.values_mut() {
+            if let Some(report) = self.backend.take_bypass_report(&mut supervised.handle) {
+                reports.push((supervised.run_id.clone(), report));
+            }
+        }
+        if reports.is_empty() {
+            return;
+        }
+        let listed = feed.listed();
+        for (run_id, report) in reports {
+            let listed = listed.clone();
+            let id = run_id.clone();
+            let result = registry.run_job(move |store| {
+                use crate::ports::RunRecords as _;
+                let mut changes = crate::domain::runs::ops::RunChanges::default();
+                if let Some(record) = store.run_record(&id)? {
+                    crate::domain::runs::ops::record_bypass(
+                        store,
+                        &mut changes,
+                        record,
+                        &report,
+                        &listed,
+                        &crate::time::now_rfc3339(),
+                    )?;
+                }
+                Ok(((), changes))
+            });
+            match result {
+                Ok(((), events)) => self.publish_run_events(events),
+                Err(err) => self.emit_diagnostic(&format!(
+                    "the bypass detection report for Run `{run_id}` could not be recorded \
+                     ({err}); the next change is recorded"
+                )),
+            }
+        }
+    }
+
     /// Construct an empty supervisor with the current OS's process backend and
     /// the PRODUCTION backoff schedule (1s base, ×2, 60s cap — spine AD-15).
     /// The engine's production constructor is [`Supervisor::with_runtime`];
@@ -1079,6 +1144,7 @@ impl Supervisor {
     pub fn new() -> Self {
         Self {
             backend: proc::ProcBackend::new(),
+            bypass_feed: None,
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff: BackoffSchedule::production(),
@@ -1138,6 +1204,7 @@ impl Supervisor {
     pub fn with_runtime(_runtime: tokio::runtime::Handle) -> Self {
         Self {
             backend: proc::ProcBackend::new(),
+            bypass_feed: None,
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff: BackoffSchedule::production(),
@@ -1196,6 +1263,7 @@ impl Supervisor {
     pub(crate) fn with_backoff(backoff: BackoffSchedule) -> Self {
         Self {
             backend: proc::ProcBackend::new(),
+            bypass_feed: None,
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff,
