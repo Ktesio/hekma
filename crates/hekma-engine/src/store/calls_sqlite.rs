@@ -30,7 +30,7 @@ use crate::ports::{ProcessFingerprint, StoreError};
 /// proxy-owning engine when it opens the segment it writes; a read-only
 /// reader never migrates and still reads version 1 (only more slowly for
 /// Run-scoped pages).
-pub(crate) const CALLS_SCHEMA_VERSION: i64 = 2;
+pub(crate) const CALLS_SCHEMA_VERSION: i64 = 3;
 
 pub(crate) const CALLS_V1: &str = "\
 CREATE TABLE IF NOT EXISTS calls.calls (
@@ -149,14 +149,26 @@ pub(crate) fn attach(conn: &Connection, segment: Option<&Path>) -> Result<(), St
             backend(err)
         })?;
     }
-    if version < CALLS_SCHEMA_VERSION {
+    if version < 2 {
         // The read surface's step: two additive indexes, stamped in ONE
         // crash-atomic transaction (a crash between the DDL and the stamp
         // re-runs cleanly — every statement is IF NOT EXISTS).
         conn.execute_batch(&format!(
-            "BEGIN IMMEDIATE;\n{CALLS_V2}\nPRAGMA calls.user_version = \
-             {CALLS_SCHEMA_VERSION};\nCOMMIT;"
+            "BEGIN IMMEDIATE;\n{CALLS_V2}\nPRAGMA calls.user_version = 2;\nCOMMIT;"
         ))
+        .map_err(|err| {
+            let _ = conn.execute_batch("ROLLBACK");
+            backend(err)
+        })?;
+    }
+    if version < 3 {
+        // Story 24-3: when a call parked at a hold, so a crash closes it as
+        // a held call (`hold_end: crash`). Additive; the ALTER and the stamp
+        // commit together.
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;\nALTER TABLE calls.open_calls ADD COLUMN held_at TEXT;\n\
+             PRAGMA calls.user_version = 3;\nCOMMIT;",
+        )
         .map_err(|err| {
             let _ = conn.execute_batch("ROLLBACK");
             backend(err)
@@ -307,6 +319,18 @@ impl super::SqliteStore {
             .clone()
     }
 
+    /// Story 24-3: mark an open call as parked at a hold (`at`), so a crash
+    /// closes it as a held call.
+    pub(crate) fn mark_open_call_held(&self, call_id: &str, at: &str) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "UPDATE calls.open_calls SET held_at = ?2 WHERE call_id = ?1 AND held_at IS NULL",
+                [call_id, at],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
     /// Insert a call-start record (`open_calls`). A replay (same call id)
     /// is a no-op.
     pub(crate) fn insert_open_call(&self, start: &CallStart) -> Result<(), StoreError> {
@@ -394,13 +418,15 @@ impl super::SqliteStore {
             String,
             Option<i64>,
             Option<i64>,
+            Option<String>,
         );
         let rows: Vec<Row> = {
             let mut stmt = self
                 .conn()
                 .prepare(
                     "SELECT call_id, run_id, token_id, control_depth, binding, started_at, \
-                     owner_pid, owner_start_time FROM calls.open_calls ORDER BY call_id",
+                     owner_pid, owner_start_time, held_at FROM calls.open_calls \
+                     ORDER BY call_id",
                 )
                 .map_err(backend)?;
             let mapped = stmt
@@ -414,6 +440,7 @@ impl super::SqliteStore {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 })
                 .map_err(backend)?;
@@ -421,7 +448,9 @@ impl super::SqliteStore {
         };
         let now = crate::time::now_rfc3339();
         let (mut crashed, mut recovered) = (0, 0);
-        for (call_id, run_id, token_id, depth, binding, started_at, pid, start_time) in rows {
+        for (call_id, run_id, token_id, depth, binding, started_at, pid, start_time, held_at) in
+            rows
+        {
             let dead = match (pid, start_time) {
                 (Some(pid), Some(start_time)) => {
                     let fingerprint = ProcessFingerprint::new(
@@ -460,8 +489,14 @@ impl super::SqliteStore {
                 token_id,
                 control_depth: depth_str(&depth).to_string(),
                 binding,
-                disposition: crate::domain::calls::CallDisposition::Pass,
-                hold_end: None,
+                // Story 24-3: a call parked at a hold when its owner died
+                // closes as a held call the crash ended.
+                disposition: if held_at.is_some() {
+                    crate::domain::calls::CallDisposition::Hold
+                } else {
+                    crate::domain::calls::CallDisposition::Pass
+                },
+                hold_end: held_at.as_ref().map(|_| "crash".to_string()),
                 outcome,
                 status: None,
                 status_class: StatusClass::TransportError,
@@ -822,6 +857,66 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_held_at_step_rolls_back_and_leaves_the_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let segment = tmp.path().join("2026-11-03.db");
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "ATTACH DATABASE '{}' AS calls;\nBEGIN IMMEDIATE;\n{CALLS_V1}\n{CALLS_V2}\n\
+                 ALTER TABLE calls.open_calls ADD COLUMN held_at TEXT;\n\
+                 PRAGMA calls.user_version = 2;\nCOMMIT;",
+                segment.to_string_lossy()
+            ))
+            .unwrap();
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(
+            attach(&conn, Some(&segment)).is_err(),
+            "the duplicate column fails the step"
+        );
+        let version: i64 = Connection::open(&segment)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2, "rolled back: the stamp did not land");
+    }
+
+    #[test]
+    fn a_call_parked_at_a_hold_when_its_owner_died_closes_as_a_held_crash() {
+        let (_tmp, store) = store();
+        let dead = ProcessFingerprint::new(1, 1);
+        store
+            .insert_open_call(&start("call_parked", Some(dead)))
+            .unwrap();
+        store.mark_open_call_held("call_parked", "t1").unwrap();
+        // A second mark keeps the first time.
+        store.mark_open_call_held("call_parked", "t2").unwrap();
+        let held_at: Option<String> = store
+            .conn()
+            .query_row(
+                "SELECT held_at FROM calls.open_calls WHERE call_id = 'call_parked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(held_at.as_deref(), Some("t1"));
+        let probe = |_: &ProcessFingerprint| Some(false);
+        assert_eq!(store.close_orphaned_calls(&probe).unwrap(), (1, 0));
+        let (outcome, disposition, _, _) = store.call_record_for_test("call_parked").unwrap();
+        assert_eq!((outcome.as_str(), disposition.as_str()), ("crash", "hold"));
+        let hold_end: Option<String> = store
+            .conn()
+            .query_row(
+                "SELECT hold_end FROM calls.calls WHERE call_id = 'call_parked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hold_end.as_deref(), Some("crash"));
+    }
+
+    #[test]
     fn the_segment_is_reused_and_a_newer_segment_is_refused() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("calls");
@@ -835,12 +930,12 @@ mod tests {
         assert_eq!(segment_path(&dir).unwrap(), first);
         let conn = Connection::open_in_memory().unwrap();
         attach(&conn, Some(&first)).unwrap();
-        conn.execute_batch("PRAGMA calls.user_version = 3").unwrap();
+        conn.execute_batch("PRAGMA calls.user_version = 4").unwrap();
         conn.execute_batch("DETACH DATABASE calls").unwrap();
         let again = Connection::open_in_memory().unwrap();
         assert!(matches!(
             attach(&again, Some(&first)),
-            Err(StoreError::SchemaTooNew { found: 3, .. })
+            Err(StoreError::SchemaTooNew { found: 4, .. })
         ));
         // An in-memory segment works for stores without a state directory.
         let memory = Connection::open_in_memory().unwrap();
@@ -866,8 +961,9 @@ mod tests {
             ))
             .unwrap();
         }
-        // The proxy-owning engine's attach migrates it: both indexes exist
-        // and the stamp reads 2.
+        // The proxy-owning engine's attach migrates it: both indexes exist,
+        // open calls can be marked held (story 24-3), and the stamp reads
+        // the current version.
         {
             let conn = Connection::open_in_memory().unwrap();
             attach(&conn, Some(&segment)).unwrap();
@@ -877,7 +973,15 @@ mod tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 2);
+            assert_eq!(version, CALLS_SCHEMA_VERSION);
+            let held: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('open_calls') WHERE name = 'held_at'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(held, 1, "the v3 step adds held_at");
             let indexes: Vec<String> = conn
                 .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
                 .unwrap()
@@ -919,7 +1023,10 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2, "the stamp lands after the clean re-run");
+        assert_eq!(
+            version, CALLS_SCHEMA_VERSION,
+            "the stamp lands after the clean re-run"
+        );
     }
 
     #[test]
