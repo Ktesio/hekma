@@ -49,6 +49,26 @@ CREATE TABLE IF NOT EXISTS compacted_runs (
 );
 ";
 
+/// Schema v25 (story 24-4 phase 3): the healthy-count covering index (its
+/// predicate is [`super::runs_sqlite::HEALTHY_PREDICATE`], verbatim), and
+/// `run_identities(run_id)`, so a Run delete's cascade reads an index
+/// instead of the whole table.
+pub(super) const SCHEMA_V25: &str = "\
+CREATE INDEX IF NOT EXISTS idx_runs_healthy ON runs(run_id) \
+WHERE status = 'active' AND anomalies = '';
+CREATE INDEX IF NOT EXISTS idx_run_identities_run ON run_identities(run_id);
+";
+
+/// Undo v25 on a fully migrated store, for the older upgrade tests.
+#[cfg(test)]
+pub(crate) const UNDO_V25_FOR_TEST: &str =
+    "DROP INDEX idx_runs_healthy; DROP INDEX idx_run_identities_run;";
+
+/// Run the v25 step.
+pub(super) fn migrate_v25(conn: &Connection) -> Result<(), StoreError> {
+    super::runs_sqlite::migrate_runs_step(conn, 25, SCHEMA_V25)
+}
+
 /// Undo v24 on a fully migrated store, for the older upgrade tests.
 #[cfg(test)]
 pub(crate) const UNDO_V24_FOR_TEST: &str = "\
@@ -69,12 +89,14 @@ const CANDIDATES_SQL: &str = "SELECT run_id, ended_at FROM runs \
      WHERE status = 'ended' AND ended_at < ?1 AND (ended_at > ?2 OR (ended_at = ?2 AND run_id > ?3)) \
      ORDER BY ended_at, run_id LIMIT ?4";
 
-/// Whether any descendant of `?1` is still open (the walk rides
-/// `idx_runs_parent`).
-const OPEN_DESCENDANT_SQL: &str = "WITH RECURSIVE d(id) AS ( \
-         SELECT run_id FROM runs WHERE parent_run_id = ?1 \
-         UNION SELECT r.run_id FROM runs r JOIN d ON r.parent_run_id = d.id) \
-     SELECT EXISTS (SELECT 1 FROM d JOIN runs x ON x.run_id = d.id WHERE x.status <> 'ended')";
+/// Whether any descendant of `?1` is still open. The walk rides
+/// `idx_runs_parent` and carries each row's status, so it never joins back
+/// to `runs` (a join let the planner scan every open Run per candidate:
+/// about 2 ms each at 100,000 Runs, found by the Run-scale ladder).
+const OPEN_DESCENDANT_SQL: &str = "WITH RECURSIVE d(id, status) AS ( \
+         SELECT run_id, status FROM runs WHERE parent_run_id = ?1 \
+         UNION ALL SELECT r.run_id, r.status FROM runs r JOIN d ON r.parent_run_id = d.id) \
+     SELECT EXISTS (SELECT 1 FROM d WHERE status <> 'ended')";
 
 /// Where a compaction pass has reached: the last candidate it read, so a
 /// Run that stays (an open descendant) never starves the next job.
@@ -637,5 +659,52 @@ mod tests {
             .unwrap();
         let err = store.compacted_run("run_X").unwrap_err().to_string();
         assert!(err.contains("unreadable labels"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod plan_pins {
+    use super::*;
+    use crate::store::SqliteStore;
+
+    fn plan(store: &SqliteStore, sql: &str) -> Vec<String> {
+        store
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(["run_X"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn a_compaction_candidate_costs_index_reads_not_a_walk_of_every_open_run() {
+        // Story 24-4: the Run-scale ladder found the descendant check
+        // scanning every open Run per candidate, and a Run delete's cascade
+        // scanning `run_identities`. Both now read indexes only.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(&dir.path().join("state.db")).unwrap();
+        let walk = plan(&store, OPEN_DESCENDANT_SQL);
+        assert!(
+            walk.iter()
+                .all(|line| !line.contains("idx_runs_open") && line != "SCAN runs"),
+            "{walk:?}"
+        );
+        assert!(
+            walk.iter().any(|line| line.contains("idx_runs_parent")),
+            "{walk:?}"
+        );
+        let delete = plan(&store, "DELETE FROM runs WHERE run_id = ?1");
+        assert!(
+            delete.iter().all(|line| !line.starts_with("SCAN ")),
+            "a cascade scans a table: {delete:?}"
+        );
+        assert!(
+            delete
+                .iter()
+                .any(|line| line.contains("idx_run_identities_run")),
+            "{delete:?}"
+        );
     }
 }

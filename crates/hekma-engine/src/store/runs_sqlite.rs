@@ -121,14 +121,12 @@ pub(super) fn listing_listed_count(
     }
 }
 
-/// The healthy-open count (story 21-5). It rides `idx_runs_open`: its
-/// `status <> 'ended'` conjunct names the partial predicate verbatim
-/// (`active` implies it; the explicit conjunct is what makes the index
-/// usable).
+/// The healthy-open count (story 21-5). Story 24-4: it reads
+/// `idx_runs_healthy` alone — the statement repeats the partial index's
+/// predicate verbatim, so the count is index-only and never visits a
+/// `runs` row (at a million open Runs, the table walk was the cost).
 pub(super) fn listing_healthy_count(selector: Option<&Selector>) -> ListingStatement {
-    let mut sql = "SELECT COUNT(*) FROM runs WHERE status <> 'ended' AND status = 'active' \
-                   AND anomalies = ''"
-        .to_string();
+    let mut sql = format!("SELECT COUNT(*) FROM runs WHERE {HEALTHY_PREDICATE}");
     let mut params = Vec::new();
     if let Some(selector) = selector {
         let (arms, selector_params) = selector_arms_sql(selector, 1);
@@ -137,6 +135,10 @@ pub(super) fn listing_healthy_count(selector: Option<&Selector>) -> ListingState
     }
     ListingStatement { sql, params }
 }
+
+/// The healthy-count index's predicate (story 24-4), shared verbatim by the
+/// v25 DDL and the count so SQLite uses the partial index.
+pub(super) const HEALTHY_PREDICATE: &str = "status = 'active' AND anomalies = ''";
 
 /// The Selector arms' `run_id` selection (the 21-9 `select_runs` shape,
 /// minus its status filter and limit — the view predicate composes beside

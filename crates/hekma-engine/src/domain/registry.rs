@@ -281,6 +281,11 @@ pub struct Registry {
     /// they may bump the counter too, and an extra reload publish is
     /// harmless).
     pub(crate) data_version: std::sync::Mutex<i64>,
+    /// Story 24-4: the `PRAGMA data_version` the WRITER's connection last
+    /// saw. It changes only when another connection commits, so it tells a
+    /// foreign commit from this engine's own (the reader's counter moves
+    /// for both); `None` until the first check anchors it.
+    pub(crate) writer_data_version: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
 }
 
 impl Registry {
@@ -397,6 +402,7 @@ impl Registry {
             policies: std::sync::Arc::new(crate::domain::runs::policy::PolicyCache::default()),
             open_events: std::sync::Mutex::new(Vec::new()),
             data_version: std::sync::Mutex::new(0),
+            writer_data_version: std::sync::Arc::default(),
         };
         // Story 23-1: anchor the reader's change counter so the engine's own
         // open-time jobs (the policy sweep below) never read as a foreign
@@ -404,6 +410,14 @@ impl Registry {
         if let Ok(version) = registry.store.data_version() {
             *registry.data_version.lock().expect("data version mutex") = version;
         }
+        // Story 24-4: and the writer's, so the first tick tells a foreign
+        // commit from this engine's own.
+        let anchor = std::sync::Arc::clone(&registry.writer_data_version);
+        let _ = registry.writer.call(move |ctx| {
+            let version = ctx.store().data_version()?;
+            *anchor.lock().unwrap_or_else(|p| p.into_inner()) = Some(version);
+            Ok(())
+        });
         // Story 21-3: the cached policy set loads, the FR-21 upgrade
         // finishes (pending list → config writes → markers + one event),
         // and every open Run resolves once so the stored resolutions and
@@ -835,6 +849,7 @@ impl Registry {
             policies: std::sync::Arc::new(crate::domain::runs::policy::PolicyCache::default()),
             open_events: std::sync::Mutex::new(Vec::new()),
             data_version: std::sync::Mutex::new(0),
+            writer_data_version: std::sync::Arc::default(),
         };
         // Fingerprint first, then load (see the writer open above).
         let baseline = registry.store.policies_fingerprint();
@@ -970,8 +985,12 @@ impl Registry {
     /// it advanced, one writer job re-reads the Runs, the key index and the
     /// bindings and REPLACES the published snapshot (never on the hot path;
     /// ≤ 1 s pickup for a foreign revocation, a foreign binding change or a
-    /// foreign Run end). The O(changed-entries) refinement is deferred (24-4).
-    /// A failed reload keeps the last good snapshot serving; the caller
+    /// foreign Run end). Story 24-4: the reader's counter moves for this
+    /// engine's own commits too, so the writer job first reads ITS
+    /// connection's counter, which moves only for another connection's
+    /// commit: unchanged, nothing is reloaded (a write costs O(1) here, not
+    /// a re-read of every open Run — the Run-scale ladder's finding). A
+    /// failed reload keeps the last good snapshot serving; the caller
     /// surfaces it.
     pub(crate) fn poll_foreign_commits(&self) -> Result<(), StoreError> {
         let Ok(version) = self.store.data_version() else {
@@ -984,7 +1003,17 @@ impl Registry {
         *seen = version;
         drop(seen);
         let publisher = std::sync::Arc::clone(&self.run_snapshot);
+        let writer_seen = std::sync::Arc::clone(&self.writer_data_version);
         self.writer.call(move |ctx| {
+            let version = ctx.store().data_version()?;
+            {
+                let mut seen = writer_seen.lock().unwrap_or_else(|p| p.into_inner());
+                let foreign = seen.is_none_or(|last| last != version);
+                *seen = Some(version);
+                if !foreign {
+                    return Ok(());
+                }
+            }
             let entries = crate::domain::runs::ops::open_entries(ctx.store())?;
             let keys = crate::domain::runs::keys::open_keys(ctx.store())?;
             let bindings = crate::domain::runs::bindings::published_table(ctx.store())?;

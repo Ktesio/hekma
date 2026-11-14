@@ -1257,6 +1257,30 @@ class ReleaseDocsTests(unittest.TestCase):
             perf_job[calls_step : perf_job.index("- name: Upload the measured report", calls_step)],
         )
         self.assertIn("perf-budgets-calls-report.json", perf_job)
+        # Story 24-4: the Run-scale ladder's 100k rung, after the calls run,
+        # pinned the same way.
+        scale_step = perf_job.index("- name: Run the Run-scale ladder at 100k")
+        self.assertGreater(scale_step, calls_step, "the ladder follows the calls run")
+        scale_text = perf_job[perf_job.index("run: |", scale_step) :]
+        next_scale_step = _re.search(r"\n      - name:", scale_text[1:])
+        scale_block = (
+            scale_text[: 1 + next_scale_step.start()] if next_scale_step else scale_text
+        )
+        scale_last_line = next(
+            line for line in reversed(scale_block.splitlines()) if line.strip()
+        )
+        self.assertEqual(
+            scale_last_line.strip(),
+            "target/release/examples/perf-budgets --run-scale 100000",
+        )
+        self.assertIn("set -euo pipefail", scale_block)
+        self.assertNotIn("|| true", scale_block)
+        self.assertNotIn("--baseline", scale_block)
+        self.assertIn(
+            "PERF_BUDGETS_REPORT_PATH: perf-budgets-scale-report.json",
+            perf_job[scale_step : perf_job.index("- name: Upload the measured report", scale_step)],
+        )
+        self.assertIn("perf-budgets-scale-report.json", perf_job)
         ps_upload = perf_job.index("- name: Upload the measured report", ps_step)
         self.assertIn(
             "PERF_BUDGETS_REPORT_PATH: perf-budgets-ps-report.json",

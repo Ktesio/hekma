@@ -116,7 +116,7 @@ use crate::ports::{
 /// `proxy_state.identity_headers` (the root, on by default) and
 /// `run_bindings.identity_headers` (the per-binding override) — see
 /// [`super::runs_sqlite`].
-pub(crate) const SCHEMA_VERSION: i64 = 24;
+pub(crate) const SCHEMA_VERSION: i64 = 25;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -816,6 +816,11 @@ fn migrate(
     // row reads as the 7-day defaults).
     if version < 24 {
         super::retention_sqlite::migrate_v24(conn)?;
+    }
+    // Story 24-4: v25 adds the healthy-count covering index (one
+    // crash-atomic step, additive).
+    if version < 25 {
+        super::retention_sqlite::migrate_v25(conn)?;
     }
     Ok(notes)
 }

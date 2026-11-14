@@ -1169,13 +1169,26 @@ fn the_listing_queries_read_indexes_only_never_a_table_scan() {
                 || line == "SCAN r"
                 || line.starts_with("SCAN runs ")
                 || line.starts_with("SCAN r ");
-            let through_a_listing_index =
-                ["idx_runs_open", "idx_runs_exception", "idx_runs_ended_at"]
-                    .iter()
-                    .any(|index| line.contains(index));
+            let through_a_listing_index = [
+                "idx_runs_open",
+                "idx_runs_exception",
+                "idx_runs_ended_at",
+                "idx_runs_healthy",
+            ]
+            .iter()
+            .any(|index| line.contains(index));
             assert!(
                 !scans_runs || through_a_listing_index,
                 "{name} table-scans runs: {line} (full plan: {plan:?})"
+            );
+        }
+        // Story 24-4: the healthy count is index-only (a covering read of
+        // its partial index, never a `runs` row).
+        if name == "count healthy selector=false" {
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("COVERING INDEX idx_runs_healthy")),
+                "{name}: the healthy count must be index-only: {plan:?}"
             );
         }
         // And every statement with an ended arm reads it through the window
@@ -1199,6 +1212,10 @@ fn a_v15_state_dir_migrates_to_v16_and_the_listing_reads_it() {
     let db = tmp.path().join("state.db");
     {
         let store = SqliteStore::open(&db).unwrap();
+        store
+            .conn()
+            .execute_batch(crate::store::retention_sqlite::UNDO_V25_FOR_TEST)
+            .unwrap();
         store
             .conn()
             .execute_batch(crate::store::retention_sqlite::UNDO_V24_FOR_TEST)
@@ -1401,6 +1418,10 @@ fn a_v16_state_dir_migrates_to_v17_and_a_live_run_keeps_running_without_a_key() 
     let db = tmp.path().join("state.db");
     {
         let store = SqliteStore::open(&db).unwrap();
+        store
+            .conn()
+            .execute_batch(crate::store::retention_sqlite::UNDO_V25_FOR_TEST)
+            .unwrap();
         store
             .conn()
             .execute_batch(crate::store::retention_sqlite::UNDO_V24_FOR_TEST)
@@ -1615,6 +1636,10 @@ fn a_v19_state_dir_migrates_to_v20_seeding_activity_and_changing_no_run() {
     let db = tmp.path().join("state.db");
     {
         let store = SqliteStore::open(&db).unwrap();
+        store
+            .conn()
+            .execute_batch(crate::store::retention_sqlite::UNDO_V25_FOR_TEST)
+            .unwrap();
         store
             .conn()
             .execute_batch(crate::store::retention_sqlite::UNDO_V24_FOR_TEST)
