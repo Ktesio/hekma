@@ -50,6 +50,7 @@ mod resync;
 pub(crate) mod runs;
 mod secret;
 mod supervisor;
+pub(crate) mod timed_mutex;
 mod transition;
 mod usage;
 pub(crate) use usage::mint_ulid;

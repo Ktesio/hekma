@@ -203,4 +203,11 @@ Each is a public-contract or product choice; the recommendation is the spec's cu
   - A test pins both: `agent_home` answers with the registry held by another thread, and the split read returns what the one-piece read returned.
 
   Steps 1–4 (`TimedMutex` with its adversarial fixture and the tightened 6 s isolation bound; `critical()` scopes over engine.rs's lock sites with the symbol-anchored debt ratchet in CI; the `StoreGate` splits; `SupervisorShared`/`InstanceState`), the selector-arm composition, the reader pool and the proxy composition remain. Each is its own commit and two-pass review, per the archived plan's risk asymmetry.
+- 2026-11-14 — **phase 4b (built): AD-18 Step 1.**
+  - **The instrument:** `domain/timed_mutex.rs`. `TimedMutex` has `Mutex::lock`'s shape, so all 147 engine.rs call sites compile unchanged. `#[track_caller]` captures each site, and with timing off the cost is one relaxed atomic load. `LockTiming` keeps per-site hold count, max and p99 over the last 1,024 holds.
+  - **The surface:** `Engine::set_lock_timing` and `Engine::lock_hold_stats` (`LockHoldStats`), a diagnostic surface that is not a stable contract.
+  - **The bound:** the interaction isolation bound (`tests/interaction.rs`) is tightened from 9 s to the documented 6 s (AI-59's 5 s bound plus 1 s). Locally it measures 5.75 s.
+  - **What the instrument shows:** the stuck send holds BOTH the registry and the supervisor lock for its 5 s bound. That is the cross-instance coupling Steps 3–4 split, and the test now pins it by site.
+  - **Drift:** the spec's adversarial 25-instance fixture is narrowed to this two-instance pathological pair, the existing isolation test now instrumented. A 25-instance fleet with an armed Stop budget and a `--follow` reader needs the fixture work of Steps 2–4 and is recorded there.
+  - **Not built:** Steps 2–4.
 

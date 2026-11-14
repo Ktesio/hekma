@@ -895,7 +895,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   evidence: `crates/hekma-engine/src/store/runs_sqlite.rs` (`listing_arms`), `crates/hekma-engine/src/domain/registry.rs` (`list_runs`). Trigger: phase 4, with AD-18 Steps 0–4.
 
 - source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (Phase 4)
-  summary: AD-18 Steps 1–4 (`TimedMutex` and the adversarial fixture, named scopes with the debt ratchet, the `StoreGate` splits, `SupervisorShared`/`InstanceState`) are not built yet. Step 0 (the `EnginePaths` hoist and the off-guard log reads) landed in phase 4a.
+  summary: AD-18 Steps 2–4 (named scopes with the debt ratchet, the `StoreGate` splits, `SupervisorShared`/`InstanceState`) and Step 1's full 25-instance adversarial fixture are not built yet. Step 0 landed in phase 4a. Step 1's `TimedMutex` and the tightened 6 s isolation bound landed in phase 4b, where the instrument showed a stuck send holding both engine locks for its whole bound.
   evidence: `crates/hekma-engine/src/engine.rs` (bare `.lock()` sites). Trigger: phase 4 of the story.
 
 - source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (O2: usage events at compaction)
