@@ -758,6 +758,7 @@ hekma binding list [--after <name>] [--limit <n>] [--json]
 hekma binding show openai [--json]
 hekma binding set openai --label team=platform
 hekma binding set openai --clear-labels
+hekma binding set litellm --identity-headers on
 hekma binding delete openai
 hekma binding route add openai backup --upstream https://backup.example.com/v1
 hekma binding route remove openai backup
@@ -772,13 +773,29 @@ hekma binding credential list openai [--json]
   - The custodied key is stored as a `secret:NAME` reference only. It is inert until key custody ships, and `create` says so.
 - `show` prints the **client base URL**: the proxy's address plus the prefix, for example `http://127.0.0.1:8400/openai`. Point the client's base URL there. Before any host has served the state directory, no port is recorded yet, and `show` says so.
 - `set` changes the prefix, the upstream, the labels (`--label` replaces the whole set; `--clear-labels` removes them) or the custodied-key reference (`--clear-custodied-key` removes it). A prefix or upstream change keeps the binding's Runs. A label change updates its open Runs.
+- `set --identity-headers on|off|inherit` decides whether this binding's calls carry `x-hekma-run-id` and `x-hekma-labels`, whatever the proxy setting is; `inherit` follows the proxy setting again. It applies to the next call. `show` names a binding's own setting. See [`hekma proxy`](#hekma-proxy-show--set-identity-headers-onoff).
 - `delete` ends the binding's Run and its split Runs with cause `binding-removed`. Further calls on its prefix get `404 hekma_no_route`.
 - `route add|remove` manages up to 16 **reroute routes** per binding. They are stored and checked now, and used when reroute ships.
 - `credential issue --class announce|proxy-access` prints the binding's credential once, on stdout, with a note on stderr: `hk_ann_…` for announce, `hk_pxy_…` for proxy-access. Only its hash is stored. Issuing again revokes the previous credential of that class. `revoke` works per class, and `list` shows token ids and states, never a value. The announce credential [announces](announce.md) Runs beneath its binding, and heartbeats or closes the Runs it created; the note says so. **Nothing accepts a proxy-access credential yet**; the release that adds the proxy beyond loopback will.
 
 There are at most 256 bindings. A refusal names the field or the clash: a bad prefix, upstream or reference, a duplicate name or prefix, or a `/` binding while an upgraded agent holds the legacy route. A refusal exits `2`, and a missing binding or route exits `3`. The same operations are on the Control API under [`/v0/bindings`](control-api.md), for the Operator bearer only.
 
-## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--no-identity-headers] [--proxy-allowed-hosts <name,...>] [--proxy-allowed-origins <origin,...>] [--listen <addr> --bearer-secret <name> [--tls-cert <pem> --tls-key <pem>]] [--state-dir <dir>] [--log-capture <mode>] [--otlp-endpoint <url> [--otlp-headers <k=v,...>] [--otlp-flush-interval <secs>]]`
+## `hekma proxy show | set identity-headers <on|off>`
+
+Show or change the [metering proxy's](metering-proxy.md) settings. Today there is one: whether forwarded calls carry the **identity headers**, `x-hekma-run-id` and `x-hekma-labels` (the Run's id and labels, never content or a credential). They are on by default.
+
+```bash
+hekma proxy show [--json]
+hekma proxy set identity-headers off [--json]
+```
+
+- `show` reads the state directory read-only and starts nothing. It prints the proxy's recorded address and `identity-headers on|off`. When a running host was started with a flag that overrides the stored setting, it says so.
+- `set identity-headers on|off` goes through the local Service Host, like every write. The setting is stored in the state directory, so an auto-started host reads it too, and it applies to the very next forwarded call, with no restart. It is one `proxy_setting` event.
+- A binding's own setting (`hekma binding set <name> --identity-headers`) wins over this one, and `hekma serve --identity-headers` or `--no-identity-headers` overrides it for one run.
+
+The same setting is `PATCH /v0/proxy` on the [Control API](control-api.md#endpoint-bindings-and-the-metering-proxy). See [Hekma in front of a gateway](gateways.md).
+
+## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--no-identity-headers | --identity-headers] [--proxy-allowed-hosts <name,...>] [--proxy-allowed-origins <origin,...>] [--listen <addr> --bearer-secret <name> [--tls-cert <pem> --tls-key <pem>]] [--state-dir <dir>] [--log-capture <mode>] [--otlp-endpoint <url> [--otlp-headers <k=v,...>] [--otlp-flush-interval <secs>]]`
 
 Run the long-running **Service Host**: one process that owns a state directory for its whole lifetime — it adopts every live agent at open, holds the single-writer host lock, and waits. On SIGTERM (or Ctrl+C / SIGINT) it stops every RUNNING agent through the bounded graceful ladder, surfaces each per-instance outcome, and only then exits. While it runs, stdout stays silent — the command's "result" is the long-running process itself, and everything of operator consequence is a `[hekma] `-prefixed diagnostic line on **stderr** (host startup naming the state root, the signal receipt, each per-instance stop outcome, shutdown complete), interleaved with the engine's own diagnostics on the same stream.
 
@@ -797,7 +814,7 @@ Every serve — explicit or auto-started by a `hekma agent` write — binds a **
 
 - `--stop-window <secs>` — the graceful stop window, in whole seconds, each running agent gets to exit on before the stop ladder escalates to a forced kill (default `30`, the same default as `hekma agent stop`; bounded `1..=86400` — `0` and out-of-range values are refused as a usage error, on this flag and on every other serve surface).
 - `--metering-listen <port>` — the loopback port of the host's **metering proxy**, the one listener every metered model call goes through (see [The metering proxy](metering-proxy.md)). Without it the host uses the port recorded for this state directory, or lets the OS pick one the first time and records it, so a restart binds the same port and adopted agents keep a live base URL. A port that is already in use never makes the host move to another: the host keeps serving the Control API, names the port and why in a diagnostic (and in `GET /v0/proxy`), and refuses `engine-observed` starts until you free the port or pass another.
-- `--no-identity-headers` — stop adding the outbound identity headers. By default every call the metering proxy forwards carries `x-hekma-run-id` and `x-hekma-labels` (the Run's id and labels) to the model provider; with this flag neither is sent.
+- `--no-identity-headers` / `--identity-headers` — override the stored identity-header setting for this run only. By default every call the metering proxy forwards carries `x-hekma-run-id` and `x-hekma-labels` (the Run's id and labels) to the model provider, unless [`hekma proxy set identity-headers off`](#hekma-proxy-show--set-identity-headers-onoff) stored otherwise. `--no-identity-headers` sends neither until this host stops; `--identity-headers` sends both. The flag is never stored, a binding's own setting still wins, and the started notice says when the flag disagrees with the stored setting. Passing both is a usage error.
 - `--proxy-allowed-hosts <name,...>` — `Host` header values the metering proxy accepts besides loopback addresses and `localhost` (comma-separated; a listed name matches with or without a port). Any other `Host` is refused with `403 hekma_bad_host`, which stops DNS-rebinding pages.
 - `--proxy-allowed-origins <origin,...>` — `Origin` values the metering proxy accepts, as a browser sends them (`https://app.example`). By default a request carrying any `Origin` is refused; SDKs send none.
 - `--listen <addr>` / `--bearer-secret <name>` — expose the **Control API** (v0, unstable) on an operator address too: an HTTP/JSON surface over the hosted fleet — registration, lifecycle, config, budgets and usage, input, memory, live SSE events — guarded by the resolved bearer token. Both flags or neither (a half-configured API is a usage error); the secret NAME resolves like every Hekma secret (env var, then the state root's `secrets.toml`), and an unresolvable name — or a secret that resolved to an EMPTY value — refuses the startup before anything binds. Operator tooling for a trusted operator — not a multi-tenant service. See [the Control API reference](control-api.md).

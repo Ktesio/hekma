@@ -603,6 +603,7 @@ fn show_names_the_remediation_before_any_host_recorded_a_proxy_port() {
             upstream: "http://127.0.0.1:9".into(),
             labels: Vec::new(),
             custodied_key: None,
+            identity_headers: None,
         })
         .unwrap();
     drop(engine);

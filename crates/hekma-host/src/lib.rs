@@ -92,11 +92,13 @@ pub struct ServeOptions {
     /// port never hops: the host serves on, says which port and why, and
     /// refuses `engine-observed` starts until it is free.
     pub metering_listen_port: u16,
-    /// Story 23-1 (`--no-identity-headers`): when `false` (the default) the
-    /// proxy adds `x-hekma-run-id` and `x-hekma-labels` to outbound calls
-    /// (the run id and labels sent to the model provider — on by default);
-    /// `true` sends neither.
-    pub identity_headers: bool,
+    /// Story 23-1 / 21-8 (`--no-identity-headers`, `--identity-headers`):
+    /// this run's override of the stored outbound identity-header setting
+    /// (`x-hekma-run-id` and `x-hekma-labels`, the run id and labels sent
+    /// to the model provider). `None` (the default) follows the stored
+    /// setting, on unless an Operator turned it off; `Some(on)` forces it
+    /// for this run only and is never stored.
+    pub identity_headers: Option<bool>,
     /// Story 22-2 (`--proxy-allowed-hosts`): `Host` header values the
     /// metering proxy accepts beyond the loopback literals (`127.0.0.0/8`,
     /// `::1`, `localhost`). Empty (the default) = the loopback literals
@@ -794,6 +796,16 @@ where
     if let Some(url) = &proxy_url {
         notifier.note(&format!("the metering proxy is listening on {url}."));
     }
+    // Story 21-8: a serve flag that overrides the stored identity-header
+    // setting says so, so the per-run override is never silent.
+    if let Some(note) = engine
+        .blocking()
+        .proxy_settings()
+        .ok()
+        .and_then(|settings| identity_headers_note(&settings))
+    {
+        notifier.note(&note);
+    }
 
     // (5.5) The Control API mounts here: AFTER the engine opens and the
     // started notice lands, BEFORE the signal wait. The LOCAL endpoint
@@ -1082,5 +1094,47 @@ async fn autostart_idle_exit(
         if matches!(activity.idle_for(), Some(idle) if idle >= window) {
             return "idle: no live agent and no request";
         }
+    }
+}
+
+/// The started notice's line when this run's serve flag disagrees with the
+/// stored identity-header setting (story 21-8).
+fn identity_headers_note(settings: &hekma_engine::ProxySettings) -> Option<String> {
+    let word = |on: bool| if on { "on" } else { "off" };
+    (settings.forced_by_flag && settings.identity_headers != settings.stored_identity_headers).then(
+        || {
+            format!(
+                "outbound identity headers are {} for this run (a serve flag); the stored \
+                 setting is {}, and the next start without the flag uses it.",
+                word(settings.identity_headers),
+                word(settings.stored_identity_headers)
+            )
+        },
+    )
+}
+
+#[cfg(test)]
+mod identity_headers_note_tests {
+    use super::identity_headers_note;
+    use hekma_engine::ProxySettings;
+
+    #[test]
+    fn the_started_notice_names_a_flag_that_disagrees_with_the_stored_setting() {
+        let settings = |identity_headers, stored_identity_headers, forced_by_flag| ProxySettings {
+            identity_headers,
+            stored_identity_headers,
+            forced_by_flag,
+        };
+        let note = identity_headers_note(&settings(false, true, true)).unwrap();
+        assert!(note.contains("off for this run"), "{note}");
+        assert!(note.contains("stored setting is on"), "{note}");
+        let note = identity_headers_note(&settings(true, false, true)).unwrap();
+        assert!(
+            note.contains("on for this run") && note.contains("is off"),
+            "{note}"
+        );
+        // A flag that agrees, or no flag, says nothing.
+        assert!(identity_headers_note(&settings(true, true, true)).is_none());
+        assert!(identity_headers_note(&settings(false, false, false)).is_none());
     }
 }

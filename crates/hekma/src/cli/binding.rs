@@ -73,6 +73,8 @@ pub struct SetArgs {
     pub clear_labels: bool,
     pub custodied_key: Option<String>,
     pub clear_custodied_key: bool,
+    /// `--identity-headers on|off|inherit` (story 21-8).
+    pub identity_headers: Option<String>,
     pub json: bool,
 }
 
@@ -189,10 +191,11 @@ pub fn set(args: SetArgs) -> Result<(), Box<dyn std::error::Error>> {
         && args.labels.is_empty()
         && args.custodied_key.is_none()
         && !args.clear_custodied_key
+        && args.identity_headers.is_none()
     {
         return Err(invalid(
-            "nothing to set: pass --prefix, --upstream, --label, --clear-labels or \
-             --custodied-key",
+            "nothing to set: pass --prefix, --upstream, --label, --clear-labels, \
+             --custodied-key or --identity-headers",
         ));
     }
     let mut patch = json!({});
@@ -217,6 +220,13 @@ pub fn set(args: SetArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.clear_custodied_key {
         patch["custodied_key"] = Value::Null;
+    }
+    // Story 21-8: `inherit` (null) returns the binding to the proxy setting.
+    match args.identity_headers.as_deref() {
+        Some("on") => patch["identity_headers"] = json!(true),
+        Some("off") => patch["identity_headers"] = json!(false),
+        Some(_) => patch["identity_headers"] = Value::Null,
+        None => {}
     }
     let path = format!("/v0/bindings/{}", args.name);
     let routed = route("PATCH", &path, Some(patch)).map_err(routed_error)?;
@@ -383,7 +393,13 @@ fn print_summary(binding: &Value, base_url: Option<&str>) {
     let base = base_url
         .map(|url| format!("  client base URL {url}"))
         .unwrap_or_default();
-    println!("{name}: {prefix} -> {upstream}{labels}{base}");
+    // Story 21-8: a binding's own identity-header override, when it has one.
+    let headers = match binding["identity_headers"].as_bool() {
+        Some(true) => "  identity headers on",
+        Some(false) => "  identity headers off",
+        None => "",
+    };
+    println!("{name}: {prefix} -> {upstream}{labels}{base}{headers}");
 }
 
 fn print_document(key: &str, value: &Value) {

@@ -302,6 +302,9 @@ struct EngineInner {
     /// Story 23-2: the Lease and window knobs (the proxy's sweeper and the
     /// announce and heartbeat jobs read the same values).
     leases: crate::domain::runs::lease::LeaseOptions,
+    /// Story 21-8: this run's serve-flag override of the stored
+    /// identity-header setting (`None` follows the stored setting).
+    identity_headers_flag: Option<bool>,
 }
 
 /// Open-time options for the long-running Host (story 17-2) — the additive,
@@ -601,6 +604,7 @@ impl Engine {
         let credential_reader = Mutex::new(registry.open_credential_reader(false)?);
         let calls_dir = registry.calls_dir();
         let leases = metering_proxy.leases;
+        let identity_headers_flag = metering_proxy.identity_headers;
         let inner = Arc::new(EngineInner {
             metering_proxy: Mutex::new(proxy),
             metering_proxy_error: proxy_error,
@@ -612,6 +616,7 @@ impl Engine {
             credential_reader,
             calls_dir,
             leases,
+            identity_headers_flag,
         });
 
         // (1) Orphan adoption on open (AC-B / AI-7 / AI-8). Reconcile BEFORE the
@@ -679,6 +684,7 @@ impl Engine {
             credential_reader,
             calls_dir,
             leases: crate::domain::runs::lease::LeaseOptions::default(),
+            identity_headers_flag: None,
         });
         Ok(Self {
             rt: Arc::new(rt),
@@ -945,6 +951,50 @@ impl Engine {
         })
         .await
         .and_then(|outcome| Self::bound_binding(outcome, "create"))
+    }
+
+    /// The shared Metering Proxy's Operator settings (story 21-8): the
+    /// stored outbound identity-header setting and this run's serve-flag
+    /// override of it. A read: no writer job.
+    pub async fn proxy_settings(&self) -> Result<crate::domain::ProxySettings, BindingError> {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let stored = inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .reader()
+                .proxy_identity_headers()?;
+            Ok(crate::domain::ProxySettings::of(
+                stored,
+                inner.identity_headers_flag,
+            ))
+        })
+        .await
+    }
+
+    /// Turn the outbound identity headers on or off for every forwarded
+    /// call (story 21-8): persisted in the state directory, so every host
+    /// start reads it; one `proxy_setting` event; published before the
+    /// acknowledgement, so the very next call follows it. A binding's own
+    /// override and this run's serve flag still win.
+    pub async fn set_proxy_identity_headers(
+        &self,
+        on: bool,
+    ) -> Result<crate::domain::ProxySettings, BindingError> {
+        self.refuse_if_read_only().map_err(BindingError::Store)?;
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            Self::binding_write(&inner, move |job, _| {
+                let at = crate::time::now_rfc3339();
+                crate::domain::runs::bindings::set_identity_headers(job, on, &at)
+            })?;
+            Ok(crate::domain::ProxySettings::of(
+                on,
+                inner.identity_headers_flag,
+            ))
+        })
+        .await
     }
 
     /// Change a binding (story 23-1): a prefix or upstream change keeps its
@@ -4390,6 +4440,21 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.stop_metering_proxy(grace))
+    }
+
+    /// Blocking twin of [`Engine::proxy_settings`].
+    pub fn proxy_settings(&self) -> Result<crate::domain::ProxySettings, BindingError> {
+        self.engine.rt.block_on(self.engine.proxy_settings())
+    }
+
+    /// Blocking twin of [`Engine::set_proxy_identity_headers`].
+    pub fn set_proxy_identity_headers(
+        &self,
+        on: bool,
+    ) -> Result<crate::domain::ProxySettings, BindingError> {
+        self.engine
+            .rt
+            .block_on(self.engine.set_proxy_identity_headers(on))
     }
 
     /// Blocking twin of [`Engine::create_binding`].

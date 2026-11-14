@@ -1325,6 +1325,25 @@ pub(crate) struct ProxyDocument {
     /// Why it is not running, present when it is not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Story 21-8: whether forwarded calls carry `x-hekma-run-id` and
+    /// `x-hekma-labels` on this host run (a binding's override aside).
+    pub identity_headers: bool,
+    /// Story 21-8: the stored setting every host start reads.
+    pub stored_identity_headers: bool,
+    /// Story 21-8: `true` when this run's serve flag overrides the stored
+    /// setting.
+    pub forced_by_flag: bool,
+}
+
+/// The `PATCH /v0/proxy` body (story 21-8): the stored outbound
+/// identity-header setting. Unknown fields are refused, so a typo never
+/// reads as a no-op.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProxySettingsRequest {
+    /// `true` adds the identity headers to forwarded calls; `false` sends
+    /// neither.
+    pub identity_headers: bool,
 }
 
 /// The `POST /v0/bindings/{name}/credentials` body: the class to issue

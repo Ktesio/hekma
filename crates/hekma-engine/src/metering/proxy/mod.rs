@@ -49,8 +49,12 @@ pub struct MeteringProxyOptions {
     /// Record the bound port for the state directory and reuse it (the
     /// host sets this; embedders default to an unrecorded ephemeral port).
     pub sticky: bool,
-    /// Add `x-hekma-run-id` and `x-hekma-labels` to outbound calls.
-    pub identity_headers: bool,
+    /// Story 21-8: this run's override of the stored outbound
+    /// identity-header setting (`x-hekma-run-id` and `x-hekma-labels`).
+    /// `None` (the default) follows the stored setting, which an Operator
+    /// changes live; `Some(on)` forces it for this run only and is never
+    /// stored. A binding's own override still wins.
+    pub identity_headers: Option<bool>,
     /// The most calls in flight at once.
     pub max_concurrent_calls: usize,
     /// The most request and response bytes buffered at once.
@@ -92,7 +96,7 @@ impl Default for MeteringProxyOptions {
             enabled: true,
             port: 0,
             sticky: false,
-            identity_headers: true,
+            identity_headers: None,
             max_concurrent_calls: 512,
             max_buffered_bytes: 512 * 1024 * 1024,
             allowed_hosts: Vec::new(),
@@ -204,7 +208,7 @@ impl MeteringProxy {
             snapshot: deps.snapshot,
             pump,
             client: crate::metering::relay::proxy_client(tls_config(options)),
-            identity_headers: options.identity_headers,
+            identity_headers_flag: options.identity_headers,
             inflight: Arc::new(Semaphore::new(options.max_concurrent_calls.max(1))),
             max_calls: options.max_concurrent_calls.max(1),
             buffered_kib: Arc::new(Semaphore::new(kib as usize)),

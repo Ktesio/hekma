@@ -222,6 +222,9 @@ fn json_body(response: &mut ureq::http::Response<ureq::Body>) -> serde_json::Val
 fn every_route(addr: &str) -> Vec<(&'static str, String)> {
     vec![
         ("GET", format!("http://{addr}/v0/version")),
+        // Story 21-8: the proxy's settings.
+        ("GET", format!("http://{addr}/v0/proxy")),
+        ("PATCH", format!("http://{addr}/v0/proxy")),
         ("GET", format!("http://{addr}/v0/fleet")),
         ("GET", format!("http://{addr}/v0/events")),
         ("POST", format!("http://{addr}/v0/instances")),
@@ -403,7 +406,9 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
         || (method == "GET" && url.ends_with("/v0/runs"))
         // The calls listing (story 19-4): no calls recorded is a valid EMPTY
         // listing too (the by-id read keeps its 404).
-        || (method == "GET" && url.ends_with("/v0/calls"));
+        || (method == "GET" && url.ends_with("/v0/calls"))
+        // Story 21-8: the proxy's settings read answers 200.
+        || (method == "GET" && url.ends_with("/v0/proxy"));
         let register = method == "POST" && url.ends_with("/v0/instances");
         // The ack POST reached its handler but this loop's register-shaped
         // body carries no `seq` — the Json extractor's 422 is the
@@ -418,7 +423,9 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
         ]
         .iter()
         .any(|route| url.ends_with(&format!("/v0/runs/{route}")))
-            || (method == "PATCH" && url.ends_with("/run_ghost/limits"));
+            || (method == "PATCH" && url.ends_with("/run_ghost/limits"))
+            // Story 21-8: the proxy PATCH denies unknown fields too.
+            || (method == "PATCH" && url.ends_with("/v0/proxy"));
         let ack_wrong_body = ack_wrong_body || set_wrong_body;
         // The Run open POST reached its handler: the register-shaped body
         // names no parent, so the exactly-one-parent rule answers 400.
@@ -5704,6 +5711,148 @@ fn the_calls_routes_refuse_every_credential_class_but_the_operator_bearer() {
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         let _ = json_body(&mut response);
     }
+
+    server.stop().unwrap();
+}
+
+#[test]
+fn the_proxy_settings_route_is_operator_only_and_stores_the_identity_header_switch() {
+    // Story 21-8: GET /v0/proxy carries the switch; PATCH stores it (200,
+    // the effective settings); a non-boolean or an unknown field is 400;
+    // a Run Key, a refresh credential and a binding's credentials are
+    // refused.
+    let state = tempfile::tempdir().unwrap();
+    drop(hekma_engine::Engine::open(Some(state.path().to_path_buf())).unwrap());
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+             process_owner, created_at, updated_at) \
+             VALUES ('run_ROOT', 'announced', 0, 'active', '', 0, 't', 't');",
+        )
+        .unwrap();
+    }
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle.clone());
+    let client = client();
+    let url = format!("http://{}/v0/proxy", server.addr);
+
+    let mut response = get_ok(&client, &server.addr, "/v0/proxy");
+    let shown = json_body(&mut response);
+    assert_eq!(shown["identity_headers"], true, "{shown}");
+    assert_eq!(shown["stored_identity_headers"], true);
+    assert_eq!(shown["forced_by_flag"], false);
+
+    let mut response = call(
+        &client,
+        "PATCH",
+        &url,
+        Some(serde_json::json!({"identity_headers": false})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let set = json_body(&mut response);
+    assert_eq!(set["identity_headers"], false, "{set}");
+    assert_eq!(set["stored_identity_headers"], false);
+    assert_eq!(set["running"], true);
+    let mut response = get_ok(&client, &server.addr, "/v0/proxy");
+    assert_eq!(json_body(&mut response)["identity_headers"], false);
+
+    for body in [
+        serde_json::json!({"identity_headers": "banana"}),
+        serde_json::json!({"identity_headers": false, "labels": []}),
+        serde_json::json!({}),
+    ] {
+        let response = call(&client, "PATCH", &url, Some(body.clone()));
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{body}"
+        );
+    }
+
+    // Every other credential class is refused.
+    let mut response = client
+        .post(format!("http://{}/v0/runs", server.addr))
+        .header("Authorization", format!("Bearer {BEARER_VALUE}"))
+        .send_json(serde_json::json!({"parent_run_id": "run_ROOT"}))
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let opened = json_body(&mut response);
+    let mut presented = vec![
+        opened["credentials"]["run_key"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        opened["credentials"]["refresh_credential"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    ];
+    let response = call(
+        &client,
+        "POST",
+        &format!("http://{}/v0/bindings", server.addr),
+        Some(serde_json::json!({
+            "name": "gw", "prefix": "/gw", "upstream": "http://127.0.0.1:9/v1",
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::CREATED);
+    for class in ["announce", "proxy-access"] {
+        let mut response = call(
+            &client,
+            "POST",
+            &format!("http://{}/v0/bindings/gw/credentials", server.addr),
+            Some(serde_json::json!({ "class": class })),
+        );
+        presented.push(
+            json_body(&mut response)["token"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    for token in &presented {
+        let response = call_as(
+            &client,
+            token,
+            "PATCH",
+            &url,
+            r#"{"identity_headers":true}"#,
+        );
+        let status = response.status();
+        assert!(
+            status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED,
+            "{status}"
+        );
+    }
+    let mut response = get_ok(&client, &server.addr, "/v0/proxy");
+    assert_eq!(
+        json_body(&mut response)["stored_identity_headers"],
+        false,
+        "nothing a refused class sent was stored"
+    );
+
+    // A binding's own setting rides its document.
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("http://{}/v0/bindings/gw", server.addr),
+        Some(serde_json::json!({"identity_headers": true})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(&mut response)["binding"]["identity_headers"],
+        true
+    );
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("http://{}/v0/bindings/gw", server.addr),
+        Some(serde_json::json!({"identity_headers": null})),
+    );
+    assert!(json_body(&mut response)["binding"]
+        .get("identity_headers")
+        .is_none());
 
     server.stop().unwrap();
 }

@@ -112,7 +112,11 @@ use crate::ports::{
 /// v22 (story 23-4): wire dispositions — `run_dispositions` (the verb
 /// hold/reject/reroute reasons) and the held-call columns on `runs` — see
 /// [`super::runs_sqlite`].
-pub(crate) const SCHEMA_VERSION: i64 = 22;
+/// v23 (story 21-8): the outbound identity-header switch —
+/// `proxy_state.identity_headers` (the root, on by default) and
+/// `run_bindings.identity_headers` (the per-binding override) — see
+/// [`super::runs_sqlite`].
+pub(crate) const SCHEMA_VERSION: i64 = 23;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -780,6 +784,11 @@ fn migrate(
     // one-way, no backfill).
     if version < 22 {
         super::runs_sqlite::migrate_v22(conn)?;
+    }
+    // Story 21-8: v23 adds the identity-header switch (one crash-atomic
+    // step, one-way, no backfill: the root reads on, every binding inherits).
+    if version < 23 {
+        super::runs_sqlite::migrate_v23(conn)?;
     }
     Ok(notes)
 }
