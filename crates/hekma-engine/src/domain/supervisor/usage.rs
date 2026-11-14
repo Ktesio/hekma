@@ -126,7 +126,7 @@ impl Supervisor {
                 }
             }
         }
-        let names: Vec<InstanceName> = self.running.keys().cloned().collect();
+        let names: Vec<InstanceName> = self.instances.running.keys().cloned().collect();
         if refresh.reloaded {
             self.recheck_after_policy_reload(registry, &names);
         }
@@ -143,7 +143,7 @@ impl Supervisor {
     /// foreign engine cannot latch what it cannot execute).
     fn recheck_after_policy_reload(&mut self, registry: &Registry, names: &[InstanceName]) {
         for name in names {
-            let Some(supervised) = self.running.get(name) else {
+            let Some(supervised) = self.instances.running.get(name) else {
                 continue;
             };
             let Some(run_id) = registry.open_process_run(name).ok().flatten() else {
@@ -173,7 +173,7 @@ impl Supervisor {
         mode: DrainMode,
     ) {
         self.drain_usage_for(registry, name, mode);
-        if self.running.get(name).is_some_and(|s| s.is_acp) {
+        if self.instances.running.get(name).is_some_and(|s| s.is_acp) {
             self.drain_stderr_usage_for(registry, name, mode);
         }
     }
@@ -255,7 +255,7 @@ impl Supervisor {
         channel: UsageChannel,
     ) {
         // Only running/adopted instances have a cursor + metering context.
-        let (cursor, run_id, metering_source) = match self.running.get(name) {
+        let (cursor, run_id, metering_source) = match self.instances.running.get(name) {
             Some(s) => (
                 channel.cursor(s),
                 s.run_id.clone(),
@@ -280,7 +280,7 @@ impl Supervisor {
             // arm (never re-read from 0 under the same live `run_id` → no
             // double-count → no inflated bill).
             UsageTail::Shrunk { new_cursor } => {
-                if let Some(s) = self.running.get_mut(name) {
+                if let Some(s) = self.instances.running.get_mut(name) {
                     channel.set_cursor(s, new_cursor);
                 }
                 return;
@@ -307,7 +307,7 @@ impl Supervisor {
                 // has arrived this Run. Recorded at PARSE time (not commit):
                 // "seen" is about the agent's behavior, not the store's.
                 if !parsed.is_empty() {
-                    if let Some(s) = self.running.get_mut(name) {
+                    if let Some(s) = self.instances.running.get_mut(name) {
                         s.sentinel_lines_seen = true;
                     }
                 }
@@ -340,7 +340,7 @@ impl Supervisor {
                 // `new_cursor` (which was `cursor + consumed`) exactly —
                 // reached only when every event behind the advance is durable.
                 if committed_count == parsed.len() {
-                    if let Some(s) = self.running.get_mut(name) {
+                    if let Some(s) = self.instances.running.get_mut(name) {
                         channel.set_cursor(s, cursor + consumed);
                         channel.set_park(s, None);
                     }
@@ -373,7 +373,12 @@ impl Supervisor {
                     // another process's write lock) is contention, never a
                     // poisoned row — it is retried without spending an attempt,
                     // so bounded contention can never skip billable usage.
-                    let attempts = match self.running.get(name).and_then(|s| channel.park(s)) {
+                    let attempts = match self
+                        .instances
+                        .running
+                        .get(name)
+                        .and_then(|s| channel.park(s))
+                    {
                         Some((parked_cursor, n)) if parked_cursor == cursor => {
                             if busy {
                                 n
@@ -385,7 +390,7 @@ impl Supervisor {
                     };
                     if attempts >= USAGE_PARK_MAX_ATTEMPTS {
                         let lost = parsed.len() - committed_count;
-                        if let Some(s) = self.running.get_mut(name) {
+                        if let Some(s) = self.instances.running.get_mut(name) {
                             channel.set_cursor(s, cursor + consumed);
                             channel.set_park(s, None);
                         }
@@ -397,7 +402,7 @@ impl Supervisor {
                             name.as_str(),
                         );
                         self.emit_diagnostic(&skip);
-                    } else if let Some(s) = self.running.get_mut(name) {
+                    } else if let Some(s) = self.instances.running.get_mut(name) {
                         channel.set_park(s, Some((cursor, attempts)));
                     }
                 }
@@ -499,7 +504,7 @@ impl Supervisor {
         }
         // Consumer 1: the usage cursor. It must sit at (or past) the file's
         // end — a lagging cursor means unread bytes; defer.
-        let usage_cursor = match self.running.get(name) {
+        let usage_cursor = match self.instances.running.get(name) {
             Some(s) => channel.cursor(s),
             None => return,
         };
@@ -537,7 +542,7 @@ impl Supervisor {
         match truncated {
             Some(()) => {
                 self.clear_truncate_deferral(channel);
-                if let Some(s) = self.running.get_mut(name) {
+                if let Some(s) = self.instances.running.get_mut(name) {
                     channel.set_cursor(s, 0);
                 }
                 let truncated_notice = format!(
@@ -613,7 +618,7 @@ impl Supervisor {
     /// unlink failure emits a diagnostic naming the path and the error, and
     /// never fails the stop/reap itself.
     pub(super) fn unlink_raw_logs_if_metadata(&self, registry: &Registry, name: &InstanceName) {
-        let metadata = match self.running.get(name).map(|s| s.capture_mode) {
+        let metadata = match self.instances.running.get(name).map(|s| s.capture_mode) {
             Some(Some(LogCaptureMode::Metadata)) => true,
             Some(_) => false,
             None => self.log_capture_mode == LogCaptureMode::Metadata,
@@ -752,6 +757,7 @@ impl Supervisor {
         // read, AC-B; the Rate in force at commit, 3-3's no-retro-repricing)
         // travel in the job: the writer reads no engine state (D2).
         let generation = self
+            .instances
             .running
             .get(name)
             .map_or(0, |supervised| supervised.launch_generation);
@@ -760,7 +766,7 @@ impl Supervisor {
         // — the ledger is per-Run priced, so a child-only Policy Cost Cap
         // sees cost priced at the child's Rate, not the owner's (or none).
         // The owner's own usage prices at the evaluator's Rate as before.
-        let row_rate = if self.running.get(name).map(|s| &s.run_id) == Some(run_id) {
+        let row_rate = if self.instances.running.get(name).map(|s| &s.run_id) == Some(run_id) {
             None
         } else {
             match registry.run_rate(run_id) {
@@ -868,7 +874,7 @@ impl Supervisor {
         // kept, note carried), never a silent label-less resolve.
         let _ = run_id;
         let resolution = registry.resolved_limits(name, None);
-        let supervised = self.running.get(name);
+        let supervised = self.instances.running.get(name);
         pipeline::EvalInput {
             name: Some(name.clone()),
             run_id: run_id.clone(),
@@ -1152,7 +1158,7 @@ impl Supervisor {
         scope: BreachScope,
     ) {
         let reason = governance::LatchKey::new(dimension, scope);
-        let Some(supervised) = self.running.get(name) else {
+        let Some(supervised) = self.instances.running.get(name) else {
             return;
         };
         if supervised.observed_route {

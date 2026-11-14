@@ -138,7 +138,7 @@ fn wait_for_crash(sup: &mut Supervisor, registry: &Registry) -> Vec<RestartPlan>
         }
         // Also stop once nothing is supervised AND state is failed (a `never`
         // policy returns no plan but still crashes).
-        if sup.running.is_empty() {
+        if sup.instances.running.is_empty() {
             return plans;
         }
         assert!(Instant::now() < deadline, "crash was never detected");
@@ -1072,7 +1072,7 @@ fn poll_once_ignores_an_exit_during_a_requested_stop_not_a_crash() {
             plans.is_empty(),
             "an exit during a requested stop is not a crash"
         );
-        if sup.running.is_empty() {
+        if sup.instances.running.is_empty() {
             break;
         }
         assert!(
@@ -1122,7 +1122,7 @@ fn stop_on_a_stopping_instance_without_the_unconfirmed_flag_takes_the_ordinary_p
 
     registry.set_state(&name, LifecycleState::Stopping).unwrap();
     assert!(
-        !sup.running.get(&name).unwrap().stop_unconfirmed,
+        !sup.instances.running.get(&name).unwrap().stop_unconfirmed,
         "a freshly-started handle must default to NOT stop_unconfirmed"
     );
 
@@ -1134,7 +1134,7 @@ fn stop_on_a_stopping_instance_without_the_unconfirmed_flag_takes_the_ordinary_p
     );
 
     // Teardown.
-    let supervised = sup.running.get_mut(&name).unwrap();
+    let supervised = sup.instances.running.get_mut(&name).unwrap();
     let _ = sup
         .shared
         .backend
@@ -1158,7 +1158,11 @@ fn stop_retry_on_a_stuck_unconfirmed_instance_polls_cheaply_no_compounding() {
     // own bookkeeping on that path — see its docs): the row is
     // `stopping`, the handle is retained, and it is marked unconfirmed.
     registry.set_state(&name, LifecycleState::Stopping).unwrap();
-    sup.running.get_mut(&name).unwrap().stop_unconfirmed = true;
+    sup.instances
+        .running
+        .get_mut(&name)
+        .unwrap()
+        .stop_unconfirmed = true;
 
     let start = Instant::now();
     let err = sup.stop(&registry, "stuck", None).unwrap_err();
@@ -1177,13 +1181,13 @@ fn stop_retry_on_a_stuck_unconfirmed_instance_polls_cheaply_no_compounding() {
     // is still retained (not dropped) for a further retry to reconcile.
     assert_eq!(state_of(&registry, "stuck"), LifecycleState::Stopping);
     assert!(
-        sup.running.contains_key(&name),
+        sup.instances.running.contains_key(&name),
         "the handle must be retained across a failed retry, never silently dropped"
     );
 
     // Teardown: really kill the still-running process so it does not
     // leak past this test.
-    let supervised = sup.running.get_mut(&name).unwrap();
+    let supervised = sup.instances.running.get_mut(&name).unwrap();
     let _ = sup
         .shared
         .backend
@@ -1208,13 +1212,17 @@ fn stop_retry_on_a_stuck_unconfirmed_instance_maps_a_poll_failure_honestly() {
 
     // The stuck-retry premise: row `stopping`, handle retained, flagged.
     registry.set_state(&name, LifecycleState::Stopping).unwrap();
-    sup.running.get_mut(&name).unwrap().stop_unconfirmed = true;
+    sup.instances
+        .running
+        .get_mut(&name)
+        .unwrap()
+        .stop_unconfirmed = true;
 
     // Arm the poll fault for THIS handle's pid, then retry the stop.
     let pid = sup
         .shared
         .backend
-        .pid(&sup.running.get(&name).unwrap().handle);
+        .pid(&sup.instances.running.get(&name).unwrap().handle);
     sup.arm_poll_fault(pid);
 
     let start = Instant::now();
@@ -1235,14 +1243,14 @@ fn stop_retry_on_a_stuck_unconfirmed_instance_maps_a_poll_failure_honestly() {
     // the flagged handle retained for a later retry.
     assert_eq!(state_of(&registry, "stuckpoll"), LifecycleState::Stopping);
     assert!(
-        sup.running.contains_key(&name),
+        sup.instances.running.contains_key(&name),
         "the flagged handle must be retained across the poll failure"
     );
 
     // Teardown: disarm is impossible (the seam holds for the supervisor's
     // lifetime), so kill through the backend directly — a real stop of a
     // live process, never the faulted poll.
-    let supervised = sup.running.get_mut(&name).unwrap();
+    let supervised = sup.instances.running.get_mut(&name).unwrap();
     let _ = sup
         .shared
         .backend
@@ -1263,7 +1271,11 @@ fn stop_retry_self_heals_once_the_stuck_process_actually_exits() {
     let name = InstanceName::new("heals").unwrap();
 
     registry.set_state(&name, LifecycleState::Stopping).unwrap();
-    sup.running.get_mut(&name).unwrap().stop_unconfirmed = true;
+    sup.instances
+        .running
+        .get_mut(&name)
+        .unwrap()
+        .stop_unconfirmed = true;
 
     // Simulate the OS condition clearing: the process ACTUALLY exits now.
     // A real, portable kill via the SAME ProcessBackend::stop the
@@ -1273,7 +1285,7 @@ fn stop_retry_self_heals_once_the_stuck_process_actually_exits() {
     // test. The process is NOT genuinely stuck in this test (only its
     // BOOKKEEPING pretends it was), so this succeeds quickly.
     {
-        let supervised = sup.running.get_mut(&name).unwrap();
+        let supervised = sup.instances.running.get_mut(&name).unwrap();
         sup.shared
             .backend
             .stop(&mut supervised.handle, Duration::from_secs(2))
@@ -1289,7 +1301,7 @@ fn stop_retry_self_heals_once_the_stuck_process_actually_exits() {
         "the stuck stopping row must reconcile to stopped, not stay stuck forever"
     );
     assert!(
-        !sup.running.contains_key(&name),
+        !sup.instances.running.contains_key(&name),
         "the handle must be released once reconciled"
     );
 }
@@ -1320,7 +1332,11 @@ fn poll_once_reconciles_a_stuck_unconfirmed_stop_to_stopped_self_healing() {
     let name = InstanceName::new("reaperheals").unwrap();
 
     registry.set_state(&name, LifecycleState::Stopping).unwrap();
-    sup.running.get_mut(&name).unwrap().stop_unconfirmed = true;
+    sup.instances
+        .running
+        .get_mut(&name)
+        .unwrap()
+        .stop_unconfirmed = true;
 
     // Wait for the process to actually exit on its own, then let the
     // reaper observe it.
@@ -1331,7 +1347,7 @@ fn poll_once_reconciles_a_stuck_unconfirmed_stop_to_stopped_self_healing() {
             plans.is_empty(),
             "this is a reconciliation, never a crash/restart"
         );
-        if !sup.running.contains_key(&name) {
+        if !sup.instances.running.contains_key(&name) {
             break;
         }
         assert!(
@@ -1364,7 +1380,7 @@ fn adopt_orphans_with_no_records_adopts_nothing() {
     let (_state, _manifest, registry) = setup_fake("idle", &["--linger-ms", "600000"]);
     let mut sup = Supervisor::with_backoff(fast_backoff());
     assert_eq!(sup.adopt_orphans(&registry), 0);
-    assert!(sup.running.is_empty());
+    assert!(sup.instances.running.is_empty());
 }
 
 #[test]
@@ -1475,7 +1491,10 @@ fn adopt_orphans_skips_a_record_whose_owner_is_live_elsewhere() {
         0,
         "a live-owner record must NOT be adopted"
     );
-    assert!(sup2.running.is_empty(), "no handle may be re-held");
+    assert!(
+        sup2.instances.running.is_empty(),
+        "no handle may be re-held"
+    );
     assert_eq!(
         state_of(&registry, "hosted"),
         LifecycleState::Running,
@@ -1511,7 +1530,10 @@ fn adopt_orphans_adopts_a_dead_owner_record() {
         1,
         "a dead-owner record adopts"
     );
-    assert!(sup2.running.contains_key(&name), "the handle is re-held");
+    assert!(
+        sup2.instances.running.contains_key(&name),
+        "the handle is re-held"
+    );
     sup2.stop(&registry, "orphan", Some(Duration::from_secs(5)))
         .unwrap();
 }
@@ -1542,7 +1564,10 @@ fn adopt_orphans_skips_a_record_whose_lease_is_held_by_a_live_engine_elsewhere()
         0,
         "a record leased to a live engine elsewhere must NOT be adopted"
     );
-    assert!(sup2.running.is_empty(), "no handle may be re-held");
+    assert!(
+        sup2.instances.running.is_empty(),
+        "no handle may be re-held"
+    );
     assert_eq!(
         state_of(&registry, "leased"),
         LifecycleState::Running,
@@ -1581,7 +1606,10 @@ fn adopt_orphans_takes_the_lease_when_adopting_a_dead_owners_record() {
         1,
         "the dead lease turns over"
     );
-    assert!(sup2.running.contains_key(&name), "the handle is re-held");
+    assert!(
+        sup2.instances.running.contains_key(&name),
+        "the handle is re-held"
+    );
     let self_fp = sup2.shared.backend.self_fingerprint().unwrap();
     let after = registry.spawn_record(&name).unwrap().unwrap();
     assert_eq!(
@@ -1636,7 +1664,7 @@ fn adopt_orphans_re_adopts_without_a_new_cas_when_the_lease_already_names_this_p
         1,
         "this process's own lease does not block its own adoption"
     );
-    assert!(sup3.running.contains_key(&name));
+    assert!(sup3.instances.running.contains_key(&name));
     sup3.stop(&registry, "revisit", Some(Duration::from_secs(5)))
         .unwrap();
     drop(sup2); // its adopted handle's teardown on the dead pid is a no-op
@@ -1664,7 +1692,7 @@ fn adopt_orphans_ignores_the_owner_for_a_detached_record() {
         1,
         "a detached record adopts regardless of its owner"
     );
-    assert!(sup2.running.contains_key(&name));
+    assert!(sup2.instances.running.contains_key(&name));
     sup2.stop(&registry, "freebird", Some(Duration::from_secs(5)))
         .unwrap();
 }
@@ -1687,13 +1715,16 @@ fn stop_reacquires_a_live_owners_agent_on_demand_and_really_stops_it() {
 
     let mut sup2 = Supervisor::with_backoff(fast_backoff());
     assert_eq!(sup2.adopt_orphans(&registry), 0);
-    assert!(!sup2.running.contains_key(&name), "no handle from adoption");
+    assert!(
+        !sup2.instances.running.contains_key(&name),
+        "no handle from adoption"
+    );
     let stopped = sup2
         .stop(&registry, "heldsvc", Some(Duration::from_secs(5)))
         .expect("an explicit stop re-acquires the process on demand");
     assert_eq!(stopped.state, LifecycleState::Stopped);
     assert!(
-        !sup2.running.contains_key(&name),
+        !sup2.instances.running.contains_key(&name),
         "the ladder tore the re-held handle down"
     );
     assert_eq!(
@@ -1709,7 +1740,7 @@ fn stop_reacquires_a_live_owners_agent_on_demand_and_really_stops_it() {
 #[test]
 fn supervisor_constructs_empty() {
     let sup = Supervisor::new();
-    assert!(sup.running.is_empty());
+    assert!(sup.instances.running.is_empty());
 }
 
 #[test]
@@ -3317,7 +3348,7 @@ fn a_crashed_detached_agent_restarts_detached_and_the_record_keeps_the_flag() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         sup.poll_once(&registry);
-        if sup.running.is_empty() {
+        if sup.instances.running.is_empty() {
             break;
         }
         assert!(Instant::now() < deadline, "the crash was never reaped");
@@ -3698,16 +3729,16 @@ fn poll_error_streaks_clear_when_a_handle_is_removed() {
     // Clean passes: no entry may survive.
     sup.poll_once(&registry);
     assert!(
-        sup.poll_error_streaks.is_empty(),
+        sup.instances.poll_error_streaks.is_empty(),
         "clean polls leave no streak entry: {:?}",
-        sup.poll_error_streaks
+        sup.instances.poll_error_streaks
     );
     // The crash is reaped; the removed handle leaves no entry behind.
     let _ = wait_for_crash(&mut sup, &registry);
     assert!(
-        sup.poll_error_streaks.is_empty(),
+        sup.instances.poll_error_streaks.is_empty(),
         "a removed handle must leave no streak entry: {:?}",
-        sup.poll_error_streaks
+        sup.instances.poll_error_streaks
     );
 }
 
@@ -3797,7 +3828,7 @@ fn poll_once_handle_specific_poll_failure_wiring_lands_failed_and_removes_the_ha
     let pid = sup
         .shared
         .backend
-        .pid(&sup.running.get(&name).unwrap().handle);
+        .pid(&sup.instances.running.get(&name).unwrap().handle);
     sup.arm_poll_fault(pid);
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -3816,11 +3847,11 @@ fn poll_once_handle_specific_poll_failure_wiring_lands_failed_and_removes_the_ha
         );
     }
     assert!(
-        sup.running.is_empty(),
+        sup.instances.running.is_empty(),
         "the un-pollable handle must be removed from the supervisor"
     );
     assert!(
-        sup.poll_error_streaks.is_empty() && sup.poll_last_errors.is_empty(),
+        sup.instances.poll_error_streaks.is_empty() && sup.instances.poll_last_errors.is_empty(),
         "the removed handle leaves no streak or last-error entry behind"
     );
     // The crash cause carries the full story: the persistent failure AND
@@ -3853,13 +3884,15 @@ fn poll_once_multi_handle_same_tick_failure_is_environmental_and_keeps_handles_a
     let sink = install_capture_sink(&mut sup);
 
     let pid_a = sup.shared.backend.pid(
-        &sup.running
+        &sup.instances
+            .running
             .get(&InstanceName::new("enva").unwrap())
             .unwrap()
             .handle,
     );
     let pid_b = sup.shared.backend.pid(
-        &sup.running
+        &sup.instances
+            .running
             .get(&InstanceName::new("envb").unwrap())
             .unwrap()
             .handle,
@@ -3872,16 +3905,16 @@ fn poll_once_multi_handle_same_tick_failure_is_environmental_and_keeps_handles_a
     }
 
     assert_eq!(
-        sup.running.len(),
+        sup.instances.running.len(),
         2,
         "an environmental failure must keep every handle alive"
     );
     assert_eq!(state_of(&registry, "enva"), LifecycleState::Running);
     assert_eq!(state_of(&registry, "envb"), LifecycleState::Running);
     assert!(
-        sup.poll_error_streaks.is_empty(),
+        sup.instances.poll_error_streaks.is_empty(),
         "no streak may grow on an environmental tick: {:?}",
-        sup.poll_error_streaks
+        sup.instances.poll_error_streaks
     );
     let text = sink_text(&sink);
     assert!(
@@ -4183,7 +4216,7 @@ fn a_failed_ledger_insert_parks_the_cursor_and_retries_exactly_once() {
 
     // (1) Whole-table fault: the drain parks, the diagnostic is audible.
     append_usage_lines(&log, &[(0, 10, 20), (1, 11, 22)]);
-    let cursor_before = sup.running.get(&name).unwrap().usage_cursor;
+    let cursor_before = sup.instances.running.get(&name).unwrap().usage_cursor;
     let conn = rusqlite::Connection::open(&db).unwrap();
     // The FULL schema of `usage_events` — the table AND every index (the
     // dedup index is its own sqlite_master row), tables first.
@@ -4213,7 +4246,7 @@ fn a_failed_ledger_insert_parks_the_cursor_and_retries_exactly_once() {
 
     sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
     assert_eq!(
-        sup.running.get(&name).unwrap().usage_cursor,
+        sup.instances.running.get(&name).unwrap().usage_cursor,
         cursor_before,
         "a failed INSERT must park the drain cursor (AI-41: no silent drop)"
     );
@@ -4250,7 +4283,7 @@ fn a_failed_ledger_insert_parks_the_cursor_and_retries_exactly_once() {
     );
     let log_len = std::fs::metadata(&log).unwrap().len();
     assert_eq!(
-        sup.running.get(&name).unwrap().usage_cursor,
+        sup.instances.running.get(&name).unwrap().usage_cursor,
         log_len,
         "the cursor advances past the block only once every event committed"
     );
@@ -4261,7 +4294,7 @@ fn a_failed_ledger_insert_parks_the_cursor_and_retries_exactly_once() {
     // the committed event as a DuplicateReplay (the UNIQUE dedup key — no
     // double-count) while the failed one finally commits.
     append_usage_lines(&log, &[(2, 1, 2), (3, 3, 4)]);
-    let parked_at = sup.running.get(&name).unwrap().usage_cursor;
+    let parked_at = sup.instances.running.get(&name).unwrap().usage_cursor;
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute(
         "CREATE TRIGGER ai41_fail_second_insert BEFORE INSERT ON usage_events \
@@ -4278,7 +4311,7 @@ fn a_failed_ledger_insert_parks_the_cursor_and_retries_exactly_once() {
         "the first event of the block commits (10+11+1), the second fails"
     );
     assert_eq!(
-        sup.running.get(&name).unwrap().usage_cursor,
+        sup.instances.running.get(&name).unwrap().usage_cursor,
         parked_at,
         "the partial failure must park the cursor before the block (re-drift both)"
     );
@@ -4296,7 +4329,7 @@ fn a_failed_ledger_insert_parks_the_cursor_and_retries_exactly_once() {
              the failed event commits on retry"
     );
     assert_eq!(
-        sup.running.get(&name).unwrap().usage_cursor,
+        sup.instances.running.get(&name).unwrap().usage_cursor,
         std::fs::metadata(&log).unwrap().len(),
         "the cursor advances only once every event is durable"
     );
@@ -4474,7 +4507,7 @@ fn a_post_commit_signal_failure_on_resume_advises_stop_only_and_stop_lands() {
         .unwrap();
     assert_eq!(state_of(&registry, "sigresume"), LifecycleState::Stopped);
     assert!(
-        !sup.running.contains_key(&name),
+        !sup.instances.running.contains_key(&name),
         "the handle must be released by the terminal stop"
     );
 }
@@ -4496,7 +4529,7 @@ fn a_budget_driven_pause_with_no_in_memory_handle_wraps_the_override_in_the_qual
     // Drop the ONLY held handle (its kill-on-drop ends the process; the row
     // still says `running`) — the AI-8 premise: a pause with nothing held
     // to signal.
-    sup.running.remove(&name);
+    sup.instances.running.remove(&name);
     let cause = TransitionCause::budget_exceeded(BreachScope::Cumulative, 15, 30);
     sup.pause_with_cause(&registry, &name, cause).unwrap();
     assert_eq!(state_of(&registry, "ovrwrap"), LifecycleState::Paused);
@@ -4544,7 +4577,7 @@ fn a_failed_terminal_drain_announces_the_lost_batch_to_the_sink() {
     let sink = install_capture_sink(&mut sup);
     let log = registry.agent_output_log_path(&name);
     append_usage_lines(&log, &[(0, 10, 20), (1, 11, 22)]);
-    let cursor_before = sup.running.get(&name).unwrap().usage_cursor;
+    let cursor_before = sup.instances.running.get(&name).unwrap().usage_cursor;
     let db = state.path().join("state.db");
 
     // Sabotage the ledger (drop the table; the full schema is restored
@@ -4582,7 +4615,7 @@ fn a_failed_terminal_drain_announces_the_lost_batch_to_the_sink() {
         "the notice must name the lost COUNT: {text}"
     );
     assert_eq!(
-        sup.running.get(&name).unwrap().usage_cursor,
+        sup.instances.running.get(&name).unwrap().usage_cursor,
         cursor_before,
         "a terminal drain that commits nothing must not advance the cursor"
     );
@@ -4783,13 +4816,15 @@ fn the_environmental_tick_cap_escalates_once_then_resumes_crash_credit() {
     sup.start(&registry, "envcap-a").unwrap();
     sup.start(&registry, "envcap-b").unwrap();
     let pid_a = sup.shared.backend.pid(
-        &sup.running
+        &sup.instances
+            .running
             .get(&InstanceName::new("envcap-a").unwrap())
             .unwrap()
             .handle,
     );
     let pid_b = sup.shared.backend.pid(
-        &sup.running
+        &sup.instances
+            .running
             .get(&InstanceName::new("envcap-b").unwrap())
             .unwrap()
             .handle,
@@ -4902,13 +4937,18 @@ fn the_self_reported_park_gives_up_after_max_attempts_and_skips_loudly() {
     )
     .unwrap();
     drop(conn);
-    let cursor_at_fault = sup.running.get(&name).unwrap().usage_cursor;
+    let cursor_at_fault = sup.instances.running.get(&name).unwrap().usage_cursor;
 
     // Three consecutive drains AT THE SAME cursor: park, park, and the THIRD
     // gives up (attempts >= USAGE_PARK_MAX_ATTEMPTS on that pass).
     for pass in 1..USAGE_PARK_MAX_ATTEMPTS {
         sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
-        let parked = sup.running.get(&name).unwrap().usage_park_attempts;
+        let parked = sup
+            .instances
+            .running
+            .get(&name)
+            .unwrap()
+            .usage_park_attempts;
         assert_eq!(
             parked,
             Some((cursor_at_fault, pass)),
@@ -4936,7 +4976,11 @@ fn the_self_reported_park_gives_up_after_max_attempts_and_skips_loudly() {
     assert!(text.contains("5 usage event(s)"), "{text}");
     assert!(text.contains("byte offset 0"), "{text}");
     assert_eq!(
-        sup.running.get(&name).unwrap().usage_park_attempts,
+        sup.instances
+            .running
+            .get(&name)
+            .unwrap()
+            .usage_park_attempts,
         None,
         "the park state must clear once the cursor moved past the block"
     );
@@ -5030,7 +5074,7 @@ fn crash_cause_for_a_signal_death_says_signal_without_inventing_a_code() {
     sup.start(&registry, "sigdeath").unwrap();
     let name = InstanceName::new("sigdeath").unwrap();
     {
-        let supervised = sup.running.get_mut(&name).unwrap();
+        let supervised = sup.instances.running.get_mut(&name).unwrap();
         sup.shared
             .backend
             .stop(&mut supervised.handle, Duration::from_secs(5))
@@ -5088,7 +5132,7 @@ fn persistent_poll_failure_with_a_live_sibling_handle_names_no_sole_handle() {
     let pid = sup
         .shared
         .backend
-        .pid(&sup.running.get(&lone).unwrap().handle);
+        .pid(&sup.instances.running.get(&lone).unwrap().handle);
     sup.arm_poll_fault(pid);
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -5108,7 +5152,10 @@ fn persistent_poll_failure_with_a_live_sibling_handle_names_no_sole_handle() {
     }
     // The sibling survives the whole episode.
     assert_eq!(state_of(&registry, "sib"), LifecycleState::Running);
-    assert!(sup.running.contains_key(&InstanceName::new("sib").unwrap()));
+    assert!(sup
+        .instances
+        .running
+        .contains_key(&InstanceName::new("sib").unwrap()));
     // The cause names the persistent failure and the last error, but NOT the
     // only-held-handle caveat — a sibling WAS held.
     let events = Supervisor::read_events(&registry, "lone").unwrap();
@@ -5146,7 +5193,7 @@ fn poll_once_drops_the_handle_when_the_instance_row_is_gone_mid_crash() {
     // One clean poll first: the process may have exited before we removed
     // the row; only proceed while the handle is still held.
     let _ = sup.poll_once(&registry);
-    if !sup.running.contains_key(&name) {
+    if !sup.instances.running.contains_key(&name) {
         // It already crashed under us — restart it for a deterministic leg.
         sup.start(&registry, "ghostrow").unwrap();
     }
@@ -5156,7 +5203,7 @@ fn poll_once_drops_the_handle_when_the_instance_row_is_gone_mid_crash() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let _ = sup.poll_once(&registry);
-        if !sup.running.contains_key(&name) {
+        if !sup.instances.running.contains_key(&name) {
             break;
         }
         assert!(
@@ -5167,7 +5214,7 @@ fn poll_once_drops_the_handle_when_the_instance_row_is_gone_mid_crash() {
     // The row-gone arm leaves NO transition events on a deleted row (the
     // remove already took them) and no streak residue.
     assert!(
-        sup.poll_error_streaks.is_empty() && sup.poll_last_errors.is_empty(),
+        sup.instances.poll_error_streaks.is_empty() && sup.instances.poll_last_errors.is_empty(),
         "the dropped handle must leave no streak or last-error bookkeeping"
     );
     let lookup = registry.lookup(&name);
@@ -5664,7 +5711,7 @@ fn the_release_pass_reconciles_an_already_dead_paused_child() {
     // The child dies while the row reads paused (a suspended process killed
     // by signal — the release-time discovery premise).
     let pid = {
-        let supervised = sup.running.get(&name).unwrap();
+        let supervised = sup.instances.running.get(&name).unwrap();
         sup.shared.backend.pid(&supervised.handle)
     };
     test_kill_pid(pid);
@@ -5672,7 +5719,7 @@ fn the_release_pass_reconciles_an_already_dead_paused_child() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let exited = {
-            let supervised = sup.running.get_mut(&name).unwrap();
+            let supervised = sup.instances.running.get_mut(&name).unwrap();
             sup.shared
                 .backend
                 .poll(&mut supervised.handle)
@@ -6319,7 +6366,7 @@ fn metadata_unlink_covers_the_crash_reap_path_too() {
     // EXTERNAL kill (the backend's stop, OUTSIDE the lifecycle): no stop
     // path runs, so the reaper's crash reap is the only cleanup left.
     {
-        let supervised = sup.running.get_mut(&name).unwrap();
+        let supervised = sup.instances.running.get_mut(&name).unwrap();
         sup.shared
             .backend
             .stop(&mut supervised.handle, Duration::from_secs(2))
@@ -6745,6 +6792,7 @@ fn setup_detached_absent_liveness(
 /// The held handle's pid (the seam key — the backend fronts faults by pid).
 fn held_pid(sup: &Supervisor, name: &InstanceName) -> u32 {
     let handle = &sup
+        .instances
         .running
         .get(name)
         .unwrap_or_else(|| panic!("{name} must be held"))
@@ -8139,7 +8187,7 @@ fn the_budget_evaluation_commit_failure_is_surfaced_and_records_no_breach() {
     // input (`pipeline::evaluate`'s first guard), so both evaluations below
     // must run against the started Run's chain to mean anything.
     sup.start(&registry, "evalfault").unwrap();
-    let run_id = sup.running.get(&name).unwrap().run_id.clone();
+    let run_id = sup.instances.running.get(&name).unwrap().run_id.clone();
 
     sup.enforce_budget(&registry, &name, &run_id, "engine-observed");
 
@@ -9872,7 +9920,7 @@ fn a_relaunch_does_not_re_apply_a_breach_the_operator_raised_away() {
     // does — bounded.
     sup.resume(&registry, "rununlatch").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while sup.running.contains_key(&name) {
+    while sup.instances.running.contains_key(&name) {
         sup.poll_once(&registry);
         assert!(Instant::now() < deadline, "the crash was never detected");
         std::thread::sleep(Duration::from_millis(20));

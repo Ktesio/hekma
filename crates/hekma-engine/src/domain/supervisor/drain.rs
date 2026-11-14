@@ -565,7 +565,7 @@ impl Supervisor {
                         ));
                         return Err(err);
                     }
-                    if let Some(supervised) = self.running.get_mut(&name) {
+                    if let Some(supervised) = self.instances.running.get_mut(&name) {
                         supervised.cooperatively_paused = true;
                     }
                 }
@@ -617,7 +617,7 @@ impl Supervisor {
                     // never a fabricated completion. No handle held (the
                     // adopted-no-handle shape) → nothing to poll — the file
                     // poll alone stands.
-                    let child_ended = match self.running.get_mut(&name) {
+                    let child_ended = match self.instances.running.get_mut(&name) {
                         Some(supervised) => matches!(
                             self.shared.backend.poll(&mut supervised.handle),
                             Ok(status) if status.is_exited()
