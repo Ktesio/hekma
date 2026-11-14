@@ -887,3 +887,26 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-24-1-one-shim-per-supervised-process.md` (Phase 2: ACP stdio across a restart)
   summary: shim-rpc v1 has `write_stdin` but no `subscribe_stdout` push frames yet, so an ACP session's stdout cannot ride a Shim.
   evidence: `crates/hekma-engine/src/shim/proto.rs`. Trigger: phase 2 (the ACP backend moving onto the Shim).
+
+## From spec-24-4 (scale substrate) — phase 1 build, 2026-11-14
+
+- source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (Phase 2)
+  summary: The delta-log snapshot publisher, the `--run-scale` benchmark with its CI step, and the listing's scale fixes (covering count index, selector arms on the partial indexes, the reader pool, the off-guard log reads) are not built yet.
+  evidence: `crates/hekma-engine/src/domain/runs/snapshot.rs` (`RunSnapshot::with` still clones). Trigger: phase 2 of the story (next build).
+
+- source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (Phase 3)
+  summary: AD-18 Steps 0–4 (the `EnginePaths` hoist, `TimedMutex`, named scopes with the debt ratchet, the `StoreGate` splits, `SupervisorShared`/`InstanceState`) are not built yet.
+  evidence: `crates/hekma-engine/src/engine.rs` (bare `.lock()` sites). Trigger: phase 3 of the story.
+
+- source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (O2: usage events at compaction)
+  summary: Compaction keeps a Run's `usage_events` rows until O2 is ruled; deleting them would also change what the event resync replays for an instance.
+  evidence: `crates/hekma-engine/src/store/retention_sqlite.rs` (`compact_one`). Trigger: Islam's O2 ruling.
+
+- source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (the compacted read over the API)
+  summary: `GET /v0/runs/{id}` answers 404 for a compacted Run; only `hekma run show` and `Engine::compacted_run` read the summary.
+  evidence: `crates/hekma-host/src/control/routes.rs`. Trigger: a Host asking for compacted Runs over the API.
+
+- source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (Design: new deferrals)
+  summary: Outbox and export retention at Run scale; a calls-file size cap (with names that sort after the day's first file); `ANALYZE`, which the engine never runs.
+  evidence: the spec's Design Notes. Trigger: a Host report of outbox growth or of a daily calls file above a stated size; the Run-scale ladder showing a planner miss.
+

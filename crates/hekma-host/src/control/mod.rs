@@ -323,6 +323,11 @@ fn router(state: ApiState) -> Router {
             "/v0/proxy",
             get(routes::proxy_show).patch(routes::proxy_update),
         )
+        // Story 24-4: the retention windows and the compaction state.
+        .route(
+            "/v0/retention",
+            get(routes::retention_show).put(routes::retention_update),
+        )
         // Live events (SSE).
         .route("/v0/events", get(sse::live_events))
         // The ephemeral-host export surface (story 17-4): the global outbox

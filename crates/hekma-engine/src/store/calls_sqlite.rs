@@ -1,8 +1,11 @@
 //! The per-call records store (story 23-1, spine AD-26 / AD-27).
 //!
 //! `<state-dir>/calls/` holds SQLite segment files named by their UTC
-//! creation date. This story creates the first and writes only it (rotation,
-//! retention and drop-whole come later, on the same naming). The segment is
+//! creation date. The writer writes one, the head: it rolls to a new
+//! `<UTC date>.db` between batches when the date changes (story 24-4),
+//! carrying this process's still-open calls with it, so a call's start and
+//! its close land in one file. Files past the calls retention window are
+//! deleted whole, never one holding an open call. The head is
 //! ATTACHed to the store writer's connection as `calls`, so a writer batch
 //! commits state.db and the calls store together — atomic per file under
 //! WAL, not across files, which the open-time closure below accounts for.
@@ -169,7 +172,139 @@ fn opt_i64(value: Option<u64>) -> Option<i64> {
 impl super::SqliteStore {
     /// Attach the calls store to this (writer) connection.
     pub(crate) fn attach_calls(&self, segment: Option<&Path>) -> Result<(), StoreError> {
-        attach(self.conn(), segment)
+        attach(self.conn(), segment)?;
+        let mut head = self.calls_head.lock().unwrap_or_else(|p| p.into_inner());
+        *head = CallsHead {
+            path: segment.map(Path::to_path_buf),
+            retry_at: None,
+        };
+        Ok(())
+    }
+
+    /// Roll the head segment when the UTC date has moved past its name
+    /// (story 24-4). Runs between writer batches. This process's open calls
+    /// move to the new head (copied, then deleted from the old file, so a
+    /// crash in between leaves a copy the next open absorbs); another
+    /// owner's stay where its own close will find them. A failure keeps
+    /// writing the old head and retries a minute later.
+    pub(crate) fn rotate_calls_if_due(&self) {
+        let today = crate::time::now_rfc3339();
+        let Some(today) = today.get(..10) else {
+            return;
+        };
+        self.rotate_calls_to(today);
+    }
+
+    /// [`Self::rotate_calls_if_due`] for a given date (the test seam).
+    pub(crate) fn rotate_calls_to(&self, today: &str) -> Option<PathBuf> {
+        let mut head = self.calls_head.lock().unwrap_or_else(|p| p.into_inner());
+        let current = head.path.clone()?;
+        let date = crate::domain::runs::retention::segment_date(&current)?;
+        if date.as_str() >= today {
+            return None;
+        }
+        if head
+            .retry_at
+            .is_some_and(|at| std::time::Instant::now() < at)
+        {
+            return None;
+        }
+        let next = current.with_file_name(format!("{today}.db"));
+        match self.roll_head(&current, &next) {
+            Ok(()) => {
+                *head = CallsHead {
+                    path: Some(next.clone()),
+                    retry_at: None,
+                };
+                Some(next)
+            }
+            Err(_) => {
+                head.retry_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+                None
+            }
+        }
+    }
+
+    fn roll_head(&self, current: &Path, next: &Path) -> Result<(), StoreError> {
+        let mine = i64::from(std::process::id());
+        let carried = read_open_rows(self.conn(), "calls.open_calls", Some(mine))?;
+        self.conn()
+            .execute("DETACH DATABASE calls", [])
+            .map_err(backend)?;
+        if let Err(err) = attach(self.conn(), Some(next)) {
+            // Keep writing the old head rather than none.
+            let _ = attach(self.conn(), Some(current));
+            return Err(err);
+        }
+        // The new head is attached now, so the roll has happened whatever
+        // follows. A carry that fails leaves the rows in the old file, where
+        // the next open's absorption finds them once this process is gone.
+        if !carried.is_empty()
+            && insert_open_rows(self.conn(), "calls.open_calls", &carried).is_ok()
+        {
+            if let Ok(old) = Connection::open(current) {
+                let _ = delete_open_rows(&old, "open_calls", &carried);
+            }
+        }
+        Ok(())
+    }
+
+    /// Move the open calls a dead owner left in segments other than the
+    /// head into the head (story 24-4), so the open-time closure closes
+    /// them. A live owner's rows, and rows whose owner cannot be told, stay
+    /// put. Returns how many moved.
+    pub(crate) fn absorb_open_calls(
+        &self,
+        calls_dir: &Path,
+        alive: &dyn Fn(&ProcessFingerprint) -> Option<bool>,
+    ) -> Result<u64, StoreError> {
+        let head = self
+            .calls_head
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .path
+            .clone();
+        let Some(head) = head else {
+            return Ok(0);
+        };
+        let mut moved = 0;
+        for segment in segment_files(calls_dir)? {
+            if segment == head {
+                continue;
+            }
+            let conn = Connection::open(&segment).map_err(backend)?;
+            let has_table: bool = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'open_calls')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(backend)?;
+            if !has_table {
+                continue;
+            }
+            let rows: Vec<OpenRow> = read_open_rows(&conn, "open_calls", None)?
+                .into_iter()
+                .filter(|row| row.owner_dead(alive))
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            insert_open_rows(self.conn(), "calls.open_calls", &rows)?;
+            delete_open_rows(&conn, "open_calls", &rows)?;
+            moved += rows.len() as u64;
+        }
+        Ok(moved)
+    }
+
+    /// The head segment's path (`None` for an in-memory segment).
+    pub(crate) fn calls_head_path(&self) -> Option<PathBuf> {
+        self.calls_head
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .path
+            .clone()
     }
 
     /// Insert a call-start record (`open_calls`). A replay (same call id)
@@ -375,6 +510,186 @@ impl super::SqliteStore {
             .ok()
             .flatten()
     }
+}
+
+/// The writer's head segment and when a failed roll may be retried.
+#[derive(Debug, Default)]
+pub(crate) struct CallsHead {
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) retry_at: Option<std::time::Instant>,
+}
+
+/// One `open_calls` row, as rotation and absorption move it.
+#[derive(Clone, Debug)]
+struct OpenRow {
+    call_id: String,
+    run_id: String,
+    token_id: Option<String>,
+    control_depth: String,
+    binding: Option<String>,
+    started_at: String,
+    owner_pid: Option<i64>,
+    owner_start_time: Option<i64>,
+}
+
+impl OpenRow {
+    fn owner_dead(&self, alive: &dyn Fn(&ProcessFingerprint) -> Option<bool>) -> bool {
+        match (self.owner_pid, self.owner_start_time) {
+            (Some(pid), Some(start_time)) => {
+                let fingerprint = ProcessFingerprint::new(
+                    u32::try_from(pid).unwrap_or(u32::MAX),
+                    start_time.max(0) as u64,
+                );
+                alive(&fingerprint) == Some(false)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn read_open_rows(
+    conn: &Connection,
+    table: &str,
+    owner_pid: Option<i64>,
+) -> Result<Vec<OpenRow>, StoreError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT call_id, run_id, token_id, control_depth, binding, started_at, owner_pid, \
+             owner_start_time FROM {table} WHERE ?1 IS NULL OR owner_pid = ?1 ORDER BY call_id"
+        ))
+        .map_err(backend)?;
+    let rows = stmt
+        .query_map([owner_pid], |row| {
+            Ok(OpenRow {
+                call_id: row.get(0)?,
+                run_id: row.get(1)?,
+                token_id: row.get(2)?,
+                control_depth: row.get(3)?,
+                binding: row.get(4)?,
+                started_at: row.get(5)?,
+                owner_pid: row.get(6)?,
+                owner_start_time: row.get(7)?,
+            })
+        })
+        .map_err(backend)?;
+    rows.collect::<Result<_, _>>().map_err(backend)
+}
+
+fn insert_open_rows(conn: &Connection, table: &str, rows: &[OpenRow]) -> Result<(), StoreError> {
+    for row in rows {
+        conn.execute(
+            &format!(
+                "INSERT OR IGNORE INTO {table} (call_id, run_id, token_id, control_depth, \
+                 binding, started_at, owner_pid, owner_start_time) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            ),
+            rusqlite::params![
+                row.call_id,
+                row.run_id,
+                row.token_id,
+                row.control_depth,
+                row.binding,
+                row.started_at,
+                row.owner_pid,
+                row.owner_start_time
+            ],
+        )
+        .map_err(backend)?;
+    }
+    Ok(())
+}
+
+fn delete_open_rows(conn: &Connection, table: &str, rows: &[OpenRow]) -> Result<(), StoreError> {
+    for row in rows {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE call_id = ?1"),
+            [&row.call_id],
+        )
+        .map_err(backend)?;
+    }
+    Ok(())
+}
+
+/// The `calls/*.db` files, oldest name first.
+fn segment_files(calls_dir: &Path) -> Result<Vec<PathBuf>, StoreError> {
+    let entries = match std::fs::read_dir(calls_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(StoreError::Backend(format!(
+                "could not read the calls directory {}: {err}",
+                calls_dir.display()
+            )))
+        }
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "db"))
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
+/// Delete whole every calls file dated before `cutoff_date` (`YYYY-MM-DD`)
+/// that is not `head` and holds no open call (story 24-4): checkpoint it,
+/// then remove the `.db` with its `-wal` and `-shm`. A file that cannot be
+/// opened or removed now is left for the next pass. Returns how many went.
+pub(crate) fn drop_expired_segments(
+    calls_dir: &Path,
+    head: Option<&Path>,
+    cutoff_date: &str,
+) -> u64 {
+    let Ok(segments) = segment_files(calls_dir) else {
+        return 0;
+    };
+    let mut dropped = 0;
+    for segment in segments {
+        if head.is_some_and(|head| head == segment) {
+            continue;
+        }
+        let Some(date) = crate::domain::runs::retention::segment_date(&segment) else {
+            continue;
+        };
+        if date.as_str() >= cutoff_date {
+            continue;
+        }
+        let Ok(conn) = Connection::open(&segment) else {
+            continue;
+        };
+        // A file with no `open_calls` table (never written) holds none; the
+        // count is read only when the table exists (SQLite resolves a table
+        // name when the statement is prepared, whichever branch runs).
+        let has_table = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'open_calls')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(true);
+        let open: i64 = if has_table {
+            conn.query_row("SELECT COUNT(*) FROM open_calls", [], |row| row.get(0))
+                .unwrap_or(-1)
+        } else {
+            0
+        };
+        if open != 0 {
+            continue;
+        }
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        drop(conn);
+        let removed = std::fs::remove_file(&segment);
+        if removed.is_err() && segment.exists() {
+            continue;
+        }
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = segment.clone().into_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(sidecar));
+        }
+        dropped += 1;
+    }
+    dropped
 }
 
 /// The stored depth string back as the static name a record carries.
@@ -613,5 +928,151 @@ mod tests {
             assert_eq!(depth_str(depth), depth);
         }
         assert_eq!(depth_str("bogus"), "observed");
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use crate::domain::calls::CallStart;
+    use crate::store::SqliteStore;
+
+    fn start(call_id: &str, pid: u32) -> CallStart {
+        CallStart {
+            call_id: call_id.to_string(),
+            run_id: RunId::from_wire("run_R".to_string()),
+            token_id: None,
+            control_depth: "announced",
+            binding: None,
+            started_at: "2026-11-13T23:59:59Z".to_string(),
+            owner: Some(ProcessFingerprint::new(pid, 42)),
+        }
+    }
+
+    fn open_ids(path: &Path) -> Vec<String> {
+        let conn = Connection::open(path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT call_id FROM open_calls ORDER BY call_id")
+            .unwrap();
+        let ids = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        ids
+    }
+
+    #[test]
+    fn the_head_rolls_on_the_date_and_carries_only_this_processes_open_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        std::fs::create_dir_all(&calls).unwrap();
+        let store = SqliteStore::open(&dir.path().join("state.db")).unwrap();
+        let old = calls.join("2026-11-13.db");
+        store.attach_calls(Some(&old)).unwrap();
+        store
+            .insert_open_call(&start("call_MINE", std::process::id()))
+            .unwrap();
+        store.insert_open_call(&start("call_THEIRS", 1)).unwrap();
+        assert_eq!(store.rotate_calls_to("2026-11-13"), None, "not due");
+        let new = store.rotate_calls_to("2026-11-14").expect("rolled");
+        assert_eq!(new, calls.join("2026-11-14.db"));
+        assert_eq!(store.calls_head_path(), Some(new.clone()));
+        assert_eq!(open_ids(&new), vec!["call_MINE".to_string()]);
+        assert_eq!(open_ids(&old), vec!["call_THEIRS".to_string()]);
+        assert_eq!(store.rotate_calls_to("2026-11-14"), None);
+        // An in-memory head never rolls.
+        let memory = SqliteStore::open(&dir.path().join("other.db")).unwrap();
+        memory.attach_calls(None).unwrap();
+        assert_eq!(memory.rotate_calls_to("2099-01-01"), None);
+        assert_eq!(memory.calls_head_path(), None);
+    }
+
+    #[test]
+    fn a_failed_roll_keeps_the_old_head_and_waits_before_retrying() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        std::fs::create_dir_all(&calls).unwrap();
+        let store = SqliteStore::open(&dir.path().join("state.db")).unwrap();
+        let old = calls.join("2026-11-13.db");
+        store.attach_calls(Some(&old)).unwrap();
+        // A directory where the new file would go: the attach fails.
+        std::fs::create_dir_all(calls.join("2026-11-14.db")).unwrap();
+        assert_eq!(store.rotate_calls_to("2026-11-14"), None);
+        assert_eq!(store.calls_head_path(), Some(old.clone()));
+        store.insert_open_call(&start("call_AFTER", 7)).unwrap();
+        assert_eq!(open_ids(&old), vec!["call_AFTER".to_string()]);
+        // Inside the retry wait nothing is tried.
+        std::fs::remove_dir(calls.join("2026-11-14.db")).unwrap();
+        assert_eq!(store.rotate_calls_to("2026-11-14"), None);
+    }
+
+    #[test]
+    fn a_dead_owners_open_calls_in_older_files_move_to_the_head_and_a_live_ones_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        std::fs::create_dir_all(&calls).unwrap();
+        let older = calls.join("2026-11-12.db");
+        {
+            let seed = SqliteStore::open(&dir.path().join("seed.db")).unwrap();
+            seed.attach_calls(Some(&older)).unwrap();
+            seed.insert_open_call(&start("call_DEAD", 111)).unwrap();
+            seed.insert_open_call(&start("call_LIVE", 222)).unwrap();
+        }
+        std::fs::write(calls.join("notes.txt"), "not a segment").unwrap();
+        let store = SqliteStore::open(&dir.path().join("state.db")).unwrap();
+        let head = calls.join("2026-11-14.db");
+        store.attach_calls(Some(&head)).unwrap();
+        let alive = |f: &ProcessFingerprint| Some(f.pid == 222);
+        assert_eq!(store.absorb_open_calls(&calls, &alive).unwrap(), 1);
+        assert_eq!(open_ids(&head), vec!["call_DEAD".to_string()]);
+        assert_eq!(open_ids(&older), vec!["call_LIVE".to_string()]);
+        assert_eq!(store.absorb_open_calls(&calls, &alive).unwrap(), 0);
+        // With no head there is nothing to absorb into.
+        let memory = SqliteStore::open(&dir.path().join("memory.db")).unwrap();
+        memory.attach_calls(None).unwrap();
+        assert_eq!(memory.absorb_open_calls(&calls, &alive).unwrap(), 0);
+        assert_eq!(
+            store
+                .absorb_open_calls(&dir.path().join("missing"), &alive)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn files_past_the_window_go_whole_unless_they_hold_an_open_call_or_are_the_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        std::fs::create_dir_all(&calls).unwrap();
+        let make = |name: &str, open: bool| {
+            let path = calls.join(name);
+            let seed = SqliteStore::open(&dir.path().join(format!("{name}.state"))).unwrap();
+            seed.attach_calls(Some(&path)).unwrap();
+            if open {
+                seed.insert_open_call(&start("call_OPEN", 1)).unwrap();
+            }
+            path
+        };
+        let expired = make("2026-11-01.db", false);
+        // A file never written (no tables at all) goes too.
+        drop(Connection::open(calls.join("2026-11-03.db")).unwrap());
+        let busy = make("2026-11-02.db", true);
+        let recent = make("2026-11-10.db", false);
+        let head = make("2026-10-01.db", false);
+        std::fs::write(calls.join("2026-11-01.db-wal"), b"").unwrap();
+        std::fs::write(calls.join("notes.db"), b"").unwrap();
+        let dropped = drop_expired_segments(&calls, Some(&head), "2026-11-07");
+        assert_eq!(dropped, 2);
+        assert!(!calls.join("2026-11-03.db").exists());
+        assert!(!expired.exists());
+        assert!(!calls.join("2026-11-01.db-wal").exists());
+        assert!(busy.exists() && recent.exists() && head.exists());
+        assert!(calls.join("notes.db").exists(), "not a dated file");
+        assert_eq!(drop_expired_segments(&calls, Some(&head), "2026-11-07"), 0);
+        assert_eq!(
+            drop_expired_segments(&dir.path().join("missing"), None, "2026-11-07"),
+            0
+        );
     }
 }

@@ -185,6 +185,12 @@ pub use domain::{
     RunSummary, ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT,
     RUN_LISTING_SCHEMA_VERSION,
 };
+// Story 24-4: the retention windows, the compaction state and what a
+// compacted Run keeps.
+pub use domain::runs::retention::{
+    CompactedRun, CompactionState, RetentionChange, RetentionError, RetentionSettings,
+    RetentionView, RETENTION_DEFAULT_DAYS, RETENTION_MAX_DAYS, RETENTION_MIN_DAYS,
+};
 // The per-call read surface over the calls store: the query, the record,
 // the listing and its document, the forward-compatible enums, the cursor
 // wrappers, the error surface, and the helpers the surfaces share.

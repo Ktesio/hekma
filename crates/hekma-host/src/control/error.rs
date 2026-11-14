@@ -550,6 +550,20 @@ impl From<hekma_engine::BindingError> for ApiError {
     }
 }
 
+impl From<hekma_engine::RetentionError> for ApiError {
+    fn from(err: hekma_engine::RetentionError) -> Self {
+        let message = err.to_string();
+        match err {
+            hekma_engine::RetentionError::Invalid { .. } => {
+                let mut error = Self::new(ApiErrorKind::InvalidBody, message);
+                error.code = Some("invalid-retention");
+                error
+            }
+            hekma_engine::RetentionError::Store(_) => Self::new(ApiErrorKind::Internal, message),
+        }
+    }
+}
+
 impl From<ConfigError> for ApiError {
     fn from(err: ConfigError) -> Self {
         let encoded = crate::wire::encode_config(&err);

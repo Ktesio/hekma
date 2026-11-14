@@ -1356,6 +1356,36 @@ pub(crate) struct ProxySettingsRequest {
     pub identity_headers: bool,
 }
 
+/// `GET`/`PUT /v0/retention` (story 24-4): the two windows and what the
+/// compaction passes have done.
+#[derive(Serialize)]
+pub(crate) struct RetentionDocument {
+    pub schema_version: u32,
+    pub settings: hekma_engine::RetentionSettings,
+    pub compaction: hekma_engine::CompactionState,
+}
+
+impl RetentionDocument {
+    pub(crate) fn of(view: hekma_engine::RetentionView) -> Self {
+        RetentionDocument {
+            schema_version: CONTROL_API_SCHEMA_VERSION,
+            settings: view.settings,
+            compaction: view.compaction,
+        }
+    }
+}
+
+/// The `PUT /v0/retention` body (story 24-4): either window, in days.
+/// Unknown fields are refused, so a typo never reads as a no-op.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetentionRequest {
+    #[serde(default)]
+    pub run_retention_days: Option<u32>,
+    #[serde(default)]
+    pub calls_retention_days: Option<u32>,
+}
+
 /// The `POST /v0/bindings/{name}/credentials` body: the class to issue
 /// (`announce` or `proxy-access`).
 #[derive(Deserialize, Default)]

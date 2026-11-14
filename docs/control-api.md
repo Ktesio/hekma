@@ -549,6 +549,26 @@ write. A change commits one `labels-changed` Run
 event; repeating it changes nothing and emits nothing.
 `GET /v0/runs/{id}/labels` answers `{"schema_version": 1, "run_id", "labels"}`.
 
+### Retention
+
+`GET /v0/retention` reads the two retention windows and what compaction has
+done; `PUT /v0/retention` changes either window. Operator bearer only.
+
+```json
+{
+  "schema_version": 1,
+  "settings": {"run_retention_days": 7, "calls_retention_days": 7, "updated_at": "2026-11-14T09:00:00Z"},
+  "compaction": {"last_pass_at": "2026-11-14T09:00:01Z", "runs_compacted": 12, "segments_dropped": 1}
+}
+```
+
+The `PUT` body names `run_retention_days`, `calls_retention_days` or both
+(unknown fields are refused). A window outside 1 to 3650 days, or a body
+that names neither, is `400` with code `invalid-retention`; a wrong type is
+`422`. `updated_at` is absent until a window is first set, and
+`last_pass_at` until the first pass. The Run window is the listing's
+ended-Run window and the compaction cutoff (see [Runs](runs.md#retention)).
+
 ### Lifecycle verbs on a Run
 
 `POST /v0/runs/{id}/stop`, `/pause`, `/resume` and `/drain` act on the Run

@@ -154,6 +154,16 @@ Examples:
   hekma label set --selector team=core,env=prod tier=gold --dry-run
   hekma label remove --selector team=core tier --yes";
 
+const RETENTION_AFTER_HELP: &str = "\
+Details:
+  With no option, prints both windows and what compaction has done; it reads
+  the state directory and starts nothing. An ended Run is kept in full for the
+  Run window (7 days unless set), then reduced to its usage totals, labels and
+  end cause; a Run with an open descendant waits for it. Per-call records are
+  kept for the calls window (7 days unless set), then their file is deleted
+  whole. A change goes through the local Service Host, which compacts once a
+  day and when it starts.";
+
 const SET_VERB_AFTER_HELP: &str = "\
 Details:
   The target is an agent, a run id, or --selector key=value[,key=value...],
@@ -634,6 +644,19 @@ enum RunCommands {
         /// The run id
         run_id: String,
         /// Print the Run as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show or change how long ended Runs and per-call records are kept
+    #[command(after_help = RETENTION_AFTER_HELP)]
+    Retention {
+        /// Keep ended Runs in full for this many days, then compact them (1-3650)
+        #[arg(long, value_name = "DAYS", value_parser = clap::value_parser!(u32).range(1..=3650))]
+        runs: Option<u32>,
+        /// Keep per-call records for this many days, then delete their file (1-3650)
+        #[arg(long, value_name = "DAYS", value_parser = clap::value_parser!(u32).range(1..=3650))]
+        calls: Option<u32>,
+        /// Print the settings as JSON
         #[arg(long)]
         json: bool,
     },
@@ -1553,6 +1576,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 timeout_ms: None,
             }),
             RunCommands::Show { run_id, json } => cli::run::show(&run_id, json),
+            RunCommands::Retention { runs, calls, json } => cli::run::retention(runs, calls, json),
             RunCommands::Keys { run_id, json } => cli::run::keys(&run_id, json),
             RunCommands::RevokeKeys {
                 run_id,

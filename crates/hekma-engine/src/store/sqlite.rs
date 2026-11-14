@@ -116,7 +116,7 @@ use crate::ports::{
 /// `proxy_state.identity_headers` (the root, on by default) and
 /// `run_bindings.identity_headers` (the per-binding override) — see
 /// [`super::runs_sqlite`].
-pub(crate) const SCHEMA_VERSION: i64 = 23;
+pub(crate) const SCHEMA_VERSION: i64 = 24;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -399,6 +399,9 @@ pub(crate) const BUSY_TIMEOUT_MS: u64 = 5_000;
 /// the engine goes async and blocking DB calls move to a blocking pool.
 pub struct SqliteStore {
     conn: Connection,
+    /// Story 24-4: the calls segment this (writer) connection has attached,
+    /// so the writer can roll it on the UTC date boundary.
+    pub(super) calls_head: std::sync::Mutex<super::calls_sqlite::CallsHead>,
 }
 
 /// The import notes a v12 upgrade produced (story 21-1): legacy event-file
@@ -432,7 +435,13 @@ impl SqliteStore {
         // Fold any usage row another writer left unfolded (an older engine
         // still running against this database after the upgrade).
         in_immediate_txn(&conn, || super::run_store_sqlite::fold_unfolded_rows(&conn))?;
-        Ok((Self { conn }, notes))
+        Ok((
+            Self {
+                conn,
+                calls_head: Default::default(),
+            },
+            notes,
+        ))
     }
 
     /// Open the Registry's READ-ONLY connection (story 21-1, AD-27): the DB
@@ -444,7 +453,10 @@ impl SqliteStore {
         Self::configure(&conn)?;
         conn.pragma_update(None, "query_only", "ON")
             .map_err(backend)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            calls_head: Default::default(),
+        })
     }
 
     /// Open a database for a READ-ONLY engine (story 21-4,
@@ -478,7 +490,10 @@ impl SqliteStore {
                 current: SCHEMA_VERSION,
             });
         }
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            calls_head: Default::default(),
+        })
     }
 
     /// The empty fleet a READ-ONLY engine reads when no state database exists
@@ -489,7 +504,10 @@ impl SqliteStore {
         migrate(&conn, &NoLegacy, &super::runs_sqlite::NoBreachDefault)?;
         conn.pragma_update(None, "query_only", "ON")
             .map_err(backend)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            calls_head: Default::default(),
+        })
     }
 
     /// The connection, for the sibling Run-scale implementation.
@@ -503,7 +521,10 @@ impl SqliteStore {
         let conn = Connection::open_in_memory().map_err(backend)?;
         Self::configure(&conn)?;
         migrate(&conn, &NoLegacy, &super::runs_sqlite::NoBreachDefault)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            calls_head: Default::default(),
+        })
     }
 
     /// Apply the AD-6 connection pragmas.
@@ -789,6 +810,12 @@ fn migrate(
     // step, one-way, no backfill: the root reads on, every binding inherits).
     if version < 23 {
         super::runs_sqlite::migrate_v23(conn)?;
+    }
+    // Story 24-4: v24 adds the retention windows, the compaction state and
+    // the compacted Runs (one crash-atomic step, one-way, no backfill: no
+    // row reads as the 7-day defaults).
+    if version < 24 {
+        super::retention_sqlite::migrate_v24(conn)?;
     }
     Ok(notes)
 }
