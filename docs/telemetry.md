@@ -1,6 +1,6 @@
 ---
 title: Telemetry export (OTLP)
-description: The opt-in OTLP/HTTP+JSON metrics exporter — the versioned otlp-metrics v1 exposition, its configuration flags, the estimate honesty rule, and the drop/diagnostic behavior.
+description: The opt-in OTLP/HTTP+JSON metrics exporter — the versioned otlp-metrics v2 exposition (and the deprecated v1), its configuration flags, https collectors, the estimate honesty rule, and the drop/diagnostic behavior.
 ---
 
 # Telemetry export (OTLP)
@@ -20,7 +20,8 @@ The privacy default is structural, not a toggle:
 
 The export is **metrics-only**. No prompts, no responses, no agent content,
 and no secrets ever ride a payload — the attribute vocabulary is closed
-(instance and run identifiers, budget words, state names, estimate labels).
+(instance names, Control Depth, Policy names, the label keys you allow-list,
+budget words, state names, estimate labels; a Run id only inside exemplars).
 
 ## Inbound telemetry: `/v1/metrics`
 
@@ -91,19 +92,93 @@ hekma serve --otlp-endpoint http://127.0.0.1:4318
 hekma serve --otlp-endpoint http://127.0.0.1:4318 \
   --otlp-headers authorization=secret:OTLP_AUTH \
   --otlp-flush-interval 30
+hekma serve --otlp-endpoint https://otel.example.com \
+  --otlp-label-keys team,env --otlp-ca-file internal-ca.pem
 ```
 
 | Flag | Meaning |
 |------|---------|
-| `--otlp-endpoint <url>` | The collector's base URL. **http:// only** — see [the https deferral](#the-https-deferral). Every flush POSTs to `<endpoint>/v1/metrics`. Refused shapes (a typed usage error before anything starts): a URL with a query string (`?`) or fragment (`#`), a non-numeric port, or a base that already ends in `/v1/metrics` — pass the base URL; the exporter appends the path. |
+| `--otlp-endpoint <url>` | The collector's base URL, `http://` or `https://` (see [https collectors](#https-collectors)). Every flush POSTs to `<endpoint>/v1/metrics`. Refused shapes (a typed usage error before anything starts): a URL with a query string (`?`) or fragment (`#`), a non-numeric port, or a base that already ends in `/v1/metrics` — pass the base URL; the exporter appends the path. |
 | `--otlp-headers <name=value,...>` | Headers attached to every POST (auth and friends). A value may be a `secret:NAME` reference — resolved once at startup from the environment, then the state directory's `secrets.toml`. Values are never logged; a reference that cannot be resolved refuses the startup, naming the secret. Control characters (CR/LF and friends) in a name or value, and duplicate names (case-insensitive), are refused at parse time. |
 | `--otlp-flush-interval <secs>` | The flush cadence in whole seconds, `1..=3600`. Default `10`. Requires `--otlp-endpoint` — the exporter never half-exists. |
+| `--otlp-exposition <v1\|v2>` | Which exposition to emit. Default `v2`; `v1` is [deprecated](#the-deprecated-exposition-otlp-metrics-v1). |
+| `--otlp-label-keys <key,...>` | The label keys exported as `hekma.label.<key>` attributes in v2, at most 8. **None by default.** Refused with `v1`, which carries no label attributes. |
+| `--otlp-label-cardinality <n>` | Each allow-listed key's distinct-value cap, `2..=10000`. Default `200`. Values past it fold into one series (see [the label cap](#the-label-cap)). |
+| `--otlp-ca-file <pem>` | A PEM root certificate to trust for an `https://` collector, beside the built-in public roots. A file that cannot be read, or holds no certificate, refuses the start, naming it. |
 
-The same three flags exist on the `hekma-host` container binary. `--otlp-headers`
-and `--otlp-flush-interval` each require `--otlp-endpoint` — the exporter never
-half-exists.
+The same flags exist on the `hekma-host` container binary. Every flag but
+`--otlp-endpoint` requires `--otlp-endpoint` — the exporter never half-exists.
 
-## The exposition: `otlp-metrics v1`
+## The exposition: `otlp-metrics v2`
+
+> **On main, not yet released.** v2 is the default from the next release; Hekma 0.11.0 emits v1.
+
+The metric surface is **versioned**; the version rides the payload's
+instrumentation scope (`otlp-metrics v2`). v2 groups series by what you
+steer, never by Run, so the number of series stays flat however many Runs
+there are:
+
+- **No `hekma.run_id` attribute** on any data point. Per-Run detail rides
+  **exemplars** instead: each token-usage and breach point carries up to 8
+  exemplars, the 8 most recently observed distinct Runs, each with only
+  `hekma.run_id` in `filteredAttributes`, a `timeUnixNano` and an `asInt`.
+  There is no trace or span id (traces are not exported), no label value, no
+  credential and no content.
+- **`hekma.control_depth`**: `observed`, `wire`, `announced` or `supervised`,
+  read from the event. A Run that runs supervised without a wire path is
+  still `supervised`.
+- **`hekma.policy`**, on families tied to a limit (`hekma.budget.breaches`):
+  the name of the Policy that supplied the breached limit, `default` for the
+  default Policy, or `explicit` for a limit set on the Run or its agent.
+- **`hekma.label.<key>`** for the keys you allow-list (bound and Caller
+  values alike), and none otherwise.
+- **`hekma.instance`** when the Run has an Agent Instance. Runs Hekma did
+  not start (wire and observed Runs) export too, without it. The **256
+  most recently observed instances** keep their series; an older one leaves
+  the payload, and a note names the count once per flush. That is a
+  window, not a drop: `hekma.otlp.dropped` does not grow from it.
+
+| Name | Type | Unit | Attributes | Notes |
+|------|------|------|------------|-------|
+| `gen_ai.client.token_usage` | histogram | `{token}` | `gen_ai.token.type`, `hekma.instance`?, `hekma.control_depth`, `hekma.label.*` | As in v1 (the same fixed bounds), with exemplars. |
+| `hekma.budget.breaches` | sum | `{breach}` | `hekma.instance`?, `hekma.control_depth`, `hekma.policy`, `hekma.budget.dimension`, `hekma.budget.scope`, `hekma.budget.action`, `hekma.label.*` | +1 per recorded breach, with exemplars. |
+| `hekma.usage.cost` | sum | `USD` | `hekma.instance`?, `hekma.control_depth`, **`hekma.estimate_state`**, `hekma.label.*` | As in v1. |
+| `hekma.agent.state` | gauge | `{state}` | `hekma.instance`, `hekma.state` | As in v1. |
+| `hekma.run.anomalies` | sum | `{anomaly}` | `hekma.anomaly`, `hekma.control_depth` | +1 each time a Run gains an Anomaly flag. |
+| `hekma.calls.unscented` | sum | `{call}` | `outcome` (`served`/`refused`) | Calls no Hekma credential identified, under Scent-Check `shadow` (served) or `enforce` (refused). Always two series, whatever the calls sent. |
+| `hekma.telemetry.received` | sum | `{point}` | `outcome` (`accepted`/`skipped`) | Inbound telemetry points on `/v1/metrics`. |
+| `hekma.otlp.folded` | sum | `{observation}` | — | Label values folded past their key's cap. Always emitted. |
+| `hekma.otlp.dropped` | sum | `{event}` | — | As in v1. Always emitted. |
+
+`?` marks an attribute present only when the Run has an Agent Instance.
+Bypass detection's counter joins when bypass detection ships.
+
+### The label cap
+
+Each allow-listed key keeps its first `--otlp-label-cardinality` distinct
+values (200 by default). Every further value is exported as
+`__hekma_overflow__`, one series for that key; each folded observation
+counts on `hekma.otlp.folded`, and a note names the key once per flush. A
+real value equal to `__hekma_overflow__` shares that series. The set of
+values seen resets when the host restarts, as cumulative sums do.
+
+### Moving from v1
+
+- A dashboard that groups by `hekma.run_id` should group by
+  `hekma.control_depth` and the label keys you allow-list
+  (`--otlp-label-keys team,env`), and drill into a Run through the
+  exemplars.
+- The v1 series stop when the host restarts on v2, and v2's start fresh
+  (cumulative sums reset at a restart in both).
+- To keep v1 for now, start the host with `--otlp-exposition v1`.
+
+## The deprecated exposition: `otlp-metrics v1`
+
+> **Deprecated.** v1 stays selectable with `--otlp-exposition v1` for at least one minor release after v2 ships, and is removed only in a major release.
+
+The sections below describe v1, which keys token usage by Run.
+
+### Wire rules
 
 The metric surface is **versioned**. The version marker is `otlp-metrics v1`
 (it also rides the payload's instrumentation scope). Until the surface is
@@ -222,15 +297,18 @@ The exporter never delays supervision or enforcement:
 - **No durable telemetry.** The exporter keeps no files and no cursors; the
   Usage Ledger's outbox remains the only durable export surface.
 
-## The https deferral
+## https collectors
 
-v1 accepts **http:// endpoints only**. `https://` is a documented deferral,
-not an oversight: the tested surface must equal the shipped surface, and TLS
-handshakes are not provably testable network-free in this repository's
-hermetic suite. The standard bridge — an OpenTelemetry Collector (or any
-local forwarding collector) accepting http:// on loopback and exporting
-TLS upstream — works today and is the recommended posture. The deferral
-reopens when an operator names an https collector as a real need.
+> **On main, not yet released.** Hekma 0.11.0 accepts `http://` collectors only.
+
+`--otlp-endpoint` takes `https://` as well as `http://`. The exporter trusts
+the built-in public root certificates (never the system store) and, with
+`--otlp-ca-file`, a PEM root of your own, such as an internal CA or a
+self-signed collector. TLS 1.2 is the minimum. A certificate the exporter
+cannot verify fails the delivery like any terminal error: the batch is not
+delivered, a note says so, `hekma.otlp.dropped` grows, and the next flush
+tries again. A local collector accepting `http://` on loopback and exporting
+TLS upstream remains a fine posture.
 
 ## Grafana and Datadog
 

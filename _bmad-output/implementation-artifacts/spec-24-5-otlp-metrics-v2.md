@@ -2,7 +2,7 @@
 title: 'otlp-metrics v2: no run id on metrics, depth/policy/allow-listed labels, exemplars, https collectors'
 type: 'feature'
 created: '2026-11-13'
-status: 'ready-for-dev'
+status: 'review'
 review_loop_iteration: 0
 baseline_commit: '38eae602a5add5e9c1f6216a324ff92abc30b96a'
 context:
@@ -147,3 +147,12 @@ Each O-item is the owner's (Islam's) ruling — public-contract choices, marked 
 
 - 2026-11-13 — spec drafted from Story 24.5 and its Epic 24 seams (24.1-24.4, 23.4), FR-59 + FR-46/49/50/51/54/60 and §6/§7 of the PRD, AD-21 and its 2026-10-30 amendment plus the AD-14 amendment, the versions/reconcile reviews (F-9, F17), the key-custody security review (§7.6, R1.15, R3.5, T3.5), the 20-1/21-2/21-3/21-6/22-3/23-1/23-3/23-4 specs and every promise they make to this story, the deferred-work entries naming it, and the otlp module + flags + docs at 38eae60. Status drafted, awaiting the orchestrator's review and Islam's rulings on O1-O5.
 - 2026-11-13 — orchestrator review: approved for build. Orchestrator items 2–10 are accepted as recommended. Item 1 (additive optional depth, Policy and label fields on the usage and breach payloads) is accepted too, but because it changes event schemas it goes to Islam alongside O1–O5; the build proceeds on the recommendations. Build after 24-4 in the Epic 24 order, riding 23-1's built shapes (`UsageEvent.instance` optional with `call_id`, instance-less usage skipped by v1) and 22-3/22-4's counters as they land; record any drift here.
+- 2026-11-14 — built by the orchestrator (GLM's weekly limit is spent until 2026-11-19; Opus subagents are off), stacked on the 22-5 build (0d7c20c), and built BEFORE 24-1 and 22-4 (the build order put it after them): 24-1 is a cross-OS supervision rewrite provable only through CI, and only this story's bypass counter needs 22-4. Every O-item is built on its recommended option. Drift:
+  - **`hekma.bypass.detected` is not emitted** until 22-4 lands (deferred-work).
+  - **The payload fields** ride `UsageUpdateEvent` (`control_depth`, `policies`, `labels`) and `BudgetBreachEvent` (`control_depth`, `policy`, `labels`), stamped from a `RunContext` read in the committing job (the run row, its labels and its stored Policy resolution). A breach's `policy` is the source of the breached limit: the Policy's name, `default`, or `explicit` for a Run, instance or Caller limit (and when no resolution is stored).
+  - **The counters are sampled, not evented:** `Engine::export_counters()` returns the proxy's unscented counts and the inbound-telemetry points (the intake reports each batch's accepted and skipped points to the engine); the exporter samples them at each flush.
+  - **`OtlpOptions::from_flags` is unchanged;** the four flags parse through a second step in the same module, `with_exposition_flags`, which both CLI surfaces call.
+  - **https uses `hyper-rustls`** (already in the tree through the engine) with the vendored webpki roots plus the CA file's roots.
+  - **The breach exemplar's value is `1`** (the counter's increment); a token exemplar's value is the observation's token count.
+  Tests: the attribute projection (allow-list, cap and fold, the instance window); v2 without I/O (no `hekma.run_id` attribute, depth, labels, exemplar shape and the 8-most-recent rule, breach Policy names, the fold count and note, the cost label, the always-emitted families, v1 and v2 through `ExporterState`); the client's https URL and CA-file refusals; end to end (v2 against a supervised agent with the vocabulary pinned, the v1 switch, an https collector with and without its root, the flag refusals); the engine stamping (a proxied call's usage event carries depth and labels; older events decode); `supplier`'s table; the real binary's exit-2 refusals.
+

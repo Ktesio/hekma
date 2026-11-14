@@ -4,6 +4,16 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — `otlp-metrics v2`: telemetry grouped by depth, Policy and labels (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **v2 is the default exposition.** `hekma.run_id` leaves every data point; series group by `hekma.control_depth`, `hekma.policy` (on breaches: the Policy that supplied the breached limit, `default`, or `explicit`), `hekma.instance` (the 256 most recently observed) and the label keys you allow-list with `--otlp-label-keys` (none by default; each key capped at `--otlp-label-cardinality` distinct values, default 200, past which values fold into `__hekma_overflow__`). Per-Run detail rides exemplars: the 8 most recent distinct Runs, `hekma.run_id` only.
+> - **Runs Hekma did not start export too** (wire and observed Runs).
+> - **New families:** `hekma.run.anomalies`, `hekma.calls.unscented`, `hekma.telemetry.received`, `hekma.otlp.folded`.
+> - **`https://` collectors** are supported, with `--otlp-ca-file` for a root of your own.
+> - **Deprecation:** `otlp-metrics v1` stays selectable with `--otlp-exposition v1` for at least one minor release and is removed only in a major release. Dashboards grouping by `hekma.run_id` move to depth, allow-listed labels and exemplars; see the migration notes in `docs/telemetry.md`.
+> - **Engine surface (additive):** `UsageUpdateEvent` gains `control_depth`, `policies` and `labels`; `BudgetBreachEvent` gains `control_depth`, `policy` and `labels` (absent on older events); new `Engine::export_counters`, `Engine::note_telemetry_points` and `ExportCounters`.
+
 > **Unreleased — the metering proxy beyond loopback (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >

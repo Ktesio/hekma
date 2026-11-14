@@ -221,8 +221,8 @@ A call is **scented** when a valid Run Key identifies it: sent in `x-hekma-run-k
 | Mode | An unscented call is |
 |---|---|
 | `off` | Served, unchecked. |
-| `shadow` | Served. The Run it lands on gets the `unscented` **Anomaly** on the first such call (one event; `hekma ps` lists the Run), and the proxy counts it. |
-| `enforce` | Refused with `401 hekma_unscented_call`, before anything is forwarded. The per-call record says `enforce`. |
+| `shadow` | Served. The Run it lands on gets the `unscented` **Anomaly** on the first such call (one event; `hekma ps` lists the Run), and the proxy counts it (the `hekma.calls.unscented` OTLP counter, `outcome=served`). |
+| `enforce` | Refused with `401 hekma_unscented_call`, before anything is forwarded. The per-call record says `enforce`, and `hekma.calls.unscented` counts it under `outcome=refused`. |
 
 - **The default is `off`, everywhere.** The default Policy is seeded `off`, and Hekma never changes it on upgrade, so a default Policy you edited stays as you left it. There is no per-environment default: to check identities, write a Policy, for example `hekma policy create prod --selector env=prod --scent-check shadow`.
 - **The strictest mode up the chain applies.** A call is checked under the strictest mode of its Run and every Run above it, so a child Run under an `enforce` parent is `enforce`, whatever Policies its own labels select.
