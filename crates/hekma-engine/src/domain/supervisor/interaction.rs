@@ -264,28 +264,54 @@ impl Supervisor {
         registry: &Registry,
         name: &str,
     ) -> Result<(Vec<LogLine>, u64), EngineError> {
+        Self::read_agent_log_at(&Self::agent_log_paths(registry, name)?)
+    }
+
+    /// Story 24-4 (AD-18 Step 0): the instance's lookup and its log paths —
+    /// the only part of a log read that needs the registry. The file reads
+    /// ([`Self::read_agent_log_at`], [`Self::read_agent_log_since_at`]) run
+    /// after the caller drops the guard, so a 50 MiB log never holds it.
+    pub(crate) fn agent_log_paths(
+        registry: &Registry,
+        name: &str,
+    ) -> Result<AgentLogPaths, EngineError> {
         let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
             name: name.to_string(),
             reason,
         })?;
         registry.lookup(&name).map_err(registry_to_engine)?;
+        let generations = (1..LOG_ROTATE_GENERATIONS)
+            .rev()
+            .map(|generation| registry.attributed_output_log_generation_path(&name, generation))
+            .collect();
+        let current = registry.attributed_output_log_path(&name);
+        Ok(AgentLogPaths {
+            name,
+            generations,
+            current,
+        })
+    }
 
+    /// The whole-log read over resolved paths (no registry access).
+    pub(crate) fn read_agent_log_at(
+        paths: &AgentLogPaths,
+    ) -> Result<(Vec<LogLine>, u64), EngineError> {
+        let name = &paths.name;
         let mut lines = Vec::new();
         // Oldest generation first (LOG_ROTATE_GENERATIONS - 1 down to 1),
         // then the current generation last — append order overall.
-        for generation in (1..LOG_ROTATE_GENERATIONS).rev() {
-            let path = registry.attributed_output_log_generation_path(&name, generation);
-            read_log_lines_from(&path, &mut lines).map_err(|detail| EngineError::Log {
+        for path in &paths.generations {
+            read_log_lines_from(path, &mut lines).map_err(|detail| EngineError::Log {
                 name: name.as_str().to_string(),
                 path: path.to_string_lossy().into_owned(),
                 detail,
             })?;
         }
-        let current = registry.attributed_output_log_path(&name);
+        let current = &paths.current;
         // Read the CURRENT generation's raw text ONCE so its exact byte
         // length (the cursor) and its parsed lines come from the identical
         // bytes — never a second, later, potentially-inconsistent read.
-        let current_text = match std::fs::read_to_string(&current) {
+        let current_text = match std::fs::read_to_string(current) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => {
@@ -329,14 +355,17 @@ impl Supervisor {
         name: &str,
         cursor: u64,
     ) -> Result<(Vec<LogLine>, u64), EngineError> {
-        let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
-            name: name.to_string(),
-            reason,
-        })?;
-        registry.lookup(&name).map_err(registry_to_engine)?;
+        Self::read_agent_log_since_at(&Self::agent_log_paths(registry, name)?, cursor)
+    }
 
-        let path = registry.attributed_output_log_path(&name);
-        let bytes = match std::fs::read(&path) {
+    /// The follow read over resolved paths (no registry access).
+    pub(crate) fn read_agent_log_since_at(
+        paths: &AgentLogPaths,
+        cursor: u64,
+    ) -> Result<(Vec<LogLine>, u64), EngineError> {
+        let name = &paths.name;
+        let path = &paths.current;
+        let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
@@ -779,4 +808,15 @@ pub(super) fn prime_backlog_window(bytes: &[u8], n: u64) -> (u64, u64) {
         }
     }
     (bytes.len() as u64, skipped)
+}
+
+/// An instance's resolved log paths (story 24-4, AD-18 Step 0): what a log
+/// read needs from the registry, carried out from under its guard.
+#[derive(Debug)]
+pub(crate) struct AgentLogPaths {
+    name: InstanceName,
+    /// The rotated generations, oldest first.
+    generations: Vec<std::path::PathBuf>,
+    /// The current generation.
+    current: std::path::PathBuf,
 }
