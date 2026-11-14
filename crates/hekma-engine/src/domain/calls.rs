@@ -51,6 +51,7 @@ pub const CALLS_LISTING_SCHEMA_VERSION: u32 = 1;
 /// knows). `hold`, `reroute` and `reject` are in the shape now — the
 /// fence stories that produce them fill them in later.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum CallDisposition {
     /// Forwarded.
     Pass,
@@ -110,6 +111,7 @@ impl CallDisposition {
 ///
 /// Forward-compatible the same way [`CallDisposition`] is.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum CallOutcome {
     /// The upstream answered and the response was relayed.
     Completed,
@@ -171,13 +173,19 @@ impl CallOutcome {
 /// Forward-compatible the same way [`CallDisposition`] is.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StatusClass {
+    #[serde(rename = "2xx")]
     Success,
+    #[serde(rename = "3xx")]
     Redirect,
+    #[serde(rename = "4xx")]
     ClientError,
+    #[serde(rename = "5xx")]
     ServerError,
     /// Refused by the proxy (no upstream status).
+    #[serde(rename = "refused")]
     Refused,
     /// No upstream status (connect, TLS or mid-body failure, disconnect).
+    #[serde(rename = "transport-error")]
     TransportError,
     /// A value this build does not know (read from a newer build's store).
     #[serde(untagged)]
