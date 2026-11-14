@@ -1396,3 +1396,118 @@ fn the_otlp_exposition_flags_are_usage_refusals_when_they_cannot_apply() {
     assert!(run.stderr.contains("--otlp-endpoint"), "{}", run.stderr);
     assert!(!state_dir.exists(), "a refused serve created nothing");
 }
+
+#[test]
+fn the_shim_command_is_hidden_internal_and_refuses_bad_arguments_without_touching_state() {
+    // Story 24-1: `hekma shim` is not in `hekma --help`; its own help says
+    // internal; missing or malformed arguments are usage refusals (exit 2)
+    // that create nothing.
+    let ctx = TestContext::new();
+    let state_dir = ctx.project_dir.join("state");
+    let run = run_hekma_agent(&["--help"], &ctx.project_dir, &state_dir);
+    assert!(
+        !run.stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("shim")),
+        "{}",
+        run.stdout
+    );
+    let run = run_hekma_agent(&["shim", "--help"], &ctx.project_dir, &state_dir);
+    assert!(
+        run.stdout.contains("Internal") && run.stdout.contains("shim-rpc 1.0"),
+        "{}",
+        run.stdout
+    );
+    let run = run_hekma_agent(&["shim"], &ctx.project_dir, &state_dir);
+    assert_eq!(run.code, Some(2), "{}", run.stderr);
+    let socket = ctx.project_dir.join("shims").join("s-x.sock");
+    let run = run_hekma_agent(
+        &[
+            "shim",
+            "--listen",
+            socket.to_str().unwrap(),
+            "--expect-secret-hash",
+            "not-hex",
+            "--launch-id",
+            "l",
+        ],
+        &ctx.project_dir,
+        &state_dir,
+    );
+    assert_eq!(run.code, Some(2), "{}", run.stderr);
+    assert!(run.stderr.contains("64 hex"), "{}", run.stderr);
+    assert!(!state_dir.exists(), "a refused shim created nothing");
+}
+
+#[test]
+fn a_real_shim_process_keeps_its_child_across_a_disconnect_and_leaves_once_acknowledged() {
+    // Story 24-1: the `hekma shim` binary out of process — an engine
+    // connects, launches, goes away; a second engine reconnects, stops the
+    // child and acknowledges its exit; the Shim exits 0.
+    if is_windows() {
+        return; // The Windows transport arrives with the Shim's wiring.
+    }
+    let ctx = TestContext::new();
+    let state = ctx.project_dir.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let key = hekma_engine::shim::secret::host_key(&state).unwrap();
+    let secret = hekma_engine::shim::secret::connection_secret(&key, "launch-e2e");
+    let hash =
+        hekma_engine::shim::secret::to_hex(&hekma_engine::shim::secret::secret_hash(&secret));
+    let socket = hekma_engine::shim::socket_path(&state, "launch-e2e");
+    let mut shim = Command::new(env!("CARGO_BIN_EXE_hekma"))
+        .args(["shim", "--listen"])
+        .arg(&socket)
+        .args(["--expect-secret-hash", &hash, "--launch-id", "launch-e2e"])
+        .env("KTESIO_NO_UPDATE_CHECK", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let bound = Duration::from_secs(10);
+    let deadline = Instant::now() + bound;
+    let (mut engine, status) = loop {
+        match hekma_engine::shim::connect(&socket, &secret, bound) {
+            Ok(connected) => break connected,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Err(err) => panic!("the Shim never listened: {err}"),
+        }
+    };
+    assert!(!status.launched);
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+    let (pid, _) = engine
+        .spawn(hekma_engine::shim::proto::ShimSpawn {
+            exec: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env,
+            working_dir: ctx.project_dir.clone(),
+            log_file: None,
+            attributed_log_path: None,
+            stderr_log_file: None,
+            instance_name: "shimmed".into(),
+            pipe_stdin: false,
+            detach: false,
+            pipe_stdout: false,
+            inherit_env: false,
+            capture_mode: "full".into(),
+        })
+        .unwrap();
+    drop(engine);
+    assert!(pid_alive(pid), "the child outlives its engine's connection");
+    let (mut engine, status) = hekma_engine::shim::connect(&socket, &secret, bound).unwrap();
+    assert!(status.launched && status.exit.is_none(), "{status:?}");
+    engine.stop(Duration::from_secs(2)).unwrap();
+    assert!(engine.poll().unwrap().is_some());
+    engine.ack_exit().unwrap();
+    let deadline = Instant::now() + bound;
+    let exit = loop {
+        if let Some(status) = shim.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the Shim never left");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(exit.success(), "{exit:?}");
+    assert!(!socket.exists(), "the Shim removed its socket");
+}

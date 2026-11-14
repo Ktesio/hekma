@@ -32,6 +32,8 @@
 //! and the OS/init reaps the non-child on exit). An adopted process is supervised
 //! for the new engine's lifetime exactly like a freshly spawned one.
 
+/// Story 24-1: the Shim's Unix transport.
+pub mod shim;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, Stdio};

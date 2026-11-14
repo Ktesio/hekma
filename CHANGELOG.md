@@ -4,6 +4,12 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — the Shim, part one (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **Internal, nothing changes yet:** a hidden `hekma shim` command and the `hekma-engine::shim` module add the Shim, the small supervisor that will own each supervised process so it survives the engine. The supervisor does not use it yet; agents start, stop and adopt exactly as before. A `shim-host-key` file (owner-only) is created in the state directory only when a Shim is used.
+> - **Engine surface (additive):** the public `shim` module (`run`, `connect`, `socket_path`, the `proto`, `secret`, `server` and `client` submodules) and `backends::shim_listen`/`shim_connect` (Unix; Windows returns unsupported until the named-pipe transport lands). No schema change.
+
 > **Unreleased — `otlp-metrics v2`: telemetry grouped by depth, Policy and labels (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >
