@@ -210,4 +210,12 @@ Each is a public-contract or product choice; the recommendation is the spec's cu
   - **What the instrument shows:** the stuck send holds BOTH the registry and the supervisor lock for its 5 s bound. That is the cross-instance coupling Steps 3–4 split, and the test now pins it by site.
   - **Drift:** the spec's adversarial 25-instance fixture is narrowed to this two-instance pathological pair, the existing isolation test now instrumented. A 25-instance fleet with an armed Stop budget and a `--follow` reader needs the fixture work of Steps 2–4 and is recorded there.
   - **Not built:** Steps 2–4.
+- 2026-11-14 — **phase 4c (built): AD-18 Step 2** (stacked on 24-3 phase 9, #434).
+  - **The scopes:** `domain/bounded.rs`. `RegistryCell::critical()` takes the registry. `SupervisorCell::after(&RegistryGuard)` is the only ordered way to the supervisor, so the R→S order is enforced by the compiler; `after_recovering`/`critical_recovering` serve the best-effort `Drop`. `SupervisorCell::alone()` is the listed exception. `cell_scope` (and `cell_scope_recovering` for the credential reader) lock a small cell for one closure. All keep `#[track_caller]`, so Step 1's per-site stats still name the engine.rs line.
+  - **engine.rs:** all 157 lock sites are converted: 93 registry, 46 ordered supervisor, 1 more ordered by restructuring `binding_write`, 9 cells, and 2 recovering locks in `Drop`. No bare `.lock()` is left. Six supervisor-only reads take `alone()`: `with_diagnostics`, `has_live_capture`, `log_capture_mode`, `refresh_bypass_hosts`, and two test seams.
+  - **The ratchet:** `.ad17-debt.txt` lists those six by symbol (`Type::function`, never a line number). `scripts/check_ad17_debt.py` fails on a new site, on a second site in a listed function, and on a paid-down site still listed. Its `--self-test` mutation-tests each of those, plus symbol stability under line shifts. Both run in the CI docs job, and `scripts/test_automation.py` pins them.
+  - **Drift from the spec:**
+    - The spec named closure-shaped `critical()`/`cell_scope()` scopes. The big locks use guard-returning named scopes instead: converting 140 multi-statement sites into closures would rewrite every body for no gain, since `after(&guard)` already makes `&mut Supervisor` unobtainable without a live registry guard.
+    - The small cells do use closures.
+  - **Not built:** Steps 3 and 4.
 
