@@ -116,7 +116,7 @@ use crate::ports::{
 /// `proxy_state.identity_headers` (the root, on by default) and
 /// `run_bindings.identity_headers` (the per-binding override) — see
 /// [`super::runs_sqlite`].
-pub(crate) const SCHEMA_VERSION: i64 = 25;
+pub(crate) const SCHEMA_VERSION: i64 = 26;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -821,6 +821,10 @@ fn migrate(
     // crash-atomic step, additive).
     if version < 25 {
         super::retention_sqlite::migrate_v25(conn)?;
+    }
+    // Story 19-5: v26 adds the reconciliation submissions (additive).
+    if version < 26 {
+        super::reconcile_sqlite::migrate_v26(conn)?;
     }
     Ok(notes)
 }

@@ -481,6 +481,8 @@ impl From<RunError> for ApiError {
                 ApiErrorKind::Conflict
             }
             RunError::CredentialUnavailable { .. } => ApiErrorKind::Unavailable,
+            // Story 19-5: a reference reused with different figures.
+            RunError::ReconciliationConflict { .. } => ApiErrorKind::Conflict,
             // The request itself cannot be honored.
             RunError::NestingTooDeep { .. }
             | RunError::ActionUnavailable { .. }

@@ -8,6 +8,7 @@
 pub(crate) mod calls_read;
 pub(crate) mod calls_sqlite;
 pub(crate) mod proxy_sqlite;
+pub(crate) mod reconcile_sqlite;
 pub(crate) mod retention_sqlite;
 mod run_store_sqlite;
 pub(crate) mod runs_sqlite;

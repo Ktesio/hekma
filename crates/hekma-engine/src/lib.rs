@@ -184,6 +184,12 @@ pub use domain::{
 };
 // Story 24-4 (AD-18 Step 1): lock hold timing, a diagnostic surface.
 pub use domain::timed_mutex::LockHoldStats;
+// Story 19-5: reconciliation — a Run's confirmed usage beside its
+// estimated figures.
+pub use domain::runs::reconcile::{
+    ReconcileDrift, ReconcileOutcome, ReconcileRequest, ReconcileSource, ReconciledView,
+    Reconciliation, RECONCILE_NOTE_MAX, RECONCILE_REFERENCE_MAX,
+};
 // Story 24-4: the retention windows, the compaction state and what a
 // compacted Run keeps.
 pub use domain::runs::retention::{

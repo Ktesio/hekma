@@ -811,6 +811,59 @@ pub(crate) async fn run_show(
     }))
 }
 
+/// `POST /v0/runs/{id}/reconciliation` (story 19-5, Operator bearer only)
+/// — submit the Run's confirmed usage. Answers the stored submission and
+/// whether it was a replay of one already stored.
+pub(crate) async fn run_reconcile(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    ApiJson(request): ApiJson<dto::ReconcileBody>,
+) -> ApiResult<Json<dto::ReconcileDocument>> {
+    let source = match request.source.as_deref() {
+        None => hekma_engine::ReconcileSource::Host,
+        Some(raw) => hekma_engine::ReconcileSource::from_wire(raw).ok_or_else(|| {
+            ApiError::from(hekma_engine::RunError::Invalid {
+                field: "source".to_string(),
+                reason: format!("`{raw}` is not a source (provider or host)"),
+            })
+        })?,
+    };
+    let outcome = state
+        .engine
+        .reconcile_run(
+            &run_id,
+            hekma_engine::ReconcileRequest {
+                reference: request.reference,
+                source,
+                input_tokens: request.input_tokens,
+                output_tokens: request.output_tokens,
+                cached_tokens: request.cached_tokens,
+                cost_micros: request.cost_micros.map(hekma_engine::Micros),
+                note: request.note,
+            },
+            hekma_engine::RunActor::Operator,
+        )
+        .await?;
+    Ok(Json(dto::ReconcileDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        reconciliation: outcome.reconciliation,
+        replayed: outcome.replayed,
+    }))
+}
+
+/// `GET /v0/runs/{id}/reconciliation` (story 19-5, Operator bearer only)
+/// — every submission for the Run, newest first.
+pub(crate) async fn run_reconciliations(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<dto::ReconciliationsDocument>> {
+    let reconciliations = state.engine.run_reconciliations(&run_id).await?;
+    Ok(Json(dto::ReconciliationsDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        reconciliations,
+    }))
+}
+
 /// The `?run=&token_id=&outcome=&disposition=&status_class=&model=&depth=&
 /// binding=&from=&to=&view=&limit=&cursor=` query of the calls listing (the
 /// per-call read surface). RAW strings parsed in [`calls_list`] so every

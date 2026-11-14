@@ -108,6 +108,16 @@ A limit set on a Run outranks the agent's `budget.*` configuration and every Pol
 
 <a id="run-keys"></a>**Every Run has a Run Key.** Each supervised launch gets its own [Run Key](run-keys.md) in `HEKMA_RUN_KEY`, and a child Run opened over the Control API gets its own Run Key and refresh credential once. A Run Key acts as its Run's Caller: it may open child Runs beneath its Run, close them and tighten their limits, and nothing else. Keys are stored as hashes, revoked when their process exits, when their Run ends, or with `hekma run revoke-keys`; `hekma run keys` lists them by token id. A used refresh credential presented again raises the `credential-reuse` Anomaly.
 
+<a id="reconciliation"></a>**Confirmed usage beside the estimate (reconciliation).** Every figure Hekma counts is labelled `estimated`. When the provider's invoice or your own gateway confirms a Run's usage, submit it with `hekma run reconcile <run-id> --input N --output N [--cached N] [--dollars D] [--source provider|host] [--ref ID]` or `POST /v0/runs/{id}/reconciliation`.
+
+- **What a submission states.** The Run's confirmed totals for the Run and its descendants, the same scope as Hekma's figure for that Run.
+- **Nothing is overwritten.** Submissions are stored beside the estimated figures and never replace them. The newest submission is the Run's `reconciled` figure.
+- **Where it shows.** `hekma run show` and the Run document carry both figures, each labelled, with the drift between them (reconciled − estimated) per dimension. There is no dollar drift unless you submitted a confirmed cost: Hekma never derives a reconciled dollar figure from its own Rate.
+- **Retries.** A retry with the same reference and figures changes nothing, and the same reference with different figures is refused. Without `--ref`, the CLI builds the reference from the figures.
+- **Who may submit.** Only the Operator or a Host. A Run's own Caller cannot attest its own usage.
+- **Budgets keep acting on the estimated figures.**
+- **Events.** Each accepted submission is one `reconciled` Run event.
+
 <a id="retention"></a>**Retention and compaction.** An ended Run keeps its full detail for the **Run retention window**, seven days unless you change it. Past the window it is **compacted**: Hekma keeps its run id, usage totals (input, output and cached tokens and the estimated cost, its descendants included), labels with their sources, end cause, Control Depth and when it was created, ended and compacted, and deletes the rest of its detail (limits, latches, dispositions, credentials and its own usage rollup). A compacted Run no longer appears in `hekma ps`; `hekma run show <run-id>` answers its summary. Its usage still counts on every ancestor, its usage records and events stay, and a Run with an open descendant waits until the last one ends. The Service Host compacts when it starts and then once a day, in batches of at most 250 Runs. The calls store has its own window (also seven days): Hekma starts a new per-call record file each UTC day and deletes a file whole once it is past the window, never one that still holds a call in flight. Read or change both windows with [`hekma run retention`](commands.md#hekma-run-retention) or [`GET`/`PUT /v0/retention`](control-api.md#retention).
 
 ## What is coming
