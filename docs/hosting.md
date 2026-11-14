@@ -243,6 +243,18 @@ what the dead one recorded:
 Agents held directly die with the host only if the operating system takes
 their process group with it; those that survive are treated the same way.
 
+**What a crash can lose.** Everything a command or the Control API changes
+(a Run, a label, a limit, a Policy, a hold, a Lease, a revocation) is
+committed before the command answers, so a crash loses none of it. The only
+window is the per-call stream the metering proxy writes in the background:
+call records and their usage are written in batches of at most 250 ms or 512
+records. A call relayed in the last batch before a hard kill can go
+uncounted; its record closes at the next start as `crash` with unknown
+tokens, an under-count, never a double count. Held calls are connections, not
+records: their bytes die with the host, and their records close as `crash`.
+The 5-second loss bound promised for usage is the outer limit; the batch
+window is what the build guarantees.
+
 An agent the dead host was still starting is never left `starting`: if its
 process is alive, the next host marks it `running`. When its adapter
 declares a readiness probe, the probe's answer died with the host, so the
