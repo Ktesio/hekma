@@ -1083,6 +1083,25 @@ impl Supervisor {
         self.backend.set_bypass_feed(feed);
     }
 
+    /// Story 24-2 (Handoff Mode): let go of every process held through a
+    /// Shim WITHOUT stopping it — the handle is dropped (its connection
+    /// closes) and the Shim keeps the process for the next engine, which
+    /// reconnects through adoption. Returns the released instances, sorted.
+    /// Directly held processes are untouched.
+    pub(crate) fn release_shim_held(&mut self) -> Vec<InstanceName> {
+        let mut names: Vec<InstanceName> = self
+            .running
+            .iter()
+            .filter(|(_, supervised)| self.backend.is_shim(&supervised.handle))
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        for name in &names {
+            self.running.remove(name);
+        }
+        names
+    }
+
     /// Story 22-4: hand a refreshed provider-host list to every live Shim.
     pub(crate) fn push_bypass_hosts(&mut self, config: &crate::shim::proto::BypassConfig) {
         for supervised in self.running.values_mut() {
