@@ -830,7 +830,7 @@ impl Supervisor {
 
         // (4) Spawn. A spawn failure lands the instance in `failed` with the
         // diagnostic preserved and no zombie (the backend spawned nothing / reaps).
-        let mut handle = match self.backend.spawn(&spec) {
+        let mut handle = match self.shared.backend.spawn(&spec) {
             Ok(handle) => handle,
             Err(err) => return Err(self.fail_launch(registry, &name, &err)),
         };
@@ -869,7 +869,7 @@ impl Supervisor {
         let restart_count = restart.map(|(attempt, _)| attempt).unwrap_or(0);
         let record = SpawnRecord {
             name: name.clone(),
-            fingerprint: self.backend.fingerprint(&handle),
+            fingerprint: self.shared.backend.fingerprint(&handle),
             restart_policy: policy,
             restart_count,
             last_known_cause: None,
@@ -895,7 +895,7 @@ impl Supervisor {
             // (skip: the agent is supervised here) from a crashed one (adopt
             // armed, story 1-6). `None` on a degraded start-time read keeps
             // the pre-boundary adopt-armed posture, never a spawn failure.
-            owner: self.backend.self_fingerprint(),
+            owner: self.shared.backend.self_fingerprint(),
             // The ADOPTION LEASE (schema v11, issue #328) is adoption-only:
             // a fresh spawn takes NO lease. The spawning engine's ownership
             // is the `owner` fact above, and the registry already refuses a
@@ -909,13 +909,12 @@ impl Supervisor {
             lease: None,
             // Story 24-1: the Shim the process was launched through, so a
             // later engine reconnects to it.
-            shim: self
-                .backend
-                .shim_endpoint(&handle)
-                .map(|endpoint| crate::ports::ShimRecord {
+            shim: self.shared.backend.shim_endpoint(&handle).map(|endpoint| {
+                crate::ports::ShimRecord {
                     socket: endpoint.socket,
                     launch_id: endpoint.launch_id,
-                }),
+                }
+            }),
         };
         // Story 21-1: the record and the instance's NEW launch generation
         // commit in one writer job — every usage row of this launch carries
@@ -992,7 +991,10 @@ impl Supervisor {
                 // handle there leaves a recorded (adoptable) process, not an
                 // unrecorded one.
                 if detach {
-                    let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
+                    let _ = self
+                        .shared
+                        .backend
+                        .stop(&mut handle, Duration::from_millis(500));
                 }
                 drop(handle);
                 return Err(self.fail_launch_detail(
@@ -1030,9 +1032,9 @@ impl Supervisor {
         // tolerated set {1} closes the transport + refuses the start
         // (traffic-free — the error names both integers, never any payload).
         let acp = if is_acp {
-            let stdin_state = self.backend.take_stdin(&mut handle);
-            let stdout = self.backend.take_stdout(&mut handle);
-            let capture = self.backend.log_capture(&handle);
+            let stdin_state = self.shared.backend.take_stdin(&mut handle);
+            let stdout = self.shared.backend.take_stdout(&mut handle);
+            let capture = self.shared.backend.log_capture(&handle);
             match crate::acp::AcpConnection::start(
                 name.as_str(),
                 stdin_state,
@@ -1081,7 +1083,10 @@ impl Supervisor {
                             // backend's bounded stop, and land the instance
                             // `failed` with the traffic-free refusal detail.
                             drop(connection);
-                            let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
+                            let _ = self
+                                .shared
+                                .backend
+                                .stop(&mut handle, Duration::from_millis(500));
                             drop(handle);
                             return Err(self.fail_launch_detail(
                                 registry,
@@ -1094,7 +1099,10 @@ impl Supervisor {
                 Err(connection_err) => {
                     // No transport (e.g. a detached acp spawn has no stdin
                     // pipe): the same close + refuse shape.
-                    let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
+                    let _ = self
+                        .shared
+                        .backend
+                        .stop(&mut handle, Duration::from_millis(500));
                     drop(handle);
                     return Err(self.fail_launch_detail(registry, &name, connection_err));
                 }
@@ -1153,7 +1161,7 @@ impl Supervisor {
             };
             let outcome = match super::super::readiness::run_probe(
                 gate,
-                &self.backend,
+                &self.shared.backend,
                 &mut handle,
                 probe_log_path,
                 usage_cursor,
@@ -1187,13 +1195,13 @@ impl Supervisor {
                                 .to_string(),
                         })
                     } else {
-                        match self.injected_poll_fault(self.backend.pid(&handle)) {
+                        match self.injected_poll_fault(self.shared.backend.pid(&handle)) {
                             Some(source) => Err(source),
-                            None => self.backend.poll(&mut handle),
+                            None => self.shared.backend.poll(&mut handle),
                         }
                     };
                     #[cfg(not(test))]
-                    let recheck = self.backend.poll(&mut handle);
+                    let recheck = self.shared.backend.poll(&mut handle);
                     match recheck {
                         Ok(ProcessStatus::Exited { code }) => {
                             super::super::readiness::ProbeOutcome::ProcessExited(code)
@@ -1246,13 +1254,19 @@ impl Supervisor {
                     // Teardown first (the handshake-failure shape: a short
                     // graceful stop — which also works on a DETACHED handle —
                     // then the drop releases whatever remains).
-                    let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
+                    let _ = self
+                        .shared
+                        .backend
+                        .stop(&mut handle, Duration::from_millis(500));
                     // Review round 1 (E2): a graceful window is an offer, not
                     // a guarantee — if the process is STILL alive after it,
                     // escalate to the stop ladder's final leg (a zero-window
                     // stop is SIGKILL + confirm on unix) instead of dropping a
                     // possibly-live handle onto the OS.
-                    if matches!(self.backend.poll(&mut handle), Ok(ProcessStatus::Alive)) {
+                    if matches!(
+                        self.shared.backend.poll(&mut handle),
+                        Ok(ProcessStatus::Alive)
+                    ) {
                         // Coverage-second-pass wiring seam (cfg(test)): an
                         // armed pid's final-leg stop FAILS here, driving the
                         // surfaced could-not-force-kill arm below (the same
@@ -1260,14 +1274,14 @@ impl Supervisor {
                         // fronts).
                         #[cfg(test)]
                         let kill = {
-                            let pid = self.backend.pid(&handle);
+                            let pid = self.shared.backend.pid(&handle);
                             match Self::injected_zero_stop(&self.stop_fault_pids, pid) {
                                 Some(injected) => injected,
-                                None => self.backend.stop(&mut handle, Duration::ZERO),
+                                None => self.shared.backend.stop(&mut handle, Duration::ZERO),
                             }
                         };
                         #[cfg(not(test))]
-                        let kill = self.backend.stop(&mut handle, Duration::ZERO);
+                        let kill = self.shared.backend.stop(&mut handle, Duration::ZERO);
                         if let Err(kill_err) = kill {
                             self.emit_diagnostic(&format!(
                                 "{}: readiness-timeout teardown could not force-kill the \
@@ -1326,7 +1340,7 @@ impl Supervisor {
                     // stable-window reset); the charged crash path applies
                     // verbatim with no anchor to measure.
                     let decision = self.plan_restart(registry, &name, &base_detail, None);
-                    let crash_log_capture = self.backend.log_capture(&handle);
+                    let crash_log_capture = self.shared.backend.log_capture(&handle);
                     if self
                         .transition_with_log_capture(
                             registry,
@@ -1397,7 +1411,7 @@ impl Supervisor {
             starting,
             LifecycleState::Running,
             ready_cause,
-            self.backend.log_capture(&handle),
+            self.shared.backend.log_capture(&handle),
             RunFate::Terminal,
         )?;
         // The Run id was minted BEFORE the record commit (story 15-2 — the
@@ -1717,7 +1731,7 @@ impl Supervisor {
     fn watch_startup(&self, handle: &mut proc::ProcHandle) -> Option<Option<i32>> {
         let deadline = std::time::Instant::now() + STARTUP_SURVIVAL_WINDOW;
         loop {
-            match self.backend.poll(handle) {
+            match self.shared.backend.poll(handle) {
                 Ok(ProcessStatus::Exited { code }) => return Some(code),
                 Ok(ProcessStatus::Alive) => {}
                 // A poll error during startup is treated as still-alive; the next
