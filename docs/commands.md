@@ -1010,9 +1010,9 @@ Two environment variables control `hekma`'s own behavior (they are never injecte
 
 When a `hekma` subcommand runs, Hekma checks whether a newer GitHub Release is available, using an hourly cache. If an update is available, it prints a short stderr notice asking you to run `hekma self-update`. Machine-readable JSON on stdout is unaffected. `hekma serve` is exempt — a long-running host is not a point-in-time command, and its stderr stream carries host diagnostics, not update notices. Disable checks with `KTESIO_NO_UPDATE_CHECK=1` (also skipped when `CI=true`).
 
-### `hekma self-update`
+### `hekma self-update [--no-restart]`
 
-Update the `hekma` binary itself, preserving the current install channel (Homebrew, Cargo, or a manual release binary). Running instances already hold their own process image: they keep executing the binary they were started with until their next start, so a self-update does not interrupt them — restart agents to pick up the new version.
+Update the `hekma` binary itself, preserving the current install channel (Homebrew, Cargo, or a manual release binary). Running instances already hold their own process image: they keep executing the binary they were started with until their next start, so a self-update does not interrupt them — restart agents to pick up the new version. After an update, a host serving the state directory is asked to move onto the new binary in place, as [`hekma serve --upgrade`](hosting.md#agents-in-their-own-shim-a-preview) does (Unix; agents in their own Shim keep running and the metering proxy refuses no connection); with no host running nothing is asked, and if the host cannot upgrade the note says to restart it. `--no-restart` replaces the binaries only.
 
 ```bash
 hekma self-update

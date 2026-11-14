@@ -21,6 +21,9 @@ Details:
   Updates the hekma binary using the current install channel. Homebrew installs run
   brew upgrade, Cargo installs run cargo install --force, and manual binary
   installs download and verify the latest GitHub Release archive.
+  After an update, a host serving the state directory is asked to move onto
+  the new binary in place (on Unix: agents in their own Shim keep running);
+  --no-restart skips that.
 
 Example:
   hekma self-update";
@@ -270,7 +273,12 @@ enum Commands {
         about = "Update the hekma binary",
         after_help = SELF_UPDATE_AFTER_HELP
     )]
-    SelfUpdate,
+    SelfUpdate {
+        /// Replace the binaries only: do not ask a running host to move
+        /// onto the new binary in place
+        #[arg(long)]
+        no_restart: bool,
+    },
     /// Manage Agent Instances in the Fleet
     #[command(
         about = "Manage Agent Instances in the Fleet",
@@ -1464,7 +1472,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match cli.command {
-        Some(Commands::SelfUpdate) => cli::self_update::run(),
+        Some(Commands::SelfUpdate { no_restart }) => cli::self_update::run(no_restart),
         // Story 24-1: the Shim (internal). It touches no state.db; a bad
         // argument is a usage refusal.
         Some(Commands::Shim {
@@ -2022,7 +2030,7 @@ fn lifecycle_args(
 }
 
 fn should_check_for_updates(command: &Option<Commands>) -> bool {
-    matches!(command, Some(command) if !matches!(command, Commands::SelfUpdate | Commands::Serve { .. } | Commands::Shim { .. }))
+    matches!(command, Some(command) if !matches!(command, Commands::SelfUpdate { .. } | Commands::Serve { .. } | Commands::Shim { .. }))
 }
 
 /// Classify a returned diagnostic into the documented, stable numeric exit

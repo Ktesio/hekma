@@ -263,7 +263,7 @@ fn proxy_allowed_origins(values: Vec<String>) -> Result<Vec<String>, String> {
 /// directory to hand over in place, then wait (bounded) until `control.json`
 /// names its successor. With no host serving, nothing is started: there is
 /// nothing to upgrade.
-fn upgrade(state_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn upgrade(state_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let root = hekma_engine::paths::EnginePaths::new(state_dir)
         .map_err(|err| ServeOptionsInvalid {
             message: err.to_string(),
