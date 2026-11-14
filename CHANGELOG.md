@@ -4,6 +4,16 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — the Shim, part two: agents in their own Shim, a preview (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **Off by default.** With `EngineOptions::shim_exe` set (and `hekma serve` with `HEKMA_SHIM=1`), each supervised agent is launched through its own Shim. The agent then outlives the engine, and the next engine reconnects to it. Unix only; ACP agents stay held directly.
+> - **Dropping an engine does not stop a Shim-held agent;** only an explicit stop or `shutdown` does.
+> - **Engine surface (breaking within the unreleased 0.12.0):**
+>   - `EngineOptions` gains `shim_exe`;
+>   - `SpawnRecord` gains `shim` (`ShimRecord`);
+>   - `state.db` migrates one way to schema 27.
+
 > **Unreleased — reconciliation: confirmed usage beside the estimate (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >

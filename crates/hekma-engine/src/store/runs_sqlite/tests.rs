@@ -1214,6 +1214,13 @@ fn a_v15_state_dir_migrates_to_v16_and_the_listing_reads_it() {
         let store = SqliteStore::open(&db).unwrap();
         store
             .conn()
+            .execute_batch(
+                "ALTER TABLE agent_runtime DROP COLUMN shim_socket; \
+                 ALTER TABLE agent_runtime DROP COLUMN shim_launch_id;",
+            )
+            .unwrap();
+        store
+            .conn()
             .execute_batch(crate::store::reconcile_sqlite::UNDO_V26_FOR_TEST)
             .unwrap();
         store
@@ -1422,6 +1429,13 @@ fn a_v16_state_dir_migrates_to_v17_and_a_live_run_keeps_running_without_a_key() 
     let db = tmp.path().join("state.db");
     {
         let store = SqliteStore::open(&db).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "ALTER TABLE agent_runtime DROP COLUMN shim_socket; \
+                 ALTER TABLE agent_runtime DROP COLUMN shim_launch_id;",
+            )
+            .unwrap();
         store
             .conn()
             .execute_batch(crate::store::reconcile_sqlite::UNDO_V26_FOR_TEST)
@@ -1644,6 +1658,13 @@ fn a_v19_state_dir_migrates_to_v20_seeding_activity_and_changing_no_run() {
     let db = tmp.path().join("state.db");
     {
         let store = SqliteStore::open(&db).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "ALTER TABLE agent_runtime DROP COLUMN shim_socket; \
+                 ALTER TABLE agent_runtime DROP COLUMN shim_launch_id;",
+            )
+            .unwrap();
         store
             .conn()
             .execute_batch(crate::store::reconcile_sqlite::UNDO_V26_FOR_TEST)

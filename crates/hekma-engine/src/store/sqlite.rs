@@ -116,7 +116,7 @@ use crate::ports::{
 /// `proxy_state.identity_headers` (the root, on by default) and
 /// `run_bindings.identity_headers` (the per-binding override) — see
 /// [`super::runs_sqlite`].
-pub(crate) const SCHEMA_VERSION: i64 = 26;
+pub(crate) const SCHEMA_VERSION: i64 = 27;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -826,6 +826,16 @@ fn migrate(
     if version < 26 {
         super::reconcile_sqlite::migrate_v26(conn)?;
     }
+    // Story 24-1: v27 records the Shim a process was launched through
+    // (additive; NULL for every process held directly).
+    if version < 27 {
+        super::runs_sqlite::migrate_runs_step(
+            conn,
+            27,
+            "ALTER TABLE agent_runtime ADD COLUMN shim_socket TEXT;\n\
+             ALTER TABLE agent_runtime ADD COLUMN shim_launch_id TEXT;",
+        )?;
+    }
     Ok(notes)
 }
 
@@ -1258,8 +1268,8 @@ impl StateStore for SqliteStore {
                 "INSERT INTO agent_runtime \
                  (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause, \
                   detached, acp_session_id, run_id, owner_pid, owner_start_time, \
-                  lease_pid, lease_start_time) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+                  lease_pid, lease_start_time, shim_socket, shim_launch_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
                  ON CONFLICT(instance_id) DO UPDATE SET \
                  pid = excluded.pid, start_time = excluded.start_time, \
                  restart_policy = excluded.restart_policy, \
@@ -1271,7 +1281,9 @@ impl StateStore for SqliteStore {
                  owner_pid = excluded.owner_pid, \
                  owner_start_time = excluded.owner_start_time, \
                  lease_pid = excluded.lease_pid, \
-                 lease_start_time = excluded.lease_start_time",
+                 lease_start_time = excluded.lease_start_time, \
+                 shim_socket = excluded.shim_socket, \
+                 shim_launch_id = excluded.shim_launch_id",
                 rusqlite::params![
                     id,
                     record.fingerprint.pid as i64,
@@ -1293,6 +1305,11 @@ impl StateStore for SqliteStore {
                     // through the compare-and-set below.
                     record.lease.map(|lease| lease.pid as i64),
                     record.lease.map(|lease| lease.start_time as i64),
+                    record
+                        .shim
+                        .as_ref()
+                        .map(|shim| shim.socket.to_string_lossy().into_owned()),
+                    record.shim.as_ref().map(|shim| shim.launch_id.clone()),
                 ],
             )
             .map_err(backend)?;
@@ -1507,7 +1524,7 @@ impl StateStore for SqliteStore {
             .query_row(
                 "SELECT pid, start_time, restart_policy, restart_count, last_known_cause, \
                  detached, acp_session_id, run_id, owner_pid, owner_start_time, \
-                 lease_pid, lease_start_time \
+                 lease_pid, lease_start_time, shim_socket, shim_launch_id \
                  FROM agent_runtime WHERE instance_id = ?1",
                 [id],
                 |row| Ok(row_to_spawn_record(name.clone(), row)),
@@ -1524,7 +1541,8 @@ impl StateStore for SqliteStore {
             .prepare(
                 "SELECT i.name, r.pid, r.start_time, r.restart_policy, r.restart_count, \
                  r.last_known_cause, r.detached, r.acp_session_id, r.run_id, \
-                 r.owner_pid, r.owner_start_time, r.lease_pid, r.lease_start_time \
+                 r.owner_pid, r.owner_start_time, r.lease_pid, r.lease_start_time, \
+                 r.shim_socket, r.shim_launch_id \
                  FROM agent_runtime r JOIN agent_instances i ON i.id = r.instance_id \
                  ORDER BY i.name",
             )
@@ -2088,6 +2106,16 @@ fn row_to_spawn_record(
         }
         _ => None,
     };
+    // Story 24-1 (schema v27): the Shim the process was launched through.
+    let shim_socket: Option<String> = row.get("shim_socket").map_err(backend)?;
+    let shim_launch_id: Option<String> = row.get("shim_launch_id").map_err(backend)?;
+    let shim = match (shim_socket, shim_launch_id) {
+        (Some(socket), Some(launch_id)) => Some(crate::ports::ShimRecord {
+            socket: std::path::PathBuf::from(socket),
+            launch_id,
+        }),
+        _ => None,
+    };
     let restart_policy =
         RestartPolicy::from_wire(&policy_raw).ok_or_else(|| StoreError::CorruptRow {
             name: name.as_str().to_string(),
@@ -2104,6 +2132,7 @@ fn row_to_spawn_record(
         run_id,
         owner,
         lease,
+        shim,
     })
 }
 
@@ -2464,6 +2493,7 @@ mod tests {
             run_id: None,
             owner: None,
             lease: None,
+            shim: None,
         }
     }
 

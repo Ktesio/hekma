@@ -585,6 +585,13 @@ pub fn fake_acp_agent_bin() -> PathBuf {
     helper_bin_in(BinDir::TestDeps, "fake_acp_agent")
 }
 
+/// Locate the `shim_host` test helper (story 24-1): a Shim program for
+/// `EngineOptions::shim_exe`, resolved and built on demand like
+/// [`fake_agent_bin`].
+pub fn shim_host_bin() -> PathBuf {
+    helper_bin_in(BinDir::TestDeps, "shim_host")
+}
+
 /// The SHARED helper locator: resolve `target/<profile>/<name><EXE_SUFFIX>`
 /// from the running binary's hop, building the named `[[bin]]` on demand
 /// when absent. `fake_agent_bin_in` and [`fake_acp_agent_bin_in`]'s engine.

@@ -256,6 +256,56 @@ pub fn spawn_detached_process(
     Ok(child.id())
 }
 
+/// Create (or check) the owner-only Shim socket directory (story 24-1):
+/// the engine prepares it before starting a Shim, the same way the Shim
+/// checks it before listening.
+pub fn shim_prepare_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        unix::shim::prepare_dir(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Whether this OS has a Shim transport (story 24-1: Unix sockets now;
+/// the Windows named pipe follows).
+pub fn shim_supported() -> bool {
+    cfg!(unix)
+}
+
+/// Spawn the Shim program DETACHED, like [`spawn_detached_process`], but
+/// with a cleared environment (story 24-1, R2.3's Shim half): only `PATH`,
+/// `HOME` and `TMPDIR` pass, so no provider variable rides into the Shim.
+/// The agent's own environment travels in its launch request.
+pub fn spawn_shim_process(
+    exe: &std::path::Path,
+    args: &[std::ffi::OsString],
+    log: &std::path::Path,
+) -> std::io::Result<u32> {
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)?;
+    let err = out.try_clone()?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(args)
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(out)
+        .stderr(err);
+    for key in ["PATH", "HOME", "TMPDIR", "SystemRoot"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    let child = spawn_detached_command(&mut command)?;
+    Ok(child.id())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
