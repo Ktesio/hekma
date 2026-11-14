@@ -990,8 +990,13 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: Not built yet:
     - the full `kill -9` drill matrix (a parked hold, in-flight calls, Leases and `wire`/`announced` Runs, both modes, the Windows `taskkill /F` leg);
     - ~~SM-7's auditor~~ (built in phase 4, asserted in six scenarios; still missing: the socket-activated scenario and an SDK-shaped client harness);
-    - the flush-bound measurement and its docs.
+    - ~~the flush-bound measurement and its docs~~ (stated in phase 8: the writer's 250 ms / 512-record batch, pinned by a unit test; a measured kill-during-batch drill is still open).
+
+  Phases 5, 7 and 9 add the drills for committed governance, Leases (held and lapsed while no host runs) and the `recovery` event. Still open: the Windows leg, and CLI `--json` fields derived from the event.
 
   Phase 1 tests the posture split with a real SIGKILL on Unix only.
   evidence: `crates/hekma/tests/shim_cli.rs`. Trigger: 24-3 phase 2 and 3.
 
+- source_spec: `spec-24-3-crash-recovery-and-registry-completeness.md` (found while building phase 9)
+  summary: Some test runs leave `fake_agent` processes behind, SIGSTOPped (state `T`), so they never reach their `--linger-ms` exit. 19 were found on the build machine, up to three days old, all with `--emit-usage 1 --linger-ms 600000`. A paused agent whose test ends without a stop keeps running stopped forever.
+  evidence: `ps -eo pid,etime,stat,command | grep debug/fake_agent`. Trigger: the next test-harness pass; a `TestContext` drop that SIGCONTs and kills its agents, or `fake_agent` exiting when its parent dies.
