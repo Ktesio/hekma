@@ -24,8 +24,9 @@ pub const RETENTION_MIN_DAYS: u32 = 1;
 pub const RETENTION_MAX_DAYS: u32 = 3650;
 
 /// The most Runs one compaction job reduces (one writer job each, so a
-/// pass never holds the writer long).
-pub const COMPACTION_BATCH: usize = 500;
+/// pass never holds the writer long: about 30 ms at 100,000 Runs, inside
+/// the acked-write bound a queued write may wait behind).
+pub const COMPACTION_BATCH: usize = 250;
 
 /// How often the sweeper runs a compaction pass (and once at start).
 pub const COMPACTION_INTERVAL_SECS: u64 = 86_400;

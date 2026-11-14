@@ -2158,6 +2158,10 @@ struct CliArgs {
     /// seeded records and its absolute gates; refused beside the other
     /// flags.
     calls_seed: Option<u64>,
+    /// Story 24-4: run ONLY the Run-scale ladder rung at N seeded Runs (the
+    /// first `hekma ps` page, the publish cost, and its scaling against the
+    /// 10k reference) and its absolute gates; refused beside the other flags.
+    run_scale: Option<u64>,
     help: bool,
 }
 
@@ -2201,6 +2205,12 @@ fn usage_text() -> String {
          \x20                          and the by-id probe (PERF_BUDGETS_CALLS_ITERATIONS,\n\
          \x20                          default 40); gates each p99 under 1 s. Refused beside\n\
          \x20                          the other flags.\n\
+         \x20 --run-scale <N>        story 24-4: run ONLY the Run-scale ladder: seed 10000\n\
+         \x20                          Runs, measure, seed to N, measure again; gates the\n\
+         \x20                          first hekma ps page (p99 < 1 s), an acked Run write\n\
+         \x20                          with its snapshot publish (p99 <= 50 ms, p50 <= 10 ms),\n\
+         \x20                          and that p50 not scaling with N (<= 3x the 10k figure).\n\
+         \x20                          N >= 10000. Refused beside the other flags.\n\
          \x20 --help | -h             this text.\n\
          \n\
          \x20 No flags: the absolute budgets gate exactly as before and the report is\n\
@@ -2243,7 +2253,7 @@ fn parse_cli_args(argv: &[String]) -> Result<CliArgs, String> {
             return Err(format!(
                 "unknown argument {raw:?} \
                  (supported: --baseline <file>, --write-baseline <file>, --serve-shape, \
-                 --ps-seed <N>, --proxy, --calls-seed <N>, --help)"
+                 --ps-seed <N>, --proxy, --calls-seed <N>, --run-scale <N>, --help)"
             ));
         };
         if flag == "--proxy" {
@@ -2296,6 +2306,31 @@ fn parse_cli_args(argv: &[String]) -> Result<CliArgs, String> {
                 return Err("--calls-seed given more than once".to_string());
             }
             parsed.calls_seed = Some(count);
+            index += 1;
+            continue;
+        }
+        if flag == "--run-scale" {
+            let value = match inline_value {
+                Some(value) => value,
+                None => {
+                    index += 1;
+                    argv.get(index).cloned().ok_or_else(|| {
+                        "--run-scale requires a count (usage: --run-scale <N>)".to_string()
+                    })?
+                }
+            };
+            let count: u64 = value.parse().map_err(|_| {
+                format!("--run-scale requires a whole number of Runs (got {value:?})")
+            })?;
+            if count < RUN_SCALE_REFERENCE {
+                return Err(format!(
+                    "--run-scale requires at least {RUN_SCALE_REFERENCE} Runs (the reference rung)"
+                ));
+            }
+            if parsed.run_scale.is_some() {
+                return Err("--run-scale given more than once".to_string());
+            }
+            parsed.run_scale = Some(count);
             index += 1;
             continue;
         }
@@ -3558,6 +3593,295 @@ fn calls_scenario(seed: u64) -> Result<bool, String> {
     Ok(passed)
 }
 
+// ---------------------------------------------------------------------------
+// Story 24-4: the Run-scale ladder (--run-scale <N>)
+// ---------------------------------------------------------------------------
+
+/// The reference rung every ladder run measures first (the scaling gate's
+/// denominator).
+const RUN_SCALE_REFERENCE: u64 = 10_000;
+
+/// The first `hekma ps` page plus counts, p99, strict (SM-8's number).
+const RUN_SCALE_PAGE_BUDGET_MS: f64 = 1000.0;
+
+/// An acked Run write (commit plus snapshot publish), p99: the store
+/// writer's acked-write bound, held at scale. The tail is the background
+/// jobs a write can queue behind (the Lease sweeper, compaction).
+const RUN_SCALE_ACKED_WRITE_BUDGET_MS: f64 = 50.0;
+
+/// The typical acked Run write with its publish, p50.
+const RUN_SCALE_PUBLISH_BUDGET_MS: f64 = 10.0;
+
+/// The write p50 at N may be at most this many times the reference's...
+const RUN_SCALE_SCALING_FACTOR: f64 = 3.0;
+
+/// ...or this much above it, whichever is larger (sub-millisecond figures
+/// are noise-dominated).
+const RUN_SCALE_SCALING_FLOOR_MS: f64 = 2.0;
+
+/// Acked Run writes per publish storm.
+const RUN_SCALE_STORM_WRITES: u64 = 200;
+
+/// The instances the seeded Runs belong to.
+const RUN_SCALE_INSTANCES: usize = 4;
+
+/// One rung's measurement.
+#[derive(Debug, Clone, PartialEq)]
+struct RungFigures {
+    seed: u64,
+    open_runs: u64,
+    page_p99_ms: f64,
+    publish_p99_ms: f64,
+    /// Reported, not gated: the publish median and slowest write.
+    publish_p50_ms: f64,
+    publish_max_ms: f64,
+}
+
+/// The ladder gates (pure): the page budget at N, the acked-write tail,
+/// the typical write with its publish, and that typical cost not scaling
+/// with N against the reference (the median, so a background job the
+/// storm happens to queue behind cannot fake or hide growth).
+fn run_scale_gates(reference: &RungFigures, at: &RungFigures) -> Vec<(&'static str, bool)> {
+    let allowed = (reference.publish_p50_ms * RUN_SCALE_SCALING_FACTOR)
+        .max(reference.publish_p50_ms + RUN_SCALE_SCALING_FLOOR_MS);
+    vec![
+        (
+            "run_scale_ps_first_page_p99_lt_1s",
+            at.page_p99_ms < RUN_SCALE_PAGE_BUDGET_MS,
+        ),
+        (
+            "run_scale_acked_write_p99_le_50ms",
+            at.publish_p99_ms <= RUN_SCALE_ACKED_WRITE_BUDGET_MS,
+        ),
+        (
+            "run_scale_publish_p50_le_10ms",
+            at.publish_p50_ms <= RUN_SCALE_PUBLISH_BUDGET_MS,
+        ),
+        (
+            "run_scale_publish_p50_at_seed_le_3x_the_10k_figure",
+            at.publish_p50_ms <= allowed,
+        ),
+    ]
+}
+
+fn run_run_scale_scenario(seed: u64) -> i32 {
+    match run_scale_scenario(seed) {
+        Ok(passed) => i32::from(!passed),
+        Err(reason) => {
+            note(&format!(
+                "the Run-scale scenario could not run: {reason} — exiting 2"
+            ));
+            2
+        }
+    }
+}
+
+/// Seed rows `[from, to)` round-robin over `names` through `engine`.
+fn seed_run_scale(
+    engine: &Engine,
+    names: &[String],
+    from: u64,
+    to: u64,
+    now_unix: u64,
+) -> Result<(), String> {
+    let facade = engine.blocking();
+    let mut seeded = from;
+    while seeded < to {
+        let count = ((to - seeded) as usize).min(PS_SEED_CHUNK);
+        let rows = ps_seed_rows(seeded, count, now_unix);
+        let instance = &names[(seeded as usize / PS_SEED_CHUNK) % names.len()];
+        facade
+            .seed_runs_for_perf(instance, rows)
+            .map_err(|err| format!("seeding failed at {seeded}: {err}"))?;
+        seeded += count as u64;
+    }
+    Ok(())
+}
+
+/// Measure one rung over `state` holding `seed` Runs: a fresh write engine
+/// (its open-time snapshot loads every open Run), a storm of acked label
+/// writes on open seeded Runs (each one commits and publishes), then the
+/// first exceptions page plus counts through read-only engines.
+fn measure_rung(
+    state: &std::path::Path,
+    seed: u64,
+    iterations: usize,
+    round: u64,
+) -> Result<RungFigures, String> {
+    let opened_at = hekma_engine::format_rfc3339(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+    let engine = Engine::open(Some(state.to_path_buf()))
+        .map_err(|err| format!("open the measuring engine: {err}"))?;
+    let facade = engine.blocking();
+    // The open-time retention pass compacts the seed's old ended Runs in
+    // bounded writer jobs; the storm measures publishing, so it starts once
+    // THIS engine's pass is recorded (a pass recorded at or after the open;
+    // an earlier rung's record does not count). Bounded wait.
+    let waited = Instant::now();
+    while waited.elapsed() < Duration::from_secs(300) {
+        let done = facade
+            .retention()
+            .map(|view| {
+                view.compaction
+                    .last_pass_at
+                    .is_some_and(|at| at.as_str() >= opened_at.as_str())
+            })
+            .unwrap_or(true);
+        if done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut publish = Vec::with_capacity(RUN_SCALE_STORM_WRITES as usize);
+    // Open, healthy rows: the seed mix's buckets 36..100.
+    let open_rows: Vec<u64> = (0..seed).filter(|i| i % 100 >= 36).collect();
+    if open_rows.is_empty() {
+        return Err("the seed holds no open Run".to_string());
+    }
+    let stride = (open_rows.len() as u64 / RUN_SCALE_STORM_WRITES).max(1);
+    note(&format!(
+        "Run-scale rung {seed}: the publish storm starts ({RUN_SCALE_STORM_WRITES} writes)"
+    ));
+    for n in 0..RUN_SCALE_STORM_WRITES {
+        let index = open_rows[((n * stride) as usize) % open_rows.len()];
+        let mut change = hekma_engine::LabelChange::default();
+        change
+            .set
+            .insert("storm".to_string(), format!("r{round}w{n}"));
+        let at = Instant::now();
+        facade
+            .label_run(&format!("run_bench{index:08}"), change, false)
+            .map_err(|err| format!("the storm write failed: {err}"))?;
+        publish.push(at.elapsed().as_secs_f64() * 1000.0);
+    }
+    drop(engine);
+    let mut pages = Vec::with_capacity(iterations);
+    let mut open_runs = 0;
+    for _ in 0..iterations {
+        let reader = Engine::open_read_only(Some(state.to_path_buf()))
+            .map_err(|err| format!("the read-only open failed: {err}"))?;
+        let at = Instant::now();
+        let listing = reader
+            .blocking()
+            .list_runs(hekma_engine::ListRunsQuery::exceptions())
+            .map_err(|err| format!("the listing read failed: {err}"))?;
+        pages.push(at.elapsed().as_secs_f64() * 1000.0);
+        open_runs = listing.counts.healthy_open;
+    }
+    publish.sort_by(f64::total_cmp);
+    pages.sort_by(f64::total_cmp);
+    Ok(RungFigures {
+        seed,
+        open_runs,
+        page_p99_ms: percentile(&pages, 99.0),
+        publish_p99_ms: percentile(&publish, 99.0),
+        publish_p50_ms: percentile(&publish, 50.0),
+        publish_max_ms: publish.last().copied().unwrap_or(0.0),
+    })
+}
+
+fn run_scale_scenario(seed: u64) -> Result<bool, String> {
+    let default_iterations = if seed >= 1_000_000 { 10 } else { 40 };
+    let iterations =
+        env_u64("PERF_BUDGETS_RUN_SCALE_ITERATIONS", default_iterations).max(1) as usize;
+    let state = tempfile::TempDir::new().map_err(|err| err.to_string())?;
+    let manifest_tmp = tempfile::TempDir::new().map_err(|err| err.to_string())?;
+    let manifest_dir = ManifestFixture::heartbeat(MANIFEST_KIND, HEARTBEAT_MS, AGENT_LINGER_MS)
+        .exec(fake_agent_bin_in(BinDir::Examples))
+        .write(manifest_tmp.path());
+    let names: Vec<String> = (0..RUN_SCALE_INSTANCES)
+        .map(|i| format!("scale-{i:02}"))
+        .collect();
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let started = Instant::now();
+    {
+        let engine = Engine::open(Some(state.path().to_path_buf()))
+            .map_err(|err| format!("open the engine: {err}"))?;
+        for name in &names {
+            engine
+                .blocking()
+                .register_with_adapter(name, &AdapterRef::Manifest(manifest_dir.clone()))
+                .map_err(|err| format!("register {name}: {err}"))?;
+        }
+        seed_run_scale(&engine, &names, 0, RUN_SCALE_REFERENCE, now_unix)?;
+    }
+    let reference = measure_rung(state.path(), RUN_SCALE_REFERENCE, iterations, 0)?;
+    {
+        let engine = Engine::open(Some(state.path().to_path_buf()))
+            .map_err(|err| format!("reopen the engine: {err}"))?;
+        seed_run_scale(&engine, &names, RUN_SCALE_REFERENCE, seed, now_unix)?;
+    }
+    let at = if seed == RUN_SCALE_REFERENCE {
+        reference.clone()
+    } else {
+        measure_rung(state.path(), seed, iterations, 1)?
+    };
+    let gates = run_scale_gates(&reference, &at);
+    let passed = gates.iter().all(|(_, ok)| *ok);
+    let rung = |figures: &RungFigures| {
+        serde_json::json!({
+            "seed": figures.seed,
+            "healthy_open_runs": figures.open_runs,
+            "ps_first_page_p99_ms": figures.page_p99_ms,
+            "publish_p99_ms": figures.publish_p99_ms,
+            "publish_p50_ms": figures.publish_p50_ms,
+            "publish_max_ms": figures.publish_max_ms,
+        })
+    };
+    let report = serde_json::json!({
+        "run_scale": {
+            "story": "24-4",
+            "iterations": iterations,
+            "storm_writes": RUN_SCALE_STORM_WRITES,
+            "seed_mix": "the ps-seed mix: 2% active+breach, 2% held, 2% ended+anomaly \
+                 inside the window, 20% ended clean inside, 10% ended older, the rest \
+                 active healthy",
+            "publish_note": "an acked label write on an open seeded Run, which commits \
+                 and publishes the Run snapshot, timed by the caller",
+            "reference": rung(&reference),
+            "at_seed": rung(&at),
+            "budgets": {
+                "ps_first_page_p99_ms_lt": RUN_SCALE_PAGE_BUDGET_MS,
+                "acked_write_p99_ms_le": RUN_SCALE_ACKED_WRITE_BUDGET_MS,
+                "publish_p50_ms_le": RUN_SCALE_PUBLISH_BUDGET_MS,
+                "scaling": format!(
+                    "publish p50 at the seed <= max({RUN_SCALE_SCALING_FACTOR} x the reference, \
+                     the reference + {RUN_SCALE_SCALING_FLOOR_MS} ms)"
+                ),
+            },
+            "gates": gates
+                .iter()
+                .map(|(name, ok)| serde_json::json!({"name": name, "passed": ok}))
+                .collect::<Vec<_>>(),
+            "wall_seconds": started.elapsed().as_secs_f64(),
+            "passed": passed,
+        }
+    });
+    let text = serde_json::to_string_pretty(&report).map_err(|err| err.to_string())?;
+    println!("{text}");
+    if let Ok(path) = std::env::var("PERF_BUDGETS_REPORT_PATH") {
+        std::fs::write(&path, &text).map_err(|err| format!("write {path}: {err}"))?;
+    }
+    note(&format!(
+        "Run-scale rung {seed}: ps first page p99 {:.2} ms (reference {:.2} ms), acked write \
+         p50 {:.3} ms / p99 {:.3} ms (reference p50 {:.3} ms) — {}",
+        at.page_p99_ms,
+        reference.page_p99_ms,
+        at.publish_p50_ms,
+        at.publish_p99_ms,
+        reference.publish_p50_ms,
+        if passed { "PASS" } else { "FAIL" }
+    ));
+    Ok(passed)
+}
+
 fn main() {
     // Story 15-5: the flag surface (--baseline / --write-baseline). Parsed
     // FIRST so a usage error cannot waste a minute of measurement; invalid
@@ -3575,6 +3899,19 @@ fn main() {
         return;
     }
     let config = HarnessConfig::from_env();
+    if let Some(seed) = cli.run_scale {
+        if cli.baseline.is_some()
+            || cli.write_baseline.is_some()
+            || cli.serve_shape
+            || cli.ps_seed.is_some()
+            || cli.proxy
+            || cli.calls_seed.is_some()
+        {
+            note("--run-scale runs on its own: drop the other flags — exiting 2");
+            std::process::exit(2);
+        }
+        std::process::exit(run_run_scale_scenario(seed));
+    }
     if let Some(seed) = cli.calls_seed {
         if cli.baseline.is_some()
             || cli.write_baseline.is_some()
@@ -5782,6 +6119,7 @@ mod tests {
                 ps_seed: None,
                 proxy: false,
                 calls_seed: None,
+                run_scale: None,
                 help: false,
             }
         );
@@ -5798,6 +6136,7 @@ mod tests {
                 ps_seed: None,
                 proxy: false,
                 calls_seed: None,
+                run_scale: None,
                 help: false,
             }
         );
@@ -5816,6 +6155,7 @@ mod tests {
                 ps_seed: None,
                 proxy: false,
                 calls_seed: None,
+                run_scale: None,
                 help: false,
             }
         );
@@ -6348,6 +6688,80 @@ mod tests {
         assert_eq!(outcome.page_p(0.95), 12.0);
         assert_eq!(outcome.page_p(0.50), 6.0);
         assert_eq!(outcome.open_p(0.99), 1.0, "constant samples rank constant");
+    }
+
+    #[test]
+    fn the_run_scale_flag_parses_and_the_ladder_gates_hold_their_lines() {
+        let parse =
+            |args: &[&str]| parse_cli_args(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            parse(&["--run-scale", "100000"]).unwrap().run_scale,
+            Some(100_000)
+        );
+        assert_eq!(
+            parse(&["--run-scale=10000"]).unwrap().run_scale,
+            Some(10_000)
+        );
+        for bad in [
+            vec!["--run-scale"],
+            vec!["--run-scale", "lots"],
+            vec!["--run-scale", "9999"],
+            vec!["--run-scale", "10000", "--run-scale", "20000"],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
+        assert!(usage_text().contains("--run-scale <N>"));
+        let rung = |seed, page, p50, p99| RungFigures {
+            seed,
+            open_runs: seed / 2,
+            page_p99_ms: page,
+            publish_p99_ms: p99,
+            publish_p50_ms: p50,
+            publish_max_ms: p99,
+        };
+        let passing = |reference: &RungFigures, at: &RungFigures| -> Vec<bool> {
+            run_scale_gates(reference, at)
+                .iter()
+                .map(|(_, ok)| *ok)
+                .collect()
+        };
+        let reference = rung(10_000, 20.0, 0.4, 20.0);
+        assert_eq!(
+            passing(&reference, &rung(100_000, 40.0, 0.6, 45.0)),
+            vec![true, true, true, true]
+        );
+        // The floor: 0.4 ms may grow to 2.4 ms (0.4 + 2.0 beats 3 x 0.4).
+        assert_eq!(
+            passing(&reference, &rung(100_000, 40.0, 2.4, 45.0))[3],
+            true
+        );
+        assert_eq!(
+            passing(&reference, &rung(100_000, 40.0, 2.5, 45.0))[3],
+            false
+        );
+        // The factor: a 3 ms reference may grow to 9 ms.
+        let slower = rung(10_000, 20.0, 3.0, 20.0);
+        assert_eq!(
+            passing(&slower, &rung(100_000, 40.0, 9.0, 45.0)),
+            vec![true; 4]
+        );
+        assert_eq!(
+            passing(&slower, &rung(100_000, 1000.0, 10.5, 50.5)),
+            vec![false, false, false, false]
+        );
+        let names: Vec<&str> = run_scale_gates(&reference, &reference)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "run_scale_ps_first_page_p99_lt_1s",
+                "run_scale_acked_write_p99_le_50ms",
+                "run_scale_publish_p50_le_10ms",
+                "run_scale_publish_p50_at_seed_le_3x_the_10k_figure"
+            ]
+        );
     }
 
     #[test]

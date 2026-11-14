@@ -11101,3 +11101,51 @@ fn home_isolation_points_the_home_variables_inside_the_agent_home() {
     sup.stop(&registry, name.as_str(), Some(Duration::from_secs(5)))
         .unwrap();
 }
+
+#[test]
+fn this_engines_own_commits_never_reload_the_snapshot_and_a_foreign_commit_does() {
+    // Story 24-4 (the Run-scale ladder's finding): the tick's foreign-commit
+    // check used to reload every open Run after each of this engine's own
+    // writes. The writer connection's counter moves only for another
+    // connection's commit, so an own write reloads nothing.
+    let state = tempfile::tempdir().unwrap();
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let set_window = |registry: &Registry, days: u32| {
+        registry
+            .writer()
+            .call(move |ctx| {
+                ctx.store().set_retention(
+                    &crate::domain::runs::retention::RetentionChange {
+                        run_retention_days: Some(days),
+                        calls_retention_days: None,
+                    },
+                    "t",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    };
+    let generation = |registry: &Registry| registry.run_snapshot().generation;
+    registry.poll_foreign_commits().unwrap();
+    let before = generation(&registry);
+    for days in 2..6 {
+        set_window(&registry, days);
+        registry.poll_foreign_commits().unwrap();
+    }
+    assert_eq!(generation(&registry), before, "an own commit reloaded");
+    // Another engine's commit is picked up by the next tick.
+    let other = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    set_window(&other, 9);
+    registry.poll_foreign_commits().unwrap();
+    assert!(
+        generation(&registry) > before,
+        "a foreign commit was missed"
+    );
+    let after = generation(&registry);
+    registry.poll_foreign_commits().unwrap();
+    assert_eq!(
+        generation(&registry),
+        after,
+        "one foreign commit, one reload"
+    );
+}
