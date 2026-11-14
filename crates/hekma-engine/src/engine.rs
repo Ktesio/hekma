@@ -1592,8 +1592,12 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         let kind = kind.to_string();
-        self.run_blocking(move || inner.registry.critical().register(&name, &kind))
-            .await
+        self.run_blocking(move || {
+            inner
+                .registry
+                .gate(|registry| registry.register(&name, &kind))
+        })
+        .await
     }
 
     /// Register a new Agent Instance, resolving `reference` to an adapter first.
@@ -1705,7 +1709,7 @@ impl Engine {
     /// List the whole Fleet, ordered by name.
     pub async fn list(&self) -> Result<Vec<AgentInstance>, RegistryError> {
         let inner = Arc::clone(&self.inner);
-        self.run_blocking(move || inner.registry.critical().list())
+        self.run_blocking(move || inner.registry.gate(|registry| registry.list()))
             .await
     }
 
@@ -2117,8 +2121,12 @@ impl Engine {
     ) -> Result<EffectiveCapabilities, RegistryError> {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
-        self.run_blocking(move || inner.registry.critical().effective_capabilities(&name))
-            .await
+        self.run_blocking(move || {
+            inner
+                .registry
+                .gate(|registry| registry.effective_capabilities(&name))
+        })
+        .await
     }
 
     /// Start a registered Agent Instance (AC1/AC2).
@@ -2642,7 +2650,9 @@ impl Engine {
                 name: name.clone(),
                 reason: reason.to_string(),
             })?;
-            inner.registry.critical().reveal_secrets(&iname, overrides)
+            inner
+                .registry
+                .gate(|registry| registry.reveal_secrets(&iname, overrides))
         })
         .await
     }
@@ -2805,7 +2815,7 @@ impl Engine {
     pub async fn run(&self, run_id: &str) -> Result<RunView, RunError> {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
-        self.run_blocking(move || inner.registry.critical().run_view(&run_id))
+        self.run_blocking(move || inner.registry.gate(|registry| registry.run_view(&run_id)))
             .await
     }
 
@@ -2854,8 +2864,12 @@ impl Engine {
     ) -> Result<Vec<crate::domain::runs::reconcile::Reconciliation>, RunError> {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
-        self.run_blocking(move || inner.registry.critical().run_reconciliations(&run_id))
-            .await
+        self.run_blocking(move || {
+            inner
+                .registry
+                .gate(|registry| registry.run_reconciliations(&run_id))
+        })
+        .await
     }
 
     /// A compacted Run's summary (story 24-4): what an ended Run keeps once
@@ -2869,8 +2883,12 @@ impl Engine {
     {
         let inner = Arc::clone(&self.inner);
         let run_id = run_id.to_string();
-        self.run_blocking(move || inner.registry.critical().compacted_run(&run_id))
-            .await
+        self.run_blocking(move || {
+            inner
+                .registry
+                .gate(|registry| registry.compacted_run(&run_id))
+        })
+        .await
     }
 
     /// The retention windows and the compaction state (story 24-4). Reads
@@ -2879,7 +2897,7 @@ impl Engine {
         &self,
     ) -> Result<crate::domain::runs::retention::RetentionView, crate::ports::StoreError> {
         let inner = Arc::clone(&self.inner);
-        self.run_blocking(move || inner.registry.critical().retention_view())
+        self.run_blocking(move || inner.registry.gate(|registry| registry.retention_view()))
             .await
     }
 
@@ -2900,7 +2918,11 @@ impl Engine {
         self.refuse_if_read_only()?;
         let inner = Arc::clone(&self.inner);
         Ok(self
-            .run_blocking(move || inner.registry.critical().set_retention(change))
+            .run_blocking(move || {
+                inner
+                    .registry
+                    .gate(|registry| registry.set_retention(change))
+            })
             .await?)
     }
 
@@ -2910,8 +2932,12 @@ impl Engine {
     pub async fn instance_run(&self, instance: &str) -> Result<RunView, RunError> {
         let inner = Arc::clone(&self.inner);
         let instance = instance.to_string();
-        self.run_blocking(move || inner.registry.critical().instance_run(&instance))
-            .await
+        self.run_blocking(move || {
+            inner
+                .registry
+                .gate(|registry| registry.instance_run(&instance))
+        })
+        .await
     }
 
     /// Bind and unbind labels on one Run as the Operator (story 21-9, PRD
@@ -2948,8 +2974,12 @@ impl Engine {
     pub async fn select_runs(&self, selector: &Selector) -> Result<Vec<RunRecord>, RunError> {
         let inner = Arc::clone(&self.inner);
         let selector = selector.clone();
-        self.run_blocking(move || inner.registry.critical().select_runs(&selector))
-            .await
+        self.run_blocking(move || {
+            inner
+                .registry
+                .gate(|registry| registry.select_runs(&selector))
+        })
+        .await
     }
 
     /// [`Engine::select_runs`] with each matched Run assembled as its
@@ -2962,8 +2992,12 @@ impl Engine {
     ) -> Result<Vec<RunSummary>, RunError> {
         let inner = Arc::clone(&self.inner);
         let selector = selector.clone();
-        self.run_blocking(move || inner.registry.critical().select_run_summaries(&selector))
-            .await
+        self.run_blocking(move || {
+            inner
+                .registry
+                .gate(|registry| registry.select_run_summaries(&selector))
+        })
+        .await
     }
 
     /// Whether `verb` would act on Run `run_id` (story 21-6): the Run's
@@ -3484,7 +3518,7 @@ impl Engine {
     ) -> Result<Vec<crate::domain::CredentialSummary>, RunError> {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
-        self.run_blocking(move || inner.registry.critical().run_keys(&run_id))
+        self.run_blocking(move || inner.registry.gate(|registry| registry.run_keys(&run_id)))
             .await
     }
 
@@ -3495,8 +3529,12 @@ impl Engine {
     pub async fn run_limits_view(&self, run_id: &str) -> Result<RunLimitsView, RunError> {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
-        self.run_blocking(move || inner.registry.critical().run_limits_view(&run_id))
-            .await
+        self.run_blocking(move || {
+            inner
+                .registry
+                .gate(|registry| registry.run_limits_view(&run_id))
+        })
+        .await
     }
 
     /// The Run listing (story 21-5, PRD FR-50): one exception-first (or
@@ -3511,7 +3549,7 @@ impl Engine {
     /// lock, read-only connection) — this is `hekma ps`'s read.
     pub async fn list_runs(&self, query: ListRunsQuery) -> Result<RunListing, RunError> {
         let inner = Arc::clone(&self.inner);
-        self.run_blocking(move || inner.registry.critical().list_runs(&query))
+        self.run_blocking(move || inner.registry.gate(|registry| registry.list_runs(&query)))
             .await
     }
 
@@ -3567,8 +3605,12 @@ impl Engine {
     ) -> Result<(), RunError> {
         let instance = instance.to_string();
         let inner = Arc::clone(&self.inner);
-        self.run_blocking(move || inner.registry.critical().seed_perf_rows(&instance, &rows))
-            .await
+        self.run_blocking(move || {
+            inner
+                .registry
+                .gate(|registry| registry.seed_perf_rows(&instance, &rows))
+        })
+        .await
     }
 
     /// The subject Run of `event` and the labels it carries NOW (story
@@ -3747,8 +3789,12 @@ impl Engine {
         self.refuse_if_read_only().map_err(RegistryError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
-        self.run_blocking(move || inner.registry.critical().attach_memory(&name, kind))
-            .await
+        self.run_blocking(move || {
+            inner
+                .registry
+                .gate(|registry| registry.attach_memory(&name, kind))
+        })
+        .await
     }
 
     /// Detach an Agent Instance's Memory Backing (story 5-1). METADATA ONLY:
@@ -3761,8 +3807,12 @@ impl Engine {
         self.refuse_if_read_only().map_err(RegistryError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
-        self.run_blocking(move || inner.registry.critical().detach_memory(&name))
-            .await
+        self.run_blocking(move || {
+            inner
+                .registry
+                .gate(|registry| registry.detach_memory(&name))
+        })
+        .await
     }
 
     /// Read an instance's Memory Backing status through the public API (story
@@ -3779,8 +3829,12 @@ impl Engine {
     ) -> Result<Option<crate::ports::MemoryBackingStatus>, RegistryError> {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
-        self.run_blocking(move || inner.registry.critical().memory_status(&name))
-            .await
+        self.run_blocking(move || {
+            inner
+                .registry
+                .gate(|registry| registry.memory_status(&name))
+        })
+        .await
     }
 
     /// Read the recorded transition events for an instance from its log (AC1

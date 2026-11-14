@@ -2,7 +2,10 @@
 //!
 //! `engine.rs` takes its two big locks only through these:
 //!
-//! - [`RegistryCell::critical`]: the registry, the outer lock.
+//! - [`RegistryCell::critical`]: the registry, the outer lock, for a
+//!   critical section that also needs the supervisor or several calls.
+//! - [`RegistryCell::gate`]: one registry call, the guard released before
+//!   it returns (the store gate).
 //! - [`SupervisorCell::after`]: the supervisor, reachable only by showing a
 //!   held registry guard. The lock order (registry, then supervisor) is
 //!   therefore a compile-time fact, not a convention.
@@ -36,6 +39,14 @@ impl RegistryCell {
     #[track_caller]
     pub(crate) fn critical(&self) -> RegistryGuard<'_> {
         self.0.lock().expect("registry mutex poisoned")
+    }
+
+    /// AD-18 Step 3, the store gate: run one registry call and release the
+    /// lock before returning. The guard never reaches the caller, so no
+    /// filesystem or network work can run under it by accident.
+    #[track_caller]
+    pub(crate) fn gate<R>(&self, call: impl FnOnce(&Registry) -> R) -> R {
+        call(&self.critical())
     }
 
     /// Take the registry even if a panic poisoned it — only for best-effort
