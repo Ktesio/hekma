@@ -6,9 +6,9 @@
 //! - [`SupervisorCell::after`]: the supervisor, reachable only by showing a
 //!   held registry guard. The lock order (registry, then supervisor) is
 //!   therefore a compile-time fact, not a convention.
-//! - [`SupervisorCell::alone`]: the supervisor without the registry, for the
-//!   few reads that never touch the store. Each call is debt the ratchet
-//!   (`scripts/check_ad17_debt.py`, `.ad17-debt.txt`) lists by symbol.
+//! - There is no other way to the supervisor. The lock-debt ratchet
+//!   (`scripts/check_ad17_debt.py`, `.ad17-debt.txt`) fails CI on any bare
+//!   `.lock()` that comes back in `engine.rs`.
 //! - [`cell_scope`]: a small engine cell (the proxy slot, the recovery
 //!   record), locked for one closure; its guard never escapes.
 //!
@@ -75,13 +75,6 @@ impl SupervisorCell {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Take the supervisor without the registry. Listed debt: never hold
-    /// the result while taking the registry.
-    #[track_caller]
-    pub(crate) fn alone(&self) -> TimedGuard<'_, Supervisor> {
-        self.0.lock().expect("supervisor mutex poisoned")
     }
 }
 

@@ -313,6 +313,13 @@ struct EngineInner {
     bypass_feed: Option<Arc<crate::domain::bypass::BypassFeed>>,
     /// Story 24-3: what the open found of the previous data-path owner.
     recovery: Mutex<Option<HostRecovery>>,
+    /// AD-18: the log-capture posture, fixed at open (read without the
+    /// supervisor lock).
+    log_capture: LogCaptureMode,
+    /// AD-18: the custody cache the supervisor and the proxy share, held
+    /// here too so the cache-miss test seam needs no supervisor lock.
+    #[cfg(test)]
+    custody_cache: Option<Arc<crate::domain::custody::CustodyCache>>,
 }
 
 impl EngineInner {
@@ -326,7 +333,8 @@ impl EngineInner {
         };
         let snapshot = self.run_snapshot.current();
         if let Some(config) = feed.refresh(&snapshot) {
-            self.supervisor.alone().push_bypass_hosts(&config);
+            let registry = self.registry.critical();
+            self.supervisor.after(&registry).push_bypass_hosts(&config);
         }
     }
 }
@@ -720,6 +728,9 @@ impl Engine {
         let identity_headers_flag = metering_proxy.identity_headers;
         let lock_timing = Arc::new(crate::domain::timed_mutex::LockTiming::default());
         let inner = Arc::new(EngineInner {
+            log_capture: supervisor.log_capture_mode(),
+            #[cfg(test)]
+            custody_cache: supervisor.custody_cache(),
             metering_proxy: Mutex::new(proxy),
             metering_proxy_error: proxy_error,
             read_only: false,
@@ -844,6 +855,9 @@ impl Engine {
         let paths = registry.paths.clone();
         let lock_timing = Arc::new(crate::domain::timed_mutex::LockTiming::default());
         let inner = Arc::new(EngineInner {
+            log_capture: supervisor.log_capture_mode(),
+            #[cfg(test)]
+            custody_cache: supervisor.custody_cache(),
             metering_proxy: Mutex::new(None),
             metering_proxy_error: None,
             read_only: true,
@@ -1500,7 +1514,11 @@ impl Engine {
     /// reaper-fired diagnostics for adopted instances in the open-to-install
     /// window, prefer [`Engine::open_with_diagnostics`].
     pub fn with_diagnostics(&self, sink: DiagnosticSink) {
-        self.inner.supervisor.alone().install_diagnostics(sink);
+        let registry = self.inner.registry.critical();
+        self.inner
+            .supervisor
+            .after(&registry)
+            .install_diagnostics(sink);
     }
 
     /// Subscribe to the engine's committed-event stream (story 7-2, FR-33).
@@ -2371,7 +2389,8 @@ impl Engine {
         use crate::domain::StopFault;
         let inner = Arc::clone(&self.inner);
         let name = InstanceName::new(name).expect("test instance name");
-        let mut supervisor = inner.supervisor.alone();
+        let registry = inner.registry.critical();
+        let mut supervisor = inner.supervisor.after(&registry);
         if let Some(pid) = supervisor.held_pid(&name) {
             supervisor.arm_stop_fault(pid, StopFault::Fail);
         }
@@ -2631,7 +2650,7 @@ impl Engine {
     /// Empty the custody cache (cfg(test): the proxy's cache-miss tests).
     #[cfg(test)]
     pub(crate) fn clear_custody_cache_for_test(&self) {
-        if let Some(cache) = self.inner.supervisor.alone().custody_cache() {
+        if let Some(cache) = &self.inner.custody_cache {
             cache.clear();
         }
     }
@@ -3881,8 +3900,11 @@ impl Engine {
             return false;
         };
         let inner = Arc::clone(&self.inner);
-        self.run_blocking(move || inner.supervisor.alone().has_live_capture(&name))
-            .await
+        self.run_blocking(move || {
+            let registry = inner.registry.critical();
+            inner.supervisor.after(&registry).has_live_capture(&name)
+        })
+        .await
     }
 
     /// The engine's configured log-capture posture (story 17-4, review
@@ -3890,9 +3912,7 @@ impl Engine {
     /// self-description carries it, so a Host learns what `output.log`
     /// holds and which capture surfaces serve, without a failed round-trip.
     pub async fn log_capture_mode(&self) -> LogCaptureMode {
-        let inner = Arc::clone(&self.inner);
-        self.run_blocking(move || inner.supervisor.alone().log_capture_mode())
-            .await
+        self.inner.log_capture
     }
 
     /// Pull ONE bounded batch of committed events from the engine's global
@@ -6164,6 +6184,30 @@ mod tests {
             whole.1
         );
         assert!(Supervisor::agent_log_paths(&engine.inner.registry.critical(), "ghost").is_err());
+    }
+
+    #[test]
+    fn the_log_capture_posture_answers_while_both_locks_are_held() {
+        // Story 24-4 (AD-18): the posture is fixed at open and held on the
+        // engine, so a reader never waits on a stuck supervisor.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let expected = engine.inner.log_capture;
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let inner = Arc::clone(&engine.inner);
+        let holder = std::thread::spawn(move || {
+            let registry = inner.registry.critical();
+            let _supervisor = inner.supervisor.after(&registry);
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+        });
+        locked_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(engine.blocking().log_capture_mode(), expected);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
     }
 
     #[test]
