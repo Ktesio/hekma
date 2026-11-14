@@ -256,7 +256,20 @@ impl Supervisor {
                 .flatten()
                 .filter(|record| record.fingerprint.pid != 0);
             if let Some(record) = record {
-                match self.backend.adopt(&record.fingerprint, record.detach) {
+                // Story 24-1: through the process's Shim when one answers;
+                // otherwise by the child's fingerprint (an explicit stop
+                // acts even when another engine holds the Shim).
+                let adopted = match self
+                    .backend
+                    .reacquire_shim(&record, registry.paths.state_base())
+                    .0
+                {
+                    proc::ShimReacquire::Held(handle) => Ok(Some(handle)),
+                    proc::ShimReacquire::Busy | proc::ShimReacquire::None => {
+                        self.backend.adopt(&record.fingerprint, record.detach)
+                    }
+                };
+                match adopted {
                     Ok(Some(handle)) => {
                         self.emit_diagnostic(&format!(
                             "{}: re-acquired the supervised process for this stop by its \

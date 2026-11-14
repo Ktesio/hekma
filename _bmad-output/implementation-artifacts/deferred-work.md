@@ -876,9 +876,15 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 
 ## From spec-24-1 (one Shim per supervised process) — phase 1 build, 2026-11-14
 
-- source_spec: `spec-24-1-one-shim-per-supervised-process.md` (Phase 2: the wiring)
-  summary: The Shim library and the hidden `hekma shim` command ship unused; the supervisor still holds processes directly. Phase 2 adds `ProcHandle`/`ShimBackend`, record-before-launch, the claim rename and Shim columns, adoption by reconnect and `EngineEvent::Shim`.
-  evidence: `crates/hekma-engine/src/shim/`, `docs/architecture.md` (The Shim). Trigger: phase 2 of the story (next build).
+- source_spec: `spec-24-1-one-shim-per-supervised-process.md` (Phase 2 leftovers)
+  summary: Phase 2 wired the Shim in on Unix, opt-in (`ProcHandle`, Shim columns in schema 27, adoption by reconnect). Still to build:
+    - record-before-launch;
+    - the claim rename;
+    - `EngineEvent::Shim`;
+    - the Shim's own hardening (subreaper, non-dumpable);
+    - a `shim` command in `hekma-host`;
+    - turning the Shim on by default once O3 is ruled.
+  evidence: `crates/hekma-engine/src/domain/supervisor/proc.rs`. Trigger: Islam's O3 ruling (ledger question 32).
 
 - source_spec: `spec-24-1-one-shim-per-supervised-process.md` (Phase 2: the Windows transport)
   summary: `backends::shim_listen`/`shim_connect` return `Unsupported` on Windows; the named pipe with an owner-only DACL lands with the wiring.

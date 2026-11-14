@@ -42,7 +42,7 @@ pub use secret_resolver::{
     file_permissions_error, mode_is_owner_only, CompositeSecretResolver, EnvSecretResolver,
     FileSecretResolver, SecretError, SecretResolver,
 };
-pub use state_store::{MemoryBackingTxn, SpawnRecord, StateStore};
+pub use state_store::{MemoryBackingTxn, ShimRecord, SpawnRecord, StateStore};
 pub use usage_source::{
     assemble_usage_event, format_usage_line, parse_usage_block, parse_usage_line, ParsedUsage,
     SelfReportedUsageSource, UsageSource, USAGE_SENTINEL_PREFIX,

@@ -306,7 +306,10 @@ The contract, in five rules:
 
 Dropping an `Engine` is a **kill-on-drop teardown**: every attached agent's
 process group is terminated outright — no graceful window, no stop
-transition. `Drop` cannot run a stop ladder (it must not block), so the
+transition. The exception is an engine opened with `EngineOptions::shim_exe`
+(the Shim preview): an agent launched through a Shim keeps running when the
+engine is dropped, because its Shim owns it, and the next engine reconnects to it;
+only an explicit stop or `shutdown` ends it. `Drop` cannot run a stop ladder (it must not block), so the
 graceful path is a contract the embedder owns:
 
 - **Stop before drop.** An embedder that wants graceful stops calls

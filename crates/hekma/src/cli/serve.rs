@@ -155,6 +155,9 @@ pub fn run(flags: ServeFlags) -> Result<(), Box<dyn std::error::Error>> {
         build_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         autostart_idle_override: flags.idle_window.map(std::time::Duration::from_secs),
         set_token_ttl_override: None,
+        // Story 24-1: the Shim preview — this binary is its own Shim
+        // program (the hidden `hekma shim`).
+        shim_exe: shim_exe_from_env(),
     };
     hekma_host::serve(options).map_err(|err| {
         // The typed refusal carries its full holder-naming/remediation text
@@ -226,6 +229,16 @@ fn proxy_allowed_origins(values: Vec<String>) -> Result<Vec<String>, String> {
         origins.push(value.to_ascii_lowercase());
     }
     Ok(origins)
+}
+
+/// Story 24-1: `HEKMA_SHIM=1` launches supervised agents through a Shim (this
+/// binary's hidden `hekma shim`), so they outlive the host. Off unless set,
+/// until the Shim is on by default.
+fn shim_exe_from_env() -> Option<std::path::PathBuf> {
+    match std::env::var("HEKMA_SHIM") {
+        Ok(value) if value == "1" => std::env::current_exe().ok(),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

@@ -907,6 +907,15 @@ impl Supervisor {
             // columns: a lease must never outlive the process lifetime it
             // arbitrated.
             lease: None,
+            // Story 24-1: the Shim the process was launched through, so a
+            // later engine reconnects to it.
+            shim: self
+                .backend
+                .shim_endpoint(&handle)
+                .map(|endpoint| crate::ports::ShimRecord {
+                    socket: endpoint.socket,
+                    launch_id: endpoint.launch_id,
+                }),
         };
         // Story 21-1: the record and the instance's NEW launch generation
         // commit in one writer job — every usage row of this launch carries
@@ -1705,7 +1714,7 @@ impl Supervisor {
     /// AC2 — the inner `Option<i32>` is the OS exit code, `None` if killed by a
     /// signal with no code), or `None` if it stayed alive the whole window
     /// (ready). Reaps on exit (no zombie).
-    fn watch_startup(&self, handle: &mut backends::Handle) -> Option<Option<i32>> {
+    fn watch_startup(&self, handle: &mut proc::ProcHandle) -> Option<Option<i32>> {
         let deadline = std::time::Instant::now() + STARTUP_SURVIVAL_WINDOW;
         loop {
             match self.backend.poll(handle) {
