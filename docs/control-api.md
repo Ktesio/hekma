@@ -185,7 +185,7 @@ masked, exactly as the CLI displays it).
 | `POST` | `/v0/bindings/{name}/credentials` | Issue the binding's `{"class": "announce"\|"proxy-access"}` credential, revoking the previous one of that class. The token is in this answer only | 200 + `{"class", "token_id", "token", "note"}` |
 | `POST` | `/v0/bindings/{name}/credentials/revoke` | Revoke the binding's active credential of `{"class"}` | 204 |
 | `GET` | `/v0/bindings/{name}/credentials` | The binding's credentials: token ids, classes and states, never a value | 200 |
-| `GET` | `/v0/proxy` | Where the metering proxy listens (`running`, `url`, `port`), or why it is not running (`error`); and whether forwarded calls carry the identity headers (`identity_headers`, `stored_identity_headers`, `forced_by_flag`) | 200 |
+| `GET` | `/v0/proxy` | Where the metering proxy listens (`running`, `url`, `port`, `bind`, `tls`, and `public_url` when it binds beyond loopback), or why it is not running (`error`); and whether forwarded calls carry the identity headers (`identity_headers`, `stored_identity_headers`, `forced_by_flag`) | 200 |
 | `PATCH` | `/v0/proxy` | Turn the outbound identity headers on or off: `{"identity_headers": false}`. Stored, and applied to the very next forwarded call; one `proxy_setting` event. Answers the `GET` document | 200 |
 | `GET` | `/v0/calls?run=&token_id=&outcome=&disposition=&status_class=&model=&depth=&binding=&from=&to=&view=all\|problems&limit=&cursor=` | The metering proxy's per-call records, newest first (see [Per-call records](#per-call-records)) | 200 |
 | `GET` | `/v0/calls/{call_id}` | One per-call record | 200 + `{"schema_version", "call"}` |
@@ -218,7 +218,7 @@ A refusal carries an `error.code`:
 | `binding-limit` | 409 | 256 bindings, or 16 routes on one binding, already exist |
 | `binding-legacy-route` | 409 | A `/` binding while an upgraded agent holds the legacy root route |
 
-The binding credentials are issued and listed now. The announce credential is accepted on the [announce, heartbeat and close](#announce-and-heartbeat) routes; nothing accepts a proxy-access credential yet. The answer's `note` says which.
+The binding credentials are issued and listed now. The announce credential is accepted on the [announce, heartbeat and close](#announce-and-heartbeat) routes; a proxy-access credential authenticates calls from other machines to a [metering proxy bound beyond loopback](metering-proxy.md#beyond-loopback), on its binding's prefix only. The answer's `note` says which.
 
 **The identity-header switch.** `PATCH /v0/proxy` with `{"identity_headers": true|false}` stores the setting in the state directory and publishes it before it answers, so the very next forwarded call follows it; an auto-started host reads it at start. A body that is not JSON is `400`; a value that is not a boolean, a missing value, or any other field is `422`. The answer, like `GET /v0/proxy`, carries:
 
