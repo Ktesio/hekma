@@ -246,7 +246,48 @@ The state database has one writer thread per engine process, and its own bench l
 HEKMA_WRITER_BENCH_INSTANCES=1000 HEKMA_WRITER_BENCH_EVENTS=1000000 cargo test --release -p hekma-engine --lib writer_bench_large_seed -- --ignored --nocapture
 ```
 
-The numbers that need Runs and the shared Metering Proxy (the first page of a Run listing at 1M Runs, the proxy's added latency) are measured once those exist.
+### The Run-scale ladder
+
+`perf-budgets --run-scale <N>` (N at least 10,000) measures how the Run model holds as Runs accumulate. It runs on its own, like `--calls-seed`, refused beside the other flags, and seeds rows straight through the store with no processes, so it is Windows-safe. The seed uses the `--ps-seed` mix:
+
+- 2% active with the `breach` Anomaly;
+- 2% `held`;
+- 2% ended with an Anomaly inside the window;
+- 20% ended clean inside the window;
+- 10% ended before the window;
+- the rest active and healthy.
+
+The rung first seeds and measures the **10,000-Run reference**, then seeds to N and measures again. Each measurement:
+
+1. opens a fresh write engine, whose open-time snapshot holds every open seeded Run;
+2. waits for that engine's open-time retention pass, which compacts the seed's old ended Runs;
+3. times 200 acked Run writes (a label change on an open seeded Run, which commits and publishes the snapshot);
+4. times the first `hekma ps` exceptions page plus its counts through read-only engines (`PERF_BUDGETS_RUN_SCALE_ITERATIONS`; default 40, or 10 at 1M).
+
+| Gate | Budget |
+|---|---|
+| `run_scale_ps_first_page_p99_lt_1s` | the first page plus counts, p99 < 1 s at N |
+| `run_scale_acked_write_p99_le_50ms` | the acked write, p99 ≤ 50 ms at N (the writer's acked-write bound; the tail is the background jobs a write can queue behind, such as the Lease sweeper) |
+| `run_scale_publish_p50_le_10ms` | the acked write with its publish, p50 ≤ 10 ms at N |
+| `run_scale_publish_p50_at_seed_le_3x_the_10k_figure` | the p50 at N ≤ max(3 × the reference's, the reference's + 2 ms): the publish does not grow with the Run count |
+
+CI runs the 100k rung on every change (the perf job's sixth step, `perf-budgets-scale-report.json`). The 1M rung is run by hand, and its result is recorded here:
+
+```bash
+cargo run --release -p hekma-engine --example perf-budgets -- --run-scale 1000000
+```
+
+| Date | Platform | Seed | Healthy open | First page p99 | Write p50 / p99 | Reference p50 | Verdict |
+|---|---|---|---|---|---|---|---|
+| 2026-11-14 | macOS arm64 (Apple M5), release | 100,000 | 64,000 | 9.06 ms | 0.47 / 6.0 ms | 0.21 ms | pass |
+| 2026-11-14 | macOS arm64 (Apple M5), release | 1,000,000 | 640,000 | 90.9 ms | 0.54 / 34.5 ms | 0.42 ms | pass |
+
+The ladder found two costs that grew with the Run count, both now fixed and pinned by tests:
+
+- **Every write reloaded the whole snapshot.** The tick's foreign-commit check also fired on the engine's own commits, costing about 1 s per write at 100,000 Runs.
+- **Compaction walked every open Run per candidate,** and a Run delete's cascade scanned a table with no index, costing about 1 s per batch at 100,000 Runs.
+
+The design target beyond the ladder, 10 million Runs per Hub, is recorded and gated nowhere: there is no Hub yet. The Metering Proxy's added latency at each rung's open-Run count is not measured yet.
 
 ### Baseline trend tracking — the ratchet
 
