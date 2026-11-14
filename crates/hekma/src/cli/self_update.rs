@@ -18,7 +18,7 @@ const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Ktesio/hekma/rele
 const RELEASE_BASE_URL: &str = "https://github.com/Ktesio/hekma/releases/download";
 
 #[cfg(not(tarpaulin_include))]
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(no_restart: bool) -> Result<(), Box<dyn std::error::Error>> {
     let exe_path = std::env::current_exe().map_err(|error| SelfUpdateFailed {
         message: format!("Could not locate current hekma executable: {error}"),
     })?;
@@ -27,7 +27,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let installer = FileBinaryInstaller;
     let platform = Platform::current();
 
-    run_with_dependencies(
+    let outcome = run_with_dependencies(
         &exe_path,
         env!("CARGO_PKG_VERSION"),
         &platform,
@@ -35,7 +35,56 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         &release_client,
         &installer,
     )?;
+    // Story 24-2 (O4): move a running host onto the new binary in place.
+    if matches!(outcome, SelfUpdateOutcome::Updated(_)) && !no_restart {
+        ui::note(restart_host_after_update(None));
+    }
     Ok(())
+}
+
+/// Story 24-2: after a successful update, ask the host serving the state
+/// root (when one does) to hand over in place to the new binary; the note
+/// says what happened. Best-effort: an update never fails on it.
+fn restart_host_after_update(state_dir: Option<std::path::PathBuf>) -> String {
+    let root = hekma_engine::paths::EnginePaths::new(state_dir.clone())
+        .map(|paths| paths.state_base().to_path_buf())
+        .map_err(|err| err.to_string());
+    restart_note(
+        root,
+        &|root| crate::cli::host_client::HostClient::find(root).is_some(),
+        &|| crate::cli::serve::upgrade(state_dir.clone()).map_err(|err| err.to_string()),
+    )
+}
+
+/// The note, from the state root, whether a host serves it, and the
+/// upgrade's outcome (the seams).
+fn restart_note(
+    root: Result<std::path::PathBuf, String>,
+    host_serves: &dyn Fn(&std::path::Path) -> bool,
+    upgrade: &dyn Fn() -> Result<(), String>,
+) -> String {
+    let root = match root {
+        Ok(root) => root,
+        Err(err) => {
+            return format!(
+                "could not find the state directory ({err}); restart the host to use the new \
+                 binary"
+            )
+        }
+    };
+    if !host_serves(&root) {
+        return "no host is running; the next hekma command starts one on the new binary"
+            .to_string();
+    }
+    match upgrade() {
+        Ok(()) => "the running host moved onto the new binary in place; agents in their own \
+                   Shim kept running"
+            .to_string(),
+        Err(err) => format!(
+            "the running host could not move onto the new binary in place ({err}); restart it \
+             to use the new binary (or run hekma serve --upgrade)"
+        ),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1543,5 +1592,22 @@ mod tests {
         let wrong = format!("{}  hekma.tar.gz\n", "A".repeat(64));
         let error = verify_checksum(archive, wrong.as_bytes(), "hekma.tar.gz").unwrap_err();
         assert!(error.message.contains("Checksum verification failed"));
+    }
+
+    #[test]
+    fn with_no_host_running_an_update_asks_nothing_and_says_so() {
+        let state = tempfile::tempdir().unwrap();
+        let note = super::restart_host_after_update(Some(state.path().to_path_buf()));
+        assert!(note.contains("no host is running"), "{note}");
+        assert!(!state.path().join("control.json").exists());
+        let root = || Ok(std::path::PathBuf::from("/state"));
+        assert!(super::restart_note(root(), &|_| true, &|| Ok(())).contains("moved onto"));
+        let failed = super::restart_note(root(), &|_| true, &|| Err("busy".to_string()));
+        assert!(
+            failed.contains("(busy)") && failed.contains("restart it"),
+            "{failed}"
+        );
+        let lost = super::restart_note(Err("no home".to_string()), &|_| true, &|| Ok(()));
+        assert!(lost.contains("no home"), "{lost}");
     }
 }

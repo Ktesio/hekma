@@ -226,4 +226,5 @@ The **O-items are Islam's rulings** (product and public-contract choices); the n
     - Windows job breakaway is not checked (`unverified`);
     - launchd is `unverified` (no reliable read of `AbandonProcessGroup` from inside the job);
     - `control.json` does not carry the check (the route does).
+- 2026-11-14 — **phase 4 built** (stacked on phase 3, #425): T9's `self-update` trigger, on O4's recommended option (a). After a successful binary replacement, `hekma self-update` asks a host serving the default state root to hand over in place, through `serve --upgrade`'s own path, and waits for `control.json` to name the successor. With no host running it asks nothing and says so; if the upgrade fails, the note says to restart the host. The update itself never fails on it. `--no-restart` skips it. The host-present path is not unit-tested: it is `serve --upgrade`'s tested path. Only the no-host note is tested here, since `self-update` reaches the network.
 
