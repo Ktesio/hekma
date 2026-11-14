@@ -221,12 +221,10 @@ the host's own process and nothing else. When agents run in their own Shim,
 the started notice says what Hekma could check, and `GET /v0/host` carries
 it as `handoff_check`:
 
-| Manager | Keeps the Shims | Stops them with the host | What Hekma reports |
-|---|---|---|---|
-| systemd | `KillMode=process` or `none` | `KillMode=control-group` (the default) or `mixed` | `verified` or `unsafe`, naming the unit and its setting |
-| launchd | `AbandonProcessGroup=true` | the default | `unverified`, with how to check |
-| A container | — | stopping the container ends every process in it | `unverified` |
-| Windows | — | — | `unverified` (not checked yet) |
+- **systemd** keeps them with `KillMode=process` or `none`. The default, `control-group`, and `mixed` stop them with the host. Hekma reports `verified` or `unsafe`, naming the unit and its setting.
+- **launchd** keeps them with `AbandonProcessGroup=true`; the default stops them. Hekma reports `unverified`, with how to check.
+- **A container** ends every process in it when it stops. Hekma reports `unverified`.
+- **Windows** is not checked yet: `unverified`.
 
 Hekma never refuses to start on `unsafe`: it warns, and stopping every agent
 with the host remains a working configuration.
