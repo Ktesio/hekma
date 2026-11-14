@@ -1016,6 +1016,13 @@ jobs:
         # cannot silently re-open the hyphen-joined provenance hole (or break
         # the `no-retro-repricing` wire token's verbatim quoting).
         run: python3 scripts/check_docs.py --self-test
+      - name: AD-17 lock-debt ratchet
+        # AD-18 Step 2: engine.rs takes its locks through the named scopes
+        # in domain/bounded.rs; what is left is listed by symbol in
+        # .ad17-debt.txt and may only go down.
+        run: |
+          python3 scripts/check_ad17_debt.py --self-test
+          python3 scripts/check_ad17_debt.py
       - name: Validate release doc generation
         run: python3 scripts/generate_release_docs.py v0.0.0 --output-dir target/release-docs-test
       - name: Test automation helpers

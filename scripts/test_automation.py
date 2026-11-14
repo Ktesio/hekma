@@ -1060,6 +1060,25 @@ class ReleaseDocsTests(unittest.TestCase):
                 f"the stand-in Host must require the `{kind}` case kind",
             )
 
+    def test_ci_runs_the_ad17_lock_debt_ratchet(self) -> None:
+        # AD-18 Step 2: the docs job runs the lock-debt ratchet and its
+        # self-test, and the committed debt file passes it.
+        import sys
+
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("python3 scripts/check_ad17_debt.py --self-test", ci)
+        self.assertIn("python3 scripts/check_ad17_debt.py\n", ci)
+        self.assertTrue((release_docs.ROOT / ".ad17-debt.txt").is_file())
+        for args in (["--self-test"], []):
+            done = subprocess.run(
+                [sys.executable, str(release_docs.ROOT / "scripts" / "check_ad17_debt.py"), *args],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+
     def test_ci_perf_budgets_job_runs_the_harness_blocking(self) -> None:
         # Story 7-5 (NFR-4): the designated perf job runs the perf-budgets
         # harness on every PR and GATES the measured budgets — reads p99 and
