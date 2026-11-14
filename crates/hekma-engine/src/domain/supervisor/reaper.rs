@@ -95,8 +95,8 @@ impl Supervisor {
     /// handle insert (start / adopt), so a removed — or replaced — handle can
     /// never bequeath a stale error streak to the instance's next Run.
     pub(super) fn clear_poll_error_streak(&mut self, name: &InstanceName) {
-        self.poll_error_streaks.remove(name);
-        self.poll_last_errors.remove(name);
+        self.instances.poll_error_streaks.remove(name);
+        self.instances.poll_last_errors.remove(name);
     }
 
     /// Arm the cfg(test) poll-fault seam for `pid`: every `backend.poll` of
@@ -150,7 +150,8 @@ impl Supervisor {
     /// this; the supervisor tests reach into `running` directly instead).
     #[cfg(test)]
     pub(crate) fn held_pid(&self, name: &InstanceName) -> Option<u32> {
-        self.running
+        self.instances
+            .running
             .get(name)
             .map(|supervised| self.shared.backend.pid(&supervised.handle))
     }
@@ -159,7 +160,7 @@ impl Supervisor {
     /// site: `Some` carries the fault's synthesized `Result` (a failed stop,
     /// or the graceful-not-forced lie); `None` means run the REAL stop. An
     /// ASSOCIATED fn over the fault map (not a `&self` method) so a call site
-    /// holding a `&mut` handle borrow of `self.running` stays legal.
+    /// holding a `&mut` handle borrow of `self.instances.running` stays legal.
     /// Mirrors the `injected_poll_fault` wiring shape (cfg(test) only).
     #[cfg(test)]
     pub(super) fn injected_zero_stop(
@@ -197,7 +198,7 @@ impl Supervisor {
     /// cfg-free (the engine calls it via `spawn_blocking` on an interval); it
     /// performs NO sleeping itself. Idempotent per exit: once an instance is
     /// moved to `failed` and its handle removed, a later pass will not see it in
-    /// `self.running` again.
+    /// `self.instances.running` again.
     ///
     /// **Persistent poll errors are crash input (AI-12):** a `backend.poll` error
     /// is tolerated as transient only while its PER-INSTANCE consecutive streak
@@ -265,8 +266,8 @@ impl Supervisor {
         // Story 22-4: record each Shim's new bypass report on its Run.
         self.record_bypass_reports(registry);
 
-        // Snapshot the currently-held names (we mutate self.running as we react).
-        let names: Vec<InstanceName> = self.running.keys().cloned().collect();
+        // Snapshot the currently-held names (we mutate self.instances.running as we react).
+        let names: Vec<InstanceName> = self.instances.running.keys().cloned().collect();
         let mut plans = Vec::new();
 
         // FIRST — drain restart plans QUEUED by the start path (Epic 18): an
@@ -301,6 +302,7 @@ impl Supervisor {
             #[cfg(test)]
             {
                 let pid = self
+                    .instances
                     .running
                     .get(name)
                     .map(|supervised| self.shared.backend.pid(&supervised.handle));
@@ -309,7 +311,7 @@ impl Supervisor {
                     continue;
                 }
             }
-            let Some(supervised) = self.running.get_mut(name) else {
+            let Some(supervised) = self.instances.running.get_mut(name) else {
                 continue;
             };
             let held_by_shim = self.shared.backend.is_shim(&supervised.handle);
@@ -371,7 +373,7 @@ impl Supervisor {
             // every streak stays where it is and every handle stays alive.
             for (name, outcome) in &outcomes {
                 if let PollOutcome::Errored(err) = outcome {
-                    self.poll_last_errors.insert(
+                    self.instances.poll_last_errors.insert(
                         name.clone(),
                         truncate_for_cause(&err.to_string(), POLL_ERROR_CAUSE_MAX_CHARS),
                     );
@@ -424,7 +426,7 @@ impl Supervisor {
                 PollOutcome::Errored(err) => {
                     // Record the error's text FIRST (AI-12b): whatever the
                     // verdict, a later persistent trip must carry this why.
-                    self.poll_last_errors.insert(
+                    self.instances.poll_last_errors.insert(
                         name.clone(),
                         truncate_for_cause(&err.to_string(), POLL_ERROR_CAUSE_MAX_CHARS),
                     );
@@ -434,16 +436,24 @@ impl Supervisor {
                     // instead of the old silent `Err(_) => None` that swallowed
                     // every error forever. Reap on exit is done inside `poll`.
                     let (verdict, streak) = poll_verdict(
-                        self.poll_error_streaks.get(&name).copied().unwrap_or(0),
+                        self.instances
+                            .poll_error_streaks
+                            .get(&name)
+                            .copied()
+                            .unwrap_or(0),
                         Err(err),
                     );
                     match verdict {
                         PollVerdict::TransientError => {
-                            self.poll_error_streaks.insert(name.clone(), streak);
+                            self.instances
+                                .poll_error_streaks
+                                .insert(name.clone(), streak);
                             continue;
                         }
                         PollVerdict::PersistentError => {
-                            self.poll_error_streaks.insert(name.clone(), streak);
+                            self.instances
+                                .poll_error_streaks
+                                .insert(name.clone(), streak);
                             CrashInput::PersistentPollFailure {
                                 sole_handle: held_handles == 1,
                             }
@@ -489,8 +499,8 @@ impl Supervisor {
                     self.clear_poll_error_streak(&name);
                     // 18-3 review: the row's chain is over with the row —
                     // drop its requested-recycle streak too (no leak).
-                    self.requested_restart_streaks.remove(&name);
-                    self.running.remove(&name);
+                    self.instances.requested_restart_streaks.remove(&name);
+                    self.instances.running.remove(&name);
                     continue;
                 }
             };
@@ -517,9 +527,14 @@ impl Supervisor {
                 // which never sets `stop_unconfirmed`) keeps its EXISTING,
                 // unchanged silent-drop behavior.
                 let stuck_stopping = state == LifecycleState::Stopping
-                    && self.running.get(&name).is_some_and(|s| s.stop_unconfirmed);
+                    && self
+                        .instances
+                        .running
+                        .get(&name)
+                        .is_some_and(|s| s.stop_unconfirmed);
                 if stuck_stopping {
                     let log_capture = self
+                        .instances
                         .running
                         .get(&name)
                         .and_then(|s| self.shared.backend.log_capture(&s.handle));
@@ -530,8 +545,8 @@ impl Supervisor {
                     // 18-3 review: a stop ends any requested-recycle chain —
                     // drop its streak too (no leak; the next start paces
                     // from the base).
-                    self.requested_restart_streaks.remove(&name);
-                    self.running.remove(&name);
+                    self.instances.requested_restart_streaks.remove(&name);
+                    self.instances.running.remove(&name);
                     // Story 14-2: the settle retains an acp session id (see
                     // the ordinary stop path); identical to a clear otherwise.
                     if registry.settle_spawn_record(&name).is_ok() {
@@ -559,8 +574,8 @@ impl Supervisor {
                 // 18-3 review: a stop ends any requested-recycle chain —
                 // drop its streak too (no leak; the next start paces
                 // from the base).
-                self.requested_restart_streaks.remove(&name);
-                self.running.remove(&name);
+                self.instances.requested_restart_streaks.remove(&name);
+                self.instances.running.remove(&name);
                 continue;
             }
 
@@ -577,14 +592,15 @@ impl Supervisor {
             // handle is not the engine's child, so a `code: None` exit means "the
             // exit code is UNAVAILABLE", and the cause must say so instead of
             // asserting a signal termination it cannot prove.
-            let adopted = self.running.get(&name).is_some_and(|s| s.adopted);
+            let adopted = self.instances.running.get(&name).is_some_and(|s| s.adopted);
             let crash_log_capture = self
+                .instances
                 .running
                 .get(&name)
                 .and_then(|s| self.shared.backend.log_capture(&s.handle));
             // AI-12b: capture the last poll error's text BEFORE the bookkeeping
             // clear below (the cause build needs it).
-            let last_poll_error = self.poll_last_errors.get(&name).cloned();
+            let last_poll_error = self.instances.poll_last_errors.get(&name).cloned();
             // Story 18-3: read the CLASSIFICATION inputs BEFORE the remove
             // below — the declared classes (the per-Run lens), the prior
             // state, and the stability anchor. The state gate: the classes
@@ -593,7 +609,7 @@ impl Supervisor {
             // verbatim — the CleanExit edge is `running → stopped`, and a
             // pause-interval never counts toward stability), and the anchor
             // is measured only on that same gate.
-            let (exit_codes, running_for) = match self.running.get(&name) {
+            let (exit_codes, running_for) = match self.instances.running.get(&name) {
                 Some(supervised) => {
                     let running_for = (state == LifecycleState::Running)
                         .then(|| supervised.running_since.elapsed());
@@ -618,8 +634,8 @@ impl Supervisor {
                 // cause, NO plan, NO counter action — the operator's next
                 // fresh start is the counter reset, exactly as it has always
                 // been.
-                self.requested_restart_streaks.remove(&name);
-                self.running.remove(&name);
+                self.instances.requested_restart_streaks.remove(&name);
+                self.instances.running.remove(&name);
                 // Story 14-2: the settle retains an acp session id (see the
                 // ordinary stop path); identical to a clear otherwise. A
                 // store hiccup degrades to the pre-18-3 silence — the record
@@ -645,7 +661,7 @@ impl Supervisor {
                 );
                 continue;
             }
-            self.running.remove(&name);
+            self.instances.running.remove(&name);
             let base_detail = match crash {
                 // AI-12: the handle went permanently un-pollable — the recorded
                 // cause names the persistent poll failure, never a fabricated
@@ -777,18 +793,18 @@ impl Supervisor {
         }
 
         // PHASE 4 — DECLARED LIVENESS (story 18-2). After crash handling: any
-        // handle phase 3 reaped is gone from `self.running`, so this snapshot
+        // handle phase 3 reaped is gone from `self.instances.running`, so this snapshot
         // holds only the SURVIVING instances. Each one whose adapter declared
         // a `[liveness]` check and whose persisted state is EXACTLY `running`
         // gets ONE attempt per pass (see the tick-stretch honesty in this
         // fn's docs). The window bookkeeping is the PURE
         // `WindowDecision`; expiry runs the crash-path sequence verbatim.
-        let surviving: Vec<InstanceName> = self.running.keys().cloned().collect();
+        let surviving: Vec<InstanceName> = self.instances.running.keys().cloned().collect();
         for name in surviving {
             // Read the declared check + the open window (if any) up front, so
             // the mutable borrows below start clean.
             let (check, failing_since) = {
-                let Some(supervised) = self.running.get(&name) else {
+                let Some(supervised) = self.instances.running.get(&name) else {
                     continue;
                 };
                 match &supervised.liveness_check {
@@ -825,7 +841,11 @@ impl Supervisor {
                 // staged in-process). The SAME episode bookkeeping as the
                 // real Err arm — the seam exercises the whole arm, not just
                 // the diagnostic.
-                if self.liveness_lookup_err_names.insert(name.clone()) {
+                if self
+                    .instances
+                    .liveness_lookup_err_names
+                    .insert(name.clone())
+                {
                     self.emit_liveness_lookup_degraded(
                         &name,
                         "injected cfg(test) liveness-lookup fault (store read failed)",
@@ -838,13 +858,17 @@ impl Supervisor {
                     // A successful read ends the degraded-read episode (if
                     // one was open) — silently; recovery is not news, the
                     // ONE degradation diagnostic already covered it.
-                    self.liveness_lookup_err_names.remove(&name);
+                    self.instances.liveness_lookup_err_names.remove(&name);
                     if instance.state != LifecycleState::Running {
                         continue;
                     }
                 }
                 Err(lookup_err) => {
-                    if self.liveness_lookup_err_names.insert(name.clone()) {
+                    if self
+                        .instances
+                        .liveness_lookup_err_names
+                        .insert(name.clone())
+                    {
                         // First Err THIS episode: the ONE diagnostic.
                         self.emit_liveness_lookup_degraded(&name, &lookup_err.to_string());
                     }
@@ -874,7 +898,7 @@ impl Supervisor {
                     // The window itself always opens and always still
                     // expires; only the chatter is bounded.
                     let suppressed = {
-                        let Some(supervised) = self.running.get_mut(&name) else {
+                        let Some(supervised) = self.instances.running.get_mut(&name) else {
                             continue;
                         };
                         supervised.liveness_failing_since = Some(std::time::Instant::now());
@@ -902,7 +926,7 @@ impl Supervisor {
                     // further reopen diagnostics are suppressed; later
                     // recoveries are silent (the operator has been told).
                     let reopens = {
-                        let Some(supervised) = self.running.get_mut(&name) else {
+                        let Some(supervised) = self.instances.running.get_mut(&name) else {
                             continue;
                         };
                         supervised.liveness_failing_since = None;
@@ -946,13 +970,18 @@ impl Supervisor {
                     // charges as #1). The phase-4 gate guarantees the
                     // persisted state is EXACTLY `running`, so the anchor
                     // always measures here.
-                    let running_for = self.running.get(&name).map(|s| s.running_since.elapsed());
+                    let running_for = self
+                        .instances
+                        .running
+                        .get(&name)
+                        .map(|s| s.running_since.elapsed());
                     // Capture BEFORE the remove — the drop of the (possibly
                     // hung) handle is the sanctioned teardown (kill-on-drop,
                     // the AI-12 PersistentPollFailure precedent: a wedged
                     // agent will not stop on request, and a bounded-stop
                     // ladder must not wedge the reaper).
                     let liveness_log_capture = self
+                        .instances
                         .running
                         .get(&name)
                         .and_then(|s| self.shared.backend.log_capture(&s.handle));
@@ -978,7 +1007,7 @@ impl Supervisor {
                         .map(|record| record.detach)
                         .unwrap_or(false);
                     if detached {
-                        if let Some(supervised) = self.running.get_mut(&name) {
+                        if let Some(supervised) = self.instances.running.get_mut(&name) {
                             // AI-18 honesty (windows-latest triage 2026-10-24):
                             // every path here that does NOT kill a live wedge
                             // must SAY so — a silent skip leaves the wedged
@@ -1074,7 +1103,7 @@ impl Supervisor {
                             }
                         }
                     }
-                    self.running.remove(&name);
+                    self.instances.running.remove(&name);
                     // P7 (review round 1): the honest onset note.
                     // `failing_for_ms` counts from the FIRST OBSERVED
                     // failure; for a heartbeat file the engine CAN say how
@@ -1264,7 +1293,7 @@ impl Supervisor {
         // funnel through this fn), and the stable-reset forgiveness: a run
         // that proved stability forgives the pacing history, so the next
         // requested chain paces from the base, not the old depth.
-        self.requested_restart_streaks.remove(name);
+        self.instances.requested_restart_streaks.remove(name);
         let record = registry.spawn_record(name).ok().flatten();
         let policy = record
             .as_ref()
@@ -1378,7 +1407,7 @@ impl Supervisor {
             // counter action (the transition to `failed` + the cause's
             // policy verdict are the caller's). 18-3 review: terminal ends
             // the chain — drop its streak (no leak).
-            self.requested_restart_streaks.remove(name);
+            self.instances.requested_restart_streaks.remove(name);
             self.settle_terminal_record(registry, name, policy);
             return None;
         }
@@ -1388,6 +1417,7 @@ impl Supervisor {
         // count starts higher than the base) — and each later relaunch in
         // the chain doubles it, the cap clamping.
         let streak = self
+            .instances
             .requested_restart_streaks
             .get(name)
             .copied()
@@ -1397,7 +1427,9 @@ impl Supervisor {
         // can surface `requested-recycle N` — the pacing is visible, not
         // silent (18-3 review).
         let depth = streak + 1;
-        self.requested_restart_streaks.insert(name.clone(), depth);
+        self.instances
+            .requested_restart_streaks
+            .insert(name.clone(), depth);
         Some((
             RestartPlan {
                 name: name.clone(),
@@ -1892,8 +1924,8 @@ impl Supervisor {
                     // a charged count survived (18-3 review: the old
                     // "waits the base backoff again" wording misstated the
                     // formula `plan_requested_restart` actually computes).
-                    self.requested_restart_streaks.remove(&name);
-                    self.running.insert(
+                    self.instances.requested_restart_streaks.remove(&name);
+                    self.instances.running.insert(
                         name.clone(),
                         Supervised {
                             handle,
@@ -2000,6 +2032,7 @@ impl Supervisor {
                     // the record predates Runs) and re-syncs its wire path
                     // and bound labels from this engine's view.
                     let adopted_source = self
+                        .instances
                         .running
                         .get(&name)
                         .map(|supervised| supervised.metering_source.clone())

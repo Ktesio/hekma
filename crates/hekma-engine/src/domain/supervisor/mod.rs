@@ -822,6 +822,54 @@ pub(crate) struct SupervisorShared {
     pub(crate) pause_command_cap: Duration,
 }
 
+/// AD-18 Step 4b: the supervisor's per-instance state — the held
+/// processes and the per-instance streaks and error memories the poll keeps.
+/// Grouped so a later step can hand one instance's slice out on its own.
+#[derive(Default)]
+struct InstanceState {
+    running: HashMap<InstanceName, Supervised>,
+    /// AI-12: the per-instance CONSECUTIVE `backend.poll` error count, kept
+    /// across reaper passes so a PERSISTENT poll failure can trip
+    /// [`MAX_CONSECUTIVE_POLL_ERRORS`] and be treated as a crash signal instead
+    /// of being swallowed forever as "still-alive". A clean poll (or the
+    /// handle's removal) clears the entry; a singleton error streak restarts
+    /// from zero.
+    poll_error_streaks: HashMap<InstanceName, u32>,
+    /// Story 18-3 — the per-instance RESTART-REQUESTED streak: how many
+    /// restart-requested relaunches THIS supervisor has scheduled for the
+    /// instance since its last fresh start / adoption / clean exit. It
+    /// grows the restart-requested plan's backoff DELAY (delay index =
+    /// the UNCHARGED counter + this streak + 1) so a restart-requested loop
+    /// still backs off to its cap while the persisted counter stays
+    /// byte-unchanged (the charging write must never see a bigger number).
+    /// IN-MEMORY ONLY — an engine restart forgets it, honestly: the next
+    /// relaunch waits the base again (the crash counter, which PERSISTS,
+    /// is the operator's durable signal). Cleared at the fresh-start
+    /// insert, the adoption insert, a clean exit, an operator stop, a
+    /// dropped/terminal record, and EVERY charged crash (`plan_restart`
+    /// drops it for all its outcomes — a stable-window reset forgives the
+    /// pacing history along with the chain, 18-3 review); mirrors
+    /// `poll_error_streaks`' per-instance shape.
+    requested_restart_streaks: HashMap<InstanceName, u32>,
+    /// AI-12 (loop 1): the LAST poll error's text per handle (truncated at
+    /// [`POLL_ERROR_CAUSE_MAX_CHARS`]), so the persistent-poll-failure crash
+    /// cause can carry the actual why — not just the bare count. Updated on
+    /// every poll error (handle-specific OR environmental), read when a streak
+    /// trips, cleared wherever the streak clears.
+    poll_last_errors: HashMap<InstanceName, String>,
+    /// Liveness (story 18-2, review round 1 P2) — PER-EPISODE bookkeeping for
+    /// the phase-4 registry lookup: an instance whose `lookup` ERRORS once
+    /// gets its ONE diagnostic ("checks paused until reads recover"); every
+    /// further Err for the SAME name stays silent (no per-tick spam while the
+    /// store is down); a lookup that returns Ok clears the name (a RECOVERED
+    /// read resumes checks — and their diagnostics — silently). "Episode" =
+    /// this in-memory supervisor's lifetime (the same lifetime as the
+    /// in-memory handle map; a new engine re-arms the diagnostic, which is
+    /// correct — a new operator session deserves to hear about a degraded
+    /// read again).
+    liveness_lookup_err_names: std::collections::HashSet<InstanceName>,
+}
+
 /// The lifecycle supervisor: owns running process handles + drives transitions.
 ///
 /// Constructed empty by [`Engine::open`](crate::Engine::open). Holds ONE
@@ -833,6 +881,8 @@ pub(crate) struct SupervisorShared {
 pub struct Supervisor {
     /// AD-18 Step 4: the shared, `&self`-shaped state.
     shared: SupervisorShared,
+    /// AD-18 Step 4b: the per-instance state.
+    instances: InstanceState,
     /// Story 22-4: the provider-host list (set when Shim launches are on).
     bypass_feed: Option<std::sync::Arc<crate::domain::bypass::BypassFeed>>,
     /// Story 24-3: the instances the latest adoption pass took over.
@@ -842,7 +892,6 @@ pub struct Supervisor {
     shims_lost: Vec<InstanceName>,
     /// Story 24-3: the stop in progress cleans up after a crashed host.
     crash_cleanup: bool,
-    running: HashMap<InstanceName, Supervised>,
     /// The host-provided diagnostic sink (story 10-2), when one is installed.
     /// `None` (every constructor's default) keeps the historical behavior: the
     /// two AD-12 diagnostics go to stderr. Both emission sites run while the
@@ -894,35 +943,6 @@ pub struct Supervisor {
     /// application (or one after a start/adoption populated `running`) is a
     /// typed [`ServeOptionsRefused`] refusal, never a silent re-pin.
     serve_options_applied: bool,
-    /// AI-12: the per-instance CONSECUTIVE `backend.poll` error count, kept
-    /// across reaper passes so a PERSISTENT poll failure can trip
-    /// [`MAX_CONSECUTIVE_POLL_ERRORS`] and be treated as a crash signal instead
-    /// of being swallowed forever as "still-alive". A clean poll (or the
-    /// handle's removal) clears the entry; a singleton error streak restarts
-    /// from zero.
-    poll_error_streaks: HashMap<InstanceName, u32>,
-    /// Story 18-3 — the per-instance RESTART-REQUESTED streak: how many
-    /// restart-requested relaunches THIS supervisor has scheduled for the
-    /// instance since its last fresh start / adoption / clean exit. It
-    /// grows the restart-requested plan's backoff DELAY (delay index =
-    /// the UNCHARGED counter + this streak + 1) so a restart-requested loop
-    /// still backs off to its cap while the persisted counter stays
-    /// byte-unchanged (the charging write must never see a bigger number).
-    /// IN-MEMORY ONLY — an engine restart forgets it, honestly: the next
-    /// relaunch waits the base again (the crash counter, which PERSISTS,
-    /// is the operator's durable signal). Cleared at the fresh-start
-    /// insert, the adoption insert, a clean exit, an operator stop, a
-    /// dropped/terminal record, and EVERY charged crash (`plan_restart`
-    /// drops it for all its outcomes — a stable-window reset forgives the
-    /// pacing history along with the chain, 18-3 review); mirrors
-    /// `poll_error_streaks`' per-instance shape.
-    requested_restart_streaks: HashMap<InstanceName, u32>,
-    /// AI-12 (loop 1): the LAST poll error's text per handle (truncated at
-    /// [`POLL_ERROR_CAUSE_MAX_CHARS`]), so the persistent-poll-failure crash
-    /// cause can carry the actual why — not just the bare count. Updated on
-    /// every poll error (handle-specific OR environmental), read when a streak
-    /// trips, cleared wherever the streak clears.
-    poll_last_errors: HashMap<InstanceName, String>,
     /// AI-12 (loop 2): how many CONSECUTIVE ticks the corroboration guard has
     /// classified as environmental. Every non-environmental tick resets it.
     /// Past [`MAX_CONSECUTIVE_ENVIRONMENTAL_TICKS`] the guard stops granting
@@ -963,17 +983,6 @@ pub struct Supervisor {
     /// outside the lib's own test builds.
     #[cfg(test)]
     totals_read_fault_names: std::collections::HashSet<InstanceName>,
-    /// Liveness (story 18-2, review round 1 P2) — PER-EPISODE bookkeeping for
-    /// the phase-4 registry lookup: an instance whose `lookup` ERRORS once
-    /// gets its ONE diagnostic ("checks paused until reads recover"); every
-    /// further Err for the SAME name stays silent (no per-tick spam while the
-    /// store is down); a lookup that returns Ok clears the name (a RECOVERED
-    /// read resumes checks — and their diagnostics — silently). "Episode" =
-    /// this in-memory supervisor's lifetime (the same lifetime as the
-    /// in-memory handle map; a new engine re-arms the diagnostic, which is
-    /// correct — a new operator session deserves to hear about a degraded
-    /// read again).
-    liveness_lookup_err_names: std::collections::HashSet<InstanceName>,
     /// cfg(test) FAULT-INJECTION SEAM (review round 1 P2's test driver): an
     /// instance name listed here makes the phase-4 liveness lookup behave
     /// EXACTLY like a store-read failure (the ONE diagnostic + the silent
@@ -1186,6 +1195,7 @@ impl Supervisor {
     /// Directly held processes are untouched.
     pub(crate) fn release_shim_held(&mut self, registry: &Registry) -> Vec<InstanceName> {
         let mut names: Vec<InstanceName> = self
+            .instances
             .running
             .iter()
             .filter(|(_, supervised)| self.shared.backend.is_shim(&supervised.handle))
@@ -1193,7 +1203,7 @@ impl Supervisor {
             .collect();
         names.sort();
         for name in &names {
-            self.running.remove(name);
+            self.instances.running.remove(name);
             // The record no longer names this engine as its supervisor, so
             // the next engine adopts at once — even while this one is still
             // alive (an in-place upgrade's successor opens before it exits).
@@ -1210,7 +1220,7 @@ impl Supervisor {
 
     /// Story 22-4: hand a refreshed provider-host list to every live Shim.
     pub(crate) fn push_bypass_hosts(&mut self, config: &crate::shim::proto::BypassConfig) {
-        for supervised in self.running.values_mut() {
+        for supervised in self.instances.running.values_mut() {
             let _ = self
                 .shared
                 .backend
@@ -1225,7 +1235,7 @@ impl Supervisor {
             return;
         };
         let mut reports = Vec::new();
-        for supervised in self.running.values_mut() {
+        for supervised in self.instances.running.values_mut() {
             if let Some(report) = self
                 .shared
                 .backend
@@ -1273,6 +1283,7 @@ impl Supervisor {
     /// exercise self-reported / lifecycle paths.
     pub fn new() -> Self {
         Self {
+            instances: InstanceState::default(),
             shared: SupervisorShared {
                 backend: proc::ProcBackend::new(),
                 usage_source: SelfReportedUsageSource::new(),
@@ -1286,7 +1297,6 @@ impl Supervisor {
             adopted_names: Vec::new(),
             shims_lost: Vec::new(),
             crash_cleanup: false,
-            running: HashMap::new(),
             diagnostics: None,
             proxy_url: None,
             child_env_allowlist: false,
@@ -1298,9 +1308,6 @@ impl Supervisor {
             agent_log_truncate_deferred: false,
             policies_degraded_noted: false,
             agent_stderr_truncate_deferred: false,
-            poll_error_streaks: HashMap::new(),
-            requested_restart_streaks: HashMap::new(),
-            poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
             #[cfg(test)]
             poll_fault_pids: std::collections::HashSet::new(),
@@ -1309,7 +1316,6 @@ impl Supervisor {
             #[cfg(test)]
             #[cfg(test)]
             totals_read_fault_names: std::collections::HashSet::new(),
-            liveness_lookup_err_names: std::collections::HashSet::new(),
             #[cfg(test)]
             liveness_lookup_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
@@ -1338,6 +1344,7 @@ impl Supervisor {
     /// unchanged.
     pub fn with_runtime(_runtime: tokio::runtime::Handle) -> Self {
         Self {
+            instances: InstanceState::default(),
             shared: SupervisorShared {
                 backend: proc::ProcBackend::new(),
                 usage_source: SelfReportedUsageSource::new(),
@@ -1351,7 +1358,6 @@ impl Supervisor {
             adopted_names: Vec::new(),
             shims_lost: Vec::new(),
             crash_cleanup: false,
-            running: HashMap::new(),
             diagnostics: None,
             proxy_url: None,
             child_env_allowlist: false,
@@ -1363,9 +1369,6 @@ impl Supervisor {
             agent_log_truncate_deferred: false,
             policies_degraded_noted: false,
             agent_stderr_truncate_deferred: false,
-            poll_error_streaks: HashMap::new(),
-            requested_restart_streaks: HashMap::new(),
-            poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
             #[cfg(test)]
             poll_fault_pids: std::collections::HashSet::new(),
@@ -1374,7 +1377,6 @@ impl Supervisor {
             #[cfg(test)]
             #[cfg(test)]
             totals_read_fault_names: std::collections::HashSet::new(),
-            liveness_lookup_err_names: std::collections::HashSet::new(),
             #[cfg(test)]
             liveness_lookup_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
@@ -1402,6 +1404,7 @@ impl Supervisor {
     #[cfg(test)]
     pub(crate) fn with_backoff(backoff: BackoffSchedule) -> Self {
         Self {
+            instances: InstanceState::default(),
             shared: SupervisorShared {
                 backend: proc::ProcBackend::new(),
                 usage_source: SelfReportedUsageSource::new(),
@@ -1415,7 +1418,6 @@ impl Supervisor {
             adopted_names: Vec::new(),
             shims_lost: Vec::new(),
             crash_cleanup: false,
-            running: HashMap::new(),
             diagnostics: None,
             proxy_url: None,
             child_env_allowlist: false,
@@ -1427,9 +1429,6 @@ impl Supervisor {
             agent_log_truncate_deferred: false,
             policies_degraded_noted: false,
             agent_stderr_truncate_deferred: false,
-            poll_error_streaks: HashMap::new(),
-            requested_restart_streaks: HashMap::new(),
-            poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
             #[cfg(test)]
             poll_fault_pids: std::collections::HashSet::new(),
@@ -1438,7 +1437,6 @@ impl Supervisor {
             #[cfg(test)]
             #[cfg(test)]
             totals_read_fault_names: std::collections::HashSet::new(),
-            liveness_lookup_err_names: std::collections::HashSet::new(),
             #[cfg(test)]
             liveness_lookup_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
@@ -1567,9 +1565,9 @@ impl Supervisor {
         // inconsistent; a capture-mode flip would leave mixed-posture raw
         // files on disk. The `running` map is non-empty from the first
         // supervised process onward.
-        if !self.running.is_empty() {
+        if !self.instances.running.is_empty() {
             return Err(ServeOptionsRefused::LifecycleBegun {
-                held: self.running.len(),
+                held: self.instances.running.len(),
             });
         }
         if self.serve_options_applied {
@@ -1597,7 +1595,7 @@ impl Supervisor {
     /// silently breaking the arithmetic.
     pub(crate) fn override_stable_run_window(&mut self, window: Duration) {
         debug_assert!(
-            self.running.is_empty(),
+            self.instances.running.is_empty(),
             "the stable-run window is open-time only"
         );
         if window.is_zero() {
@@ -1628,7 +1626,7 @@ impl Supervisor {
     /// so a zero lands as the production cap, with a diagnostic saying why.
     pub(crate) fn override_pause_command_cap(&mut self, cap: Duration) {
         debug_assert!(
-            self.running.is_empty(),
+            self.instances.running.is_empty(),
             "the pause-command cap is open-time only"
         );
         if cap.is_zero() {
@@ -1738,6 +1736,7 @@ impl Supervisor {
     /// one) is a no-op.
     pub(super) fn drain_acp_notices_for(&mut self, name: &InstanceName) {
         let Some(notices) = self
+            .instances
             .running
             .get(name)
             .and_then(|supervised| supervised.acp.as_ref())
@@ -1757,7 +1756,7 @@ impl Supervisor {
     /// mirroring `drain_usage_all`/`drain_observed_all`). Called at the top
     /// of [`Supervisor::poll_once`].
     pub(super) fn drain_acp_notices_all(&mut self) {
-        let names: Vec<InstanceName> = self.running.keys().cloned().collect();
+        let names: Vec<InstanceName> = self.instances.running.keys().cloned().collect();
         for name in names {
             self.drain_acp_notices_for(&name);
         }
@@ -1774,7 +1773,8 @@ impl Supervisor {
         &self,
         name: &InstanceName,
     ) -> Option<crate::acp::AcpContextUsage> {
-        self.running
+        self.instances
+            .running
             .get(name)
             .and_then(|supervised| supervised.acp.as_ref())
             .and_then(|connection| connection.context_usage())
@@ -1786,7 +1786,8 @@ impl Supervisor {
     /// lifetime, or already torn down): the Fleet read then falls back to the
     /// ledger-derived truth (no committed usage ⇒ none seen).
     pub(crate) fn sentinel_lines_seen(&self, name: &InstanceName) -> bool {
-        self.running
+        self.instances
+            .running
             .get(name)
             .is_some_and(|supervised| supervised.sentinel_lines_seen)
     }
@@ -1800,6 +1801,7 @@ impl Supervisor {
     /// silent no-op (there is nothing to cancel — no diagnostic, no write).
     pub(super) fn cancel_in_flight_acp_turn(&mut self, name: &InstanceName) {
         let Some(connection) = self
+            .instances
             .running
             .get(name)
             .and_then(|supervised| supervised.acp.as_ref())
@@ -1852,7 +1854,7 @@ impl Supervisor {
     /// — a human-readable mirror of the SAME fact `instance.log` (above,
     /// unchanged, machine-authoritative) just recorded. The output-capture
     /// handle is looked up via [`Supervisor::log_capture_for`] (the
-    /// instance's CURRENT `self.running` entry, when one exists); fix pass
+    /// instance's CURRENT `self.instances.running` entry, when one exists); fix pass
     /// (review of #80): [`LogCapture::send_engine_line`] catches up any
     /// pending agent-out/agent-err content FIRST, so the engine line lands
     /// after whatever agent output already existed at this moment rather
@@ -1879,10 +1881,10 @@ impl Supervisor {
 
     /// Like [`Supervisor::transition`], but the `engine`-attributed
     /// [`LogCapture`] is supplied EXPLICITLY rather than looked up via
-    /// `self.running` — needed at the three call sites (`start_inner`'s
+    /// `self.instances.running` — needed at the three call sites (`start_inner`'s
     /// `starting → running`, `stop_inner`'s `stopping → stopped`, and
     /// `poll_once`'s crash `→ failed`) where the just-spawned/about-to-be-
-    /// torn-down handle is not (or no longer) present in `self.running` at
+    /// torn-down handle is not (or no longer) present in `self.instances.running` at
     /// the exact moment of the call, even though a live capture pipeline
     /// still exists (captured by the caller a few lines earlier, before the
     /// map mutation that would otherwise hide it).
@@ -1980,7 +1982,7 @@ impl Supervisor {
         )
         .map_err(transition_snapshot_to_engine)?;
         // The capture lookup mirrors `transition`'s (the instance has no
-        // `self.running` entry yet — the spawn comes after this transition).
+        // `self.instances.running` entry yet — the spawn comes after this transition).
         let log_capture = self.log_capture_for(name);
         self.after_transition_commit(registry, name, &event, &committed.append, log_capture);
         self.after_run_projection(name, committed.run_events, committed.projection_failed);
@@ -1994,7 +1996,7 @@ impl Supervisor {
     /// writer job, so the durable record can never lead a state that did not
     /// happen). The `engine`-attributed [`LogCapture`] is supplied EXPLICITLY
     /// (the same reason as [`Self::transition_with_log_capture`]: the liveness
-    /// expiry removes the handle from `self.running` BEFORE committing, so the
+    /// expiry removes the handle from `self.instances.running` BEFORE committing, so the
     /// lookup form would find nothing).
     ///
     /// The liveness expiry uses this instead of [`Self::transition`] to close
@@ -2099,10 +2101,11 @@ impl Supervisor {
     }
 
     /// `name`, if any (story 4-2, Task 4) — `None` when the instance has no
-    /// `self.running` entry (not started this session, already torn down, or
+    /// `self.instances.running` entry (not started this session, already torn down, or
     /// adopted with no recoverable capture pipeline).
     fn log_capture_for(&self, name: &InstanceName) -> Option<LogCapture> {
-        self.running
+        self.instances
+            .running
             .get(name)
             .and_then(|s| self.shared.backend.log_capture(&s.handle))
     }

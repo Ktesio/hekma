@@ -244,3 +244,7 @@ Each is a public-contract or product choice; the recommendation is the spec's cu
     - the per-instance `InstanceState`;
     - receivers taking `(&SupervisorShared, &StoreGate, &mut InstanceState)`, so shared state can be handed out without the supervisor lock.
     - The mutable configuration fields (diagnostics, proxy URL, env allowlist, log capture) stay on `Supervisor`, since they are set after construction.
+- 2026-11-14 — **phase 4h (built): AD-18 Step 4b, first half: `InstanceState`** (stacked on phase 4g, #442).
+  - **The move:** the per-instance state moves into `InstanceState`, held as `Supervisor.instances`. That is the held processes (`running`), the poll-error and requested-restart streaks, the last poll errors, and the liveness lookup-error memory. 190 accesses now read `self.instances.…`.
+  - **Behaviour:** no change, and the supervisor mutex is unchanged.
+  - **Still to do (Step 4b, second half):** the receiver change itself. Supervisor methods would take `(&SupervisorShared, &RegistryGuard, &mut InstanceState)` instead of `&mut self`, so one instance's slice can be handed out without the whole supervisor. Methods touch both halves freely today, so it is a per-method rewrite that needs review, not a mechanical pass.
