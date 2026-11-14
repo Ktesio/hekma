@@ -79,18 +79,33 @@ const HOW_TO_CHECK: &str = "check that your service manager stops only the host'
 /// The verdict for this process.
 pub fn check() -> HandoffCheck {
     let invocation_id = std::env::var("INVOCATION_ID").ok();
-    if invocation_id.as_deref().is_none_or(str::is_empty) {
-        let label = std::env::var("XPC_SERVICE_NAME").ok();
-        if let Some(verdict) = launchd_check(label.as_deref(), &query_launchd_properties) {
+    let label = std::env::var("XPC_SERVICE_NAME").ok();
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok();
+    check_either(
+        invocation_id.as_deref(),
+        label.as_deref(),
+        cgroup.as_deref(),
+        &query_kill_mode,
+        &query_launchd_properties,
+    )
+}
+
+/// Which manager decides: systemd when it started this process, else
+/// launchd when this is one of its jobs, else the systemd path's own
+/// `unverified` (the seam for [`check`]).
+pub(crate) fn check_either(
+    invocation_id: Option<&str>,
+    label: Option<&str>,
+    cgroup: Option<&str>,
+    kill_mode: &dyn Fn(&str, bool) -> Option<String>,
+    launchd: &dyn Fn(&str) -> Option<String>,
+) -> HandoffCheck {
+    if invocation_id.is_none_or(str::is_empty) {
+        if let Some(verdict) = launchd_check(label, launchd) {
             return verdict;
         }
     }
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok();
-    check_with(
-        invocation_id.as_deref(),
-        cgroup.as_deref(),
-        &query_kill_mode,
-    )
+    check_with(invocation_id, cgroup, kill_mode)
 }
 
 /// The launchd verdict, when this process is a launchd job: `label` is
@@ -232,18 +247,11 @@ mod tests {
         let killed =
             launchd_check(Some("dev.example.hekma"), &reports("inferred program")).unwrap();
         assert_eq!(killed.as_str(), "unsafe");
-        assert!(
-            killed.note().contains("AbandonProcessGroup to true"),
-            "{}",
-            killed.note()
-        );
-        assert!(!killed.note().contains("KillMode"), "{}", killed.note());
+        let note = killed.note();
+        assert!(note.contains("AbandonProcessGroup to true"));
+        assert!(!note.contains("KillMode"));
         let unread = launchd_check(Some("dev.example.hekma"), &|_: &str| None).unwrap();
-        assert!(
-            unread.detail().contains("could not read the job"),
-            "{}",
-            unread.detail()
-        );
+        assert!(unread.detail().contains("could not read the job"));
         // Not a launchd job: no verdict here, the systemd check decides.
         for label in [None, Some(""), Some("0")] {
             assert!(launchd_check(label, &reports("abandon process group")).is_none());
@@ -259,6 +267,40 @@ mod tests {
             Some("inferred program | abandon process group")
         );
         assert_eq!(launchd_properties("nothing here"), None);
+    }
+
+    #[test]
+    fn systemd_decides_first_then_a_launchd_job_then_unverified() {
+        let process = |_: &str, _: bool| Some("process".to_string());
+        let abandons = |_: &str| Some("abandon process group".to_string());
+        let systemd = check_either(
+            Some("abc"),
+            Some("dev.example.hekma"),
+            Some("0::/system.slice/hekma.service\n"),
+            &process,
+            &abandons,
+        );
+        assert_eq!(systemd.detail(), "hekma.service: KillMode=process");
+        let launchd = check_either(None, Some("dev.example.hekma"), None, &process, &abandons);
+        assert_eq!(
+            launchd.detail(),
+            "launchd job dev.example.hekma: AbandonProcessGroup=true"
+        );
+        let neither = check_either(None, Some("0"), None, &process, &abandons);
+        assert!(neither.detail().contains("not started by systemd"));
+    }
+
+    /// The real query reads a real job's properties where launchd runs
+    /// (macOS's logd is readable without privileges); elsewhere it reads
+    /// nothing.
+    #[test]
+    fn the_real_query_reads_a_system_jobs_properties_on_macos() {
+        let properties = query_launchd_properties("com.apple.logd");
+        if std::env::consts::OS == "macos" {
+            assert!(properties.is_some_and(|line| line.contains("system service")));
+        } else {
+            assert!(properties.is_none());
+        }
     }
 
     /// The real query, against a label no job has: no verdict can be read.
