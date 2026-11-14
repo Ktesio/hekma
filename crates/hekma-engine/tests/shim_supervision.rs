@@ -582,16 +582,21 @@ fn the_next_owner_reads_the_previous_posture_and_cleans_up_after_an_off_crash() 
         PreviousHost::Unknown
     );
     // An engine that owns no data path records and reads nothing.
+    assert!(
+        third.blocking().commit_recovery(0).unwrap().is_none(),
+        "nothing to reconcile"
+    );
     let plain = Engine::open(Some(state.path().to_path_buf())).unwrap();
     assert!(plain.host_recovery().is_none());
     assert!(plain.blocking().commit_recovery(0).unwrap().is_none());
 }
 
-/// Story 24-3: each host start commits one `recovery` event summing up its
-/// reconcile — the previous mode, the agents kept, and the Shims found
-/// gone — on the bus and in the outbox; a second restart sums up nothing.
+/// Story 24-3: a host start that reconciled something commits one
+/// `recovery` event summing it up — the previous mode, the agents kept, and
+/// the Shims found gone — on the bus and in the outbox; a start that found
+/// nothing records none.
 #[test]
-fn each_host_start_commits_one_recovery_event_that_sums_up_its_reconcile() {
+fn a_host_start_that_reconciles_commits_one_recovery_event_summing_it_up() {
     if std::env::consts::FAMILY != "unix" {
         return;
     }
@@ -658,18 +663,9 @@ fn each_host_start_commits_one_recovery_event_that_sums_up_its_reconcile() {
         )
         .unwrap();
     assert_eq!(kept, 1);
-    // Nothing left behind: an unknown wish, and zero counts.
+    // Nothing left behind: nothing to sum up, so no event.
     let third = open_as_host(state.path(), HandoffPosture::Unset);
-    let summary = third.blocking().commit_recovery(0).unwrap().unwrap();
-    assert_eq!(summary.posture, RecoveryPosture::Unknown);
-    assert_eq!(
-        (
-            summary.runs_adopted,
-            summary.shims_lost,
-            summary.runs_cleaned
-        ),
-        (0, 0, 0)
-    );
+    assert!(third.blocking().commit_recovery(0).unwrap().is_none());
 }
 
 /// A diagnostic sink capturing into a shared buffer.

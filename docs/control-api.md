@@ -812,7 +812,7 @@ engine's own kind-tagged JSON (`{"kind":"transition",…}`,
 `{"kind":"run",…}` for a Run created, ended or changed, and
 `{"kind":"secret_revealed",…}` when a custodied provider key is revealed,
 naming the instance and the secret, never its value, and one
-`{"kind":"recovery",…}` per host start summing up what the previous host
+`{"kind":"recovery",…}` when a host start reconciled what the previous host
 left; see [hosting](hosting.md)) — never re-shaped.
 Every event frame also carries `id: <seq>` — the event's position in the
 global outbox, the same `seq` `GET /v0/export` serves. A client that falls

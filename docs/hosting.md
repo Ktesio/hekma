@@ -243,12 +243,12 @@ what the dead one recorded:
 Agents held directly die with the host only if the operating system takes
 their process group with it; those that survive are treated the same way.
 
-Every host start then records one `recovery` event that sums up what it
-found: the dead host's mode (`posture`: `on`, `off` or `unknown`), the
+A host start that had anything to reconcile then records one `recovery`
+event that sums it up: the dead host's mode (`posture`: `on`, `off` or `unknown`), the
 agents it kept (`runs_adopted`) and stopped (`runs_cleaned`), the agents
 whose Shim was gone (`shims_lost`), and the proxied calls it closed as
-`crash` or `recovered`. A start after a clean stop records one with zero
-counts; an in-place upgrade records none. It is on `GET /v0/events` and in
+`crash` or `recovered`. A start that found nothing (no agent left running,
+no call left open) records none, and so does an in-place upgrade. It is on `GET /v0/events` and in
 the export like any other event.
 
 **What a crash can lose.** Everything a command or the Control API changes

@@ -757,3 +757,22 @@ fn a_credential_event_exports_nothing_and_carries_no_token() {
     assert_eq!(a, b);
     assert!(!a.contains("0123456789ab"));
 }
+
+/// Story 24-3: a reconcile summary has no v1 metric.
+#[test]
+fn a_recovery_event_adds_no_series() {
+    let mut state = state();
+    let before = format!("{:?}", state.snapshot(1));
+    state.observe(&EngineEvent::Recovery(hekma_engine::RecoveryEvent {
+        schema_version: hekma_engine::RECOVERY_SCHEMA_VERSION,
+        change: hekma_engine::RecoveryChange::Recovered,
+        posture: hekma_engine::RecoveryPosture::On,
+        runs_adopted: 1,
+        runs_cleaned: 0,
+        calls_closed_crash: 0,
+        calls_closed_recovered: 0,
+        shims_lost: 0,
+        at: "2026-11-14T00:00:00Z".into(),
+    }));
+    assert_eq!(format!("{:?}", state.snapshot(1)), before);
+}

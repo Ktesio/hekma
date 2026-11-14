@@ -355,7 +355,8 @@ graceful path is a contract the embedder owns:
   proxied calls the open closed (`calls_closed_crash`,
   `calls_closed_recovered`). Then call `commit_recovery(runs_cleaned)` once:
   it commits and publishes one `EngineEvent::Recovery` summing it up, or
-  returns `None` when the previous owner is still alive (an upgrade).
+  returns `None` when the previous owner is still alive (an upgrade) or
+  the open found nothing to reconcile.
   Without `host_posture` nothing is recorded or read, and adoption is
   unchanged.
 - **Notices are optional.** Pass `Some(&sink)` (a

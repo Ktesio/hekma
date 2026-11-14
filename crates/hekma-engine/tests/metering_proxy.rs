@@ -2226,6 +2226,62 @@ fn the_sweeper_silences_renews_and_ends_an_announced_run() {
     assert_ne!(fresh.record.run_id, gone.record.run_id);
 }
 
+/// Story 24-3: a Lease that lapses while no host runs is swept by the next
+/// one from the stored Lease: the Run goes `silent` once (one status
+/// change, never re-issued on later sweeps), and the restart itself renews
+/// nothing.
+#[test]
+fn a_lease_that_lapses_while_no_host_runs_goes_silent_once_at_the_next_start() {
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let options = || EngineOptions {
+        metering_proxy: MeteringProxyOptions {
+            leases: hekma_engine::LeaseOptions {
+                lease_secs: 2,
+                wire_inactivity_secs: 600,
+                silent_window_secs: 600,
+                sweep_interval_secs: 1,
+            },
+            ..MeteringProxyOptions::default()
+        },
+        ..EngineOptions::default()
+    };
+    let identity = ("binding:openai", "nightly");
+    let (run_id, lease) = {
+        let engine =
+            Engine::open_with_options(Some(state.path().to_path_buf()), options()).unwrap();
+        let port = engine.metering_proxy().unwrap().port;
+        bind(&engine, "openai", "/openai", &upstream.base(), &[]);
+        let call = post(port, "/openai/chat", &[("x-hekma-announce", "nightly")]);
+        assert_eq!(call.status, 200, "{}", call.body);
+        let run = wait_for_status(&engine, identity, "active");
+        let view = engine.blocking().run(run.record.run_id.as_str()).unwrap();
+        (run.record.run_id.clone(), view.lease_expires_at)
+        // The host goes away with the Lease still held.
+    };
+    assert!(lease.is_some());
+    // The Lease lapses while no host runs.
+    std::thread::sleep(Duration::from_secs(3));
+    let engine = Engine::open_with_options(Some(state.path().to_path_buf()), options()).unwrap();
+    let silent = wait_for_status(&engine, identity, "silent");
+    assert_eq!(silent.record.run_id, run_id);
+    let view = engine.blocking().run(run_id.as_str()).unwrap();
+    assert_eq!(view.lease_expires_at, lease, "the restart renewed nothing");
+    // Later sweeps re-issue nothing.
+    std::thread::sleep(Duration::from_secs(3));
+    let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+    let silenced: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM outbox WHERE event LIKE '%\"kind\":\"run\"%' \
+             AND event LIKE '%\"change\":\"status-changed\"%' AND event LIKE ?1 \
+             AND event LIKE '%\"status\":\"silent\"%'",
+            [format!("%{}%", run_id.as_str())],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(silenced, 1, "one silent change, never re-issued");
+}
+
 /// Story 23-2: concurrent first announces of one identity converge on ONE
 /// Run and exactly one minted pair (the writer serializes the claims).
 #[test]
