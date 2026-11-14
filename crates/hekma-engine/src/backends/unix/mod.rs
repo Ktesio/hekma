@@ -34,6 +34,8 @@
 
 /// Story 22-4: bypass detection's tree enumerator.
 pub mod bypass;
+/// Story 24-2: the handoff channel's transport.
+pub mod handoff;
 /// Story 24-1: the Shim's Unix transport.
 pub mod shim;
 use std::io;

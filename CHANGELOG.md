@@ -4,12 +4,13 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
-> **Unreleased — Handoff Mode, a preview (hekma-engine 0.12.0).**
+> **Unreleased — Handoff Mode and in-place upgrades, a preview (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >
 > - **`hekma serve --handoff`** (or `HEKMA_HANDOFF=on`): when the host stops, agents running in their own Shim are released instead of stopped. They keep running, and the next host reconnects to them. Agents held directly are still stopped. Off by default; `--no-handoff` keeps the drain.
-> - **Not yet:** handing the host to a new binary without a gap (the in-place upgrade), service-manager checks, and Windows.
-> - **Engine surface (additive):** `Engine::shutdown_for_handoff` and `HandoffShutdown`. No schema change.
+> - **`hekma serve --upgrade`** (and `POST /v0/host/upgrade`, Operator only) hands the running host over in place to the `hekma` binary now installed, on Unix. The new host connects over an owner-only socket with a one-time token; until it does, nothing stops. The old host then releases its Shim-held agents and hands over the metering proxy's listening socket (never closed, so no connection is refused) and its host lock. The new host reconnects to every agent and serves, and only then does the old one exit.
+> - **Not yet:** rolling back once the hand-over has happened (if the new host fails then, the agents keep running and the next `hekma` command starts a host that reconnects), service-manager checks, and Windows.
+> - **Engine surface (additive):** `Engine::shutdown_for_handoff`, `Engine::shutdown_for_upgrade`, `HandoffShutdown`, `MeteringProxyOptions::inherited_listener` (`InheritedListener`), and the `handoff` module. No schema change.
 
 > **Unreleased — bypass detection, a preview for agents in their own Shim (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:

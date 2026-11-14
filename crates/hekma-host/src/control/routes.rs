@@ -2319,6 +2319,35 @@ pub(crate) async fn binding_credentials(
 }
 
 /// `GET /v0/proxy` (Operator bearer only) — where the shared Metering
+/// Story 24-2: the refusal where the OS has no hand-over.
+fn upgrade_available(supported: bool) -> ApiResult<()> {
+    if supported {
+        return Ok(());
+    }
+    Err(ApiError::conflict_with_code(
+        "upgrade-unsupported",
+        "an in-place upgrade is not available on this operating system yet; restart the host \
+         instead",
+    ))
+}
+
+/// `POST /v0/host/upgrade` (story 24-2, Operator bearer only): hand this
+/// Service Host over in place to a fresh copy of its binary — the one now
+/// on disk, after an upgrade. Answers `202` once the request is taken;
+/// the host then launches its successor and hands over to it, and the
+/// successor's `control.json` names the new host. `409
+/// upgrade-unsupported` where the OS has no handoff transport.
+pub(crate) async fn host_upgrade(
+    State(state): State<ApiState>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    upgrade_available(hekma_engine::handoff::supported())?;
+    state.upgrade.notify_one();
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "upgrading": true })),
+    ))
+}
+
 /// Proxy listens (`url`, `port`), or why it is not running (`error`).
 pub(crate) async fn proxy_show(
     State(state): State<ApiState>,
@@ -2409,5 +2438,28 @@ mod tests {
         let wire = serde_json::to_value(&document).unwrap();
         assert!(wire.get("instance").is_none(), "{wire}");
         assert!(wire.get("error").is_none(), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_request_is_accepted_and_reaches_the_serve_loop() {
+        let (state, _shutdown) = super::super::test_support::quiet_api_state();
+        let refused = upgrade_available(false).unwrap_err();
+        assert!(refused
+            .error_object()
+            .to_string()
+            .contains("upgrade-unsupported"));
+        if !hekma_engine::handoff::supported() {
+            return;
+        }
+        let upgrade = std::sync::Arc::clone(&state.upgrade);
+        let waiting = tokio::spawn(async move { upgrade.notified().await });
+        tokio::task::yield_now().await;
+        let (status, Json(body)) = host_upgrade(State(state)).await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["upgrading"], true);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("the serve loop was told")
+            .unwrap();
     }
 }

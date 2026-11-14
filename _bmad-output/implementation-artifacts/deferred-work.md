@@ -944,3 +944,27 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-22-4-bypass-detection-in-the-shim.md` (T5: the `no-shim` state)
   summary: A Run launched directly (no Shim) stays `unreported` rather than storing `unavailable (no-shim)`.
   evidence: `crates/hekma-engine/src/domain/supervisor/mod.rs` (`record_bypass_reports`). Trigger: Handoff Mode making the Shim the default, when a direct launch becomes the exception worth naming.
+
+## From spec-24-2 (Handoff Mode and in-place upgrades) — build, 2026-11-14
+
+- source_spec: `spec-24-2-handoff-mode-and-in-place-upgrades.md` (T5: rollback after the offer)
+  summary: Once the predecessor has sent its socket and lock, a successor failure is not rolled back. The predecessor exits non-zero, and the next `hekma` command starts a host that reconnects to the Shims. The metering proxy is unserved until then.
+  evidence: `crates/hekma-host/src/lib.rs` (`hand_over`). Trigger: a successor failure seen in the field, or the crash-recovery story (24-3).
+
+- source_spec: `spec-24-2-handoff-mode-and-in-place-upgrades.md` (T6: service-manager checks)
+  summary: No `KillMode` (systemd) or job breakaway (Windows) check, and no `handoff_check` on `control.json` or a `GET /v0/host`. A manager that kills the whole cgroup takes the Shims down with the host.
+  evidence: `crates/hekma-host/src/lib.rs`. Trigger: the next 24-2 phase, before the default flip.
+
+- source_spec: `spec-24-2-handoff-mode-and-in-place-upgrades.md` (T7: the hand-over report and events)
+  summary: No `EngineEvent::Handoff` family and no per-Run report of processes lost across the hand-over. The predecessor and successor note the released and reconnected counts instead.
+  evidence: `crates/hekma-host/src/lib.rs`. Trigger: the next 24-2 phase.
+
+- source_spec: `spec-24-2-handoff-mode-and-in-place-upgrades.md` (T8, T9, T10, T11)
+  summary: Not built yet:
+    - a test that a held call retried across the upgrade is held again on the successor;
+    - `hekma self-update` triggering the upgrade;
+    - direct-held agents released rather than stopped (O7);
+    - Windows (`WSADuplicateSocket` and the lock gap);
+    - the default flip.
+  evidence: the spec's phase logs. Trigger: the next 24-2 phases, in that order.
+

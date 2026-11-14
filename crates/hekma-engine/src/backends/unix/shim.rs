@@ -36,7 +36,7 @@ pub fn prepare_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// The uid of a connected socket's peer.
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+pub(super) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let creds =

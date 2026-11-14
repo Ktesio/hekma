@@ -9,7 +9,7 @@ Release notes are generated when a version tag is published.
 
 The tag workflow updates the GitHub Release immediately and then opens a pull request that refreshes this file and the root `CHANGELOG.md`.
 
-> **Unreleased — Handoff Mode, a preview (hekma-engine 0.12.0).** `hekma serve --handoff` (or `HEKMA_HANDOFF=on`) releases agents running in their own Shim when the host stops, instead of stopping them; the next host reconnects to them. Agents held directly are still stopped. Off by default.
+> **Unreleased — Handoff Mode and in-place upgrades, a preview (hekma-engine 0.12.0).** `hekma serve --handoff` (or `HEKMA_HANDOFF=on`) releases agents running in their own Shim when the host stops, instead of stopping them; the next host reconnects to them. Agents held directly are still stopped. Off by default. `hekma serve --upgrade` moves a running host onto the newly installed binary in place, on Unix: agents in their own Shim keep running and the metering proxy refuses no connection.
 
 > **Unreleased — bypass detection, a preview (hekma-engine 0.12.0).** Each agent's Shim checks its process tree every 5 seconds for direct connections to a known provider host. On a Run with key custody on, a finding is the `bypass` Anomaly (`bypass[<host>]` in `hekma ps`, counted by `hekma.bypass.detected`); with custody off or no wire path it is an informational note. Every supervised Run shows its detection state (`active`, `unavailable` or `unreported`), so none reads as checked without a check. It never stops a Run. Linux and macOS. `state.db` migrates one way to schema 28.
 

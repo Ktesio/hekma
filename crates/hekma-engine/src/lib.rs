@@ -82,6 +82,8 @@
 //! [`StateStore`]: crate::ports::StateStore
 
 pub mod adapter;
+/// Story 24-2: the in-place upgrade's handoff channel.
+pub mod handoff;
 // The ACP transport core (spine AD-19, story 14-1): engine-INTERNAL — the
 // client-side codec/handshake/connection for the builtin `acp` kind. `kt`
 // never sees it; the public surface change for 14-1 is the kind's
@@ -255,7 +257,9 @@ pub use domain::runs::lease::{
 /// Story 22-1: the reserved credential config keys and the variable every
 /// supervised agent receives its Run Key in.
 pub use domain::{RUN_KEY_ENV, RUN_KEY_KEY, RUN_KEY_MARKER_PREFIX, RUN_REFRESH_KEY_KEY};
-pub use metering::proxy::{MeteringProxyOptions, ProxyInfo, ProxyStartError, ProxyTls};
+pub use metering::proxy::{
+    InheritedListener, MeteringProxyOptions, ProxyInfo, ProxyStartError, ProxyTls,
+};
 // The shutdown drain's public surface (issue #328 item 3): the planner, the
 // per-instance outcome vocabulary, and (via `Engine::shutdown` / its
 // `blocking()` twin) the drain itself.

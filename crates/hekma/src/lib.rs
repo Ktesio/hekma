@@ -490,6 +490,15 @@ enum Commands {
         /// Stop every agent on shutdown, whatever HEKMA_HANDOFF says
         #[arg(long)]
         no_handoff: bool,
+        /// Hand the running host for this state directory over to a fresh
+        /// copy of this binary, in place: agents in their own Shim keep
+        /// running and the metering proxy refuses no connection (Unix)
+        #[arg(long)]
+        upgrade: bool,
+        /// Internal: take over from the host that launched this one (an
+        /// in-place upgrade), over its handoff channel
+        #[arg(long, hide = true, value_name = "CHANNEL")]
+        handoff_from: Option<std::path::PathBuf>,
         /// Send x-hekma-run-id and x-hekma-labels to the model provider for
         /// this run only, whatever `hekma proxy set identity-headers` stored
         #[arg(long)]
@@ -1480,6 +1489,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             no_identity_headers,
             handoff,
             no_handoff,
+            upgrade,
+            handoff_from,
             identity_headers,
             proxy_allowed_hosts,
             proxy_allowed_origins,
@@ -1510,6 +1521,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 (_, true) => Some(false),
                 _ => None,
             },
+            handoff_from,
+            upgrade,
             identity_headers,
             proxy_allowed_hosts,
             proxy_allowed_origins,

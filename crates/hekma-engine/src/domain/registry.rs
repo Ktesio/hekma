@@ -1966,6 +1966,21 @@ impl Registry {
         Ok(self.write(move |store| store.settle_spawn_record(&row))?)
     }
 
+    /// Story 24-2: clear the supervising owner on an instance's spawn record
+    /// (its process was released to its Shim), so the next engine adopts it
+    /// at once. One writer job; nothing to do without a record or an owner.
+    pub(crate) fn release_spawn_owner(&self, name: &InstanceName) -> Result<(), RegistryError> {
+        let name = name.clone();
+        self.write(move |store| match store.get_spawn_record(&name)? {
+            Some(mut record) if record.owner.is_some() => {
+                record.owner = None;
+                store.upsert_spawn_record(&record)
+            }
+            _ => Ok(()),
+        })?;
+        Ok(())
+    }
+
     /// Read an instance's write-ahead spawn record, or `None` if absent.
     pub(crate) fn spawn_record(
         &self,

@@ -334,6 +334,14 @@ graceful path is a contract the embedder owns:
   reconnects to it on open) and drains every agent still held directly. It
   returns a `HandoffShutdown` with the `released` names and the drain's
   `outcomes`.
+- **In-place upgrades: `shutdown_for_upgrade(window, notes)`** is
+  `shutdown_for_handoff`, except that the metering proxy's listening socket
+  is not closed: it stops accepting and is returned (as a
+  `std::net::TcpListener`) for the engine that replaces this one, which
+  serves on it through `MeteringProxyOptions::inherited_listener`
+  (`InheritedListener::new(socket)`). A connection that arrives in between
+  waits in the socket's backlog. `hekma_engine::handoff` is the channel the
+  Service Host uses to pass that socket and its host lock to its successor.
 - **Notices are optional.** Pass `Some(&sink)` (a
   [`DiagnosticSink`](#the-diagnostic-sink)) to get the same `[hekma] `
   progress lines `serve` prints at shutdown; pass `None` for return values

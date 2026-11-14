@@ -211,10 +211,38 @@ without sending a stop, so the agent keeps running in its Shim, and notes
 `<name> released to its Shim`. The next host, started by you or by the next
 `hekma` write, reconnects to each one. Agents held directly (ACP agents, or
 any agent while `HEKMA_SHIM` is off) are still stopped, and the started
-notice says so when Handoff Mode is on without Shims. Handing the host over
-to a new binary without a gap (an in-place upgrade) is not built yet: until
-the next host starts, nothing serves the metering proxy or the Control API,
-and calls in that window are refused.
+notice says so when Handoff Mode is on without Shims. After a plain stop,
+nothing serves the metering proxy or the Control API until the next host
+starts, and calls in that window are refused.
+
+**In-place upgrades (a preview, Unix).** After installing a new `hekma`, run
+`hekma serve --upgrade` (or `POST /v0/host/upgrade`) to move the running host
+onto it without stopping agents or refusing a connection:
+
+1. The host launches the new binary with its own arguments, and the two
+   connect over a socket only your user can open, inside the state
+   directory. A one-time token, passed in the environment and never written
+   anywhere, proves the new process is the one this host launched.
+2. Until the new host answers, nothing has stopped: if it fails to start or
+   connect within 30 seconds, the old host notes why and keeps serving.
+3. The old host then stops its Control API, releases the agents held through
+   their Shims (whatever `--handoff` says), stops the agents held directly,
+   and closes its store. It hands over the metering proxy's listening
+   socket, which never closes, so a connection that arrives meanwhile waits
+   rather than being refused, and its host lock, so no third host can take
+   the state directory in between.
+4. The new host opens the state directory, reconnects to every Shim, serves
+   on the same socket, writes `control.json`, and tells the old host, which
+   exits.
+
+`hekma serve --upgrade` waits until `control.json` names the new host and
+prints both pids. With no host serving the state directory it does nothing:
+the next `hekma` command starts a host on the new binary anyway. If the new
+host fails after the hand-over, the old one exits with an error saying so;
+the agents keep running in their Shims and the next `hekma` command starts a
+host that reconnects to them. Calls that were in flight or held at the
+proxy when the old host stopped get the same retryable answer as at any
+shutdown.
 
 Each Shim also watches its agent's process tree for direct connections to
 known provider hosts, every 5 seconds, and the host records what it finds on

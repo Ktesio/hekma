@@ -52,6 +52,11 @@ pub struct ServeFlags {
     /// `--handoff` (`Some(true)`) or `--no-handoff` (`Some(false)`) (story
     /// 24-2); `None` follows `HEKMA_HANDOFF`.
     pub handoff: Option<bool>,
+    /// The hidden `--handoff-from <channel>` (story 24-2): this host is an
+    /// in-place upgrade's successor.
+    pub handoff_from: Option<PathBuf>,
+    /// `--upgrade` (story 24-2): ask the running host to hand over in place.
+    pub upgrade: bool,
     /// `--proxy-allowed-hosts <name,...>` (story 22-2).
     pub proxy_allowed_hosts: Vec<String>,
     /// `--proxy-allowed-origins <origin,...>` (story 22-2).
@@ -100,6 +105,10 @@ pub struct ServeFlags {
 /// user gets from clap — and the host alone refuses a non-loopback `--listen`
 /// without TLS (exit 2, before anything binds).
 pub fn run(flags: ServeFlags) -> Result<(), Box<dyn std::error::Error>> {
+    // Story 24-2: `--upgrade` asks the running host; it never serves.
+    if flags.upgrade {
+        return upgrade(flags.state_dir.map(PathBuf::from));
+    }
     // The OTLP flags parse through the ONE site both surfaces share (the
     // host bin's hand-rolled loop calls the same `OtlpOptions::from_flags`);
     // a malformed combination (bad scheme, out-of-bounds interval, headers
@@ -161,6 +170,13 @@ pub fn run(flags: ServeFlags) -> Result<(), Box<dyn std::error::Error>> {
         // Story 24-1: the Shim preview — this binary is its own Shim
         // program (the hidden `hekma shim`).
         shim_exe: shim_exe_from_env(),
+        // Story 24-2: a successor's one-time token, taken out of the
+        // environment so no agent this host starts inherits it.
+        handoff_token: flags
+            .handoff_from
+            .as_ref()
+            .and_then(|_| take_handoff_token()),
+        handoff_from: flags.handoff_from,
         // Story 24-2: the flag, then HEKMA_HANDOFF, then off.
         handoff: handoff_mode(
             flags.handoff,
@@ -238,6 +254,82 @@ fn proxy_allowed_origins(values: Vec<String>) -> Result<Vec<String>, String> {
         origins.push(value.to_ascii_lowercase());
     }
     Ok(origins)
+}
+
+/// `hekma serve --upgrade` (story 24-2): ask the host serving this state
+/// directory to hand over in place, then wait (bounded) until `control.json`
+/// names its successor. With no host serving, nothing is started: there is
+/// nothing to upgrade.
+fn upgrade(state_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let root = hekma_engine::paths::EnginePaths::new(state_dir)
+        .map_err(|err| ServeOptionsInvalid {
+            message: err.to_string(),
+        })?
+        .state_base()
+        .to_path_buf();
+    let Some(host) = crate::cli::host_client::HostClient::find(&root) else {
+        return Err(Box::new(ServeOptionsInvalid {
+            message: format!(
+                "no host serves {}, so there is nothing to upgrade; the next hekma command \
+                 starts one on the binary now installed",
+                root.display()
+            ),
+        }));
+    };
+    let before = host_pid(&root);
+    host.bounded(std::time::Duration::from_secs(10))
+        .call("POST", "/v0/host/upgrade", None)
+        .map_err(|err| ServeStartupFailed {
+            message: format!("the host refused the upgrade: {}", call_message(&err)),
+        })?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
+    loop {
+        let now = host_pid(&root);
+        if now.is_some() && now != before {
+            eprintln!(
+                "[hekma] upgraded in place: host pid {} handed over to pid {}",
+                before.map_or("?".to_string(), |pid| pid.to_string()),
+                now.map_or("?".to_string(), |pid| pid.to_string())
+            );
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Box::new(ServeStartupFailed {
+                message: format!(
+                    "the host accepted the upgrade, but no successor took over within 150s; \
+                     see {} for what happened",
+                    root.join("serve.log").display()
+                ),
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// The pid `control.json` names, when it names one.
+fn host_pid(root: &std::path::Path) -> Option<u64> {
+    let text = std::fs::read_to_string(root.join("control.json")).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text).ok()?["pid"].as_u64()
+}
+
+/// A host call's failure, as words.
+fn call_message(err: &crate::cli::host_client::CallError) -> String {
+    use crate::cli::host_client::CallError;
+    match err {
+        CallError::Coded { message, .. } | CallError::Refused(message) => message.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Story 24-2: the in-place upgrade's token, read once and removed from
+/// this process's environment (the host then inherits it to no agent).
+fn take_handoff_token() -> Option<String> {
+    let name = hekma_engine::handoff::HANDOFF_TOKEN_ENV;
+    let token = std::env::var(name).ok();
+    // SAFETY-free on this edition: `serve` runs this before the host starts
+    // any thread that reads the environment.
+    std::env::remove_var(name);
+    token
 }
 
 /// Story 24-2: Handoff Mode — `--handoff`/`--no-handoff`, else
@@ -346,5 +438,19 @@ mod tests {
         assert_eq!(super::handoff_mode(None, None), Ok(false));
         let err = super::handoff_mode(None, Some("maybe")).unwrap_err();
         assert!(err.contains("HEKMA_HANDOFF=maybe"), "{err}");
+    }
+
+    #[test]
+    fn a_refused_upgrade_says_why_in_words() {
+        use crate::cli::host_client::CallError;
+        let coded = CallError::Coded {
+            code: "upgrade-unsupported".to_string(),
+            message: "not on this OS".to_string(),
+        };
+        assert_eq!(super::call_message(&coded), "not on this OS");
+        assert_eq!(
+            super::call_message(&CallError::Refused("no".to_string())),
+            "no"
+        );
     }
 }

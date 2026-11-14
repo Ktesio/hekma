@@ -57,6 +57,7 @@ fn main() {
     let mut otlp_ca_file: Option<std::path::PathBuf> = None;
     let mut tls_cert: Option<std::path::PathBuf> = None;
     let mut tls_key: Option<std::path::PathBuf> = None;
+    let mut handoff_from: Option<std::path::PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -144,6 +145,15 @@ fn main() {
                          CONTROL_BEARER`",
                     ),
                     None => usage_error("--bearer-secret needs a secret NAME"),
+                }
+            }
+            // Story 24-2: internal — this host is an in-place upgrade's
+            // successor (the previous host launched it).
+            "--handoff-from" => {
+                i += 1;
+                match args.get(i) {
+                    Some(channel) => handoff_from = Some(std::path::PathBuf::from(channel)),
+                    None => usage_error("--handoff-from needs the handoff channel's path"),
                 }
             }
             "--log-capture" => {
@@ -280,6 +290,13 @@ fn main() {
         otlp,
         tls_cert,
         tls_key,
+        handoff_token: handoff_from.as_ref().and_then(|_| {
+            let name = hekma_engine::handoff::HANDOFF_TOKEN_ENV;
+            let token = std::env::var(name).ok();
+            std::env::remove_var(name);
+            token
+        }),
+        handoff_from,
         ..hekma_host::ServeOptions::default()
     };
     match hekma_host::serve(options) {

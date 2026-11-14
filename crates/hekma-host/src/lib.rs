@@ -47,7 +47,7 @@ pub mod engine_notes {
     pub use crate::control::notes::{decode, encode, ENGINE_NOTES_HEADER};
 }
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub use drain::{drain_and_stop, drain_plan, DrainOutcome, StopResult};
@@ -188,6 +188,13 @@ pub struct ServeOptions {
     /// instead of stopped. Off by default; agents held directly are always
     /// stopped.
     pub handoff: bool,
+    /// Story 24-2: this host is the successor of an in-place upgrade — the
+    /// previous host's handoff channel, which hands over the metering
+    /// proxy's socket and the host lock (instead of acquiring it).
+    pub handoff_from: Option<PathBuf>,
+    /// Story 24-2: the one-time token the previous host passed in
+    /// `HEKMA_HANDOFF_TOKEN` (required with `handoff_from`).
+    pub handoff_token: Option<String>,
 }
 
 /// Story 21-4: how long an AUTO-STARTED host waits with no live agent and no
@@ -453,6 +460,8 @@ where
         set_token_ttl_override,
         shim_exe,
         handoff,
+        handoff_from,
+        handoff_token,
     } = options;
     let shim_launches = shim_exe.is_some();
     let has_caller_sink = diagnostics.is_some();
@@ -649,7 +658,41 @@ where
     // (2) The single-writer lock. With a caller sink the refusal is noted
     // through it AND returned (AI-18); with none, the caller's own print of
     // the returned error is the single surfacing (no double line).
-    let _lock = match HostLock::acquire(&lock_path) {
+    // Story 24-2: a successor takes the previous host's lock over the
+    // handoff channel (the same lock, never a second acquisition) along with
+    // the metering proxy's listening socket.
+    let mut joined: Option<hekma_engine::handoff::Joined> = None;
+    let acquired = match &handoff_from {
+        Some(channel) => {
+            let token = handoff_token.as_deref().ok_or_else(|| {
+                refuse(ServeError::InvalidOptions {
+                    message: format!(
+                        "--handoff-from needs the token the previous host passes in {}",
+                        hekma_engine::handoff::HANDOFF_TOKEN_ENV
+                    ),
+                })
+            })?;
+            let mut taken = hekma_engine::handoff::join(
+                channel,
+                token,
+                hekma_engine::handoff::SUCCESSOR_READY_BOUND,
+            )
+            .map_err(|err| {
+                refuse(ServeError::Startup {
+                    message: format!("could not take over from the previous host: {err}"),
+                })
+            })?;
+            let file = taken.take_lock().ok_or_else(|| {
+                refuse(ServeError::Startup {
+                    message: "the previous host handed over no host lock".to_string(),
+                })
+            })?;
+            joined = Some(taken);
+            Ok(HostLock::adopt(file, &lock_path))
+        }
+        None => HostLock::acquire(&lock_path),
+    };
+    let _lock = match acquired {
         Ok(lock) => lock,
         Err(LockRefusal::Held { holder }) => {
             return Err(refuse(ServeError::StateDirLocked {
@@ -852,6 +895,13 @@ where
                     // Story 22-2: the Host/Origin guard's Operator lists.
                     allowed_hosts: proxy_allowed_hosts,
                     allowed_origins: proxy_allowed_origins,
+                    // Story 24-2: a successor serves on the socket the
+                    // previous host kept open (no connection refused).
+                    inherited_listener: joined
+                        .as_mut()
+                        .and_then(|joined| joined.take_listener())
+                        .map(hekma_engine::InheritedListener::new)
+                        .unwrap_or_default(),
                     ..hekma_engine::MeteringProxyOptions::default()
                 },
                 child_env_allowlist: !autostart,
@@ -1050,15 +1100,36 @@ where
         }
     };
 
+    // Story 24-2: a successor now serves — tell the previous host, which
+    // exits on it.
+    if let Some(joined) = joined.take() {
+        let reattached = rt
+            .block_on(engine.fleet())
+            .map(|fleet| drain_plan(&fleet).len())
+            .unwrap_or(0);
+        match joined.ready(reattached) {
+            Ok(()) => notifier.note(&format!(
+                "took over from the previous host in place; {reattached} agent(s) reconnected"
+            )),
+            Err(err) => notifier.note(&format!(
+                "took over, but the previous host could not be told ({err}); it exits when its \
+                 wait ends"
+            )),
+        }
+    }
+
     // (6) Resolve why the host ends — the received signal (it may already
     // have arrived during the arming window or the open, held by the armed
     // streams), or, in AUTO mode, idleness / a vanished state root. The
     // streams stay armed through the whole drain (the holder task inside the
     // signal source; review finding 3): a second SIGTERM mid-drain is
     // swallowed and noted, never lethal.
+    let upgrade_requests = api.upgrade_requests();
+    let mut upgrade_link: Option<hekma_engine::handoff::Link> = None;
     let ending: Ending = match early_signal {
         Some(name) => Ending::Signal(name),
-        None => {
+        None => loop {
+            let upgrade_wait = upgrade_requests.notified();
             let signal_wait = async {
                 match (&mut wait_task).await {
                     Ok(Ok(name)) => Ok(Ending::Signal(name)),
@@ -1081,27 +1152,62 @@ where
                     tokio::select! {
                         signaled = signal_wait => signaled,
                         reason = idle => Ok(Ending::Auto(reason)),
+                        () = upgrade_wait => Ok(Ending::Upgrade),
                     }
                 })
             } else {
-                rt.block_on(signal_wait)
+                rt.block_on(async {
+                    tokio::select! {
+                        signaled = signal_wait => signaled,
+                        () = upgrade_wait => Ok(Ending::Upgrade),
+                    }
+                })
             };
             match outcome {
-                Ok(ending) => ending,
+                // Story 24-2: launch the successor and wait for its hello;
+                // until then nothing has stopped, so a failure here keeps
+                // this host serving.
+                Ok(Ending::Upgrade) => match begin_upgrade(
+                    &state_root,
+                    std::env::current_exe(),
+                    hekma_engine::handoff::SUCCESSOR_CONNECT_BOUND,
+                ) {
+                    Ok(link) => {
+                        notifier.note(&format!(
+                            "upgrading in place: the successor (pid {}) connected; handing \
+                             over",
+                            link.successor_pid()
+                        ));
+                        upgrade_link = Some(link);
+                        break Ending::Upgrade;
+                    }
+                    Err(message) => {
+                        notifier.note(&format!(
+                            "the in-place upgrade did not start ({message}); this host keeps \
+                             serving"
+                        ));
+                        continue;
+                    }
+                },
+                Ok(ending) => break ending,
                 Err(err) => {
                     let _ = rt.block_on(api.shutdown());
                     local::remove_discovery(&state_root, std::process::id());
                     return Err(err);
                 }
             }
-        }
+        },
     };
-    let what = if handoff {
+    let what = if handoff || matches!(ending, Ending::Upgrade) {
         "releasing agents in their own Shim and stopping the rest"
     } else {
         "stopping running and paused agents"
     };
     match ending {
+        Ending::Upgrade => notifier.note(&format!(
+            "in-place upgrade; {what} (graceful window {}s) ...",
+            window.as_secs_f32()
+        )),
         Ending::Signal(name) => notifier.note(&format!(
             "{name} received; {what} (graceful window {}s) ...",
             window.as_secs_f32()
@@ -1143,7 +1249,11 @@ where
     // AI-18). The discovery file goes with it (story 21-4): a CLI that reads
     // it from now on starts a new host instead of calling a dead one.
     let aborted = rt.block_on(api.shutdown());
-    local::remove_discovery(&state_root, std::process::id());
+    // Story 24-2: an upgrade leaves the discovery file for the successor to
+    // rewrite (removing it would let a CLI start a third host meanwhile).
+    if upgrade_link.is_none() {
+        local::remove_discovery(&state_root, std::process::id());
+    }
     notifier.note("control api stopped; no requests are accepted for the rest of the shutdown");
     if aborted {
         notifier.note(
@@ -1158,6 +1268,27 @@ where
     // re-enumerated once (finding 5), every per-instance outcome noted by
     // the drain itself (AI-18) AND returned (the vec is the API return for
     // programmatic callers).
+    // Story 24-2: the in-place upgrade — release, keep the proxy's socket,
+    // close the engine (its store writer with it), hand the socket and the
+    // lock over, and exit once the successor serves.
+    if let Some(link) = upgrade_link {
+        let (handed, listener) = engine
+            .blocking()
+            .shutdown_for_upgrade(window, Some(&notifier.sink));
+        if !handed.released.is_empty() {
+            notifier.note(&format!(
+                "{} agent(s) left running in their Shims for the successor: {}",
+                handed.released.len(),
+                handed.released.join(", ")
+            ));
+        }
+        close_engine(engine, std::time::Duration::from_secs(10));
+        let outcome = hand_over(link, listener.as_ref(), _lock.file());
+        drop(rt);
+        let (note, result) = upgrade_outcome(outcome);
+        notifier.note(&note);
+        return result;
+    }
     // Story 24-2: in Handoff Mode, agents held through a Shim are released
     // (they keep running; the next host reconnects), the rest drain.
     if handoff {
@@ -1179,6 +1310,7 @@ where
     let label = match ending {
         Ending::Signal(name) => name,
         Ending::Auto(reason) => reason,
+        Ending::Upgrade => "upgrade",
     };
     notifier.note(&format!("shutdown complete ({label})"));
     // The engine drops HERE (after the block_on joined): the Drop teardown
@@ -1186,6 +1318,114 @@ where
     drop(engine);
     drop(rt);
     Ok(())
+}
+
+/// Story 24-2: open the handoff channel, launch the successor — this
+/// binary, with this process's own arguments plus `--handoff-from`, the
+/// token in its environment only — and wait for its checked hello.
+fn begin_upgrade(
+    state_root: &Path,
+    exe: std::io::Result<PathBuf>,
+    bound: std::time::Duration,
+) -> Result<hekma_engine::handoff::Link, String> {
+    use hekma_engine::handoff;
+    if !handoff::supported() {
+        return Err("an in-place upgrade is not available on this operating system yet".into());
+    }
+    let channel = handoff::Predecessor::open(state_root).map_err(|err| err.to_string())?;
+    let exe = exe.map_err(|err| format!("this binary's path: {err}"))?;
+    let mut child = std::process::Command::new(exe)
+        .args(successor_args(std::env::args_os().skip(1), channel.path()))
+        .env(handoff::HANDOFF_TOKEN_ENV, channel.token())
+        .spawn()
+        .map_err(|err| format!("the successor could not be launched: {err}"))?;
+    match channel.await_successor(bound) {
+        Ok(link) => Ok(link),
+        Err(err) => {
+            // It never took anything over: end it.
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(err.to_string())
+        }
+    }
+}
+
+/// The successor's arguments: this process's own, without an earlier
+/// `--handoff-from <channel>`, plus the new channel.
+fn successor_args(
+    args: impl Iterator<Item = std::ffi::OsString>,
+    channel: &Path,
+) -> Vec<std::ffi::OsString> {
+    let mut out = Vec::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--handoff-from" {
+            args.next();
+            continue;
+        }
+        out.push(arg);
+    }
+    out.push("--handoff-from".into());
+    out.push(channel.as_os_str().to_owned());
+    out
+}
+
+/// Drop the engine once nothing else holds it (its store writer closes
+/// with it, before the successor opens its own). The Control API and the
+/// exporter released their handles at their shutdown; a straggler is
+/// waited for briefly.
+fn close_engine(engine: Arc<hekma_engine::Engine>, bound: std::time::Duration) {
+    let mut engine = engine;
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        match Arc::try_unwrap(engine) {
+            Ok(engine) => {
+                drop(engine);
+                return;
+            }
+            Err(shared) if std::time::Instant::now() < deadline => {
+                engine = shared;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(shared) => {
+                drop(shared);
+                return;
+            }
+        }
+    }
+}
+
+/// The predecessor's last note and its exit, from the hand-over's outcome.
+fn upgrade_outcome(outcome: Result<(u32, usize), String>) -> (String, Result<(), ServeError>) {
+    match outcome {
+        Ok((pid, reattached)) => (
+            format!(
+                "handed over to the successor (pid {pid}, {reattached} agent(s) reconnected); \
+                 shutdown complete (upgrade)"
+            ),
+            Ok(()),
+        ),
+        Err(message) => (
+            format!(
+                "the successor did not finish taking over ({message}); agents in their Shims \
+                 keep running, and the next hekma write starts a host that reconnects to them"
+            ),
+            Err(ServeError::Startup {
+                message: format!("the in-place upgrade did not complete: {message}"),
+            }),
+        ),
+    }
+}
+
+/// Hand the socket and the lock over and wait for the successor's `ready`.
+fn hand_over(
+    mut link: hekma_engine::handoff::Link,
+    listener: Option<&std::net::TcpListener>,
+    lock: &std::fs::File,
+) -> Result<(u32, usize), String> {
+    link.offer(listener, lock).map_err(|err| err.to_string())?;
+    link.await_ready(hekma_engine::handoff::SUCCESSOR_READY_BOUND)
+        .map_err(|err| err.to_string())
 }
 
 /// Story 24-2: the started notice's Handoff Mode line, when there is one.
@@ -1208,6 +1448,8 @@ fn handoff_note(handoff: bool, shim_launches: bool) -> Option<&'static str> {
 enum Ending {
     /// An OS shutdown signal (its name).
     Signal(&'static str),
+    /// Story 24-2: an Operator asked for an in-place upgrade.
+    Upgrade,
     /// The auto-started host's own exit (story 21-4): idle, or the state
     /// root disappeared.
     Auto(&'static str),
@@ -1368,5 +1610,65 @@ mod identity_headers_note_tests {
         assert!(super::handoff_note(true, false)
             .unwrap()
             .contains("every agent is still stopped"));
+    }
+
+    #[test]
+    fn the_successor_replays_this_hosts_arguments_with_the_new_channel() {
+        let args = ["serve", "--handoff-from", "/old.sock", "--autostart"]
+            .into_iter()
+            .map(std::ffi::OsString::from);
+        let out = super::successor_args(args, std::path::Path::new("/new.sock"));
+        assert_eq!(
+            out,
+            ["serve", "--autostart", "--handoff-from", "/new.sock"]
+                .map(std::ffi::OsString::from)
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn an_upgrade_whose_successor_never_connects_keeps_this_host_and_reports_why() {
+        if !hekma_engine::handoff::supported() {
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        let bound = std::time::Duration::from_millis(400);
+        let err =
+            super::begin_upgrade(state.path(), Ok("/usr/bin/true".into()), bound).unwrap_err();
+        assert!(err.contains("connected"), "{err}");
+        let err =
+            super::begin_upgrade(state.path(), Ok(state.path().join("no-such-binary")), bound)
+                .unwrap_err();
+        assert!(err.contains("could not be launched"), "{err}");
+        let err = super::begin_upgrade(state.path(), Err(std::io::Error::other("unknown")), bound)
+            .unwrap_err();
+        assert!(err.contains("this binary's path"), "{err}");
+    }
+
+    #[test]
+    fn the_hand_overs_outcome_is_the_predecessors_last_word() {
+        let (note, result) = super::upgrade_outcome(Ok((42, 3)));
+        assert!(note.contains("pid 42, 3 agent(s)"), "{note}");
+        assert!(result.is_ok());
+        let (note, result) = super::upgrade_outcome(Err("it died".to_string()));
+        assert!(
+            note.contains("it died") && note.contains("keep running"),
+            "{note}"
+        );
+        assert!(matches!(result, Err(super::ServeError::Startup { .. })));
+    }
+
+    #[test]
+    fn closing_waits_for_a_straggling_handle_only_within_its_bound() {
+        let state = tempfile::tempdir().unwrap();
+        let engine = std::sync::Arc::new(
+            hekma_engine::Engine::open(Some(state.path().to_path_buf())).unwrap(),
+        );
+        let straggler = std::sync::Arc::clone(&engine);
+        let started = std::time::Instant::now();
+        super::close_engine(engine, std::time::Duration::from_millis(100));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+        // Alone, it closes at once.
+        super::close_engine(straggler, std::time::Duration::from_secs(10));
     }
 }
