@@ -1011,12 +1011,10 @@ where
             notifier.note(&note);
         }
         // The one durable summary of this reconcile.
-        match engine.blocking().commit_recovery(cleaned.len()) {
-            Ok(event) => recovered = event,
-            Err(err) => notifier.note(&format!(
-                "the recovery summary could not be recorded ({err}); the agents and calls \
-                 above are settled all the same"
-            )),
+        let (event, note) = recovery_committed(engine.blocking().commit_recovery(cleaned.len()));
+        recovered = event;
+        if let Some(note) = note {
+            notifier.note(&note);
         }
     }
 
@@ -1492,6 +1490,23 @@ fn hand_over(
         .map_err(|err| err.to_string())
 }
 
+/// Story 24-3: what a commit of the `recovery` summary leaves for
+/// `GET /v0/host`, and the note when it could not be recorded.
+fn recovery_committed(
+    result: Result<Option<hekma_engine::RecoveryEvent>, hekma_engine::EngineError>,
+) -> (Option<hekma_engine::RecoveryEvent>, Option<String>) {
+    match result {
+        Ok(event) => (event, None),
+        Err(err) => (
+            None,
+            Some(format!(
+                "the recovery summary could not be recorded ({err}); the agents and calls \
+                 above are settled all the same"
+            )),
+        ),
+    }
+}
+
 /// Story 24-3: the started notice's line about the previous owner's agents.
 fn recovery_note(
     recovery: &hekma_engine::HostRecovery,
@@ -1772,6 +1787,16 @@ mod identity_headers_note_tests {
         assert!(started.elapsed() >= std::time::Duration::from_millis(100));
         // Alone, it closes at once.
         super::close_engine(straggler, std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_recovery_summary_that_cannot_be_recorded_is_noted_and_left_null() {
+        let (event, note) = super::recovery_committed(Err(hekma_engine::EngineError::NotFound {
+            name: "ghost".into(),
+        }));
+        assert!(event.is_none());
+        assert!(note.unwrap().contains("could not be recorded"));
+        assert_eq!(super::recovery_committed(Ok(None)), (None, None));
     }
 
     #[test]
