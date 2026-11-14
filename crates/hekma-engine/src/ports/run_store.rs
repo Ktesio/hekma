@@ -465,6 +465,15 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// [`crate::domain::MAX_RUN_NESTING`] (story 23-2: the per-root cap).
     fn open_descendants(&self, root: &RunId) -> Result<u64, StoreError>;
 
+    /// A Run's held-call figures (story 23-4): the parked count, the oldest
+    /// parked call's start, and how its most recent held call ended.
+    fn run_held(&self, run_id: &RunId)
+        -> Result<(u64, Option<String>, Option<String>), StoreError>;
+
+    /// A Run's verb disposition reasons (story 23-4): `hold`, `reject`, or
+    /// `reroute <binding>/<route>`.
+    fn run_disposition_reasons(&self, run_id: &RunId) -> Result<Vec<String>, StoreError>;
+
     /// Every non-ended Run (the snapshot's initial load).
     fn open_runs(&self) -> Result<Vec<RunRecord>, StoreError>;
 

@@ -3,6 +3,7 @@ pub mod binding;
 pub mod budget;
 pub mod calls;
 pub(crate) mod fanout;
+pub mod hold;
 pub(crate) mod host_client;
 pub mod label;
 pub mod lifecycle;

@@ -18,6 +18,7 @@
 #[path = "custody/tests.rs"]
 mod custody_tests;
 pub(crate) mod forward;
+pub(crate) mod hold;
 pub(crate) mod identify;
 pub(crate) mod records;
 #[cfg(test)]
@@ -66,6 +67,9 @@ pub struct MeteringProxyOptions {
     /// Story 23-2: the Lease and window knobs (the sweeper runs beside the
     /// proxy, in the engine that owns the data path).
     pub leases: crate::domain::runs::lease::LeaseOptions,
+    /// Story 23-4: the most calls one held Run may have parked; past it a
+    /// call gets the retryable hold-full refusal.
+    pub max_held_per_run: usize,
     /// cfg(test) seam: one extra trusted root (DER) for the custody tests'
     /// TLS fake upstream.
     #[cfg(test)]
@@ -94,6 +98,7 @@ impl Default for MeteringProxyOptions {
             allowed_hosts: Vec::new(),
             allowed_origins: Vec::new(),
             leases: crate::domain::runs::lease::LeaseOptions::default(),
+            max_held_per_run: hold::DEFAULT_MAX_HELD_PER_RUN,
             #[cfg(test)]
             test_root_der: None,
         }
@@ -213,6 +218,7 @@ impl MeteringProxy {
             custody: deps.custody,
             allowed_hosts: options.allowed_hosts.clone().into(),
             allowed_origins: options.allowed_origins.clone().into(),
+            holds: Arc::new(hold::HoldQueues::new(options.max_held_per_run)),
             #[cfg(test)]
             ensure_delay: std::sync::Mutex::new(None),
         });
@@ -225,6 +231,7 @@ impl MeteringProxy {
             Arc::clone(&shared.pump.inbox),
             options.leases,
             Arc::clone(&shared.pump.diagnostics),
+            Arc::clone(&shared.holds),
         );
         Ok(Self {
             info: ProxyInfo {
@@ -293,14 +300,38 @@ fn spawn_sweeper(
     inbox: Arc<EvaluationInbox>,
     leases: crate::domain::runs::lease::LeaseOptions,
     diagnostics: Arc<dyn Fn(String) + Send + Sync>,
+    holds: Arc<hold::HoldQueues>,
 ) -> tokio::task::JoinHandle<()> {
     handle.spawn(async move {
-        let mut tick =
-            tokio::time::interval(Duration::from_secs(leases.sweep_interval_secs.max(1)));
+        // Story 23-4: the task also reports each held Run's parked count
+        // and oldest start, coalesced to once a second; at start nothing is
+        // parked (parked calls are connections, not rows).
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let sweep_every = Duration::from_secs(leases.sweep_interval_secs.max(1));
+        let mut last_sweep: Option<std::time::Instant> = None;
         let mut last_note: Option<std::time::Instant> = None;
+        let _ = writer
+            .call_async(|ctx| ctx.store().reset_held_stats())
+            .await;
         loop {
             tick.tick().await;
+            let reports = holds.take_reports();
+            if !reports.is_empty() {
+                let _ = writer
+                    .call_async(move |ctx| {
+                        for (run_id, count, oldest) in &reports {
+                            ctx.store()
+                                .set_held_stats(run_id, *count as u64, oldest.as_deref())?;
+                        }
+                        Ok(())
+                    })
+                    .await;
+            }
+            if last_sweep.is_some_and(|at| at.elapsed() < sweep_every) {
+                continue;
+            }
+            last_sweep = Some(std::time::Instant::now());
             let runs = Arc::clone(&runs);
             let inbox = Arc::clone(&inbox);
             let swept = writer
@@ -366,6 +397,12 @@ async fn accept_loop(
         }
     };
     drop(listener);
+    // Story 23-4: stopping from now on — a parked call answers the
+    // retryable `hekma_hold_interrupted` within its re-check tick instead
+    // of waiting out the grace to be aborted unanswered.
+    shared
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Release);
     // In-flight calls finish within the grace; the rest are aborted (their
     // drop guards record `shutdown`).
     let deadline = tokio::time::Instant::now() + grace;

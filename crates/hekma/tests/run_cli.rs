@@ -154,3 +154,32 @@ fn a_child_run_opens_shows_and_closes_under_a_detached_agent_unix() {
     let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
     assert_eq!(json["run"]["status"], "ended");
 }
+
+#[test]
+fn hold_family_refusals_map_to_the_documented_exit_codes() {
+    // Story 23-4: hekma hold|release|reroute|reject on a Run that does not
+    // exist is exit 3; reroute needs exactly one of --via and --off, and
+    // --via on another verb is exit 2 — all before any host starts.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    for verb in ["hold", "release", "reject"] {
+        let run = run_hekma_agent(&[verb, "run_ghost"], &ctx.project_dir, state_dir);
+        assert_eq!(run.code, Some(3), "{verb} stderr: {}", run.stderr);
+        assert!(run.stderr.contains("run_ghost"), "{}", run.stderr);
+    }
+    for args in [
+        vec!["reroute", "run_ghost"],
+        vec!["reroute", "run_ghost", "--via", "a/b", "--off"],
+        vec!["hold", "run_ghost", "--via", "a/b"],
+        vec!["hold"],
+    ] {
+        let run = run_hekma_agent(&args, &ctx.project_dir, state_dir);
+        assert_eq!(run.code, Some(2), "{args:?} stderr: {}", run.stderr);
+    }
+    // --help names the verbs at the top level.
+    let run = run_hekma_agent(&["--help"], &ctx.project_dir, state_dir);
+    for verb in ["hold", "release", "reroute", "reject"] {
+        assert!(run.stdout.contains(verb), "{verb}: {}", run.stdout);
+    }
+}

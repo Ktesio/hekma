@@ -32,6 +32,7 @@ use crate::ports::StoreError;
 
 pub mod announce;
 pub mod bindings;
+pub mod dispositions;
 pub(crate) mod keys;
 pub(crate) mod labels;
 pub(crate) mod lease;
@@ -62,7 +63,9 @@ pub use policy::{
     UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
 };
 pub use selector::{Selector, SelectorScope, MAX_SELECTED_RUNS};
-pub use verbs::{verb_cell, CellBehavior, RunLifecycleVerb, RunVerb, VerbCell, RUN_VERBS};
+pub use verbs::{
+    disposition_for, verb_cell, CellBehavior, RunLifecycleVerb, RunVerb, VerbCell, RUN_VERBS,
+};
 
 /// The schema version stamped on every [`RunEvent`] (AD-14). Independent of
 /// the transition, breach and usage event schemas; bumped only on an
@@ -598,6 +601,24 @@ pub struct RunView {
     /// Story 23-2: its last identified call or heartbeat (RFC 3339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_at: Option<String>,
+    /// Story 23-4: its wire disposition reasons (`hold`, `reject`,
+    /// `reroute <binding>/<route>`); empty when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispositions: Vec<String>,
+    /// Story 23-4: how many of its calls the metering proxy holds now.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub held_calls: u64,
+    /// Story 23-4: when its oldest held call started (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_held_at: Option<String>,
+    /// Story 23-4: how its most recent held call ended without a release
+    /// (`disconnect`, `shutdown`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hold_end: Option<String>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Where a child Run is opened.
@@ -667,6 +688,10 @@ pub enum RunEventKind {
     LimitsChanged,
     /// It ended.
     Ended,
+    /// An Operator or Host set or cleared one of its wire disposition
+    /// reasons (story 23-4): `hold`, `reject` or `reroute`; the cause names
+    /// which.
+    DispositionChanged,
 }
 
 impl RunEventKind {
@@ -680,6 +705,7 @@ impl RunEventKind {
             RunEventKind::LabelsChanged => "labels-changed",
             RunEventKind::LimitsChanged => "limits-changed",
             RunEventKind::Ended => "ended",
+            RunEventKind::DispositionChanged => "disposition-changed",
         }
     }
 }

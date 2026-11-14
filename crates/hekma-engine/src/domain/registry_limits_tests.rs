@@ -1463,9 +1463,11 @@ fn the_budget_jobs_edges_mixed_moves_stored_inputs_and_runs_without_an_agent() {
         )
         .unwrap_err();
     assert!(err.to_string().contains("self-reported"), "{err}");
+    // Story 23-4: a wired child's own `stop` rejects its calls, so it is
+    // accepted.
     let wired = seed();
     let child = add_child(&wired, true);
-    let err = wired
+    let planned = wired
         .registry
         .plan_run_limits(
             &child,
@@ -1477,8 +1479,8 @@ fn the_budget_jobs_edges_mixed_moves_stored_inputs_and_runs_without_an_agent() {
             LimitActor::Operator,
             None,
         )
-        .unwrap_err();
-    assert!(err.to_string().contains("engine-observed"), "{err}");
+        .unwrap();
+    assert!(planned.dry_run);
 
     // The budget read with an unreadable configuration says so and falls
     // back to the stored inputs.

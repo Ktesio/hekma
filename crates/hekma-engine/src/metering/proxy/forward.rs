@@ -33,7 +33,7 @@ use crate::domain::calls::{
 use crate::domain::credential::IssuedCredentials;
 use crate::domain::pipeline::ProxiedUsage;
 use crate::domain::runs::announce::{AnnounceClaim, Claimed};
-use crate::domain::runs::snapshot::{Disposition, SnapshotPublisher};
+use crate::domain::runs::snapshot::{Disposition, Effective, SnapshotPublisher};
 use crate::domain::runs::wire::{ensure_wire_run, Ensured, WireIdentity};
 use crate::domain::RunId;
 use crate::metering::parse::{parse_openai_sse_usage, parse_openai_usage};
@@ -61,6 +61,8 @@ pub(crate) struct RefusalCounters {
     pub unscented_served: AtomicU64,
     pub unscented_refused: AtomicU64,
     pub busy: AtomicU64,
+    /// Story 23-4: calls refused because their Run's hold queue was full.
+    pub hold_full: AtomicU64,
     pub ignored_hints: AtomicU64,
     pub capped_hints: AtomicU64,
     /// Story 23-2: header announces that created their Run (and minted),
@@ -125,6 +127,8 @@ pub(crate) struct ProxyShared {
     /// Story 22-2: the `Origin` values the guard accepts
     /// (`--proxy-allowed-origins`); an `Origin` NOT on the list is refused.
     pub allowed_origins: Arc<[String]>,
+    /// Story 23-4: the per-Run hold queues.
+    pub holds: Arc<super::hold::HoldQueues>,
     /// cfg(test) seam: slow each Run creation down inside the writer, so a
     /// creation queued behind it is not taken within the ack bound.
     #[cfg(test)]
@@ -413,6 +417,9 @@ struct Pending {
     /// Story 22-3: served unscented under `shadow` (the close raises the
     /// Run's `unscented` Anomaly).
     unscented: bool,
+    /// Story 23-4: how the call's hold ended, once it was parked (a
+    /// dropped connection while parked records `disconnect`).
+    hold_end: Option<&'static str>,
 }
 
 impl Pending {
@@ -432,7 +439,7 @@ impl Pending {
             control_depth: self.depth.to_string(),
             binding: self.binding.clone(),
             disposition,
-            hold_end: None,
+            hold_end: self.hold_end.map(str::to_string),
             outcome,
             status,
             status_class,
@@ -486,8 +493,14 @@ impl Drop for CloseGuard {
             } else {
                 CallOutcome::ClientDisconnect
             };
+            // Story 23-4: a call dropped while parked was a held call.
+            let disposition = if pending.hold_end == Some("disconnect") {
+                CallDisposition::Hold
+            } else {
+                CallDisposition::Pass
+            };
             self.close(
-                CallDisposition::Pass,
+                disposition,
                 outcome,
                 None,
                 StatusClass::TransportError,
@@ -496,6 +509,30 @@ impl Drop for CloseGuard {
             );
         }
     }
+}
+
+/// The reject-class refusal for a disposition, if any (story 23-4): a
+/// breach latched under `block` or `stop` answers 19-2's 402 byte for byte;
+/// an Operator's reject answers `402 hekma_run_reject`.
+fn reject_of(over: &Disposition) -> Option<(CallDisposition, u16, Response<Full<Bytes>>)> {
+    let refusing = over.refusing_breaches();
+    if refusing != 0 {
+        let reasons = Disposition::reasons(refusing);
+        if let Some(refusal) = crate::domain::fence_refusal(&reasons) {
+            return Some((
+                CallDisposition::Block,
+                refusal.status,
+                wire::block_response(&refusal),
+            ));
+        }
+    }
+    over.verb_reject.then(|| {
+        (
+            CallDisposition::Reject,
+            402,
+            WireError::RunReject.response(),
+        )
+    })
 }
 
 /// Ensure a wire Run through the writer, sharing one pending creation per
@@ -832,7 +869,7 @@ async fn serve_resolved(
     started: Instant,
     path: &str,
     query: Option<String>,
-    target: Target,
+    mut target: Target,
     run_id: RunId,
     announcing: bool,
 ) -> Response<Full<Bytes>> {
@@ -882,13 +919,16 @@ async fn serve_resolved(
         upstream_started: None,
         stopping: Arc::clone(&shared.stopping),
         unscented: false,
+        hold_end: None,
     }));
 
-    // The disposition over the whole ancestor chain.
+    // The disposition over the whole ancestor chain (story 23-4: AD-25's
+    // precedence — a reject-class reason refuses first; safe methods pass
+    // a reject as they pass the fence).
     let over: Disposition = snapshot.disposition_over(&run_id);
-    if over.breach_block != 0 && !wire::is_block_exempt(req.method()) {
-        let reasons = Disposition::reasons(over.breach_block);
-        if let Some(refusal) = crate::domain::fence_refusal(&reasons) {
+    let exempt = wire::is_block_exempt(req.method());
+    if !exempt {
+        if let Some((disposition, status, response)) = reject_of(&over) {
             let awaits_continue = req
                 .headers()
                 .get(hyper::header::EXPECT)
@@ -897,14 +937,14 @@ async fn serve_resolved(
                 drain_request_body(req.into_body()).await;
             }
             guard.close(
-                CallDisposition::Block,
+                disposition,
                 CallOutcome::Refused,
-                Some(refusal.status),
+                Some(status),
                 StatusClass::Refused,
                 None,
                 None,
             );
-            return wire::block_response(&refusal);
+            return response;
         }
     }
 
@@ -975,10 +1015,116 @@ async fn serve_resolved(
         });
     }
 
+    // Story 23-4 — the hold. A held call takes a ticket in its Run's queue
+    // (the per-Run cap answers the retryable hold-full refusal past it)
+    // and waits, re-reading the snapshot, until its Run is no longer held
+    // and its ticket is at the front (arrival order). It is then
+    // re-validated against the CURRENT snapshot (R1.7): a revoked key, an
+    // ended Run, an `enforce` mode it fails or a reject reason refuses it,
+    // never a forward. The body is read only after the hold, so a held
+    // call costs a connection, not buffered bytes.
+    let mut disposition_now = CallDisposition::Pass;
+    if !exempt && matches!(over.effective(), Effective::Hold) {
+        let started_at = guard.get().started_at.clone();
+        let Some(ticket) = shared.holds.enter(&run_id, &started_at) else {
+            drain_request_body(req.into_body()).await;
+            guard.close(
+                CallDisposition::Hold,
+                CallOutcome::Refused,
+                Some(503),
+                StatusClass::Refused,
+                None,
+                None,
+            );
+            shared.counters.hold_full.fetch_add(1, Ordering::Relaxed);
+            shared.note_refusals();
+            return WireError::HoldFull.response();
+        };
+        guard.get().hold_end = Some("disconnect");
+        loop {
+            if shared.stopping.load(Ordering::Acquire) {
+                drop(ticket);
+                guard.get().hold_end = Some("shutdown");
+                drain_request_body(req.into_body()).await;
+                guard.close(
+                    CallDisposition::Hold,
+                    CallOutcome::Shutdown,
+                    Some(503),
+                    StatusClass::Refused,
+                    None,
+                    None,
+                );
+                return WireError::HoldInterrupted.response();
+            }
+            let now = shared.snapshot.current().disposition_over(&run_id);
+            if !matches!(now.effective(), Effective::Hold) && ticket.is_front() {
+                break;
+            }
+            shared.holds.wait().await;
+        }
+        drop(ticket);
+        let snap = shared.snapshot.current();
+        let revoked = target
+            .token_id
+            .as_ref()
+            .is_some_and(|token_id| !snap.keys.values().any(|entry| entry.token_id == *token_id));
+        let unscented = target.token_id.is_none()
+            && !announcing
+            && snap.scent_over(&run_id) == crate::domain::runs::policy::ScentCheckMode::Enforce;
+        let refusal = if revoked || snap.run(&run_id).is_none() {
+            Some((
+                CallDisposition::Hold,
+                401,
+                WireError::CredentialRevoked.response(),
+            ))
+        } else if unscented {
+            Some((
+                CallDisposition::Enforce,
+                401,
+                WireError::UnscentedCall.response(),
+            ))
+        } else {
+            reject_of(&snap.disposition_over(&run_id))
+        };
+        if let Some((disposition, status, response)) = refusal {
+            guard.get().hold_end = Some("rejected");
+            drain_request_body(req.into_body()).await;
+            guard.close(
+                disposition,
+                CallOutcome::Refused,
+                Some(status),
+                StatusClass::Refused,
+                None,
+                None,
+            );
+            return response;
+        }
+        guard.get().hold_end = Some("released");
+    }
+    // Story 23-4 — the reroute: the call goes to the route's upstream, with
+    // the call's own rest and query; a route's own custodied key replaces
+    // the Run's (validated at set time: a key never leaves its origin).
+    if let Effective::Reroute(route) = shared
+        .snapshot
+        .current()
+        .disposition_over(&run_id)
+        .effective()
+    {
+        target.upstream = Arc::clone(&route.upstream);
+        if let (Some(key), Some(custody)) = (&route.custodied_key, target.custody.as_mut()) {
+            custody.key_ref = Arc::from(key.as_str());
+            custody.origin = Arc::clone(&route.upstream);
+        }
+        disposition_now = CallDisposition::Reroute;
+        if guard.get().hold_end.is_some() {
+            guard.get().hold_end = Some("rerouted");
+        }
+    }
+
     let Some(uri) = outbound_uri(&target.upstream, &target.rest, query.as_deref()) else {
         drain_request_body(req.into_body()).await;
         guard.close(
-            CallDisposition::Pass,
+            disposition_now.clone(),
             CallOutcome::Refused,
             None,
             StatusClass::Refused,
@@ -1017,7 +1163,7 @@ async fn serve_resolved(
         let Some(entry) = entry else {
             drain_request_body(req.into_body()).await;
             guard.close(
-                CallDisposition::Pass,
+                disposition_now.clone(),
                 CallOutcome::Refused,
                 None,
                 StatusClass::Refused,
@@ -1033,7 +1179,7 @@ async fn serve_resolved(
         if !origin_pinned {
             drain_request_body(req.into_body()).await;
             guard.close(
-                CallDisposition::Pass,
+                disposition_now.clone(),
                 CallOutcome::Refused,
                 None,
                 StatusClass::Refused,
@@ -1047,7 +1193,7 @@ async fn serve_resolved(
         if !crate::domain::custody::path_allowed(&paths, uri.path()) {
             drain_request_body(req.into_body()).await;
             guard.close(
-                CallDisposition::Pass,
+                disposition_now.clone(),
                 CallOutcome::Refused,
                 None,
                 StatusClass::Refused,
@@ -1072,7 +1218,7 @@ async fn serve_resolved(
         .and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|len| len > MAX_RELAY_BODY_BYTES as u64) {
         guard.close(
-            CallDisposition::Pass,
+            disposition_now.clone(),
             CallOutcome::Refused,
             Some(413),
             StatusClass::Refused,
@@ -1088,7 +1234,7 @@ async fn serve_resolved(
         Ok(Budgeted { bytes, permit, .. }) => (bytes, permit),
         Err(CollectError::Busy) => {
             guard.close(
-                CallDisposition::Pass,
+                disposition_now.clone(),
                 CallOutcome::Refused,
                 Some(503),
                 StatusClass::Refused,
@@ -1100,7 +1246,7 @@ async fn serve_resolved(
         }
         Err(CollectError::TooLarge) => {
             guard.close(
-                CallDisposition::Pass,
+                disposition_now.clone(),
                 CallOutcome::Refused,
                 None,
                 StatusClass::Refused,
@@ -1111,7 +1257,7 @@ async fn serve_resolved(
         }
         Err(CollectError::Body) => {
             guard.close(
-                CallDisposition::Pass,
+                disposition_now.clone(),
                 CallOutcome::ClientDisconnect,
                 None,
                 StatusClass::TransportError,
@@ -1178,7 +1324,7 @@ async fn serve_resolved(
             }
             None => {
                 guard.close(
-                    CallDisposition::Pass,
+                    disposition_now.clone(),
                     CallOutcome::Refused,
                     None,
                     StatusClass::Refused,
@@ -1208,7 +1354,7 @@ async fn serve_resolved(
     }
     let Ok(outbound) = builder.body(Full::new(req_bytes)) else {
         guard.close(
-            CallDisposition::Pass,
+            disposition_now.clone(),
             CallOutcome::UpstreamError,
             None,
             StatusClass::TransportError,
@@ -1223,7 +1369,7 @@ async fn serve_resolved(
         Ok(response) => response,
         Err(_) => {
             guard.close(
-                CallDisposition::Pass,
+                disposition_now.clone(),
                 CallOutcome::UpstreamError,
                 None,
                 StatusClass::TransportError,
@@ -1252,7 +1398,7 @@ async fn serve_resolved(
         }
         Err(_) => {
             guard.close(
-                CallDisposition::Pass,
+                disposition_now.clone(),
                 CallOutcome::UpstreamError,
                 Some(status),
                 StatusClass::TransportError,
@@ -1280,7 +1426,7 @@ async fn serve_resolved(
         .as_deref()
         .and_then(record_model);
     guard.close(
-        CallDisposition::Pass,
+        disposition_now.clone(),
         CallOutcome::Completed,
         Some(status),
         StatusClass::of_status(status),

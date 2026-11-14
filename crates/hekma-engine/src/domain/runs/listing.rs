@@ -227,6 +227,31 @@ pub struct RunSummary {
     /// Absent on Runs that own no process (a binding's Run, a child).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custody: Option<CustodyView>,
+    /// Story 23-4: the Run's wire disposition reasons (`hold`, `reject`,
+    /// `reroute <binding>/<route>`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispositions: Vec<String>,
+    /// Story 23-4: how many of its calls the metering proxy holds now.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub held_calls: u64,
+    /// Story 23-4: how long its oldest held call has waited, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_held_age_secs: Option<u64>,
+    /// Story 23-4: how its most recent held call ended without a release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hold_end: Option<String>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// The age in whole seconds of an RFC 3339 instant (fractional seconds
+/// ignored), or `None` when it does not parse.
+pub(crate) fn age_secs(at: &str, now_unix: u64) -> Option<u64> {
+    let whole = at.get(..19)?;
+    let (secs, _) = crate::time::parse_rfc3339(&format!("{whole}Z"))?;
+    Some(now_unix.saturating_sub(secs))
 }
 
 /// A listing row's custody slice (story 22-2): `on` or `off`, and the
@@ -561,6 +586,10 @@ pub(crate) fn summarize(
         identity,
         before_shared_proxy,
         custody,
+        dispositions: Vec::new(),
+        held_calls: 0,
+        oldest_held_age_secs: None,
+        last_hold_end: None,
     }
 }
 
@@ -644,7 +673,7 @@ pub(crate) fn assemble<S: crate::ports::RunRecords + crate::ports::RunStore + ?S
         } else {
             None
         };
-        items.push(summarize(
+        let mut summary = summarize(
             record,
             labels,
             usage,
@@ -655,7 +684,16 @@ pub(crate) fn assemble<S: crate::ports::RunRecords + crate::ports::RunStore + ?S
             identity,
             before_shared_proxy,
             custody,
-        ));
+        );
+        // Story 23-4: the held figures the proxy reported, and the reasons.
+        let (held, oldest, last_end) = store.run_held(&run_id)?;
+        summary.dispositions = store.run_disposition_reasons(&run_id)?;
+        summary.held_calls = held;
+        summary.oldest_held_age_secs = oldest
+            .as_deref()
+            .and_then(|at| age_secs(at, crate::time::now_unix_secs()));
+        summary.last_hold_end = last_end;
+        items.push(summary);
     }
     Ok(items)
 }
