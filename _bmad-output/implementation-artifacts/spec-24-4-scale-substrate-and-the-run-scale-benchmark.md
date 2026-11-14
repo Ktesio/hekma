@@ -226,3 +226,7 @@ Each is a public-contract or product choice; the recommendation is the spec's cu
     - the other mixed DB+FS splits (`effective_config`, `register_with_adapter`, `set_config`, `resolve_secrets`, `write_effective_config_snapshot`). Each is a single-file read or write under the lock, not a recursive tree walk, so none is a wedge on the scale of `remove`;
     - Step 4.
 
+- 2026-11-14 — **phase 4e (built): the lock debt paid to zero** (stacked on 24-2 phase 6, #439), the first `SupervisorShared`-shaped slice of Step 4.
+  - **Moved onto `EngineInner`:** the log-capture posture (fixed at open) and, for the test seam, the custody cache. `Engine::log_capture_mode` takes no lock; a test holds both engine locks on another thread and gets its answer in under a second.
+  - **Now ordered:** `refresh_bypass_hosts`, `with_diagnostics`, `has_live_capture` and the stop-fault test seam take the registry first and the supervisor through `after`. None runs with the registry already held, and each already waited behind any start, which holds both locks.
+  - **Removed:** `SupervisorCell::alone()`, so the supervisor is reachable only beside a registry guard. `.ad17-debt.txt` is empty, and the ratchet still fails CI on any bare `.lock()` or `alone()` that comes back.
