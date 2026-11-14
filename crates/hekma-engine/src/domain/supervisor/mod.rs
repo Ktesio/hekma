@@ -1088,7 +1088,7 @@ impl Supervisor {
     /// closes) and the Shim keeps the process for the next engine, which
     /// reconnects through adoption. Returns the released instances, sorted.
     /// Directly held processes are untouched.
-    pub(crate) fn release_shim_held(&mut self) -> Vec<InstanceName> {
+    pub(crate) fn release_shim_held(&mut self, registry: &Registry) -> Vec<InstanceName> {
         let mut names: Vec<InstanceName> = self
             .running
             .iter()
@@ -1098,6 +1098,16 @@ impl Supervisor {
         names.sort();
         for name in &names {
             self.running.remove(name);
+            // The record no longer names this engine as its supervisor, so
+            // the next engine adopts at once — even while this one is still
+            // alive (an in-place upgrade's successor opens before it exits).
+            if let Err(err) = registry.release_spawn_owner(name) {
+                self.emit_diagnostic(&format!(
+                    "{}: released, but its record still names this engine ({err}); the next \
+                     engine adopts it once this one exits",
+                    name.as_str()
+                ));
+            }
         }
         names
     }

@@ -465,3 +465,49 @@ fn a_handoff_shutdown_releases_shim_agents_and_the_next_engine_takes_them_back()
     let handed = facade.shutdown_for_handoff(Duration::from_secs(5), None);
     assert!(handed.released.is_empty() && handed.outcomes.is_empty());
 }
+
+/// Story 24-2: the upgrade shutdown keeps the metering proxy's socket open
+/// and hands it back; the next engine serves on that same socket, and the
+/// released agent is adopted even while the first engine is still alive.
+#[test]
+fn an_upgrade_shutdown_hands_back_the_proxy_socket_and_the_next_engine_serves_on_it() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    manifest(dir.path(), "kept", &["--linger-ms", "600000"]);
+    let first = open(state.path());
+    let facade = first.blocking();
+    facade
+        .register_with_adapter("kept", &AdapterRef::Manifest(dir.path().to_path_buf()))
+        .unwrap();
+    facade.start("kept").unwrap();
+    let port = first.metering_proxy().expect("a proxy").port;
+    let (handed, listener) = facade.shutdown_for_upgrade(Duration::from_secs(5), None);
+    assert_eq!(handed.released, vec!["kept".to_string()]);
+    let listener = listener.expect("the socket is handed back");
+    assert_eq!(listener.local_addr().unwrap().port(), port);
+    // Still open: a connection waits in the backlog instead of being refused.
+    let early = std::net::TcpStream::connect(("127.0.0.1", port));
+    assert!(early.is_ok(), "the socket stayed open across the hand-over");
+    // The second engine opens BEFORE the first is dropped.
+    let second = Engine::open_with_options(
+        Some(state.path().to_path_buf()),
+        EngineOptions {
+            shim_exe: Some(hekma_conformance::test_support::shim_host_bin()),
+            metering_proxy: hekma_engine::MeteringProxyOptions {
+                inherited_listener: hekma_engine::InheritedListener::new(listener),
+                ..hekma_engine::MeteringProxyOptions::default()
+            },
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(second.metering_proxy().expect("a proxy").port, port);
+    let status = second.blocking().instance_status("kept").unwrap();
+    assert_eq!(status.instance.state, LifecycleState::Running, "{status:?}");
+    // The second engine holds it: its stop ends the agent.
+    second.blocking().stop("kept", None).unwrap();
+    drop(first);
+}

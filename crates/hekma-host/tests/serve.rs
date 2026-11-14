@@ -760,3 +760,37 @@ fn a_panicking_signal_factory_is_a_typed_startup_refusal_not_a_hang_or_panic() {
         other => panic!("expected Startup, got {other:?}"),
     }
 }
+
+/// Story 24-2: a successor without its token, or whose previous host is not
+/// there, is refused before it takes anything — the state root is never
+/// locked by it.
+#[test]
+fn a_successor_without_its_token_or_its_predecessor_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base: PathBuf = tmp.path().join("state");
+    let options = ServeOptions {
+        state_base: Some(base.clone()),
+        handoff_from: Some(tmp.path().join("no-channel.sock")),
+        handoff_token: None,
+        ..ServeOptions::default()
+    };
+    let err = serve_with_signal(options, immediate_signal()).unwrap_err();
+    assert!(
+        matches!(&err, ServeError::InvalidOptions { message } if message.contains("HEKMA_HANDOFF_TOKEN")),
+        "{err}"
+    );
+    let options = ServeOptions {
+        state_base: Some(base.clone()),
+        handoff_from: Some(tmp.path().join("no-channel.sock")),
+        handoff_token: Some("token".to_string()),
+        ..ServeOptions::default()
+    };
+    let err = serve_with_signal(options, immediate_signal()).unwrap_err();
+    assert!(
+        matches!(&err, ServeError::Startup { message } if message.contains("could not take over")),
+        "{err}"
+    );
+    // Nothing holds the state root: a plain host still starts.
+    let lock = hekma_host::HostLock::acquire(&base.join(hekma_engine::paths::HOST_LOCK_FILE));
+    assert!(lock.is_ok());
+}

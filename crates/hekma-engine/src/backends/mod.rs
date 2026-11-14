@@ -286,6 +286,85 @@ pub fn tree_remote_addrs(root: u32) -> Result<Vec<std::net::SocketAddr>, String>
     }
 }
 
+/// Story 24-2: the handoff channel's transport (Unix: a socket with
+/// `SCM_RIGHTS`; elsewhere every call reports `Unsupported`).
+#[cfg(unix)]
+pub use unix::handoff::{Conn as HandoffConn, Listener as HandoffListener};
+
+/// Story 24-2: bind the handoff channel at `path`.
+pub fn handoff_listen(path: &std::path::Path) -> std::io::Result<HandoffListener> {
+    #[cfg(unix)]
+    {
+        unix::handoff::listen(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(handoff_unsupported())
+    }
+}
+
+/// Story 24-2: connect to the handoff channel at `path`.
+pub fn handoff_connect(path: &std::path::Path) -> std::io::Result<HandoffConn> {
+    #[cfg(unix)]
+    {
+        unix::handoff::connect(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(handoff_unsupported())
+    }
+}
+
+#[cfg(not(unix))]
+fn handoff_unsupported() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "an in-place upgrade is not available on this operating system yet",
+    )
+}
+
+/// Story 24-2: the handoff listener where no transport exists (never built).
+#[cfg(not(unix))]
+pub struct HandoffListener;
+
+/// Story 24-2: the handoff connection where no transport exists.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct HandoffConn;
+
+#[cfg(not(unix))]
+impl HandoffListener {
+    pub fn accept(&self, _bound: std::time::Duration) -> std::io::Result<HandoffConn> {
+        Err(handoff_unsupported())
+    }
+}
+
+#[cfg(not(unix))]
+impl HandoffConn {
+    pub fn send(&mut self, _line: &str) -> std::io::Result<()> {
+        Err(handoff_unsupported())
+    }
+    pub fn send_with(
+        &mut self,
+        _line: &str,
+        _listener: Option<&std::net::TcpListener>,
+        _lock: &std::fs::File,
+    ) -> std::io::Result<()> {
+        Err(handoff_unsupported())
+    }
+    pub fn recv(&mut self, _bound: std::time::Duration) -> std::io::Result<String> {
+        Err(handoff_unsupported())
+    }
+    pub fn recv_with(
+        &mut self,
+        _bound: std::time::Duration,
+    ) -> std::io::Result<(String, Option<std::fs::File>, Option<std::net::TcpListener>)> {
+        Err(handoff_unsupported())
+    }
+}
+
 /// Whether this OS has a Shim transport (story 24-1: Unix sockets now;
 /// the Windows named pipe follows).
 pub fn shim_supported() -> bool {

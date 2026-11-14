@@ -193,3 +193,30 @@ The **O-items are Islam's rulings** (product and public-contract choices); the n
   - **Drift:** no `shim released` event (24-1 built no `shim` event family; a note line per agent instead); directly held agents are STOPPED, not released (O7 recommends released: a direct handle's teardown kills the group, and releasing it needs a disarm path of its own — phase 2); the default stays `Off` (T11's flip waits for the whole acceptance suite, including the upgrade).
   - **Not in phase 1 (phase 2+):** the in-place upgrade (T3 handoff channel, T4 socket and `host.lock` transfer, T5 rollback, T8's no-refusal guarantee), the service-manager checks (T6), the post-handoff verification report (T7), the `/v0/host` routes and `self-update` trigger (T9), Windows, the default flip (T11).
   - **Tests:** the engine releases a Shim-held agent and the next engine takes it back (`tests/shim_supervision.rs`); the real binary under `HEKMA_SHIM=1 HEKMA_HANDOFF=on`, SIGTERMed, leaves the agent running and notes it, and the next auto-started host reaches it with a `send` and stops it (`crates/hekma/tests/shim_cli.rs`); the mode resolution and the started note (unit).
+- 2026-11-14 — **phase 2 built** (stacked on phase 1): the in-place upgrade on Unix.
+  - **T3:** `hekma_engine::handoff`. `handoff-rpc v1` frames (`hello`, `offer`, `ready`, `abort`) as JSON lines over a Unix socket in the owner-only `shims/` directory, with the peer's uid checked. A 256-bit token travels in `HEKMA_HANDOFF_TOKEN`; it is compared by hash, and the successor removes it from its environment before any agent starts. The transport is `backends/unix/handoff.rs`: `SCM_RIGHTS` through nix's `uio` feature (a manifest feature, not a new crate). On Windows every call reports `Unsupported`.
+  - **T2:** `Engine::shutdown_for_upgrade`. The proxy's accept loop stops but hands its socket back instead of closing it, then the engine releases and drains as in phase 1. `MeteringProxyOptions::inherited_listener` (`InheritedListener`) lets the next engine serve on that socket. Releasing a Shim agent now also clears this engine's claim on its spawn record (`Registry::release_spawn_owner`), so the successor adopts it while the predecessor is still alive. Without this, the successor skipped every agent as "supervised by another live engine", which the end-to-end test caught.
+  - **T4:**
+    - The trigger is `POST /v0/host/upgrade` (Operator only; `409 upgrade-unsupported` without a transport) and `hekma serve --upgrade`. The CLI never auto-starts a host; with none serving it refuses with exit 2 and a remediation. It waits up to 150 s for `control.json` to name a new pid.
+    - The predecessor launches `<current exe> <its own args> --handoff-from <channel>`, dropping any earlier `--handoff-from`. `hekma-host` accepts the flag too.
+    - The predecessor waits 30 s for the hello, then stops the OTLP exporter and the Control API. It leaves `control.json` in place, so no CLI starts a third host meanwhile.
+    - It then runs the upgrade shutdown, waits until it holds the engine alone and drops it (closing the store writer), and sends `offer` with the socket and the locked `host.lock`. It exits 0 on `ready`.
+    - The successor joins before anything else and adopts the same lock (`HostLock::adopt`, which rewrites the holder record). It opens the engine on the inherited socket, serves, and sends `ready` with the number of live agents.
+  - **T5, partly:** a failure before the hello, such as a successor that cannot start or connect, a wrong token or another major version, kills the successor, notes why, and the predecessor keeps serving with nothing stopped. A failure after the offer is not rolled back: the predecessor exits non-zero and says the agents keep running in their Shims, and the next `hekma` command starts a host that reconnects to them. **Drift:** the spec's rollback between the offer and the successor's engine open is deferred.
+  - **Tests:**
+    - the transport, on real descriptors: the same listening socket, and the same lock held by both until the last copy closes;
+    - the channel's token, abort and timeout paths;
+    - the engine: the socket is handed back and is still connectable, and the next engine serves on it and adopts the released agent while the first is alive;
+    - the route;
+    - a real-binary end to end: an auto-started host with a Shim agent is upgraded by `hekma serve --upgrade` while a poller dials the proxy every 5 ms. There are zero refused connections, the old host exits, `control.json` names the new pid, the agent survives, and the new host reaches it with `send` and stops it. It passed five runs out of five.
+  - **Not built:**
+    - T6, the service-manager checks;
+    - T7, a per-Run verification report beyond the reconnected count;
+    - an `EngineEvent::Handoff` family (notes only);
+    - T8, a re-held call landing on the successor: the proxy re-reads holds from its first snapshot, but no test covers it;
+    - the self-update trigger;
+    - Windows;
+    - T11, the default flip.
+
+    Each is in deferred-work.
+

@@ -2167,15 +2167,42 @@ impl Engine {
         crate::shutdown::release_and_drain(self, window, &notes).await
     }
 
+    /// Story 24-2 (the in-place upgrade): [`Engine::shutdown_for_handoff`],
+    /// except that the metering proxy's listening socket is NOT closed: it
+    /// stops accepting (a connection that arrives meanwhile waits in the
+    /// kernel's backlog) and is handed back for the successor, which serves
+    /// on it ([`MeteringProxyOptions::inherited_listener`]). `None` when no
+    /// proxy was running.
+    pub async fn shutdown_for_upgrade(
+        &self,
+        window: Duration,
+        notes: Option<&DiagnosticSink>,
+    ) -> (HandoffShutdown, Option<std::net::TcpListener>) {
+        let proxy = self
+            .inner
+            .metering_proxy
+            .lock()
+            .expect("metering proxy mutex poisoned")
+            .take();
+        let listener = match proxy {
+            Some(mut proxy) => proxy.shutdown_keeping_listener(window).await,
+            None => None,
+        };
+        let notes = crate::shutdown::Notes::over(notes);
+        let handed = crate::shutdown::release_and_drain(self, window, &notes).await;
+        (handed, listener)
+    }
+
     /// Story 24-2: release every Shim-held agent without stopping it (see
     /// [`Engine::shutdown_for_handoff`]); the released names, sorted.
     pub(crate) async fn release_shim_held(&self) -> Vec<String> {
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
             let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
             Ok::<_, std::convert::Infallible>(
                 supervisor
-                    .release_shim_held()
+                    .release_shim_held(&registry)
                     .into_iter()
                     .map(|name| name.as_str().to_string())
                     .collect(),
@@ -4181,6 +4208,17 @@ impl Blocking<'_> {
     /// Blocking [`Engine::stop`].
     pub fn stop(&self, name: &str, window: Option<Duration>) -> Result<AgentInstance, EngineError> {
         self.engine.rt.block_on(self.engine.stop(name, window))
+    }
+
+    /// Blocking [`Engine::shutdown_for_upgrade`] (story 24-2).
+    pub fn shutdown_for_upgrade(
+        &self,
+        window: Duration,
+        notes: Option<&DiagnosticSink>,
+    ) -> (HandoffShutdown, Option<std::net::TcpListener>) {
+        self.engine
+            .rt
+            .block_on(self.engine.shutdown_for_upgrade(window, notes))
     }
 
     /// Blocking [`Engine::shutdown_for_handoff`] (story 24-2).
