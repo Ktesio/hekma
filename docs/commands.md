@@ -521,10 +521,38 @@ child Run (closing an ended one changes nothing); a Run that owns an agent's
 process is stopped with `hekma agent stop`, never closed. Exit codes: `3` when
 no Run has the id, `4` when the agent has no open Run, the parent has ended or
 the Run owns a process, `2` for a malformed flag, more than 8 levels of
-nesting, or a Breach Action the child cannot execute. `close` also takes
+nesting, or a Breach Action the child cannot execute. A Run compacted past
+the [retention window](#hekma-run-retention) is not found by `close`, but
+`show` answers its summary: its usage totals, labels, end cause, depth and
+timestamps (`--json`: `{"schema_version": 1, "compacted_run": {…}}`). `close` also takes
 `--selector`, `--dry-run`, `--yes` and `--json` like the
 [lifecycle verbs](#selectors-on-the-lifecycle-verbs); a Run that owns an
 agent's process is that Run's refusal.
+
+## `hekma run retention [--runs <days>] [--calls <days>] [--json]`
+
+How long ended Runs and per-call records are kept. With no option it reads
+the state directory and starts nothing; with one it goes through the local
+Service Host, like every write.
+
+```bash
+hekma run retention
+hekma run retention --runs 30
+hekma run retention --calls 90 --json
+```
+
+| Flag | Meaning |
+|---|---|
+| `--runs <days>` | Keep ended Runs in full for this many days (1 to 3650; default 7), then compact them |
+| `--calls <days>` | Keep per-call records for this many days (1 to 3650; default 7), then delete their file whole |
+| `--json` | Print `{"schema_version": 1, "settings": {"run_retention_days", "calls_retention_days", "updated_at"}, "compaction": {"last_pass_at", "runs_compacted", "segments_dropped"}}` |
+
+The Run window is also `hekma ps`'s window: an ended Run is listed while it
+is inside it. A compacted Run keeps its run id, usage totals, labels, end
+cause, depth and timestamps (see [Runs](runs.md#retention)); a Run with an
+open descendant waits for the last one to end. The Service Host compacts
+when it starts and then once a day. Exit `2` for a window outside 1 to 3650
+days.
 
 ## Run Keys
 
@@ -574,7 +602,8 @@ hekma ps --all --limit 100 --json
 | `--json` | Print `{"schema_version": 1, "view", "selector", "items", "next_cursor", "counts"}` — one document |
 
 The default view is **exception-first**: a Run is listed when it carries an
-Anomaly (an ended Run only within seven days of its end) or a `held`,
+Anomaly (an ended Run only within the Run retention window, seven days
+unless changed) or a `held`,
 `silent` or `stale` status; healthy open Runs are counted in the footer,
 not listed, and `--all` adds every Run inside the window. Rows are ordered
 by run id, newest first, and the cursor pages without duplicates. The

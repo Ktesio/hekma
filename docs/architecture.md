@@ -67,7 +67,7 @@ A **Run** is one unit of agent work with a stable run id (`run_` + a ULID; ids r
 `hekma ps` and `GET /v0/runs` are one read: `list_runs` over the
 read-only connection. The default **exceptions view** lists a Run iff it
 carries an Anomaly (an ended Run only within a seven-day ended-Run window
-— a read-side bound until compaction lands with its knob) or holds a
+— the stored Run retention window, which the compaction pass enforces) or holds a
 `held`/`silent`/`stale` status (stored statuses, matched as stored and
 never derived at read); `--all` lists everything inside the window, and
 healthy open Runs are counted, not listed. Pages are **keyset on `run_id`
@@ -237,6 +237,12 @@ A Run's credentials (Run Keys `hk_run_`, refresh credentials `hk_ref_`, announce
 #### Wire dispositions: hold, release, reroute, reject
 
 The Operator's reasons are rows in `run_dispositions` (schema 22, one per reason per Run); breach reasons stay latch-derived, now classified as `block`, `pause` or `stop`. Every publish carries them on the snapshot's `Disposition`, and the proxy folds them over a call's ancestor chain (a process-owning Run's own `pause`/`stop` act on its process, not its calls) and acts on the strongest: reject, hold, reroute, pass. A held call takes a ticket in its Run's FIFO queue (`metering/proxy/hold.rs`), waits after its call-start record and before its body is read, re-reads the snapshot every 250 ms, leaves only at the front once released, and is re-validated against the current snapshot before it is forwarded. The sweeper task also writes each Run's parked count and oldest start once a second.
+
+#### Retention, compaction and the calls files
+
+One stored row holds two windows (seven days each by default): the Run window and the calls window. The Run window is the listing's ended-Run cutoff and the compaction pass's cutoff alike, so the two never disagree. The Service Host's sweeper runs a retention pass when it starts and then daily. Each compaction job is one writer job over at most 500 Runs that ended before the cutoff and have no open descendant (a recursive walk over the parent index); it scans at most four times its batch, so a run of blocked Runs cannot make a job unbounded, and hands its position to the next job. A compacted Run's totals come from its own rollup row, which already includes its descendants, so nothing is re-summed and no ancestor changes. Its `runs` row goes (its labels, limits, identities, latches, Policy resolution and credential rows cascade), with its dispositions, telemetry counters and rollup row; its usage events, breach records, events and outbox rows stay. The unattributed Run is never compacted. Compaction emits no events: one diagnostic line per pass, and the running totals in the `compaction_state` row.
+
+The calls store's head file rolls to a new `<UTC date>.db` between writer batches when the date changes, carrying this process's still-open calls, so a call's start and its close land in one file. Opening a store moves a dead owner's open calls from older files into the head, where the open-time closure closes them. The retention pass deletes whole (after a checkpoint, with its `-wal` and `-shm`) every file dated before the calls cutoff that is not the head and holds no open call.
 
 #### Inbound telemetry
 

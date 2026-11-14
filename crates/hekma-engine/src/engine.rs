@@ -776,6 +776,7 @@ impl Engine {
             inbox: supervisor.proxy_inbox(),
             diagnostics,
             custody: Arc::clone(custody),
+            calls_dir: Some(registry.calls_dir()),
         };
         match crate::metering::proxy::MeteringProxy::start(rt.handle(), &chosen, deps) {
             Ok(proxy) => {
@@ -2496,6 +2497,70 @@ impl Engine {
         .await
     }
 
+    /// A compacted Run's summary (story 24-4): what an ended Run keeps once
+    /// it is past the Run retention window — its id, usage totals, labels,
+    /// end cause, Control Depth and timestamps. `None` when `run_id` was
+    /// never compacted. Reads only.
+    pub async fn compacted_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::domain::runs::retention::CompactedRun>, crate::ports::StoreError>
+    {
+        let inner = Arc::clone(&self.inner);
+        let run_id = run_id.to_string();
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .compacted_run(&run_id)
+        })
+        .await
+    }
+
+    /// The retention windows and the compaction state (story 24-4). Reads
+    /// only.
+    pub async fn retention(
+        &self,
+    ) -> Result<crate::domain::runs::retention::RetentionView, crate::ports::StoreError> {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .retention_view()
+        })
+        .await
+    }
+
+    /// Change the retention windows (story 24-4): the Run window moves the
+    /// listing's ended-Run cutoff and the compaction pass together; the
+    /// calls window moves when per-call record files are deleted. A window
+    /// outside 1..=3650 days is [`RetentionError::Invalid`].
+    ///
+    /// [`RetentionError::Invalid`]: crate::domain::runs::retention::RetentionError::Invalid
+    pub async fn set_retention(
+        &self,
+        change: crate::domain::runs::retention::RetentionChange,
+    ) -> Result<
+        crate::domain::runs::retention::RetentionView,
+        crate::domain::runs::retention::RetentionError,
+    > {
+        change.validate()?;
+        self.refuse_if_read_only()?;
+        let inner = Arc::clone(&self.inner);
+        Ok(self
+            .run_blocking(move || {
+                inner
+                    .registry
+                    .lock()
+                    .expect("registry mutex poisoned")
+                    .set_retention(change)
+            })
+            .await?)
+    }
+
     /// The open Run that owns an instance's supervised process (story
     /// 21-9): what an instance name means wherever a verb takes a Run.
     /// [`RunError::NoOpenRun`] when the instance has none. Reads only.
@@ -4116,6 +4181,33 @@ impl Blocking<'_> {
     /// Blocking twin of [`Engine::run`].
     pub fn run(&self, run_id: &str) -> Result<RunView, RunError> {
         self.engine.rt.block_on(self.engine.run(run_id))
+    }
+
+    /// Blocking twin of [`Engine::compacted_run`].
+    pub fn compacted_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::domain::runs::retention::CompactedRun>, crate::ports::StoreError>
+    {
+        self.engine.rt.block_on(self.engine.compacted_run(run_id))
+    }
+
+    /// Blocking twin of [`Engine::retention`].
+    pub fn retention(
+        &self,
+    ) -> Result<crate::domain::runs::retention::RetentionView, crate::ports::StoreError> {
+        self.engine.rt.block_on(self.engine.retention())
+    }
+
+    /// Blocking twin of [`Engine::set_retention`].
+    pub fn set_retention(
+        &self,
+        change: crate::domain::runs::retention::RetentionChange,
+    ) -> Result<
+        crate::domain::runs::retention::RetentionView,
+        crate::domain::runs::retention::RetentionError,
+    > {
+        self.engine.rt.block_on(self.engine.set_retention(change))
     }
 
     /// Blocking twin of [`Engine::instance_run`].

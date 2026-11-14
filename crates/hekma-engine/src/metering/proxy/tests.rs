@@ -1486,3 +1486,87 @@ fn a_peer_is_loopback_only_on_127_8_and_the_ipv6_loopback() {
         assert_eq!(super::peer_is_loopback(ip), loopback, "{ip}");
     }
 }
+
+/// Story 24-4: one retention pass over a real writer — what it compacts,
+/// which calls files it deletes, the one line it says, and that a store
+/// failure mid-pass stops it with a note instead of looping.
+mod retention_pass {
+    use std::sync::{Arc, Mutex};
+
+    use crate::store::{SqliteStore, StoreWriter};
+
+    fn seeded(sql: &str) -> (tempfile::TempDir, StoreWriter) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        drop(SqliteStore::open(&db).unwrap());
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+                 process_owner, end_cause, created_at, updated_at, ended_at) VALUES \
+                 ('run_OLD', 'announced', 0, 'ended', '', 0, 'closed', '2020-01-01T00:00:00Z', \
+                 '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+        let store = SqliteStore::open(&db).unwrap();
+        store.attach_calls(None).unwrap();
+        (dir, StoreWriter::spawn(store).unwrap())
+    }
+
+    fn pass(writer: &StoreWriter, calls: Option<&std::path::Path>) -> Vec<String> {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&lines);
+        let diagnostics: Arc<dyn Fn(String) + Send + Sync> =
+            Arc::new(move |line| sink.lock().unwrap().push(line));
+        let handle = writer.handle().unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::super::retention_pass(&handle, calls, &diagnostics));
+        let lines = lines.lock().unwrap().clone();
+        lines
+    }
+
+    #[test]
+    fn a_pass_compacts_deletes_old_calls_files_and_records_both() {
+        let (dir, writer) = seeded("");
+        let calls = dir.path().join("calls");
+        std::fs::create_dir_all(&calls).unwrap();
+        drop(rusqlite::Connection::open(calls.join("2020-01-01.db")).unwrap());
+        let lines = pass(&writer, Some(&calls));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("1 ended Run(s)") && lines[0].contains("1 per-call record file(s)"),
+            "{lines:?}"
+        );
+        assert!(!calls.join("2020-01-01.db").exists());
+        let (compacted, dropped) = writer
+            .call(|ctx| {
+                let state = ctx.store().compaction_state()?;
+                Ok((state.runs_compacted, state.segments_dropped))
+            })
+            .unwrap();
+        assert_eq!((compacted, dropped), (1, 1));
+        // Nothing left: the next pass says nothing.
+        assert!(pass(&writer, Some(&calls)).is_empty());
+    }
+
+    #[test]
+    fn a_store_failure_stops_the_pass_with_a_note() {
+        let (_dir, writer) = seeded("DROP TABLE compacted_runs;");
+        let lines = pass(&writer, None);
+        assert!(
+            lines.iter().any(|line| line.contains("stopped early")),
+            "{lines:?}"
+        );
+        // Without the retention table the pass cannot read its windows and
+        // does nothing.
+        let (_dir, writer) = seeded("DROP TABLE retention;");
+        assert!(pass(&writer, None).is_empty());
+    }
+}

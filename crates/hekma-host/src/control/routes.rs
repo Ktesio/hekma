@@ -2289,6 +2289,37 @@ pub(crate) async fn proxy_update(
     Ok(Json(proxy_document(&state, settings)))
 }
 
+/// `GET /v0/retention` (story 24-4, Operator bearer only) — the two
+/// retention windows and what compaction has done.
+pub(crate) async fn retention_show(
+    State(state): State<ApiState>,
+) -> ApiResult<Json<dto::RetentionDocument>> {
+    let view = state
+        .engine
+        .retention()
+        .await
+        .map_err(hekma_engine::RetentionError::Store)?;
+    Ok(Json(dto::RetentionDocument::of(view)))
+}
+
+/// `PUT /v0/retention` (story 24-4, Operator bearer only) — change one or
+/// both windows (1 to 3650 days; otherwise `400 invalid-retention`). The
+/// Run window moves the listing's ended-Run cutoff and the compaction pass
+/// together.
+pub(crate) async fn retention_update(
+    State(state): State<ApiState>,
+    ApiJson(request): ApiJson<dto::RetentionRequest>,
+) -> ApiResult<Json<dto::RetentionDocument>> {
+    let view = state
+        .engine
+        .set_retention(hekma_engine::RetentionChange {
+            run_retention_days: request.run_retention_days,
+            calls_retention_days: request.calls_retention_days,
+        })
+        .await?;
+    Ok(Json(dto::RetentionDocument::of(view)))
+}
+
 fn proxy_document(state: &ApiState, settings: hekma_engine::ProxySettings) -> dto::ProxyDocument {
     let info = state.engine.metering_proxy();
     dto::ProxyDocument {
