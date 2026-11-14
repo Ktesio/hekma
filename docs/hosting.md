@@ -222,7 +222,7 @@ the started notice says what Hekma could check, and `GET /v0/host` carries
 it as `handoff_check`:
 
 - **systemd** keeps them with `KillMode=process` or `none`. The default, `control-group`, and `mixed` stop them with the host. Hekma reports `verified` or `unsafe`, naming the unit and its setting.
-- **launchd** keeps them with `AbandonProcessGroup=true`; the default stops them. Hekma reports `unverified`, with how to check.
+- **launchd** keeps them with `AbandonProcessGroup=true`; the default stops them. Hekma finds its job from `XPC_SERVICE_NAME` and reads the job with `launchctl print`: `verified` when the property is set, `unsafe` (with the plist key to set) when it is not, and `unverified` when the job cannot be read.
 - **A container** ends every process in it when it stops. Hekma reports `unverified`.
 - **Windows** is not checked yet: `unverified`.
 

@@ -7,8 +7,14 @@
 //! systemd: a unit's `KillMode` decides — `process` or `none` leave the
 //! Shims alone; `control-group` (the default) or `mixed` stop every process
 //! in the unit's cgroup with the host. Found from `INVOCATION_ID` (set for
-//! every unit) and the unit name in `/proc/self/cgroup`. Other managers
-//! (launchd, Docker, supervisord) and Windows job breakaway are not
+//! every unit) and the unit name in `/proc/self/cgroup`.
+//!
+//! launchd: a job's `AbandonProcessGroup` decides — set, launchd leaves the
+//! Shims alone when the host exits; unset (the default), it kills the job's
+//! whole process group. Found from `XPC_SERVICE_NAME` (the job's label) and
+//! the `properties` line `launchctl print` reports for it.
+//!
+//! Other managers (Docker, supervisord) and Windows job breakaway are not
 //! checked yet.
 
 /// The verdict.
@@ -48,6 +54,11 @@ impl HandoffCheck {
                 "the service manager keeps agents in their own Shim running when this host stops \
                  ({setting})"
             ),
+            HandoffCheck::Unsafe(setting) if setting.starts_with("launchd") => format!(
+                "the service manager stops this host's whole process group with it ({setting}), \
+                 agents in their own Shim included: set AbandonProcessGroup to true in the job's \
+                 plist so Handoff Mode and in-place upgrades keep them running"
+            ),
             HandoffCheck::Unsafe(setting) => format!(
                 "the service manager stops every process of this host's unit with it ({setting}), \
                  agents in their own Shim included: set KillMode=process (or none) on the unit so \
@@ -67,12 +78,73 @@ const HOW_TO_CHECK: &str = "check that your service manager stops only the host'
 
 /// The verdict for this process.
 pub fn check() -> HandoffCheck {
+    let invocation_id = std::env::var("INVOCATION_ID").ok();
+    if invocation_id.as_deref().is_none_or(str::is_empty) {
+        let label = std::env::var("XPC_SERVICE_NAME").ok();
+        if let Some(verdict) = launchd_check(label.as_deref(), &query_launchd_properties) {
+            return verdict;
+        }
+    }
     let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok();
     check_with(
-        std::env::var("INVOCATION_ID").ok().as_deref(),
+        invocation_id.as_deref(),
         cgroup.as_deref(),
         &query_kill_mode,
     )
+}
+
+/// The launchd verdict, when this process is a launchd job: `label` is
+/// `XPC_SERVICE_NAME` (unset, empty or `0` outside a job), and `query`
+/// returns the `properties` line `launchctl print` reports for the job
+/// (the seam). `None` when this is not a launchd job.
+pub(crate) fn launchd_check(
+    label: Option<&str>,
+    query: &dyn Fn(&str) -> Option<String>,
+) -> Option<HandoffCheck> {
+    let label = label.filter(|label| !label.is_empty() && *label != "0")?;
+    Some(match query(label) {
+        Some(properties) if properties.contains("abandon process group") => {
+            HandoffCheck::Verified(format!("launchd job {label}: AbandonProcessGroup=true"))
+        }
+        Some(_) => HandoffCheck::Unsafe(format!(
+            "launchd job {label}: AbandonProcessGroup is not set"
+        )),
+        None => HandoffCheck::Unverified(format!(
+            "started by launchd as {label}, but `launchctl print` could not read the job; \
+             {HOW_TO_CHECK}"
+        )),
+    })
+}
+
+/// The `properties` line `launchctl print` reports for `label`, from the
+/// system domain or this user's GUI domain.
+fn query_launchd_properties(label: &str) -> Option<String> {
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())?;
+    [format!("system/{label}"), format!("gui/{uid}/{label}")]
+        .iter()
+        .find_map(|target| {
+            let output = std::process::Command::new("launchctl")
+                .args(["print", target])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            launchd_properties(&String::from_utf8_lossy(&output.stdout))
+        })
+}
+
+/// The `properties = …` line of a `launchctl print` report.
+fn launchd_properties(report: &str) -> Option<String> {
+    report
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("properties = "))
+        .map(str::to_string)
 }
 
 /// The verdict from what the OS reported: the `INVOCATION_ID`, the
@@ -142,6 +214,63 @@ fn query_kill_mode(unit: &str, user: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_launchd_job_is_judged_by_its_abandon_process_group_property() {
+        let reports = |line: &'static str| move |_: &str| Some(line.to_string());
+        let kept = launchd_check(
+            Some("dev.example.hekma"),
+            &reports("inferred program | abandon process group | system service"),
+        )
+        .unwrap();
+        assert_eq!(
+            kept,
+            HandoffCheck::Verified(
+                "launchd job dev.example.hekma: AbandonProcessGroup=true".into()
+            )
+        );
+        let killed =
+            launchd_check(Some("dev.example.hekma"), &reports("inferred program")).unwrap();
+        assert_eq!(killed.as_str(), "unsafe");
+        assert!(
+            killed.note().contains("AbandonProcessGroup to true"),
+            "{}",
+            killed.note()
+        );
+        assert!(!killed.note().contains("KillMode"), "{}", killed.note());
+        let unread = launchd_check(Some("dev.example.hekma"), &|_: &str| None).unwrap();
+        assert!(
+            unread.detail().contains("could not read the job"),
+            "{}",
+            unread.detail()
+        );
+        // Not a launchd job: no verdict here, the systemd check decides.
+        for label in [None, Some(""), Some("0")] {
+            assert!(launchd_check(label, &reports("abandon process group")).is_none());
+        }
+    }
+
+    #[test]
+    fn the_properties_line_is_read_from_a_launchctl_report() {
+        let report = "gui/501/dev.example.hekma = {\n\tactive count = 1\n\tproperties = \
+                      inferred program | abandon process group\n}\n";
+        assert_eq!(
+            launchd_properties(report).as_deref(),
+            Some("inferred program | abandon process group")
+        );
+        assert_eq!(launchd_properties("nothing here"), None);
+    }
+
+    /// The real query, against a label no job has: no verdict can be read.
+    #[test]
+    fn an_unknown_launchd_label_reads_as_unverified() {
+        let verdict = launchd_check(
+            Some("dev.example.hekma-no-such-job"),
+            &query_launchd_properties,
+        )
+        .unwrap();
+        assert_eq!(verdict.as_str(), "unverified", "{verdict:?}");
+    }
 
     const SYSTEM: &str = "0::/system.slice/hekma.service\n";
     const USER: &str = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/hekma.service\n";
