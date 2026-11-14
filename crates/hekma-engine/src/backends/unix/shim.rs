@@ -175,6 +175,7 @@ mod tests {
             pipe_stdout: false,
             inherit_env: false,
             capture_mode: "full".into(),
+            bypass: None,
         }
     }
 
@@ -277,6 +278,108 @@ mod tests {
         ));
         engine.ack_exit().unwrap();
         assert_eq!(shim.thread.join().unwrap(), ShimExit::Acknowledged);
+    }
+
+    /// Story 22-4: a fake agent holding one TCP connection to `addr`.
+    fn holding(addr: std::net::SocketAddr, log: &Path) -> ShimSpawn {
+        let mut dto = spec("true", false, log);
+        dto.exec = hekma_conformance::fake_agent_bin().display().to_string();
+        dto.args = vec!["--hold-tcp".into(), addr.to_string()];
+        dto
+    }
+
+    fn listed(addr: std::net::SocketAddr) -> crate::domain::bypass::ProviderHost {
+        crate::domain::bypass::ProviderHost {
+            host: format!("gw-{}", addr.port()),
+            port: addr.port(),
+            addrs: vec![addr.ip()],
+        }
+    }
+
+    /// Wait for the Shim's report to satisfy `done`, reading pushes and
+    /// `status`.
+    fn report_until(
+        engine: &mut ShimClient,
+        done: impl Fn(&crate::shim::proto::BypassReport) -> bool,
+    ) -> crate::shim::proto::BypassReport {
+        let deadline = std::time::Instant::now() + BOUND;
+        loop {
+            let report = engine.status().unwrap().bypass;
+            if let Some(pushed) = engine.take_pushed_bypass() {
+                if done(&pushed) {
+                    return pushed;
+                }
+            }
+            if done(&report) {
+                return report;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "last report {report:?}"
+            );
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    }
+
+    #[test]
+    fn the_shim_reports_a_listed_host_its_tree_reached_and_never_one_outside_it() {
+        let gateway = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let outside = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (gw, out) = (gateway.local_addr().unwrap(), outside.local_addr().unwrap());
+        // This test process (outside the Shim's tree) holds a connection
+        // to the second listed endpoint the whole time.
+        let _sibling = std::net::TcpStream::connect(out).unwrap();
+        let shim = start(Duration::from_secs(30), Duration::from_secs(30));
+        let log = shim.path.parent().unwrap().join("agent.log");
+        let (mut engine, _) =
+            ShimClient::hello(connect(&shim.path).unwrap(), &shim.secret, BOUND).unwrap();
+        let mut dto = holding(gw, &log);
+        dto.bypass = Some(Box::new(crate::shim::proto::BypassConfig {
+            interval_ms: 50,
+            hosts: vec![listed(gw), listed(out)],
+        }));
+        engine.spawn(dto).unwrap();
+        let report = report_until(&mut engine, |r| !r.hosts.is_empty());
+        assert_eq!(report.state, "active");
+        assert_eq!(report.hosts, vec![format!("gw-{}", gw.port())]);
+        // Polls keep running; the sibling never joins, and the host is
+        // reported once (set-once).
+        std::thread::sleep(Duration::from_millis(300));
+        let status = engine.status().unwrap();
+        assert_eq!(status.bypass.hosts, report.hosts, "{status:?}");
+        let _ = engine.stop(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn a_shim_launched_with_no_list_reports_nothing_until_one_is_pushed() {
+        let gateway = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gw = gateway.local_addr().unwrap();
+        let shim = start(Duration::from_secs(30), Duration::from_secs(30));
+        let log = shim.path.parent().unwrap().join("agent.log");
+        let (mut engine, _) =
+            ShimClient::hello(connect(&shim.path).unwrap(), &shim.secret, BOUND).unwrap();
+        engine.spawn(holding(gw, &log)).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let status = engine.status().unwrap();
+        assert_eq!(
+            status.bypass.state, "unreported",
+            "no list: never a clean read"
+        );
+        engine
+            .set_bypass_hosts(crate::shim::proto::BypassConfig {
+                interval_ms: 50,
+                hosts: vec![listed(gw)],
+            })
+            .unwrap();
+        let report = report_until(&mut engine, |r| !r.hosts.is_empty());
+        assert_eq!(report.state, "active");
+        // A reconnecting engine reads the report from `status`.
+        drop(engine);
+        std::thread::sleep(Duration::from_millis(100));
+        let (mut engine, status) =
+            ShimClient::hello(connect(&shim.path).unwrap(), &shim.secret, BOUND).unwrap();
+        assert_eq!(status.bypass.hosts, report.hosts);
+        let _ = engine.stop(Duration::from_secs(2)).unwrap();
     }
 
     #[test]

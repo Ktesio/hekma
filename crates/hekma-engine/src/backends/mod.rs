@@ -270,6 +270,22 @@ pub fn shim_prepare_dir(dir: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+/// Story 22-4: the remote addresses of the established TCP connections held
+/// by the process tree rooted at `root` — bypass detection's per-OS
+/// enumerator. `Err` names why the tree could not be read (reported as
+/// `unavailable`, never as clean).
+pub fn tree_remote_addrs(root: u32) -> Result<Vec<std::net::SocketAddr>, String> {
+    #[cfg(unix)]
+    {
+        unix::bypass::tree_remote_addrs(root)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        Err("bypass detection is not implemented on this operating system yet".to_string())
+    }
+}
+
 /// Whether this OS has a Shim transport (story 24-1: Unix sockets now;
 /// the Windows named pipe follows).
 pub fn shim_supported() -> bool {

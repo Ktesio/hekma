@@ -14,8 +14,11 @@
 //! * Runs with no Agent Instance (wire and observed Runs) export too.
 //!
 //! New families: `hekma.run.anomalies`, `hekma.calls.unscented`,
-//! `hekma.telemetry.received` and the self-metric `hekma.otlp.folded`.
-//! The `hekma.bypass.detected` family waits for bypass detection.
+//! `hekma.telemetry.received`, `hekma.bypass.detected` (story 22-4: by
+//! `hekma.provider.host`, depth and allow-listed labels, the Run via
+//! exemplar; only detections that are the `bypass` Anomaly — the expected,
+//! informational ones are not bypasses) and the self-metric
+//! `hekma.otlp.folded`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -76,6 +79,7 @@ pub struct MetricStateV2 {
     window: InstanceWindow,
     token_usage: BTreeMap<Attrs, (HistogramAccumulator, Reservoir)>,
     breaches: BTreeMap<Attrs, (u64, Reservoir)>,
+    bypass: BTreeMap<Attrs, (u64, Reservoir)>,
     cost: BTreeMap<Attrs, f64>,
     agent_state: BTreeMap<(String, String), i64>,
     anomalies: BTreeMap<Attrs, u64>,
@@ -102,6 +106,7 @@ impl MetricStateV2 {
             window: InstanceWindow::default(),
             token_usage: BTreeMap::new(),
             breaches: BTreeMap::new(),
+            bypass: BTreeMap::new(),
             cost: BTreeMap::new(),
             agent_state: BTreeMap::new(),
             anomalies: BTreeMap::new(),
@@ -241,6 +246,32 @@ impl MetricStateV2 {
             }
             EngineEvent::Run(run) => {
                 let id = run.run_id.as_str().to_string();
+                // Story 22-4: a detection that is the Anomaly counts once
+                // per new host (the event's cause names it).
+                if run.change == hekma_engine::RunEventKind::BypassDetected {
+                    if let Some(host) = run
+                        .cause
+                        .as_deref()
+                        .filter(|cause| !cause.contains("(informational"))
+                    {
+                        let mut attrs = vec![
+                            ("hekma.provider.host".to_string(), host.to_string()),
+                            (
+                                "hekma.control_depth".to_string(),
+                                depth_str(run.control_depth).to_string(),
+                            ),
+                        ];
+                        let labels: Vec<(String, String)> = run
+                            .labels
+                            .iter()
+                            .map(|label| (label.key.clone(), label.value.clone()))
+                            .collect();
+                        attrs.extend(self.labels.project(&labels));
+                        let (count, reservoir) = self.bypass.entry(attrs).or_default();
+                        *count = count.saturating_add(1);
+                        reservoir.observe(&id, time, 1);
+                    }
+                }
                 let now: BTreeSet<String> = run
                     .anomalies
                     .iter()
@@ -377,6 +408,23 @@ impl MetricStateV2 {
                 "hekma.budget.breaches",
                 "Recorded budget breaches, regardless of the action taken",
                 "{breach}",
+                points,
+            ));
+        }
+        if !self.bypass.is_empty() {
+            let points = self
+                .bypass
+                .iter()
+                .map(|(attrs, (count, reservoir))| NumberDataPoint {
+                    exemplars: reservoir.exemplars(),
+                    ..point(kv(attrs), *count)
+                })
+                .collect();
+            metrics.push(counter(
+                "hekma.bypass.detected",
+                "Provider hosts a Run's process tree reached directly while its calls go \
+                 through Hekma with key custody on (a signal, never an action)",
+                "{detection}",
                 points,
             ));
         }

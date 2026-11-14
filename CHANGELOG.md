@@ -4,6 +4,16 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — bypass detection, a preview for agents in their own Shim (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **Each Shim watches its agent's process tree** every 5 seconds for established TCP connections to a known provider host: the built-in provider hosts, every endpoint binding's upstream, every open Run's upstream and every origin pinned beside a held key. Hekma resolves the hosts (every 60 seconds, keeping the last good addresses) and hands the list to each Shim; the Shim compares address and port. Linux and macOS; Windows Runs stay `unreported` until agents run in a Shim there.
+> - **On a Run with key custody on, a finding is the `bypass` Anomaly,** shown as `bypass[<host>]` in `hekma ps` and counted by `hekma.bypass.detected` (OTLP v2, by `hekma.provider.host`, depth and allow-listed labels, the Run as exemplar). With custody off, or no wire path, it is informational: a note naming the host and why direct calls are expected. Detection never stops, pauses or fences a Run.
+> - **Never clean without checking.** Every supervised Run carries its detection state — `active`, `unavailable` with the reason, or `unreported` — in `hekma run show` (`BYPASS`) and `--json` (`bypass: {detection, reason?, hosts, informational?}`).
+> - **A signal, not a guarantee:** another proxy or VPN, HTTP/3, a connection shorter than the interval, a process outside the tree and shared CDN addresses are the documented limits.
+> - **Events:** `bypass-detected` (once per host per Run, at most 8 hosts) and `bypass-detection-changed` Run events.
+> - **Engine surface (breaking within the unreleased 0.12.0):** `Anomaly` gains `Bypass`; `RunEventKind` gains `BypassDetected` and `BypassDetectionChanged`; `RunSummary` and `RunView` gain `bypass` (`BypassView`). The Shim protocol moves to 1.1 (additive; a 1.0 Shim keeps working and reports nothing). `state.db` migrates one way to schema 28.
+
 > **Unreleased — the Shim, part two: agents in their own Shim, a preview (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >

@@ -11,6 +11,7 @@
 
 mod budget;
 mod bus;
+pub mod bypass;
 pub mod calls;
 pub(crate) mod config;
 mod cost;
@@ -117,10 +118,10 @@ pub use runs::announce::{Announced, LeaseActor};
 pub use runs::dispositions::{DispositionOutcome, DispositionVerb};
 pub use runs::telemetry::{TelemetryOutcome, TelemetryPoint, TelemetryReport, TelemetryTokenType};
 pub use runs::{
-    decode_cursor, encode_cursor, ended_run_cutoff, CustodyView, LatchedBreach, ListRunsQuery,
-    ListingCounts, ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument,
-    RunSummary, ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT,
-    RUN_LISTING_SCHEMA_VERSION,
+    decode_cursor, encode_cursor, ended_run_cutoff, BypassView, CustodyView, LatchedBreach,
+    ListRunsQuery, ListingCounts, ListingView, PerfRunRow, RunBudgetView, RunListing,
+    RunListingDocument, RunSummary, ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT,
+    LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
 };
 pub use runs::{
     disposition_for, validate_label_key, validate_label_value, verb_cell, Anomaly, CellBehavior,

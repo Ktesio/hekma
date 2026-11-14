@@ -27,7 +27,7 @@ use std::time::Duration;
 /// `shim-rpc` major version: a different major is never spoken.
 pub const SHIM_PROTOCOL_MAJOR: u32 = 1;
 /// `shim-rpc` minor version: the engine accepts its own and the previous.
-pub const SHIM_PROTOCOL_MINOR: u32 = 0;
+pub const SHIM_PROTOCOL_MINOR: u32 = 1;
 
 /// How long a Shim that is never asked to launch waits before exiting
 /// (its engine died between spawning it and the launch request).

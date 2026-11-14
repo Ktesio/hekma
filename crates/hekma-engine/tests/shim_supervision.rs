@@ -353,3 +353,76 @@ fn a_stop_reconnects_to_a_shim_that_was_busy_at_adoption() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// Story 22-4: bypass detection end to end. A binding's loopback upstream
+/// is on the provider-host list (an Operator-configured local gateway), the
+/// agent's tree holds a direct connection to it, and the Run reports it —
+/// as informational, since this Run has no wire path (its agent holds its
+/// own provider key). Detection never acts on the Run.
+#[test]
+fn a_shim_reports_a_direct_connection_to_a_listed_host_on_the_run() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    let gateway = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let gw = gateway.local_addr().unwrap();
+    let state = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    let hold = gw.to_string();
+    manifest(
+        dir.path(),
+        "byp",
+        &["--linger-ms", "600000", "--hold-tcp", &hold],
+    );
+    // The binding exists before the Shim engine opens, so its first list
+    // already carries the gateway.
+    {
+        let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+        engine
+            .blocking()
+            .create_binding(hekma_engine::BindingSpec {
+                name: "gw".into(),
+                prefix: "/gw".into(),
+                upstream: format!("http://{gw}/v1"),
+                labels: Vec::new(),
+                custodied_key: None,
+                identity_headers: None,
+            })
+            .unwrap();
+    }
+    let engine = open(state.path());
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter("byp", &AdapterRef::Manifest(dir.path().to_path_buf()))
+        .unwrap();
+    facade.start("byp").unwrap();
+    let run_id = facade.instance_run("byp").unwrap().record.run_id;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let bypass = loop {
+        let view = facade.run(run_id.as_str()).unwrap();
+        let bypass = view
+            .bypass
+            .clone()
+            .expect("a process-owning Run has a slice");
+        if !bypass.hosts.is_empty() {
+            assert!(
+                view.record.anomalies.is_empty(),
+                "informational: no Anomaly"
+            );
+            assert_eq!(view.record.status, hekma_engine::RunStatus::Active);
+            break bypass;
+        }
+        assert!(Instant::now() < deadline, "never reported: {bypass:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(bypass.detection, "active");
+    assert_eq!(bypass.hosts, vec!["127.0.0.1".to_string()]);
+    assert_eq!(bypass.informational.as_deref(), Some("no-wire"));
+    let status = facade.instance_status("byp").unwrap();
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Running,
+        "never stopped"
+    );
+    facade.stop("byp", None).unwrap();
+}

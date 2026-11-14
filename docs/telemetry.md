@@ -147,11 +147,11 @@ there are:
 | `hekma.run.anomalies` | sum | `{anomaly}` | `hekma.anomaly`, `hekma.control_depth` | +1 each time a Run gains an Anomaly flag. |
 | `hekma.calls.unscented` | sum | `{call}` | `outcome` (`served`/`refused`) | Calls no Hekma credential identified, under Scent-Check `shadow` (served) or `enforce` (refused). Always two series, whatever the calls sent. |
 | `hekma.telemetry.received` | sum | `{point}` | `outcome` (`accepted`/`skipped`) | Inbound telemetry points on `/v1/metrics`. |
+| `hekma.bypass.detected` | sum | `{detection}` | `hekma.provider.host`, `hekma.control_depth`, `hekma.label.*` | +1 per provider host a Run with key custody on reached directly ([bypass detection](run-keys.md#bypass-detection-preview)), with exemplars. Informational findings are not counted. |
 | `hekma.otlp.folded` | sum | `{observation}` | — | Label values folded past their key's cap. Always emitted. |
 | `hekma.otlp.dropped` | sum | `{event}` | — | As in v1. Always emitted. |
 
 `?` marks an attribute present only when the Run has an Agent Instance.
-Bypass detection's counter joins when bypass detection ships.
 
 ### The label cap
 

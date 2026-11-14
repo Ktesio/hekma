@@ -1221,6 +1221,10 @@ fn a_v15_state_dir_migrates_to_v16_and_the_listing_reads_it() {
             .unwrap();
         store
             .conn()
+            .execute_batch(crate::store::runs_sqlite::UNDO_V28_FOR_TEST)
+            .unwrap();
+        store
+            .conn()
             .execute_batch(crate::store::reconcile_sqlite::UNDO_V26_FOR_TEST)
             .unwrap();
         store
@@ -1435,6 +1439,10 @@ fn a_v16_state_dir_migrates_to_v17_and_a_live_run_keeps_running_without_a_key() 
                 "ALTER TABLE agent_runtime DROP COLUMN shim_socket; \
                  ALTER TABLE agent_runtime DROP COLUMN shim_launch_id;",
             )
+            .unwrap();
+        store
+            .conn()
+            .execute_batch(crate::store::runs_sqlite::UNDO_V28_FOR_TEST)
             .unwrap();
         store
             .conn()
@@ -1664,6 +1672,10 @@ fn a_v19_state_dir_migrates_to_v20_seeding_activity_and_changing_no_run() {
                 "ALTER TABLE agent_runtime DROP COLUMN shim_socket; \
                  ALTER TABLE agent_runtime DROP COLUMN shim_launch_id;",
             )
+            .unwrap();
+        store
+            .conn()
+            .execute_batch(crate::store::runs_sqlite::UNDO_V28_FOR_TEST)
             .unwrap();
         store
             .conn()
