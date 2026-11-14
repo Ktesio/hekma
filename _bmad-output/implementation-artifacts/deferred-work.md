@@ -890,13 +890,13 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 
 ## From spec-24-4 (scale substrate) — phase 1 build, 2026-11-14
 
-- source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (Phase 2)
-  summary: The delta-log snapshot publisher, the `--run-scale` benchmark with its CI step, and the listing's scale fixes (covering count index, selector arms on the partial indexes, the reader pool, the off-guard log reads) are not built yet.
-  evidence: `crates/hekma-engine/src/domain/runs/snapshot.rs` (`RunSnapshot::with` still clones). Trigger: phase 2 of the story (next build).
-
 - source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (Phase 3)
+  summary: The `--run-scale` benchmark with its CI step (the page, publish, scaling and proxy gates, measured with a second write engine over the seeded directory), and the listing's scale fixes (covering count index, selector arms on the partial indexes, the reader pool, the off-guard log reads), are not built yet. The delta-log publisher landed in phase 2.
+  evidence: `crates/hekma-engine/examples/perf-budgets.rs` (`--ps-seed` only). Trigger: phase 3 of the story.
+
+- source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (Phase 4)
   summary: AD-18 Steps 0–4 (the `EnginePaths` hoist, `TimedMutex`, named scopes with the debt ratchet, the `StoreGate` splits, `SupervisorShared`/`InstanceState`) are not built yet.
-  evidence: `crates/hekma-engine/src/engine.rs` (bare `.lock()` sites). Trigger: phase 3 of the story.
+  evidence: `crates/hekma-engine/src/engine.rs` (bare `.lock()` sites). Trigger: phase 4 of the story.
 
 - source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (O2: usage events at compaction)
   summary: Compaction keeps a Run's `usage_events` rows until O2 is ruled; deleting them would also change what the event resync replays for an instance.

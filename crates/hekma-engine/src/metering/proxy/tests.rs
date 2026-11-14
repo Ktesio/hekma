@@ -145,11 +145,11 @@ fn world() -> World {
     );
     World {
         snapshot: RunSnapshot {
-            runs,
-            keys,
+            runs: runs.into_iter().collect(),
+            keys: keys.into_iter().collect(),
             revoked: Arc::new(revoked),
             bindings: Arc::new(bindings),
-            identities,
+            identities: identities.into_iter().collect(),
             ..RunSnapshot::default()
         },
         child_key,
