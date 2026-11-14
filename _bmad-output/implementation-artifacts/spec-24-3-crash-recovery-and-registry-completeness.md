@@ -205,4 +205,11 @@ The **O-items are Islam's rulings** (product and public-contract choices); the n
     - a Shim and agent killed together: the instance leaves `running`;
     - the classifier;
     - the proc-level degrade, with `has_stdin` false and the stop working.
+- 2026-11-14 — **phase 3 built** (stacked on phase 2, #427): T3's starting-row arm, which closes the 18-1 review deferral.
+  - **What it does.** An adopted live process whose row says `starting` (its host died mid-start, its readiness wait among them) is settled at adoption, never left `starting`:
+    - with no declared readiness probe → `starting → running` with `adapter-ready` (it outlived the start's survival window, the fact that cause records);
+    - with a declared probe → `starting → running` with the new `TransitionCause::AdoptedUnconfirmed { detail }` (`adopted-unconfirmed`, naming the probe), plus a note.
+  - **Why not re-run the probe.** Of the spec's two honest arms, this builds "adopted with the gate's honesty note" rather than re-running the probe at adoption. A re-run needs the start path's probe-wait machinery (and its timeout teardown) inside adoption, which blocks the engine's open for the probe's whole budget. It is recorded as a possible follow-up.
+  - **Drift:** `TransitionCause` gains a variant (breaking within the unreleased 0.12.0).
+  - **Tests:** a real Shim-held gated and ungated pair whose rows are forced back to `starting`, then adopted by the next engine (the cause and the probe's name checked). The adoption, readiness and Shim suites, plus the engine library, all pass (1,478 tests).
 

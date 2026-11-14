@@ -7,6 +7,49 @@ use crate::domain::liveness::{self, LivenessSignal, WindowDecision};
 use crate::domain::runs::ops::RunFate;
 use crate::ports::StoreError;
 
+impl Supervisor {
+    /// Story 24-3 (the 18-1 deferral): an adopted live process whose row
+    /// says `starting` — its host died during the start. Without a declared
+    /// readiness probe it is `running` (it outlived the start's survival
+    /// window, the same fact `adapter-ready` records). With one, the probe's
+    /// answer died with the host: it is adopted as `running` with that said
+    /// (`adopted-unconfirmed`), never as if no gate had been declared.
+    pub(super) fn settle_adopted_starting(&mut self, registry: &Registry, name: &InstanceName) {
+        let gate = registry
+            .adapter_launch_facts(name)
+            .ok()
+            .and_then(|(kind, manifest, _)| {
+                crate::adapter::resolve_readiness_probe(&kind, manifest.as_deref())
+                    .ok()
+                    .flatten()
+            });
+        let cause = match &gate {
+            Some(gate) => TransitionCause::AdoptedUnconfirmed {
+                detail: crate::domain::readiness::describe(&gate.probe),
+            },
+            None => TransitionCause::AdapterReady,
+        };
+        match self.transition(
+            registry,
+            name,
+            LifecycleState::Starting,
+            LifecycleState::Running,
+            cause,
+        ) {
+            Ok(_) if gate.is_some() => self.emit_diagnostic(&format!(
+                "{}: its previous host stopped while waiting for the readiness probe; the \
+                 live process is adopted as running, but the probe never answered",
+                name.as_str()
+            )),
+            Ok(_) => {}
+            Err(err) => self.emit_diagnostic(&format!(
+                "{}: adopted while starting, but could not be marked running ({err})",
+                name.as_str()
+            )),
+        }
+    }
+}
+
 /// The portable classification domain (story 18-3): only a code in
 /// `0..=255` can match a declared class — the `[exit_codes]` lists are
 /// validated to exactly that domain (the portable exit-code domain: unix
@@ -1929,6 +1972,15 @@ impl Supervisor {
                     // host, so it is never an orphan to clean up.
                     if !record.detach {
                         self.adopted_names.push(name.clone());
+                    }
+                    // Story 24-3: a row left `starting` by a host that died
+                    // mid-start (its readiness wait among them) is settled
+                    // here, never left `starting`.
+                    if registry
+                        .lookup(&name)
+                        .is_ok_and(|instance| instance.state == LifecycleState::Starting)
+                    {
+                        self.settle_adopted_starting(registry, &name);
                     }
                     // Story 21-2: the adoption KEEPS the Run (created here if
                     // the record predates Runs) and re-syncs its wire path
