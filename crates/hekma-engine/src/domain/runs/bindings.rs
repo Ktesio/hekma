@@ -482,7 +482,15 @@ pub(crate) fn table_of(rows: &[BindingRow]) -> BindingTable {
 pub(crate) fn published_table(
     store: &crate::store::SqliteStore,
 ) -> Result<BindingTable, StoreError> {
-    Ok(table_of(&store.bindings()?).with_identity_headers(store.proxy_identity_headers()?))
+    let since = crate::time::format_rfc3339(
+        crate::time::now_unix_secs()
+            .saturating_sub(crate::domain::runs::snapshot::RECENTLY_REVOKED_SECS),
+    );
+    let (active, revoked) = store
+        .proxy_access_credentials(&since, crate::domain::runs::snapshot::RECENTLY_REVOKED_MAX)?;
+    Ok(table_of(&store.bindings()?)
+        .with_identity_headers(store.proxy_identity_headers()?)
+        .with_proxy_access(active, revoked))
 }
 
 /// The `proxy_setting` event's schema version (story 21-8).
@@ -979,6 +987,9 @@ pub(crate) fn issue_credential(
         },
         at,
     )?;
+    // Story 22-5: the data path honours the new credential (and refuses a
+    // rotated one) on the next call.
+    job.publish_table()?;
     Ok((outcome, token_id))
 }
 
@@ -1014,6 +1025,7 @@ pub(crate) fn revoke_credential(
             class.as_str()
         )),
     }
+    job.publish_table()?;
     Ok(outcome)
 }
 

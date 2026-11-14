@@ -709,6 +709,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "toml",
  "webpki-roots",
  "windows-sys 0.61.2",

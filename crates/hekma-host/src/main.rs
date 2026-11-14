@@ -41,6 +41,10 @@ fn main() {
     let mut state_dir: Option<std::path::PathBuf> = None;
     let mut stop_window: Option<u64> = None;
     let mut metering_listen: u16 = 0;
+    let mut metering_listen_addr: Option<std::net::IpAddr> = None;
+    let mut proxy_tls_cert: Option<std::path::PathBuf> = None;
+    let mut proxy_tls_key: Option<std::path::PathBuf> = None;
+    let mut proxy_public_host: Option<String> = None;
     let mut control_listen: Option<std::net::SocketAddr> = None;
     let mut bearer_secret: Option<String> = None;
     let mut log_capture: Option<hekma_engine::LogCaptureMode> = None;
@@ -81,9 +85,31 @@ fn main() {
             }
             "--metering-listen" => {
                 i += 1;
-                match args.get(i).and_then(|v| v.parse::<u16>().ok()) {
-                    Some(port) => metering_listen = port,
-                    None => usage_error("--metering-listen needs a port number (0-65535)"),
+                match args.get(i).map(|v| hekma_host::parse_metering_listen(v)) {
+                    Some(Ok((addr, port))) => {
+                        metering_listen = port;
+                        metering_listen_addr = addr;
+                    }
+                    Some(Err(message)) => usage_error(&message),
+                    None => usage_error(
+                        "--metering-listen needs a port (0-65535) or an IP:PORT address",
+                    ),
+                }
+            }
+            "--proxy-tls-cert" | "--proxy-tls-key" | "--proxy-public-host" => {
+                let flag = args[i].clone();
+                i += 1;
+                match args.get(i) {
+                    Some(value) if !value.starts_with('-') => match flag.as_str() {
+                        "--proxy-tls-cert" => {
+                            proxy_tls_cert = Some(std::path::PathBuf::from(value));
+                        }
+                        "--proxy-tls-key" => {
+                            proxy_tls_key = Some(std::path::PathBuf::from(value));
+                        }
+                        _ => proxy_public_host = Some(value.clone()),
+                    },
+                    _ => usage_error(&format!("{flag} needs a value")),
                 }
             }
             "--listen" => {
@@ -209,6 +235,10 @@ fn main() {
         state_base: state_dir,
         stop_window,
         metering_listen_port: metering_listen,
+        metering_listen_addr,
+        proxy_tls_cert,
+        proxy_tls_key,
+        proxy_public_host,
         control_listen,
         bearer_secret,
         // Story 17-4 (review finding 17): the parsed flag (absent = the
@@ -259,8 +289,17 @@ fn usage_text() -> String {
          --stop-window <secs>     Graceful stop window for the shutdown drain, a\n    \
                                   whole number of seconds from 1 to 86400 (default:\n    \
                                   the engine's 30s)\n    \
-         --metering-listen <port> Fixed loopback port for observed metering\n    \
-                                  listeners (default: 0 = OS-ephemeral)\n    \
+         --metering-listen <port|ip:port>\n    \
+                                  The metering proxy's port (default: 0 = the\n    \
+                                  recorded port, else OS-picked), or an address\n    \
+                                  and port; beyond loopback it needs\n    \
+                                  --proxy-tls-cert and --proxy-tls-key\n    \
+         --proxy-tls-cert <pem>   The metering proxy's PEM certificate chain\n    \
+                                  (owner-only), for a bind beyond loopback\n    \
+         --proxy-tls-key <pem>    Its PEM private key (owner-only)\n    \
+         --proxy-public-host <name>\n    \
+                                  The host name clients on other machines use\n    \
+                                  (shown in the proxy's URLs)\n    \
          --listen <addr>          Expose the v0 Control API on this address\n    \
                                   (e.g. 127.0.0.1:8477). Default: off\n    \
          --bearer-secret <name>   The NAME of the bearer secret guarding the\n    \

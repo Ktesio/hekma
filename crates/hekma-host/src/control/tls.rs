@@ -40,6 +40,14 @@ pub(crate) fn load_server_config(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<Arc<rustls::ServerConfig>, String> {
+    // Story 22-5: both files owner-only (the secrets-file rule), for every
+    // listener this loader serves — checked before either is read.
+    for path in [cert_path, key_path] {
+        if path.exists() {
+            hekma_engine::check_owner_only_file(path)
+                .map_err(|reason| format!("the TLS file {reason}"))?;
+        }
+    }
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
         .map_err(|err| {
             format!(

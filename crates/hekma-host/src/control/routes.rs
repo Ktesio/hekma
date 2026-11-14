@@ -2181,7 +2181,8 @@ pub(crate) async fn binding_route_delete(
 /// of that class, rotating any previous one in the same job. The token is
 /// in this answer ONCE (its hash and token id are all that is stored). The
 /// note says what accepts it: an announce credential announces beneath its
-/// binding (story 23-2); nothing accepts a proxy-access one yet.
+/// binding (story 23-2); a proxy-access one authenticates calls to the
+/// metering proxy beyond loopback (story 22-5).
 pub(crate) async fn binding_credential_issue(
     State(state): State<ApiState>,
     Path(name): Path<String>,
@@ -2212,9 +2213,11 @@ pub(crate) fn credential_note(
             "This credential is shown once and is not stored. It announces Runs beneath binding \
              `{binding}` on POST /v0/runs/announce, and heartbeats or closes the Runs it creates."
         ),
-        hekma_engine::BindingCredentialClass::ProxyAccess => "This credential is shown once and \
-             is not stored. Nothing accepts it yet; the release that does will say so."
-            .to_string(),
+        hekma_engine::BindingCredentialClass::ProxyAccess => format!(
+            "This credential is shown once and is not stored. Clients on other machines send it \
+             as their API key to the metering proxy bound beyond loopback, on binding \
+             `{binding}`'s prefix only."
+        ),
     }
 }
 
@@ -2293,6 +2296,9 @@ fn proxy_document(state: &ApiState, settings: hekma_engine::ProxySettings) -> dt
         running: info.is_some(),
         url: info.as_ref().map(|info| info.url.clone()),
         port: info.as_ref().map(|info| info.port),
+        bind: info.as_ref().map(|info| info.bind.to_string()),
+        tls: info.as_ref().is_some_and(|info| info.tls),
+        public_url: info.as_ref().and_then(|info| info.public_url.clone()),
         error: state.engine.metering_proxy_error(),
         identity_headers: settings.identity_headers,
         stored_identity_headers: settings.stored_identity_headers,

@@ -24,7 +24,7 @@ use hyper::header::{HeaderName, HeaderValue};
 use hyper::{HeaderMap, Method, Request, Response, Uri};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::identify::{identify, Attribution, CallFacts, Identified, Refusal, Target, Via};
+use super::identify::{bearer, identify, Attribution, CallFacts, Identified, Refusal, Target, Via};
 use super::records::{new_call_id, RecordPump};
 use super::wire::{self, WireError};
 use crate::domain::calls::{
@@ -56,6 +56,10 @@ pub(crate) struct RefusalCounters {
     pub bad_target: AtomicU64,
     pub bad_host: AtomicU64,
     pub path_not_allowed: AtomicU64,
+    /// Story 22-5: calls beyond loopback with no credential, and
+    /// proxy-access credentials presented on another binding's prefix.
+    pub authentication_required: AtomicU64,
+    pub credential_out_of_scope: AtomicU64,
     /// Story 22-3: unscented calls served under `shadow` and refused under
     /// `enforce`.
     pub unscented_served: AtomicU64,
@@ -129,6 +133,9 @@ pub(crate) struct ProxyShared {
     /// Story 22-2: the `Origin` values the guard accepts
     /// (`--proxy-allowed-origins`); an `Origin` NOT on the list is refused.
     pub allowed_origins: Arc<[String]>,
+    /// Story 22-5: the listener binds beyond loopback (TLS on, every call
+    /// from a non-loopback peer authenticates, `hk_pxy_` honoured).
+    pub beyond_loopback: bool,
     /// Story 23-4: the per-Run hold queues.
     pub holds: Arc<super::hold::HoldQueues>,
     /// cfg(test) seam: slow each Run creation down inside the writer, so a
@@ -146,6 +153,8 @@ impl ProxyShared {
             Refusal::CredentialRevoked => &self.counters.credential_revoked,
             Refusal::RunOutOfScope => &self.counters.out_of_scope,
             Refusal::NoRoute => &self.counters.no_route,
+            Refusal::AuthenticationRequired => &self.counters.authentication_required,
+            Refusal::CredentialOutOfScope => &self.counters.credential_out_of_scope,
         };
         counter.fetch_add(1, Ordering::Relaxed);
         self.note_refusals();
@@ -162,7 +171,8 @@ impl ProxyShared {
             "metering proxy refusals so far: {} credential in URL, {} unknown credential, {} \
              revoked credential, {} Run Key in the API-key slot, {} out of scope, {} no route, \
              {} bad target, {} bad host, {} path outside the held key's list, {} busy, {} \
-             unscented served (shadow), {} unscented refused (enforce)",
+             unscented served (shadow), {} unscented refused (enforce), {} without a credential \
+             beyond loopback, {} proxy-access credential out of scope",
             c.credential_in_url.load(Ordering::Relaxed),
             c.unknown_credential.load(Ordering::Relaxed),
             c.credential_revoked.load(Ordering::Relaxed),
@@ -175,6 +185,8 @@ impl ProxyShared {
             c.busy.load(Ordering::Relaxed),
             c.unscented_served.load(Ordering::Relaxed),
             c.unscented_refused.load(Ordering::Relaxed),
+            c.authentication_required.load(Ordering::Relaxed),
+            c.credential_out_of_scope.load(Ordering::Relaxed),
         ));
     }
 
@@ -237,6 +249,8 @@ fn refusal_error(refusal: Refusal) -> WireError {
         Refusal::CredentialRevoked => WireError::CredentialRevoked,
         Refusal::RunOutOfScope => WireError::RunOutOfScope,
         Refusal::NoRoute => WireError::NoRoute,
+        Refusal::AuthenticationRequired => WireError::AuthenticationRequired,
+        Refusal::CredentialOutOfScope => WireError::CredentialOutOfScope,
     }
 }
 
@@ -280,6 +294,27 @@ fn host_is_loopback_literal(host: &str) -> bool {
 /// cross-site requests; SDKs send none). The refusal precedes
 /// identification and any dial, and no `Access-Control-*` header is ever
 /// added — a page's read of a response body fails in the browser regardless.
+/// The Host/Origin guard for a non-loopback peer on a listener bound
+/// beyond loopback (story 22-5): each list applies when configured; an
+/// empty list restricts nothing.
+fn remote_host_origin_ok(
+    headers: &HeaderMap,
+    allowed_hosts: &[String],
+    allowed_origins: &[String],
+) -> bool {
+    let listed = |value: &str, list: &[String]| {
+        list.iter()
+            .any(|allowed| allowed.trim().eq_ignore_ascii_case(value.trim()))
+    };
+    let host_ok = allowed_hosts.is_empty()
+        || header(headers, hyper::header::HOST.as_str()).is_some_and(|host| {
+            listed(host, allowed_hosts) || listed(host_name_part(host), allowed_hosts)
+        });
+    let origin_ok = allowed_origins.is_empty()
+        || header(headers, "origin").is_none_or(|origin| listed(origin, allowed_origins));
+    host_ok && origin_ok
+}
+
 fn host_origin_ok(
     headers: &HeaderMap,
     allowed_hosts: &[String],
@@ -760,16 +795,29 @@ async fn resolve_wire(shared: &ProxyShared, attribution: Attribution) -> Result<
 pub(crate) async fn serve(
     shared: Arc<ProxyShared>,
     req: Request<Incoming>,
+    peer_loopback: bool,
 ) -> Response<Full<Bytes>> {
     // Story 22-2: the Host/Origin guard runs FIRST — before the target
     // check, before identification, before any dial — so a rebinding-shaped
     // request never reaches the key. `OPTIONS` preflights meet the same
-    // guard (never a permissive answer, never a CORS header).
-    if !host_origin_ok(
-        req.headers(),
-        &shared.allowed_hosts,
-        &shared.allowed_origins,
-    ) {
+    // guard (never a permissive answer, never a CORS header). Story 22-5:
+    // from a non-loopback peer on a listener bound beyond loopback, the
+    // lists apply when configured and an empty list restricts nothing (TLS
+    // and the per-call credential carry that boundary).
+    let remote = shared.beyond_loopback && !peer_loopback;
+    if !(if remote {
+        remote_host_origin_ok(
+            req.headers(),
+            &shared.allowed_hosts,
+            &shared.allowed_origins,
+        )
+    } else {
+        host_origin_ok(
+            req.headers(),
+            &shared.allowed_hosts,
+            &shared.allowed_origins,
+        )
+    }) {
         shared.counters.bad_host.fetch_add(1, Ordering::Relaxed);
         drain_request_body(req.into_body()).await;
         shared.note_refusals();
@@ -784,7 +832,7 @@ pub(crate) async fn serve(
         shared.counters.busy.fetch_add(1, Ordering::Relaxed);
         return WireError::ProxyBusy.response();
     };
-    let response = serve_admitted(&shared, req).await;
+    let response = serve_admitted(&shared, req, peer_loopback).await;
     drop(slot);
     response
 }
@@ -792,6 +840,7 @@ pub(crate) async fn serve(
 async fn serve_admitted(
     shared: &Arc<ProxyShared>,
     req: Request<Incoming>,
+    peer_loopback: bool,
 ) -> Response<Full<Bytes>> {
     let started = Instant::now();
     let snapshot = shared.snapshot.current();
@@ -815,10 +864,23 @@ async fn serve_admitted(
                 hint: header(headers, wire::RUN_HINT_HEADER),
                 hint_labels: header(headers, wire::LABELS_HEADER),
                 announce: header(headers, wire::ANNOUNCE_HEADER),
+                beyond_loopback: shared.beyond_loopback,
+                peer_loopback,
             },
         )
     };
     let (target, attribution, hint_ignored) = match identified {
+        // Story 22-5: an unauthenticated call from the network is answered
+        // without reading its body, and its connection closes — a large
+        // body is never buffered for a caller with no credential.
+        Identified::Refused(Refusal::AuthenticationRequired) => {
+            shared.count(Refusal::AuthenticationRequired);
+            let mut response = WireError::AuthenticationRequired.response();
+            response
+                .headers_mut()
+                .insert(hyper::header::CONNECTION, HeaderValue::from_static("close"));
+            return response;
+        }
         Identified::Refused(refusal) => {
             shared.count(refusal);
             drain_request_body(req.into_body()).await;
@@ -913,7 +975,12 @@ async fn serve_resolved(
         permit: Some(permit),
         call_id: new_call_id(),
         run_id: run_id.clone(),
-        token_id: target.token_id.clone(),
+        // Story 22-5: a proxy-access credential's token id is recorded in
+        // the same field (it never makes the call scented).
+        token_id: target
+            .token_id
+            .clone()
+            .or_else(|| target.proxy_access.clone()),
         depth,
         binding: binding.clone(),
         started_at: crate::time::now_rfc3339_micros(),
@@ -1292,6 +1359,19 @@ async fn serve_resolved(
         HeaderName::from_static("x-goog-api-key"),
         HeaderName::from_static("api-key"),
     ] {
+        // Story 22-5: an `hk_` token (a proxy-access credential, which
+        // authenticated the call and is never a provider key) never reaches
+        // the upstream, with or without a custodied key.
+        if parts.headers.get(&name).is_some_and(|value| {
+            value.to_str().is_ok_and(|raw| {
+                let raw = raw.trim();
+                let raw = bearer(raw).unwrap_or(raw);
+                raw.len() >= 3 && raw.as_bytes()[..3].eq_ignore_ascii_case(b"hk_")
+            })
+        }) {
+            parts.headers.remove(&name);
+            continue;
+        }
         if let Some(value) = parts.headers.get_mut(&name) {
             value.set_sensitive(true);
         }
