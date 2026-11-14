@@ -570,6 +570,10 @@ fn the_next_owner_reads_the_previous_posture_and_cleans_up_after_an_off_crash() 
     assert_eq!(stopped.state, LifecycleState::Stopped);
     let run = second.blocking().run(run_id.as_str()).unwrap();
     assert_eq!(run.record.end_cause.as_deref(), Some("engine-crash"));
+    // The one summary: off, one cleaned, none kept.
+    let summary = second.blocking().commit_recovery(1).unwrap().unwrap();
+    assert_eq!(summary.posture, hekma_engine::RecoveryPosture::Off);
+    assert_eq!((summary.runs_cleaned, summary.runs_adopted), (1, 0));
     drop(second);
     // The second owner recorded `unset`: a third sees an unknown wish.
     let third = open_as_host(state.path(), HandoffPosture::On);
@@ -578,8 +582,90 @@ fn the_next_owner_reads_the_previous_posture_and_cleans_up_after_an_off_crash() 
         PreviousHost::Unknown
     );
     // An engine that owns no data path records and reads nothing.
+    assert!(
+        third.blocking().commit_recovery(0).unwrap().is_none(),
+        "nothing to reconcile"
+    );
     let plain = Engine::open(Some(state.path().to_path_buf())).unwrap();
     assert!(plain.host_recovery().is_none());
+    assert!(plain.blocking().commit_recovery(0).unwrap().is_none());
+}
+
+/// Story 24-3: a host start that reconciled something commits one
+/// `recovery` event summing it up — the previous mode, the agents kept, and
+/// the Shims found gone — on the bus and in the outbox; a start that found
+/// nothing records none.
+#[test]
+fn a_host_start_that_reconciles_commits_one_recovery_event_summing_it_up() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    use hekma_engine::{EngineEvent, HandoffPosture, RecoveryPosture};
+    let state = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    manifest(dir.path(), "kept", &["--linger-ms", "600000"]);
+    {
+        let first = open_as_host(state.path(), HandoffPosture::On);
+        let facade = first.blocking();
+        facade
+            .register_with_adapter("kept", &AdapterRef::Manifest(dir.path().to_path_buf()))
+            .unwrap();
+        facade.start("kept").unwrap();
+        // Dropped without a shutdown: a crash.
+    }
+    // The Shim dies while no host holds it; the agent lives on.
+    let (pid, socket) = record(state.path());
+    kill9(shim_pid(&socket).expect("the Shim runs"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while shim_pid(&socket).is_some() {
+        assert!(Instant::now() < deadline, "the Shim never died");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(alive(pid));
+    let second = open_as_host(state.path(), HandoffPosture::Unset);
+    assert_eq!(
+        second.host_recovery().unwrap().shims_lost,
+        vec!["kept".to_string()]
+    );
+    let mut events = second.subscribe();
+    let summary = second.blocking().commit_recovery(0).unwrap().unwrap();
+    assert_eq!(summary.posture, RecoveryPosture::On);
+    assert_eq!(
+        (
+            summary.runs_adopted,
+            summary.runs_cleaned,
+            summary.shims_lost,
+            summary.calls_closed_crash,
+            summary.calls_closed_recovered,
+        ),
+        (1, 0, 1, 0, 0)
+    );
+    let published = loop {
+        match events.try_recv() {
+            Ok(EngineEvent::Recovery(event)) => break event,
+            Ok(_) => continue,
+            Err(err) => panic!("no recovery event on the bus: {err:?}"),
+        }
+    };
+    assert_eq!(published, summary);
+    second
+        .blocking()
+        .stop("kept", Some(Duration::from_secs(5)))
+        .unwrap();
+    drop(second);
+    // The outbox kept it.
+    let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+    let kept: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM outbox WHERE event LIKE '%\"kind\":\"recovery\"%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, 1);
+    // Nothing left behind: nothing to sum up, so no event.
+    let third = open_as_host(state.path(), HandoffPosture::Unset);
+    assert!(third.blocking().commit_recovery(0).unwrap().is_none());
 }
 
 /// A diagnostic sink capturing into a shared buffer.

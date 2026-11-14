@@ -1009,6 +1009,13 @@ where
         if let Some(note) = recovery_note(&recovery, &cleaned, &failed) {
             notifier.note(&note);
         }
+        // The one durable summary of this reconcile.
+        if let Err(err) = engine.blocking().commit_recovery(cleaned.len()) {
+            notifier.note(&format!(
+                "the recovery summary could not be recorded ({err}); the agents and calls \
+                 above are settled all the same"
+            ));
+        }
     }
 
     // Story 24-2: say what a shutdown will do to the agents, and whether
@@ -1768,6 +1775,9 @@ mod identity_headers_note_tests {
         let recovery = |previous, adopted: &[&str]| HostRecovery {
             previous,
             adopted: adopted.iter().map(|name| name.to_string()).collect(),
+            shims_lost: Vec::new(),
+            calls_closed_crash: 0,
+            calls_closed_recovered: 0,
         };
         let off = recovery(PreviousHost::Gone { handoff: false }, &["a", "b"]);
         let note = super::recovery_note(&off, &["a".into()], &["b (busy)".into()]).unwrap();

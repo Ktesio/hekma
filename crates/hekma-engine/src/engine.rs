@@ -380,6 +380,12 @@ pub struct HostRecovery {
     pub previous: PreviousHost,
     /// The agents this engine's open took over (still running), sorted.
     pub adopted: Vec<String>,
+    /// The agents whose recorded Shim was gone at adoption, sorted.
+    pub shims_lost: Vec<String>,
+    /// Proxied calls left open that this open closed as `crash`.
+    pub calls_closed_crash: u64,
+    /// Proxied calls left open that this open closed as `recovered`.
+    pub calls_closed_recovered: u64,
 }
 
 /// The counters the OTLP exporter samples at each flush (story 24-5): the
@@ -774,9 +780,21 @@ impl Engine {
                 .map(|name| name.as_str().to_string())
                 .collect();
             adopted.sort();
+            let mut shims_lost: Vec<String> = supervisor
+                .take_shims_lost()
+                .into_iter()
+                .map(|name| name.as_str().to_string())
+                .collect();
+            shims_lost.sort();
             if let Some(previous) = previous {
-                *inner.recovery.lock().expect("recovery mutex poisoned") =
-                    Some(HostRecovery { previous, adopted });
+                let (calls_closed_crash, calls_closed_recovered) = registry.closed_calls;
+                *inner.recovery.lock().expect("recovery mutex poisoned") = Some(HostRecovery {
+                    previous,
+                    adopted,
+                    shims_lost,
+                    calls_closed_crash,
+                    calls_closed_recovered,
+                });
             }
             // Story 21-3: publish what the open produced (the policy sweep's
             // Run events, the FR-21 upgrade's one event) on the bus — they
@@ -2278,6 +2296,64 @@ impl Engine {
             .lock()
             .expect("recovery mutex poisoned")
             .clone()
+    }
+
+    /// Story 24-3: commit and publish the one `recovery` event that sums up
+    /// this open's reconcile, once the Service Host has cleaned up after
+    /// the previous owner (`runs_cleaned` agents stopped). `None` without a
+    /// recorded posture, while the previous owner is still alive (an
+    /// in-place upgrade hands over; nothing was recovered), and when the
+    /// open found nothing to reconcile (no agent left, no Shim lost, no
+    /// call left open). The host calls it once per start.
+    pub async fn commit_recovery(
+        &self,
+        runs_cleaned: usize,
+    ) -> Result<Option<crate::domain::recovery::RecoveryEvent>, EngineError> {
+        use crate::domain::recovery::{
+            RecoveryChange, RecoveryEvent, RecoveryPosture, RECOVERY_SCHEMA_VERSION,
+        };
+        self.refuse_if_read_only().map_err(EngineError::Store)?;
+        let Some(recovery) = self.host_recovery() else {
+            return Ok(None);
+        };
+        let posture = match recovery.previous {
+            PreviousHost::Live => return Ok(None),
+            PreviousHost::Unknown => RecoveryPosture::Unknown,
+            PreviousHost::Gone { handoff: true } => RecoveryPosture::On,
+            PreviousHost::Gone { handoff: false } => RecoveryPosture::Off,
+        };
+        // A start that found nothing to reconcile records nothing: the
+        // event marks work done, not every start.
+        if recovery.adopted.is_empty()
+            && recovery.shims_lost.is_empty()
+            && recovery.calls_closed_crash == 0
+            && recovery.calls_closed_recovered == 0
+        {
+            return Ok(None);
+        }
+        let event = RecoveryEvent {
+            schema_version: RECOVERY_SCHEMA_VERSION,
+            change: RecoveryChange::Recovered,
+            posture,
+            runs_adopted: recovery.adopted.len().saturating_sub(runs_cleaned) as u64,
+            runs_cleaned: runs_cleaned as u64,
+            calls_closed_crash: recovery.calls_closed_crash,
+            calls_closed_recovered: recovery.calls_closed_recovered,
+            shims_lost: recovery.shims_lost.len() as u64,
+            at: crate::time::now_rfc3339(),
+        };
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let append = registry
+                .commit_event(EngineEvent::Recovery(event.clone()))
+                .map_err(EngineError::Store)?;
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.note_outbox_append(&append);
+            supervisor.publish(append.seq, EngineEvent::Recovery(event.clone()));
+            Ok(Some(event))
+        })
+        .await
     }
 
     /// Story 24-3: stop an agent that a crashed owner left running while
@@ -4316,6 +4392,16 @@ impl Blocking<'_> {
     /// Blocking [`Engine::stop`].
     pub fn stop(&self, name: &str, window: Option<Duration>) -> Result<AgentInstance, EngineError> {
         self.engine.rt.block_on(self.engine.stop(name, window))
+    }
+
+    /// Blocking [`Engine::commit_recovery`] (story 24-3).
+    pub fn commit_recovery(
+        &self,
+        runs_cleaned: usize,
+    ) -> Result<Option<crate::domain::recovery::RecoveryEvent>, EngineError> {
+        self.engine
+            .rt
+            .block_on(self.engine.commit_recovery(runs_cleaned))
     }
 
     /// Blocking [`Engine::clean_up_after_crash`] (story 24-3).

@@ -454,6 +454,8 @@ fn event_instance(event: &EngineEvent) -> &str {
         EngineEvent::ProxySetting(_) => "",
         // Story 22-2: a reveal names its instance.
         EngineEvent::SecretRevealed(e) => &e.instance,
+        // Story 24-3: a reconcile summary is fleet-wide.
+        EngineEvent::Recovery(_) => "",
     }
 }
 

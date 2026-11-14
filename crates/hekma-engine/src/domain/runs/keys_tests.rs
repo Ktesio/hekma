@@ -1207,6 +1207,27 @@ fn two_tokens_sharing_a_token_id_are_recorded_and_authenticated_independently() 
 }
 
 #[test]
+fn a_recovery_event_has_no_subject_run() {
+    let w = world();
+    let event = EngineEvent::Recovery(crate::domain::recovery::RecoveryEvent {
+        schema_version: crate::domain::recovery::RECOVERY_SCHEMA_VERSION,
+        change: crate::domain::recovery::RecoveryChange::Recovered,
+        posture: crate::domain::recovery::RecoveryPosture::Off,
+        runs_adopted: 0,
+        runs_cleaned: 1,
+        calls_closed_crash: 0,
+        calls_closed_recovered: 0,
+        shims_lost: 0,
+        at: "2026-11-14T00:00:00Z".into(),
+    });
+    assert_eq!(w.registry.event_subject_run(&event), None);
+    assert!(matches!(
+        super::snapshot::subject_labels(&w.registry.run_snapshot(), &event),
+        super::snapshot::SubjectLabels::NoSubject
+    ));
+}
+
+#[test]
 fn the_snapshot_subject_of_a_credential_event_is_its_run() {
     let w = world();
     let (child, _) = w.operator_child();
