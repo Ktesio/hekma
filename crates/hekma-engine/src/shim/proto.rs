@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ports::{LogCaptureMode, ProcessFingerprint, SpawnSpec};
+use crate::ports::{LogCaptureMode, SpawnSpec};
 
 /// A `shim-rpc` version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,11 +283,6 @@ impl ShimFrame {
     }
 }
 
-/// The fingerprint of a `spawned` reply.
-pub fn fingerprint(pid: u32, start_time: u64) -> ProcessFingerprint {
-    ProcessFingerprint::new(pid, start_time)
-}
-
 /// Hex of stdin bytes (the frame's encoding).
 pub fn encode_bytes(bytes: &[u8]) -> String {
     super::secret::to_hex(bytes)
@@ -372,6 +367,43 @@ mod tests {
             serde_json::from_str::<ShimFrame>(line.trim()).unwrap(),
             reply
         );
+    }
+
+    #[test]
+    fn every_op_debugs_without_payloads_and_every_code_has_a_message() {
+        let ops = [
+            Op::Stop { graceful_ms: 5 },
+            Op::Pause,
+            Op::Resume,
+            Op::Poll,
+            Op::Status,
+            Op::AckExit,
+            Op::WriteStdin {
+                data: encode_bytes(b"SENTINEL-STDIN"),
+            },
+        ];
+        for op in ops {
+            let shown = format!("{:?}", Request { id: 1, op });
+            assert!(!shown.is_empty() && !shown.contains("53454e54"), "{shown}");
+        }
+        let codes = [
+            ErrorCode::SecretMismatch,
+            ErrorCode::PeerRefused,
+            ErrorCode::Busy,
+            ErrorCode::Version,
+            ErrorCode::OpUnknown,
+            ErrorCode::ChildGone,
+            ErrorCode::BadFrame,
+            ErrorCode::WrongState,
+            ErrorCode::Backend,
+        ];
+        for code in codes {
+            assert!(!code.message().is_empty());
+            let Outcome::Error { message, .. } = Outcome::error(code) else {
+                unreachable!()
+            };
+            assert_eq!(message, code.message());
+        }
     }
 
     #[test]

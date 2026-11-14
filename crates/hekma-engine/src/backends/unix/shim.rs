@@ -197,10 +197,12 @@ mod tests {
         let path = shims.join("s-stale.sock");
         std::fs::write(&path, b"").unwrap();
         let live = listen(&path).unwrap();
-        match listen(&path) {
-            Err(err) => assert_eq!(err.kind(), io::ErrorKind::AddrInUse),
-            Ok(_) => panic!("a live socket must not be replaced"),
-        }
+        let replaced = listen(&path).err().map(|err| err.kind());
+        assert_eq!(
+            replaced,
+            Some(io::ErrorKind::AddrInUse),
+            "a live socket stays"
+        );
         drop(live);
         assert!(!path.exists(), "the listener removes its socket");
     }
@@ -251,10 +253,8 @@ mod tests {
         engine.write_stdin(b"hello\n").unwrap();
         let deadline = std::time::Instant::now() + BOUND;
         let exit = loop {
-            if let Some(exit) = engine.take_pushed_exit() {
-                break exit;
-            }
-            if let Some(exit) = engine.poll().unwrap() {
+            let found = engine.take_pushed_exit().or_else(|| engine.poll().unwrap());
+            if let Some(exit) = found {
                 break exit;
             }
             assert!(
@@ -305,5 +305,190 @@ mod tests {
         // Never launched: the idle linger ends it.
         let idle = start(Duration::from_millis(200), Duration::from_secs(30));
         assert_eq!(idle.thread.join().unwrap(), ShimExit::NeverLaunched);
+    }
+
+    /// One raw line out, one frame back (the wire as an engine sees it).
+    struct Raw {
+        writer: UnixStream,
+        reader: std::io::BufReader<UnixStream>,
+    }
+
+    impl Raw {
+        fn open(path: &Path) -> Raw {
+            let writer = UnixStream::connect(path).unwrap();
+            writer.set_read_timeout(Some(BOUND)).unwrap();
+            let reader = std::io::BufReader::new(writer.try_clone().unwrap());
+            Raw { writer, reader }
+        }
+
+        fn ask(&mut self, line: &str) -> serde_json::Value {
+            use std::io::{BufRead, Write};
+            self.writer.write_all(line.as_bytes()).unwrap();
+            self.writer.write_all(b"\n").unwrap();
+            loop {
+                let mut text = String::new();
+                self.reader.read_line(&mut text).unwrap();
+                let frame: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+                if frame["frame"] == "reply" {
+                    return frame;
+                }
+            }
+        }
+
+        fn code(&mut self, line: &str) -> String {
+            let frame = self.ask(line);
+            frame["outcome"]["code"].as_str().unwrap_or("").to_string()
+        }
+    }
+
+    #[test]
+    fn every_request_out_of_turn_is_refused_by_its_code() {
+        let shim = start(Duration::from_secs(30), Duration::from_secs(30));
+        // A first frame that is not a hello, and one that is not JSON.
+        assert_eq!(
+            Raw::open(&shim.path).code(r#"{"id":3,"op":"status"}"#),
+            "bad-frame"
+        );
+        assert_eq!(Raw::open(&shim.path).code("not json"), "bad-frame");
+        let mut raw = Raw::open(&shim.path);
+        let hello = format!(
+            r#"{{"id":1,"op":"hello","v":{{"major":1,"minor":0}},"secret":"{}","engine_pid":1}}"#,
+            secret::to_hex(&shim.secret)
+        );
+        assert_eq!(raw.ask(&hello)["outcome"]["kind"], "hello_ack");
+        // Before a launch: everything but status is out of turn.
+        assert_eq!(
+            raw.code(&hello.replace(r#""id":1"#, r#""id":2"#)),
+            "wrong-state"
+        );
+        for op in [
+            r#"{"id":4,"op":"stop","graceful_ms":10}"#,
+            r#"{"id":5,"op":"pause"}"#,
+            r#"{"id":6,"op":"resume"}"#,
+            r#"{"id":7,"op":"poll"}"#,
+            r#"{"id":8,"op":"write_stdin","data":"6869"}"#,
+            r#"{"id":9,"op":"ack_exit"}"#,
+        ] {
+            assert_eq!(raw.code(op), "wrong-state", "{op}");
+        }
+        assert_eq!(
+            raw.code(r#"{"id":10,"op":"write_stdin","data":"zz"}"#),
+            "bad-frame"
+        );
+        assert_eq!(raw.code("{broken"), "bad-frame");
+        let status = raw.ask(r#"{"id":11,"op":"status"}"#);
+        assert_eq!(status["outcome"]["status"]["launched"], false);
+        // A spawn the backend cannot take (an unknown capture mode).
+        let dir = tempfile::tempdir().unwrap();
+        let mut bad = spec("exit 0", false, &dir.path().join("agent.log"));
+        bad.capture_mode = "sideways".into();
+        let line = |id: u64, spec: &ShimSpawn| {
+            format!(
+                r#"{{"id":{id},"op":"spawn","spec":{}}}"#,
+                serde_json::to_string(spec).unwrap()
+            )
+        };
+        assert_eq!(raw.code(&line(12, &bad)), "bad-frame");
+        // A launch, then a second one; then the child exits.
+        let good = spec("sleep 0.2", true, &dir.path().join("agent.log"));
+        assert_eq!(raw.ask(&line(13, &good))["outcome"]["kind"], "spawned");
+        assert_eq!(raw.code(&line(14, &good)), "wrong-state");
+        assert_eq!(
+            raw.ask(r#"{"id":15,"op":"pause"}"#)["outcome"]["kind"],
+            "done"
+        );
+        assert_eq!(
+            raw.ask(r#"{"id":16,"op":"resume"}"#)["outcome"]["kind"],
+            "done"
+        );
+        let deadline = std::time::Instant::now() + BOUND;
+        while raw.ask(r#"{"id":17,"op":"poll"}"#)["outcome"]["exit"].is_null() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            raw.code(r#"{"id":18,"op":"write_stdin","data":"6869"}"#),
+            "child-gone"
+        );
+        assert_eq!(
+            raw.ask(r#"{"id":19,"op":"ack_exit"}"#)["outcome"]["kind"],
+            "done"
+        );
+        assert_eq!(shim.thread.join().unwrap(), ShimExit::Acknowledged);
+    }
+
+    /// A fake Shim on one end of a socket pair: answers each request with
+    /// the next scripted frame line.
+    fn fake_shim(frames: Vec<String>) -> Box<dyn ShimStream> {
+        let (engine, shim) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let mut reader = std::io::BufReader::new(shim.try_clone().unwrap());
+            let mut writer = shim;
+            for frame in frames {
+                let mut request = String::new();
+                if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                    return;
+                }
+                let _ = writer.write_all(frame.as_bytes());
+            }
+        });
+        Box::new(engine)
+    }
+
+    #[test]
+    fn the_client_reports_a_foreign_version_an_unexpected_answer_and_a_closed_shim() {
+        let ack = |major: u32| {
+            format!(
+                "{}\n",
+                serde_json::json!({"frame":"reply","id":1,"outcome":{"kind":"hello_ack",
+                    "v":{"major":major,"minor":0},"status":crate::shim::proto::ShimStatus::default()}})
+            )
+        };
+        let foreign = ShimClient::hello(fake_shim(vec![ack(9)]), &[1; 32], BOUND).unwrap_err();
+        assert!(matches!(foreign, ShimClientError::Version(_)), "{foreign}");
+        assert!(foreign.to_string().contains("9.0"));
+        let odd = r#"{"frame":"reply","id":1,"outcome":{"kind":"done"}}"#.to_string() + "\n";
+        let unexpected = ShimClient::hello(fake_shim(vec![odd.clone()]), &[1; 32], BOUND);
+        assert!(matches!(unexpected, Err(ShimClientError::Unexpected)));
+        // A reply to another id is skipped; a pushed exit is kept; every
+        // verb answered with the wrong outcome is Unexpected; then EOF.
+        let stale = r#"{"frame":"reply","id":99,"outcome":{"kind":"done"}}"#.to_string() + "\n";
+        let pushed =
+            r#"{"frame":"exit","exit":{"code":3,"at":"2026-11-14T00:00:00Z"}}"#.to_string() + "\n";
+        let reply = |id: u64, outcome: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"frame":"reply","id":id,"outcome":{"kind":outcome}})
+            )
+        };
+        let mut frames = vec![stale + &pushed + &ack(1)];
+        for (id, outcome) in [(2, "done"), (3, "done"), (4, "done"), (5, "spawned_never")] {
+            frames.push(reply(id, outcome));
+        }
+        frames.push(reply(6, "done"));
+        frames.push(reply(7, "stopped_never"));
+        let (mut client, _) = ShimClient::hello(fake_shim(frames), &[1; 32], BOUND).unwrap();
+        assert!(format!("{client:?}").contains("ShimClient"));
+        assert_eq!(
+            client.take_pushed_exit().and_then(|exit| exit.code),
+            Some(3)
+        );
+        assert!(matches!(client.poll(), Err(ShimClientError::Unexpected)));
+        assert!(matches!(client.status(), Err(ShimClientError::Unexpected)));
+        assert!(matches!(
+            client.stop(Duration::from_millis(1)),
+            Err(ShimClientError::Unexpected)
+        ));
+        assert!(client.pause().is_err());
+        assert!(matches!(
+            client.spawn(spec("exit 0", false, Path::new("/tmp/x.log"))),
+            Err(ShimClientError::Unexpected)
+        ));
+        assert!(client.resume().is_err());
+        assert!(matches!(client.ack_exit(), Err(ShimClientError::Io(_))));
     }
 }
