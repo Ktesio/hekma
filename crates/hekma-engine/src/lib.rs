@@ -259,7 +259,7 @@ pub use metering::proxy::{MeteringProxyOptions, ProxyInfo, ProxyStartError, Prox
 // The shutdown drain's public surface (issue #328 item 3): the planner, the
 // per-instance outcome vocabulary, and (via `Engine::shutdown` / its
 // `blocking()` twin) the drain itself.
-pub use shutdown::{drain_plan, DrainOutcome, StopResult};
+pub use shutdown::{drain_plan, DrainOutcome, HandoffShutdown, StopResult};
 // Story 19-1: the governance conformance vectors (AD-7/FR-44) — the embedded
 // artifact bytes plus the version/checksum accessors a Host pins against, and
 // the pure `decide` core the artifact is generated from. Additive surface.

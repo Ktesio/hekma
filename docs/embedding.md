@@ -328,6 +328,12 @@ graceful path is a contract the embedder owns:
   `Graceful`, `Forced` (the window elapsed and the ladder escalated),
   `ExitedOnItsOwn`, `Unverified`, or `Failed` with the reason — so a failed
   stop degrades the shutdown's tidiness, never its honesty.
+- **Handoff Mode: `shutdown_for_handoff(window, notes)`** stops the metering
+  proxy as `shutdown` does, then releases every agent held through a Shim
+  (no stop is sent; the agent keeps running for the next engine, which
+  reconnects to it on open) and drains every agent still held directly. It
+  returns a `HandoffShutdown` with the `released` names and the drain's
+  `outcomes`.
 - **Notices are optional.** Pass `Some(&sink)` (a
   [`DiagnosticSink`](#the-diagnostic-sink)) to get the same `[hekma] `
   progress lines `serve` prints at shutdown; pass `None` for return values
