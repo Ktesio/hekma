@@ -169,6 +169,11 @@ fn render(
         })
         .collect::<Vec<_>>();
     ui::print_table("Runs", &columns, &rows);
+    for item in &listing.items {
+        for note in bypass_notes(item.record.run_id.as_str(), item.bypass.as_ref()) {
+            ui::note(note);
+        }
+    }
     footer(listing, all, next_page);
     Ok(())
 }
@@ -306,11 +311,73 @@ fn anomalies_cell(item: &hekma_engine::RunSummary) -> String {
                 unique.dedup();
                 parts.push(format!("breach[{}]", unique.join(",")));
             }
+        } else if *anomaly == hekma_engine::Anomaly::Bypass {
+            // Story 22-4: the Anomaly names the host(s) it reached.
+            let hosts = item
+                .bypass
+                .as_ref()
+                .map(|bypass| bypass.hosts.join(","))
+                .unwrap_or_default();
+            if hosts.is_empty() {
+                parts.push("bypass".to_string());
+            } else {
+                parts.push(format!("bypass[{hosts}]"));
+            }
         } else {
             parts.push(anomaly.as_str().to_string());
         }
     }
     parts.join(",")
+}
+
+/// Story 22-4: the note lines a Run's bypass slice earns — hosts reached
+/// directly that are expected (why, by name), and detection that could not
+/// run (why). A Run with the `bypass` Anomaly is named in its cell instead;
+/// `active` with no hosts and `unreported` add nothing here (`run show` and
+/// `--json` carry every state).
+pub(crate) fn bypass_notes(run_id: &str, bypass: Option<&hekma_engine::BypassView>) -> Vec<String> {
+    let Some(bypass) = bypass else {
+        return Vec::new();
+    };
+    let mut notes = Vec::new();
+    if let Some(why) = bypass.informational.as_deref() {
+        let hosts = bypass.hosts.join(", ");
+        let reason = match why {
+            "no-wire" => {
+                "this Run has no wire path (its agent holds its own provider key), so that is \
+                 expected until key custody is turned on"
+            }
+            _ => "key custody is off for this Run, so that is expected",
+        };
+        notes.push(format!("{run_id} reached {hosts} directly; {reason}"));
+    }
+    if bypass.detection == "unavailable" {
+        let reason = bypass
+            .reason
+            .as_deref()
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default();
+        notes.push(format!(
+            "bypass detection is unavailable for {run_id}{reason}"
+        ));
+    }
+    notes
+}
+
+/// Story 22-4: a Run's bypass slice on one line (`run show`): the state,
+/// the reason, and the hosts with why they are informational.
+pub(crate) fn bypass_cell(bypass: &hekma_engine::BypassView) -> String {
+    let mut out = bypass.detection.clone();
+    if let Some(reason) = &bypass.reason {
+        out.push_str(&format!(" ({reason})"));
+    }
+    if !bypass.hosts.is_empty() {
+        out.push_str(&format!(" · reached {}", bypass.hosts.join(", ")));
+        if let Some(why) = &bypass.informational {
+            out.push_str(&format!(" (informational: {why})"));
+        }
+    }
+    out
 }
 
 /// The LABELS cell: `k=v`, a Caller label suffixed `(caller)`.
@@ -439,6 +506,7 @@ mod tests {
             identity: None,
             before_shared_proxy: false,
             custody: None,
+            bypass: None,
             dispositions: Vec::new(),
             held_calls: 0,
             oldest_held_age_secs: None,
@@ -726,5 +794,75 @@ mod tests {
         assert_eq!(status_cell(&item), "held (3 calls)");
         item.oldest_held_age_secs = Some(12);
         assert_eq!(status_cell(&item), "held (3 calls, oldest 12s)");
+    }
+
+    #[test]
+    fn a_bypass_names_its_hosts_and_expected_or_unchecked_ones_are_notes() {
+        let mut item = summary("run_B", true);
+        item.record.anomalies = vec![Anomaly::Bypass];
+        item.bypass = Some(hekma_engine::BypassView {
+            detection: "active".into(),
+            reason: None,
+            hosts: vec!["api.x.com".into(), "api.y.com".into()],
+            informational: None,
+        });
+        assert_eq!(anomalies_cell(&item), "bypass[api.x.com,api.y.com]");
+        assert!(bypass_notes("run_B", item.bypass.as_ref()).is_empty());
+        assert_eq!(
+            bypass_cell(item.bypass.as_ref().unwrap()),
+            "active · reached api.x.com, api.y.com"
+        );
+        item.bypass = None;
+        assert_eq!(anomalies_cell(&item), "bypass");
+
+        let expected = hekma_engine::BypassView {
+            detection: "active".into(),
+            reason: None,
+            hosts: vec!["api.x.com".into()],
+            informational: Some("no-wire".into()),
+        };
+        assert_eq!(
+            bypass_notes("run_N", Some(&expected)),
+            vec![
+                "run_N reached api.x.com directly; this Run has no wire path (its agent holds \
+                 its own provider key), so that is expected until key custody is turned on"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            bypass_cell(&expected),
+            "active · reached api.x.com (informational: no-wire)"
+        );
+        let off = hekma_engine::BypassView {
+            informational: Some("custody-off".into()),
+            ..expected.clone()
+        };
+        assert!(bypass_notes("run_O", Some(&off))[0]
+            .ends_with("key custody is off for this Run, so that is expected"));
+        let unavailable = hekma_engine::BypassView {
+            detection: "unavailable".into(),
+            reason: Some("the tree could not be read".into()),
+            hosts: Vec::new(),
+            informational: None,
+        };
+        assert_eq!(
+            bypass_notes("run_U", Some(&unavailable)),
+            vec![
+                "bypass detection is unavailable for run_U: the tree could not be read".to_string()
+            ]
+        );
+        assert_eq!(
+            bypass_cell(&unavailable),
+            "unavailable (the tree could not be read)"
+        );
+        let unreported = hekma_engine::BypassView {
+            detection: "unreported".into(),
+            reason: None,
+            hosts: Vec::new(),
+            informational: None,
+        };
+        assert!(bypass_notes("run_R", Some(&unreported)).is_empty());
+        assert_eq!(bypass_cell(&unreported), "unreported");
+        assert!(bypass_notes("run_X", None).is_empty());
     }
 }

@@ -258,3 +258,59 @@ fn the_exporter_state_switches_exposition_and_keeps_v1_whole() {
     assert_eq!(received[0]["asInt"], "7");
     assert_eq!(received[1]["asInt"], "2");
 }
+
+/// Story 22-4: a Run event naming a bypass detection.
+fn detected(run: &str, cause: &str) -> EngineEvent {
+    let mut event: hekma_engine::RunEvent = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "change": "bypass-detected",
+        "run_id": run,
+        "control_depth": "supervised",
+        "wire_path": true,
+        "status": "active",
+        "anomalies": ["bypass"],
+        "labels": [],
+        "cause": cause,
+        "at": "t",
+    }))
+    .unwrap();
+    event.labels = vec![hekma_engine::Label::bound("team", "core")];
+    EngineEvent::Run(event)
+}
+
+#[test]
+fn a_bypass_counts_by_host_with_the_run_as_exemplar_and_informational_ones_do_not() {
+    let mut state = MetricStateV2::new(1, "svc".into(), vec!["team".into()], 200);
+    let doc = json(&state);
+    assert!(
+        metric(&doc, "hekma.bypass.detected").is_none(),
+        "nothing yet"
+    );
+    state.observe_at(&detected("run_A", "api.x.com"), 2);
+    state.observe_at(&detected("run_B", "api.x.com"), 3);
+    state.observe_at(&detected("run_C", "api.y.com (informational: no-wire)"), 4);
+    let doc = json(&state);
+    let points = metric(&doc, "hekma.bypass.detected").unwrap()["sum"]["dataPoints"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(points.len(), 1, "the informational one is not a bypass");
+    let point = &points[0];
+    let found = attrs(point);
+    assert!(found.contains(&("hekma.provider.host".into(), "api.x.com".into())));
+    assert!(found.contains(&("hekma.control_depth".into(), "supervised".into())));
+    assert!(found.contains(&("hekma.label.team".into(), "core".into())));
+    assert!(found.iter().all(|(key, _)| key != "hekma.run_id"));
+    assert_eq!(point["asInt"], "2");
+    let runs: Vec<&str> = point["exemplars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            e["filteredAttributes"][0]["value"]["stringValue"]
+                .as_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(runs, vec!["run_B", "run_A"]);
+}

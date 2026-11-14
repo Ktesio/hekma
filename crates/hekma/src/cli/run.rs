@@ -810,6 +810,10 @@ fn render_text(view: &RunView, verb: &str) -> String {
     if let Some(custody) = &view.custody {
         row("CUSTODY", crate::cli::ps::custody_cell(Some(custody)));
     }
+    // Story 22-4: the bypass detection slice of a Run that owns a process.
+    if let Some(bypass) = &view.bypass {
+        row("BYPASS", crate::cli::ps::bypass_cell(bypass));
+    }
     row("STATUS", record.status.as_str().to_string());
     // Story 23-2: the Lease (announced or heartbeated Runs) and the last
     // sign of life, when the Run has them.
@@ -1022,5 +1026,32 @@ mod tests {
             !text.contains("LEASE") && !text.contains("LAST SEEN"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn run_show_renders_the_bypass_slice_of_a_process_owning_run() {
+        let doc = serde_json::json!({
+            "run_id": "run_01JZ6Q9G3S8V2X7K4M1N5P0R2T",
+            "control_depth": "supervised",
+            "wire_path": true,
+            "status": "active",
+            "anomalies": ["bypass"],
+            "process_owner": true,
+            "created_at": "2026-11-13T00:00:00Z",
+            "updated_at": "2026-11-13T00:00:00Z",
+            "labels": [],
+            "limits": {},
+            "usage": {"input_tokens": 0, "output_tokens": 0, "cost_micros": 0,
+                      "estimate": "estimated"},
+            "open_children": 0,
+            "bypass": {"detection": "active", "hosts": ["api.x.com"]},
+        });
+        let view: RunView = serde_json::from_value(doc).unwrap();
+        let text = render_text(&view, "");
+        assert!(
+            text.contains("BYPASS       active · reached api.x.com"),
+            "{text}"
+        );
+        assert!(text.contains("ANOMALIES    bypass"), "{text}");
     }
 }

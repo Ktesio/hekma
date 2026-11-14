@@ -227,6 +227,12 @@ pub struct RunSummary {
     /// Absent on Runs that own no process (a binding's Run, a child).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custody: Option<CustodyView>,
+    /// Story 22-4: the Run's bypass detection, when it owns a supervised
+    /// process: the state (`unreported`, `active`, `unavailable`), the
+    /// listed hosts its tree reached directly, and why those are
+    /// informational when they are not the `bypass` Anomaly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass: Option<BypassView>,
     /// Story 23-4: the Run's wire disposition reasons (`hold`, `reject`,
     /// `reroute <binding>/<route>`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -278,6 +284,60 @@ impl CustodyView {
                 state: "off".to_string(),
                 reason: "pre-custody".to_string(),
             },
+        }
+    }
+}
+
+/// A Run's bypass detection slice (story 22-4): host names and a state —
+/// never an address. Silence means checked only beside `active`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BypassView {
+    /// `unreported` (no report yet: the first check is pending, or the
+    /// agent does not run through a Shim), `active` (checked on every
+    /// interval) or `unavailable` (the tree could not be read; see
+    /// `reason`).
+    pub detection: String,
+    /// Why detection is `unavailable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The listed provider hosts the Run's process tree reached directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    /// Why `hosts` are expected rather than the `bypass` Anomaly:
+    /// `no-wire` (the agent holds its own provider key) or `custody-off`.
+    /// Absent when there are no hosts or they are the Anomaly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub informational: Option<String>,
+}
+
+impl BypassView {
+    /// Derive the view from the stored slice and the Run's wire path and
+    /// custody (the same verdict the report was recorded under).
+    pub(crate) fn of(
+        stored: Option<crate::ports::RunBypassRow>,
+        record: &RunRecord,
+        custody: Option<&crate::ports::RunCustodyRow>,
+    ) -> Self {
+        use crate::domain::bypass::{bypass_verdict, BypassVerdict};
+        let stored = stored.unwrap_or_else(|| crate::ports::RunBypassRow {
+            detection: "unreported".to_string(),
+            ..Default::default()
+        });
+        let custody_on = custody.is_some_and(|row| row.state == "on");
+        let informational = if stored.hosts.is_empty() {
+            None
+        } else {
+            match bypass_verdict(record.wire_path, Some(custody_on)) {
+                BypassVerdict::Anomaly => None,
+                BypassVerdict::NoWire => Some("no-wire".to_string()),
+                BypassVerdict::CustodyOff => Some("custody-off".to_string()),
+            }
+        };
+        Self {
+            detection: stored.detection,
+            reason: stored.reason,
+            hosts: stored.hosts,
+            informational,
         }
     }
 }
@@ -586,6 +646,7 @@ pub(crate) fn summarize(
         identity,
         before_shared_proxy,
         custody,
+        bypass: None,
         dispositions: Vec::new(),
         held_calls: 0,
         oldest_held_age_secs: None,
@@ -668,11 +729,22 @@ pub(crate) fn assemble<S: crate::ports::RunRecords + crate::ports::RunStore + ?S
         let before_shared_proxy = legacy.as_ref().is_some_and(|legacy| legacy == &run_id);
         // Story 22-2: custody surfaces on process-owning rows only (a
         // binding's Run or a child holds no process environment to fence).
-        let custody = if process_owner {
-            Some(CustodyView::of(store.run_custody(&run_id)?))
+        let custody_row = if process_owner {
+            store.run_custody(&run_id)?
         } else {
             None
         };
+        // Story 22-4: the bypass slice, on process-owning rows only.
+        let bypass = if process_owner {
+            Some(BypassView::of(
+                store.run_bypass(&run_id)?,
+                &record,
+                custody_row.as_ref(),
+            ))
+        } else {
+            None
+        };
+        let custody = process_owner.then(|| CustodyView::of(custody_row));
         let mut summary = summarize(
             record,
             labels,
@@ -685,6 +757,7 @@ pub(crate) fn assemble<S: crate::ports::RunRecords + crate::ports::RunStore + ?S
             before_shared_proxy,
             custody,
         );
+        summary.bypass = bypass;
         // Story 23-4: the held figures the proxy reported, and the reasons.
         let (held, oldest, last_end) = store.run_held(&run_id)?;
         summary.dispositions = store.run_disposition_reasons(&run_id)?;
