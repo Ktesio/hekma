@@ -14,8 +14,13 @@
 //! whole process group. Found from `XPC_SERVICE_NAME` (the job's label) and
 //! the `properties` line `launchctl print` reports for it.
 //!
-//! Other managers (Docker, supervisord) and Windows job breakaway are not
-//! checked yet.
+//! A container: when this host is the container's first process (PID 1),
+//! its exit ends the container and every agent in it, so the verdict is
+//! `unsafe`. Otherwise agents outlive the host only while the container's
+//! first process keeps running, which Hekma cannot see: `unverified`. Found
+//! from `/.dockerenv`, `/run/.containerenv` or a container cgroup path.
+//!
+//! supervisord and Windows job breakaway are not checked yet.
 
 /// The verdict.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +59,12 @@ impl HandoffCheck {
                 "the service manager keeps agents in their own Shim running when this host stops \
                  ({setting})"
             ),
+            HandoffCheck::Unsafe(setting) if setting.starts_with("container") => format!(
+                "this host's exit ends its container ({setting}), and every agent in it, agents \
+                 in their own Shim included: run the host under a process that outlives it (a \
+                 shell or process supervisor as the container's first process) for Handoff Mode \
+                 and in-place upgrades to keep them running"
+            ),
             HandoffCheck::Unsafe(setting) if setting.starts_with("launchd") => format!(
                 "the service manager stops this host's whole process group with it ({setting}), \
                  agents in their own Shim included: set AbandonProcessGroup to true in the job's \
@@ -81,13 +92,48 @@ pub fn check() -> HandoffCheck {
     let invocation_id = std::env::var("INVOCATION_ID").ok();
     let label = std::env::var("XPC_SERVICE_NAME").ok();
     let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok();
-    check_either(
+    let marker = ["/.dockerenv", "/run/.containerenv"]
+        .iter()
+        .any(|path| std::path::Path::new(path).exists());
+    let verdict = check_either(
         invocation_id.as_deref(),
         label.as_deref(),
         cgroup.as_deref(),
         &query_kill_mode,
         &query_launchd_properties,
-    )
+    );
+    container_check(verdict, marker, cgroup.as_deref(), std::process::id())
+}
+
+/// A container's verdict, when systemd and launchd left it unverified:
+/// `marker` is whether a container runtime's marker file exists, `cgroup`
+/// this process's cgroup text, `pid` its process id (the seam for
+/// [`check`]).
+pub(crate) fn container_check(
+    verdict: HandoffCheck,
+    marker: bool,
+    cgroup: Option<&str>,
+    pid: u32,
+) -> HandoffCheck {
+    let runtime_cgroup = cgroup.is_some_and(|text| {
+        ["docker", "containerd", "kubepods", "libpod"]
+            .iter()
+            .any(|runtime| text.contains(runtime))
+    });
+    if !matches!(verdict, HandoffCheck::Unverified(_)) || !(marker || runtime_cgroup) {
+        return verdict;
+    }
+    if pid == 1 {
+        HandoffCheck::Unsafe(
+            "container: this host is the container's first process (PID 1)".to_string(),
+        )
+    } else {
+        HandoffCheck::Unverified(
+            "in a container: agents outlive this host only while the container's first process \
+             keeps running, and stopping the container ends them all"
+                .to_string(),
+        )
+    }
 }
 
 /// Which manager decides: systemd when it started this process, else
@@ -301,6 +347,33 @@ mod tests {
         } else {
             assert!(properties.is_none());
         }
+    }
+
+    #[test]
+    fn a_container_host_is_unsafe_as_pid_1_and_unverified_otherwise() {
+        let unknown = || HandoffCheck::Unverified("not started by systemd".into());
+        let docker = Some("0::/docker/abc123\n");
+        let pid1 = container_check(unknown(), false, docker, 1);
+        assert_eq!(pid1.as_str(), "unsafe");
+        let note = pid1.note();
+        assert!(note.contains("ends its container"));
+        assert!(!note.contains("KillMode"));
+        let child = container_check(unknown(), true, None, 42);
+        assert!(child.detail().contains("in a container"));
+        assert_eq!(child.as_str(), "unverified");
+        for runtime in ["kubepods", "containerd", "libpod"] {
+            let cgroup = format!("0::/{runtime}/x\n");
+            assert_eq!(
+                container_check(unknown(), false, Some(&cgroup), 1).as_str(),
+                "unsafe"
+            );
+        }
+        // Not a container: unchanged.
+        let plain = container_check(unknown(), false, Some("0::/user.slice\n"), 1);
+        assert_eq!(plain, unknown());
+        // A verdict systemd or launchd reached stands.
+        let verified = HandoffCheck::Verified("hekma.service: KillMode=process".into());
+        assert_eq!(container_check(verified.clone(), true, docker, 1), verified);
     }
 
     /// The real query, against a label no job has: no verdict can be read.

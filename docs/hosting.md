@@ -223,7 +223,7 @@ it as `handoff_check`:
 
 - **systemd** keeps them with `KillMode=process` or `none`. The default, `control-group`, and `mixed` stop them with the host. Hekma reports `verified` or `unsafe`, naming the unit and its setting.
 - **launchd** keeps them with `AbandonProcessGroup=true`; the default stops them. Hekma finds its job from `XPC_SERVICE_NAME` and reads the job with `launchctl print`: `verified` when the property is set, `unsafe` (with the plist key to set) when it is not, and `unverified` when the job cannot be read.
-- **A container** ends every process in it when it stops. Hekma reports `unverified`.
+- **A container** ends every process in it when it stops, and ends when its first process exits. When the host is that first process (PID 1), Hekma reports `unsafe`: its exit ends the container. Otherwise it reports `unverified`, since agents outlive the host only while the container's first process keeps running. Hekma recognizes a container from `/.dockerenv`, `/run/.containerenv`, or a Docker, containerd, Kubernetes or Podman cgroup.
 - **Windows** is not checked yet: `unverified`.
 
 Hekma never refuses to start on `unsafe`: it warns, and stopping every agent

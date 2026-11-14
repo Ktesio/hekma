@@ -233,3 +233,10 @@ The **O-items are Islam's rulings** (product and public-contract choices); the n
   - **The verdicts:** `verified` when the property is set. `unsafe` when it is not; the started notice names the plist key, not systemd's `KillMode`. `unverified` when the job cannot be read.
   - **Tests:** unit-tested through the `launchd_check` seam, the properties parser, and the real query against an unknown label. The parser was checked by hand against real `launchctl print` output on macOS 27. No LaunchAgent is installed by any test.
   - **Still unchecked:** Docker, supervisord and Windows job breakaway.
+- 2026-11-14 — **phase 6 built** (stacked on 24-3 phase 10, #438): T6's container half.
+  - **Detection:** `/.dockerenv`, `/run/.containerenv`, or a `docker`/`containerd`/`kubepods`/`libpod` cgroup path. It applies only where systemd and launchd left the verdict `unverified`.
+  - **The verdicts:**
+    - A host that is the container's PID 1 is `unsafe`: its exit ends the container and every agent in it. The notice says to put a process that outlives the host first.
+    - Otherwise `unverified`, with the container-specific reason. Hekma cannot see whether the first process outlives it, so it does not claim to.
+  - **Tests:** unit-tested through the `container_check` seam.
+  - **Still unchecked:** supervisord and Windows job breakaway.
