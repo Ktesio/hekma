@@ -550,3 +550,101 @@ fn a_kill_9_loses_nothing_committed_before_it() {
     assert!(hekma(&["release", child.as_str()]).success);
     assert!(hekma(&["agent", "stop", "svc"]).success);
 }
+
+/// Story 24-3 (T5, R2): an announced Run's Lease survives a `kill -9`
+/// unchanged — the next host shows the same Run, status and Lease.
+#[test]
+fn an_announced_runs_lease_survives_a_kill_9() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let _host = HostGuard(state_dir);
+    let hekma = |args: &[&str]| run_hekma_agent_with_env(args, &ctx.project_dir, state_dir, &[]);
+    let created = hekma(&[
+        "binding",
+        "create",
+        "gw",
+        "--prefix",
+        "/gw",
+        "--upstream",
+        "http://127.0.0.1:9/v1",
+    ]);
+    assert!(created.success, "{}", both(&created));
+    let issued = hekma(&[
+        "binding",
+        "credential",
+        "issue",
+        "gw",
+        "--class",
+        "announce",
+        "--json",
+    ]);
+    assert!(issued.success, "{}", both(&issued));
+    let doc: serde_json::Value = serde_json::from_str(&issued.stdout).unwrap();
+    let credential = ["credential", "value", "token"]
+        .iter()
+        .find_map(|key| {
+            doc[key]
+                .as_str()
+                .or_else(|| doc["credential"][key].as_str())
+        })
+        .unwrap_or_else(|| panic!("no credential in {doc}"))
+        .to_string();
+    // Announce over the local endpoint.
+    let addr = control_doc(state_dir)["addr"].as_str().unwrap().to_string();
+    let body = r#"{"external_id":"nightly-1","labels":{"step":"draft"}}"#;
+    let request = format!(
+        "POST /v0/runs/announce HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {credential}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let answer = {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut out = String::new();
+        stream.read_to_string(&mut out).unwrap();
+        out
+    };
+    assert!(answer.starts_with("HTTP/1.1 201"), "{answer}");
+    let json = &answer[answer.find("\r\n\r\n").unwrap() + 4..];
+    let announced: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
+    let run_id = ["run_id"]
+        .iter()
+        .find_map(|key| announced["run"][key].as_str().or(announced[key].as_str()))
+        .unwrap_or_else(|| panic!("no run id in {announced}"))
+        .to_string();
+    let show = || -> serde_json::Value {
+        let run = hekma(&["run", "show", run_id.as_str(), "--json"]);
+        assert!(run.success, "{}", both(&run));
+        serde_json::from_str(&run.stdout).unwrap()
+    };
+    let before = show();
+    assert!(before["run"]["lease_expires_at"].is_string(), "{before}");
+
+    helpers::kill_host(state_dir);
+    // The next write starts a host over the same state directory.
+    let restarted = hekma(&["label", "set", run_id.as_str(), "after=crash"]);
+    assert!(restarted.success, "{}", both(&restarted));
+    let after = show();
+    for field in [
+        "run_id",
+        "status",
+        "lease_expires_at",
+        "control_depth",
+        "anomalies",
+    ] {
+        assert_eq!(
+            after["run"][field], before["run"][field],
+            "{field}: {after}"
+        );
+    }
+    let actions = hekma_conformance::sm7::audit_state_dir(state_dir);
+    assert!(
+        hekma_conformance::sm7::unauthorized(&actions).is_empty(),
+        "{actions:?}"
+    );
+}

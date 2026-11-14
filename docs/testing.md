@@ -239,6 +239,11 @@ ceiling and a hold on a Run of a running agent, SIGKILLs the host, and
 checks that the next host reads that Run back byte-for-byte, along with the
 agent's own Run. The next host already serves the hold, from its first
 snapshot.
+Another announces a Run under a binding's announce credential, SIGKILLs
+the host, and checks that the next host shows the same Run, status and
+Lease. In the first drill, a call parked at the hold sees its connection end
+with no answer, and its record closes once at the next start as `hold`,
+with `hold_end` `crash`.
 
 ## Performance budgets (NFR-4)
 
