@@ -280,8 +280,11 @@ struct EngineInner {
     /// Story 24-4 (AD-18 Step 0): the state directory's paths, held OUTSIDE
     /// the registry mutex, so path arithmetic takes no lock.
     paths: crate::paths::EnginePaths,
-    registry: Mutex<Registry>,
-    supervisor: Mutex<Supervisor>,
+    /// Story 24-4 (AD-18 Step 1): the two engine locks record their holds
+    /// per call site when lock timing is on ([`Engine::set_lock_timing`]).
+    registry: crate::domain::timed_mutex::TimedMutex<Registry>,
+    supervisor: crate::domain::timed_mutex::TimedMutex<Supervisor>,
+    lock_timing: Arc<crate::domain::timed_mutex::LockTiming>,
     /// The supervisor's event bus clone (story 7-2): held OUTSIDE the mutex so
     /// [`Engine::subscribe`] hands out receivers without ever contending on
     /// the supervisor lock. Both clones share one broadcast channel.
@@ -623,13 +626,23 @@ impl Engine {
         let paths = registry.paths.clone();
         let leases = metering_proxy.leases;
         let identity_headers_flag = metering_proxy.identity_headers;
+        let lock_timing = Arc::new(crate::domain::timed_mutex::LockTiming::default());
         let inner = Arc::new(EngineInner {
             metering_proxy: Mutex::new(proxy),
             metering_proxy_error: proxy_error,
             read_only: false,
             paths,
-            registry: Mutex::new(registry),
-            supervisor: Mutex::new(supervisor),
+            registry: crate::domain::timed_mutex::TimedMutex::new(
+                "registry",
+                Arc::clone(&lock_timing),
+                registry,
+            ),
+            supervisor: crate::domain::timed_mutex::TimedMutex::new(
+                "supervisor",
+                Arc::clone(&lock_timing),
+                supervisor,
+            ),
+            lock_timing,
             events,
             run_snapshot,
             credential_reader,
@@ -694,13 +707,23 @@ impl Engine {
         let credential_reader = Mutex::new(registry.open_credential_reader(true)?);
         let calls_dir = registry.calls_dir();
         let paths = registry.paths.clone();
+        let lock_timing = Arc::new(crate::domain::timed_mutex::LockTiming::default());
         let inner = Arc::new(EngineInner {
             metering_proxy: Mutex::new(None),
             metering_proxy_error: None,
             read_only: true,
             paths,
-            registry: Mutex::new(registry),
-            supervisor: Mutex::new(supervisor),
+            registry: crate::domain::timed_mutex::TimedMutex::new(
+                "registry",
+                Arc::clone(&lock_timing),
+                registry,
+            ),
+            supervisor: crate::domain::timed_mutex::TimedMutex::new(
+                "supervisor",
+                Arc::clone(&lock_timing),
+                supervisor,
+            ),
+            lock_timing,
             events,
             run_snapshot,
             credential_reader,
@@ -1385,6 +1408,22 @@ impl Engine {
     /// event — what `export_events` serves.
     pub fn subscribe_sequenced(&self) -> broadcast::Receiver<(u64, EngineEvent)> {
         self.inner.events.subscribe_sequenced()
+    }
+
+    /// Switch lock timing on or off (story 24-4, AD-18 Step 1). While on,
+    /// every hold of the engine's registry and supervisor locks is recorded
+    /// against its call site; switching on clears earlier records. Off by
+    /// default; a diagnostic surface for lock-contention work, not a
+    /// stable contract.
+    pub fn set_lock_timing(&self, on: bool) {
+        self.inner.lock_timing.set_enabled(on);
+    }
+
+    /// The recorded lock holds per call site, the longest first (story
+    /// 24-4, AD-18 Step 1): each site's hold count, max and p99 over its
+    /// most recent holds. Empty while lock timing is off.
+    pub fn lock_hold_stats(&self) -> Vec<crate::domain::timed_mutex::LockHoldStats> {
+        self.inner.lock_timing.snapshot()
     }
 
     /// The engine-computed Agent Home path for `name` (display helper).

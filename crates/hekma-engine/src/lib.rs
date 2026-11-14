@@ -182,6 +182,8 @@ pub use domain::{
     RunSummary, ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT,
     RUN_LISTING_SCHEMA_VERSION,
 };
+// Story 24-4 (AD-18 Step 1): lock hold timing, a diagnostic surface.
+pub use domain::timed_mutex::LockHoldStats;
 // Story 24-4: the retention windows, the compaction state and what a
 // compacted Run keeps.
 pub use domain::runs::retention::{
