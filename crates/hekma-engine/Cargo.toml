@@ -66,6 +66,10 @@ bytes = { workspace = true }
 hyper-rustls = { workspace = true }
 rustls = { workspace = true }
 webpki-roots = { workspace = true }
+# Story 22-5: the metering proxy beyond loopback serves TLS. The SAME
+# tokio-rustls the host already uses for its `--listen` listener (0.26 over
+# the in-tree rustls+ring pair): no new package, the one-rustls gate holds.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 # Unix ProcessBackend (AD-4): dedicated process groups (setpgid) + signal
 # delivery to the group (SIGTERM/SIGKILL via killpg). Target-gated so it is only

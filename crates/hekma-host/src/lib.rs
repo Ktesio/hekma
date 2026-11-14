@@ -92,6 +92,22 @@ pub struct ServeOptions {
     /// port never hops: the host serves on, says which port and why, and
     /// refuses `engine-observed` starts until it is free.
     pub metering_listen_port: u16,
+    /// Story 22-5 (`--metering-listen IP:PORT`): the address the metering
+    /// proxy binds. `None` (the default, and a bare port) is `127.0.0.1`.
+    /// An address beyond loopback requires [`ServeOptions::proxy_tls_cert`]
+    /// and [`ServeOptions::proxy_tls_key`]; every call from another machine
+    /// must then carry a credential.
+    pub metering_listen_addr: Option<std::net::IpAddr>,
+    /// Story 22-5 (`--proxy-tls-cert`): the PEM certificate chain the
+    /// metering proxy serves beyond loopback (owner-only on Unix).
+    pub proxy_tls_cert: Option<PathBuf>,
+    /// Story 22-5 (`--proxy-tls-key`): its PEM private key (owner-only on
+    /// Unix).
+    pub proxy_tls_key: Option<PathBuf>,
+    /// Story 22-5 (`--proxy-public-host`): the host name clients beyond
+    /// loopback use, shown in the proxy's URLs (display only; without it
+    /// the bind address is shown).
+    pub proxy_public_host: Option<String>,
     /// Story 23-1 / 21-8 (`--no-identity-headers`, `--identity-headers`):
     /// this run's override of the stored outbound identity-header setting
     /// (`x-hekma-run-id` and `x-hekma-labels`, the run id and labels sent
@@ -193,6 +209,10 @@ impl std::fmt::Debug for ServeOptions {
             .field("state_base", &self.state_base)
             .field("stop_window", &self.stop_window)
             .field("metering_listen_port", &self.metering_listen_port)
+            .field("metering_listen_addr", &self.metering_listen_addr)
+            .field("proxy_tls_cert", &self.proxy_tls_cert)
+            .field("proxy_tls_key", &self.proxy_tls_key)
+            .field("proxy_public_host", &self.proxy_public_host)
             .field("control_listen", &self.control_listen)
             .field("bearer_secret", &self.bearer_secret)
             .field("log_capture", &self.log_capture)
@@ -403,6 +423,10 @@ where
         state_base,
         stop_window,
         metering_listen_port,
+        metering_listen_addr,
+        proxy_tls_cert,
+        proxy_tls_key,
+        proxy_public_host,
         identity_headers,
         proxy_allowed_hosts,
         proxy_allowed_origins,
@@ -457,12 +481,17 @@ where
         && (control_listen.is_some()
             || bearer_secret.is_some()
             || tls_cert.is_some()
-            || tls_key.is_some())
+            || tls_key.is_some()
+            || proxy_tls_cert.is_some()
+            || proxy_tls_key.is_some()
+            || proxy_public_host.is_some()
+            || metering_listen_addr.is_some_and(|addr| !addr.is_loopback()))
     {
         return Err(refuse(ServeError::InvalidOptions {
             message: "--autostart refuses the explicit-listener flags (--listen, \
-                      --bearer-secret, --tls-cert, --tls-key): an auto-started host serves \
-                      only its loopback local endpoint"
+                      --bearer-secret, --tls-cert, --tls-key, --proxy-tls-cert, \
+                      --proxy-tls-key, --proxy-public-host, and a --metering-listen address \
+                      beyond loopback): an auto-started host serves only on loopback"
                 .to_string(),
         }));
     }
@@ -516,6 +545,52 @@ where
             }
         }
     };
+    // (0.3) Story 22-5: the metering proxy beyond loopback. Its own PEM
+    // pair (both or neither), only with a bind beyond loopback, and
+    // REQUIRED there; read and checked (owner-only) before the lock.
+    let proxy_beyond_loopback = metering_listen_addr.is_some_and(|addr| !addr.is_loopback());
+    let proxy_tls = match (&proxy_tls_cert, &proxy_tls_key) {
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(refuse(ServeError::InvalidOptions {
+                message: "--proxy-tls-cert and --proxy-tls-key go together: pass both PEM \
+                          files (or neither, for a loopback metering proxy)"
+                    .to_string(),
+            }));
+        }
+        (Some(cert), Some(key)) => {
+            if !proxy_beyond_loopback {
+                return Err(refuse(ServeError::InvalidOptions {
+                    message: "--proxy-tls-cert/--proxy-tls-key require a --metering-listen \
+                              address beyond loopback (for example 0.0.0.0:8400): on \
+                              loopback the metering proxy serves plain HTTP"
+                        .to_string(),
+                }));
+            }
+            match control::tls::load_server_config(cert, key) {
+                Ok(config) => Some(hekma_engine::ProxyTls(config)),
+                Err(message) => return Err(refuse(ServeError::InvalidOptions { message })),
+            }
+        }
+    };
+    if let Some(addr) = metering_listen_addr.filter(|_| proxy_beyond_loopback) {
+        if proxy_tls.is_none() {
+            return Err(refuse(ServeError::InvalidOptions {
+                message: format!(
+                    "the metering proxy cannot bind {addr} beyond loopback without transport \
+                     encryption: pass --proxy-tls-cert and --proxy-tls-key (PEM files), or \
+                     bind 127.0.0.1"
+                ),
+            }));
+        }
+    }
+    if proxy_public_host.is_some() && !proxy_beyond_loopback {
+        return Err(refuse(ServeError::InvalidOptions {
+            message: "--proxy-public-host requires a --metering-listen address beyond \
+                      loopback: it names the host clients on other machines use"
+                .to_string(),
+        }));
+    }
     if let Some(addr) = control_listen {
         if !addr.ip().is_loopback() && tls_config.is_none() {
             return Err(refuse(ServeError::InvalidOptions {
@@ -755,6 +830,10 @@ where
                 metering_proxy: hekma_engine::MeteringProxyOptions {
                     enabled: true,
                     port: metering_listen_port,
+                    // Story 22-5: the bind and its TLS (beyond loopback).
+                    bind: metering_listen_addr,
+                    tls: proxy_tls,
+                    public_host: proxy_public_host,
                     sticky: true,
                     identity_headers,
                     // Story 22-2: the Host/Origin guard's Operator lists.
@@ -792,9 +871,32 @@ where
     // beside the state root — the address every metered agent and binding
     // client points at. (A bind failure was already surfaced by the
     // engine's open note; this stays silent then.)
-    let proxy_url = engine.metering_proxy().map(|info| info.url);
-    if let Some(url) = &proxy_url {
-        notifier.note(&format!("the metering proxy is listening on {url}."));
+    let proxy_info = engine.metering_proxy();
+    let proxy_url = proxy_info.as_ref().map(|info| info.url.clone());
+    // Story 22-5: beyond loopback, the address other machines use (the
+    // public host when given, else the bind address).
+    let proxy_public_url = proxy_info.as_ref().and_then(|info| info.public_url.clone());
+    match (&proxy_url, &proxy_public_url) {
+        (Some(_), Some(public)) => {
+            notifier.note(&format!(
+                "the metering proxy is listening on {public}. Every call to it from another \
+                 machine must carry a credential."
+            ));
+            if !engine.proxy_access_active() {
+                notifier.note(
+                    "no proxy-access credential is active yet, so every call from other \
+                     machines will be refused until you issue one (hekma binding credential \
+                     issue <name> --class proxy-access).",
+                );
+            }
+        }
+        (Some(url), None) => {
+            notifier.note(&format!("the metering proxy is listening on {url}."));
+        }
+        _ => {}
+    }
+    if proxy_url.is_some() {
+        notifier.note(&port_squatting_note(hekma_engine::interactive_users_hint()));
     }
     // Story 21-8: a serve flag that overrides the stored identity-header
     // setting says so, so the per-run override is never silent.
@@ -843,6 +945,7 @@ where
         // Story 23-1: where the shared Metering Proxy listens (absent when
         // it could not bind — `GET /v0/proxy` and the open note say why).
         metering_proxy_url: proxy_url,
+        metering_proxy_public_url: proxy_public_url,
     };
     if let Err(err) = local::write_discovery(&state_root, &discovery) {
         drop(bound);
@@ -1097,6 +1200,46 @@ async fn autostart_idle_exit(
     }
 }
 
+/// Parse a `--metering-listen` value (story 22-5): a bare port keeps the
+/// loopback meaning (`127.0.0.1`), `IP:PORT` names the address (`[IPv6]:PORT`
+/// for IPv6). A host name is refused: the proxy binds an address, and only
+/// an IP literal says which one. Shared by `hekma serve` and `hekma-host`.
+pub fn parse_metering_listen(raw: &str) -> Result<(Option<std::net::IpAddr>, u16), String> {
+    let raw = raw.trim();
+    if let Ok(port) = raw.parse::<u16>() {
+        return Ok((None, port));
+    }
+    if let Ok(addr) = raw.parse::<std::net::SocketAddr>() {
+        return Ok((Some(addr.ip()), addr.port()));
+    }
+    Err(format!(
+        "--metering-listen {raw:?} is not a port or an IP:PORT address: pass a port (0-65535), \
+         or an IP literal and a port such as 0.0.0.0:8400 or [::]:8400 (a host name is not \
+         accepted)"
+    ))
+}
+
+/// The started notice's port-squatting line (story 22-5): whenever the
+/// proxy binds, since its sticky port is what another user could take
+/// while no host holds it.
+pub(crate) fn port_squatting_note(other_users: Option<usize>) -> String {
+    match other_users {
+        Some(0) => "this machine has no other user accounts that can log in, so no other user \
+                    can listen on the metering proxy's port while Hekma is not running."
+            .to_string(),
+        Some(_) => "this machine has other user accounts that can log in. While Hekma is not \
+                    running, another user could listen on the metering proxy's port and \
+                    collect what is sent to it. Use socket activation (systemd or launchd), run \
+                    Hekma on a machine you do not share, or bind a privileged port where the \
+                    operating system allows one."
+            .to_string(),
+        None => "Hekma cannot tell whether this machine has other interactive users. If it \
+                 does, another user could listen on the metering proxy's port while Hekma is \
+                 not running; see the metering proxy docs on port squatting."
+            .to_string(),
+    }
+}
+
 /// The started notice's line when this run's serve flag disagrees with the
 /// stored identity-header setting (story 21-8).
 fn identity_headers_note(settings: &hekma_engine::ProxySettings) -> Option<String> {
@@ -1136,5 +1279,17 @@ mod identity_headers_note_tests {
         // A flag that agrees, or no flag, says nothing.
         assert!(identity_headers_note(&settings(true, true, true)).is_none());
         assert!(identity_headers_note(&settings(false, false, false)).is_none());
+    }
+
+    #[test]
+    fn the_port_squatting_line_says_what_the_account_list_shows() {
+        let others = super::port_squatting_note(Some(2));
+        assert!(
+            others.contains("other user accounts that can log in"),
+            "{others}"
+        );
+        assert!(others.contains("socket activation"), "{others}");
+        assert!(super::port_squatting_note(Some(0)).contains("no other user accounts"));
+        assert!(super::port_squatting_note(None).contains("cannot tell"));
     }
 }

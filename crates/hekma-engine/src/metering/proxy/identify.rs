@@ -46,6 +46,13 @@ pub(crate) struct CallFacts<'a> {
     pub hint_labels: Option<&'a str>,
     /// Story 23-2: the `x-hekma-announce` header.
     pub announce: Option<&'a str>,
+    /// Story 22-5: the listener binds beyond loopback, so a proxy-access
+    /// credential in the API-key slot is honoured, and a non-loopback
+    /// peer must authenticate.
+    pub beyond_loopback: bool,
+    /// Story 22-5: the connection's peer is loopback (`127.0.0.0/8`,
+    /// `::1`). Always true on a loopback-bound listener.
+    pub peer_loopback: bool,
 }
 
 /// Why a call was refused before any upstream dial.
@@ -57,6 +64,12 @@ pub(crate) enum Refusal {
     CredentialRevoked,
     RunOutOfScope,
     NoRoute,
+    /// Story 22-5: beyond loopback, a call from a non-loopback peer with
+    /// no credential at all.
+    AuthenticationRequired,
+    /// Story 22-5: a valid proxy-access credential on another binding's
+    /// prefix, or on a Run route.
+    CredentialOutOfScope,
 }
 
 /// How the call reached its Run (for the record's binding field and the
@@ -85,6 +98,10 @@ pub(crate) struct Target {
     /// credential, the unattributed Run and a header-announced Run never
     /// get one (they hold no eligible credential to begin with).
     pub custody: Option<CustodyInfo>,
+    /// Story 22-5: the token id of the proxy-access credential that
+    /// authenticated the call (beyond loopback). It never makes the call
+    /// scented: only a Run Key does.
+    pub proxy_access: Option<String>,
 }
 
 /// Which Run a call is attributed to.
@@ -140,7 +157,7 @@ fn fallback_of(base: Attribution) -> (Option<RunId>, Option<WireIdentity>) {
     }
 }
 
-fn bearer(value: &str) -> Option<&str> {
+pub(crate) fn bearer(value: &str) -> Option<&str> {
     let value = value.trim();
     let (scheme, rest) = value.split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
@@ -160,12 +177,16 @@ enum KeyVerdict {
     Revoked,
 }
 
-fn verdict(snapshot: &RunSnapshot, raw: &str) -> KeyVerdict {
+/// `remote`: the call came beyond loopback from a non-loopback peer (story
+/// 22-5) — a supervised Run's key is then unknown: a supervised agent is
+/// local by definition, so its key from the network is a stolen key.
+fn verdict(snapshot: &RunSnapshot, raw: &str, remote: bool) -> KeyVerdict {
     let Some((class, secret)) = parse_presented(raw.trim()) else {
         return KeyVerdict::Unknown;
     };
     let hash = TokenHash::of_token(secret.expose_secret());
     match snapshot.keys.get(&hash) {
+        Some(entry) if remote && entry.process_owner => KeyVerdict::Unknown,
         Some(entry) if entry.class == TokenClass::RunKey && class == TokenClass::RunKey => {
             KeyVerdict::Run(
                 entry.run_id.clone(),
@@ -204,9 +225,38 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
         .or(facts.api_key.map(str::trim).filter(|v| looks_like_token(v)));
     // `(run, token id, custody-eligible)` of the key that identifies the
     // call.
+    let remote = facts.beyond_loopback && !facts.peer_loopback;
     let mut custody_slot = false;
+    // Story 22-5: beyond loopback, a proxy-access credential in the slot
+    // authenticates the call for its own binding (`(binding, token id)`).
+    let mut proxy_access: Option<(String, String)> = None;
+    let proxy_access_slot = slot.filter(|raw| {
+        facts.beyond_loopback
+            && matches!(
+                parse_presented(raw.trim()),
+                Some((TokenClass::ProxyAccess, _))
+            )
+    });
+    let slot = if let Some(raw) = proxy_access_slot {
+        let Some((_, secret)) = parse_presented(raw.trim()) else {
+            return Identified::Refused(Refusal::UnknownCredential);
+        };
+        match snapshot
+            .bindings
+            .proxy_access(&TokenHash::of_token(secret.expose_secret()))
+        {
+            Ok((binding, token_id)) => {
+                proxy_access = Some((binding.to_string(), token_id.to_string()));
+            }
+            Err(true) => return Identified::Refused(Refusal::CredentialRevoked),
+            Err(false) => return Identified::Refused(Refusal::UnknownCredential),
+        }
+        None
+    } else {
+        slot
+    };
     let key = if let Some(raw) = slot {
-        match verdict(snapshot, raw) {
+        match verdict(snapshot, raw, remote) {
             KeyVerdict::Run(run, token_id, true) => {
                 custody_slot = true;
                 Some((run, token_id, true))
@@ -221,7 +271,7 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
         None
     };
     let key = match facts.run_key.map(str::trim).filter(|v| !v.is_empty()) {
-        Some(raw) => match verdict(snapshot, raw) {
+        Some(raw) => match verdict(snapshot, raw, remote) {
             KeyVerdict::Run(run, token_id, eligible) => Some((run, token_id, eligible)),
             KeyVerdict::Unknown => return Identified::Refused(Refusal::UnknownCredential),
             KeyVerdict::Revoked => return Identified::Refused(Refusal::CredentialRevoked),
@@ -237,7 +287,7 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
     // `x-hekma-run-key`, a labelled binding's Run reached bare, the
     // unattributed Run, a header-announced Run): it is forwarded with
     // whatever key the client sent.
-    let custody = key
+    let mut custody = key
         .as_ref()
         .filter(|(_, _, eligible)| *eligible)
         .and_then(|(run, _, _)| snapshot.custody_of(run));
@@ -245,6 +295,11 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
         return Identified::Refused(Refusal::CustodyUnavailable);
     }
     let key = key.map(|(run, token_id, _)| (run, token_id));
+    // Story 22-5: beyond loopback, a call from a non-loopback peer carries
+    // a credential or is refused — before the route, the body or any dial.
+    if remote && key.is_none() && proxy_access.is_none() {
+        return Identified::Refused(Refusal::AuthenticationRequired);
+    }
 
     // 3–5. The route.
     enum Route {
@@ -295,6 +350,27 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
         } else {
             return Identified::Refused(Refusal::NoRoute);
         };
+
+    // Story 22-5: a proxy-access credential is scoped to its own binding's
+    // prefix (never a Run route, never another binding) — checked even when
+    // a Run Key on the same call identifies it (a presented credential is
+    // never silently ignored). Without a Run Key it draws its binding's
+    // custodied key, under the swap's rules.
+    if let Some((binding, _)) = &proxy_access {
+        match &route {
+            Route::Binding { name, .. } if name == binding => {}
+            _ => return Identified::Refused(Refusal::CredentialOutOfScope),
+        }
+        if key.is_none() {
+            custody = snapshot.bindings.by_name(binding).and_then(|entry| {
+                Some(crate::domain::custody::CustodyInfo {
+                    key_ref: Arc::from(entry.custodied_key.as_deref()?),
+                    origin: Arc::clone(&entry.upstream),
+                })
+            });
+        }
+    }
+    let proxy_access = proxy_access.map(|(_, token_id)| token_id);
 
     // The Run: the key's (scoped on a Run route), else the route's, else the
     // binding's own Run, else the unattributed Run.
@@ -367,6 +443,7 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
                 via,
                 token_id,
                 custody,
+                proxy_access,
             },
             attribution: Attribution::Announce {
                 claim: AnnounceClaim {
@@ -456,6 +533,7 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
             via,
             token_id,
             custody,
+            proxy_access,
         },
         attribution,
         hint_ignored,

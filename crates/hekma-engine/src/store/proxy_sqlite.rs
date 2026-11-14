@@ -570,6 +570,69 @@ impl super::SqliteStore {
             .map_err(backend)
     }
 
+    /// Story 22-5: the proxy-access credentials the data path reads — the
+    /// active ones (hash, binding, token id), and the hashes of those
+    /// revoked at or after `since` (newest first, at most `limit`), so a
+    /// revoked credential answers revoked, never unknown, across a restart.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn proxy_access_credentials(
+        &self,
+        since: &str,
+        limit: usize,
+    ) -> Result<
+        (
+            Vec<(crate::domain::credential::TokenHash, String, String)>,
+            Vec<crate::domain::credential::TokenHash>,
+        ),
+        StoreError,
+    > {
+        let hash_of = |bytes: Vec<u8>| {
+            <[u8; 32]>::try_from(bytes.as_slice())
+                .ok()
+                .map(crate::domain::credential::TokenHash::from_bytes)
+        };
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT token_hash, binding, token_id FROM binding_credentials \
+                 WHERE class = 'proxy-access' AND state = 'active'",
+            )
+            .map_err(backend)?;
+        let active = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?
+            .into_iter()
+            .filter_map(|(hash, binding, token_id)| Some((hash_of(hash)?, binding, token_id)))
+            .collect();
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT token_hash FROM binding_credentials WHERE class = 'proxy-access' \
+                 AND state = 'revoked' AND revoked_at >= ?1 ORDER BY revoked_at DESC LIMIT ?2",
+            )
+            .map_err(backend)?;
+        let revoked = stmt
+            .query_map(
+                rusqlite::params![since, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?
+            .into_iter()
+            .filter_map(hash_of)
+            .collect();
+        Ok((active, revoked))
+    }
+
     /// Insert one active binding credential.
     pub(crate) fn insert_binding_credential(
         &self,

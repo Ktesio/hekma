@@ -114,6 +114,25 @@ pub use adapter::{AdapterRef, ResolvedAdapter};
 /// Service Host (the engine owns process control; the OS parts live in
 /// `backends/`).
 pub use backends::spawn_detached_process;
+// Story 22-5: the host's port-squatting warning and its TLS key check.
+pub use backends::interactive_users_hint;
+/// Make a file readable only by its owner (mode `0600` on Unix; the
+/// per-user access control on Windows) — the rule [`check_owner_only_file`]
+/// checks, for an embedder or a test writing TLS material.
+pub use backends::restrict_to_owner;
+
+/// Story 22-5: refuse a file that other users can read (the secrets-file
+/// rule: owner-only, mode `0600` on Unix; a documented no-op on Windows,
+/// where a profile's default access control applies). The message names
+/// the path and the remediation, never the file's contents.
+pub fn check_owner_only_file(path: &std::path::Path) -> Result<(), String> {
+    backends::check_secrets_file_permissions(path).map_err(|err| match err {
+        ports::SecretError::FilePermissions { path, detail } => format!(
+            "{path} must be readable only by its owner ({detail}); fix it with: chmod 600 '{path}'"
+        ),
+        other => other.to_string(),
+    })
+}
 pub use domain::custody::{SecretRevealedEvent, SECRET_REVEALED_SCHEMA_VERSION};
 
 /// Story 22-2 (P10): harden the calling process's memory — on Linux it
@@ -217,7 +236,7 @@ pub use domain::runs::lease::{
 /// Story 22-1: the reserved credential config keys and the variable every
 /// supervised agent receives its Run Key in.
 pub use domain::{RUN_KEY_ENV, RUN_KEY_KEY, RUN_KEY_MARKER_PREFIX, RUN_REFRESH_KEY_KEY};
-pub use metering::proxy::{MeteringProxyOptions, ProxyInfo, ProxyStartError};
+pub use metering::proxy::{MeteringProxyOptions, ProxyInfo, ProxyStartError, ProxyTls};
 // The shutdown drain's public surface (issue #328 item 3): the planner, the
 // per-instance outcome vocabulary, and (via `Engine::shutdown` / its
 // `blocking()` twin) the drain itself.

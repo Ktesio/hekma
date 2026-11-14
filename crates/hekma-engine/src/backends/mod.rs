@@ -55,6 +55,77 @@ pub fn current() -> Backend {
 /// OS-agnostic file resolver ([`crate::ports::FileSecretResolver`]) calls THIS, so
 /// no `#[cfg]` leaks out of `backends/`. Re-exported cfg-selected exactly like
 /// [`Backend`].
+/// Story 22-5: how many OTHER accounts could log in on this machine, read
+/// from the OS's account list; `None` when this cannot be told (Windows,
+/// or an account list that does not name the current user, as on macOS or
+/// a directory-service host). Drives the metering proxy's port-squatting
+/// warning.
+pub fn interactive_users_hint() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+        let me = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .ok()?;
+        other_interactive_users(&passwd, &me)
+    }
+    #[cfg(windows)]
+    {
+        None
+    }
+}
+
+/// The OS-agnostic rule over a `passwd`-format account list: an account
+/// can log in when its uid is at least 1000 (not `nobody`, 65534) and its
+/// shell is not a no-login stub. `None` when `me` is not among them (the
+/// list cannot speak for this machine).
+pub(crate) fn other_interactive_users(passwd: &str, me: &str) -> Option<usize> {
+    let humans: Vec<&str> = passwd
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            let (name, uid, shell) = (fields.first()?, fields.get(2)?, fields.get(6)?);
+            let uid: u32 = uid.parse().ok()?;
+            let shell = shell.trim();
+            let no_login = shell.is_empty()
+                || ["nologin", "false", "sync", "shutdown", "halt"]
+                    .iter()
+                    .any(|stub| shell.ends_with(stub));
+            (uid >= 1000 && uid != 65534 && !no_login).then_some(*name)
+        })
+        .collect();
+    humans
+        .contains(&me)
+        .then(|| humans.iter().filter(|name| **name != me).count())
+}
+
+#[cfg(test)]
+mod interactive_users_tests {
+    use super::other_interactive_users;
+
+    #[test]
+    fn other_login_capable_accounts_are_counted_and_an_unlisted_self_cannot_tell() {
+        let passwd = "\
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1::/usr/sbin:/usr/sbin/nologin
+nobody:x:65534:65534::/nonexistent:/bin/sh
+ana:x:1000:1000::/home/ana:/bin/bash
+bo:x:1001:1001::/home/bo:/bin/zsh
+svc:x:1002:1002::/srv:/usr/sbin/nologin
+# a comment
+";
+        assert_eq!(other_interactive_users(passwd, "ana"), Some(1));
+        assert_eq!(
+            other_interactive_users("ana:x:1000:1000::/h:/bin/sh", "ana"),
+            Some(0)
+        );
+        assert_eq!(other_interactive_users(passwd, "svc"), None);
+        assert_eq!(other_interactive_users(passwd, "root"), None);
+        assert_eq!(other_interactive_users("broken line", "ana"), None);
+    }
+}
+
 #[cfg(unix)]
 pub use unix::check_secrets_file_permissions;
 #[cfg(windows)]
@@ -83,9 +154,9 @@ pub use windows::harden_host_memory;
 
 /// Owner-only file permissions (`0600` on Unix; a fresh profile file
 /// already is on Windows) — the secrets-file posture.
-#[cfg(all(test, unix))]
+#[cfg(unix)]
 pub use unix::restrict_to_owner;
-#[cfg(all(test, windows))]
+#[cfg(windows)]
 pub use windows::restrict_to_owner;
 
 // ---- Story 11-2 review-1: atomic-write filesystem glue (the cfg home) ----

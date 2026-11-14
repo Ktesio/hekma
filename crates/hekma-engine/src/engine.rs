@@ -829,6 +829,18 @@ impl Engine {
             .flatten()
     }
 
+    /// Whether any binding holds an active proxy-access credential (story
+    /// 22-5): beyond loopback, calls from other machines are refused until
+    /// one does (the started notice says so). Read from the published
+    /// snapshot; no lock, no store read.
+    pub fn proxy_access_active(&self) -> bool {
+        self.inner
+            .run_snapshot
+            .current()
+            .bindings
+            .has_proxy_access()
+    }
+
     /// Why the shared Metering Proxy is not running, when it was enabled
     /// and could not start (story 23-1).
     pub fn metering_proxy_error(&self) -> Option<String> {
