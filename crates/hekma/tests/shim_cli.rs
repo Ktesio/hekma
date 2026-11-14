@@ -146,3 +146,111 @@ fn a_handoff_mode_host_leaves_shim_agents_running_for_the_next_host() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+fn control_doc(state_dir: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(state_dir.join("control.json")).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+/// Story 24-2: `hekma serve --upgrade` hands the running host over in
+/// place: a poller dialing the metering proxy the whole time is never
+/// refused, the Shim-held agent keeps running, `control.json` names the
+/// successor, and the successor reaches the agent.
+#[test]
+fn serve_upgrade_hands_the_host_over_without_a_refused_connection() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let manifest = tempfile::tempdir().unwrap();
+    hekma_conformance::test_support::ManifestFixture::new("svc", &["--linger-ms", "600000"])
+        .guaranteed_on_all_oses("interaction")
+        .write(manifest.path());
+    let _host = HostGuard(state_dir);
+    let env = [("HEKMA_SHIM", "1")];
+    let hekma = |args: &[&str]| run_hekma_agent_with_env(args, &ctx.project_dir, state_dir, &env);
+    let manifest_arg = manifest.path().to_string_lossy().into_owned();
+    assert!(hekma(&["agent", "register", "svc", "--manifest", &manifest_arg]).success);
+    let run = hekma(&["agent", "start", "svc"]);
+    assert!(run.success, "{}", both(&run));
+    let conn = rusqlite::Connection::open(state_dir.join("state.db")).unwrap();
+    let agent: i64 = conn
+        .query_row("SELECT pid FROM agent_runtime", [], |row| row.get(0))
+        .unwrap();
+    let before = control_doc(state_dir);
+    let old_pid = before["pid"].as_i64().unwrap();
+    let proxy = before["metering_proxy_url"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("http://")
+        .to_string();
+    // Dial the proxy continuously across the whole upgrade.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poller = std::thread::spawn({
+        let stop = std::sync::Arc::clone(&stop);
+        move || {
+            let (mut ok, mut refused) = (0u32, 0u32);
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match std::net::TcpStream::connect(&proxy) {
+                    Ok(_) => ok += 1,
+                    Err(_) => refused += 1,
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            (ok, refused)
+        }
+    });
+    let run = hekma(&["serve", "--upgrade"]);
+    assert!(run.success, "{}", both(&run));
+    assert!(both(&run).contains("upgraded in place"), "{}", both(&run));
+    // The predecessor exits once the successor serves.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while alive(old_pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the old host never exited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (ok, refused) = poller.join().unwrap();
+    assert!(ok > 0, "the poller reached the proxy");
+    assert_eq!(
+        refused, 0,
+        "no connection refused across the upgrade ({ok} reached it)"
+    );
+    let after = control_doc(state_dir);
+    assert_ne!(
+        after["pid"].as_i64().unwrap(),
+        old_pid,
+        "control.json names the successor"
+    );
+    assert!(alive(agent), "the agent kept running");
+    assert!(
+        logged(state_dir, "handed over to the successor"),
+        "the predecessor notes the hand-over"
+    );
+    let run = hekma(&["agent", "send", "svc", "ping"]);
+    assert!(run.success, "{}", both(&run));
+    let run = hekma(&["agent", "stop", "svc"]);
+    assert!(run.success, "{}", both(&run));
+}
+
+/// Story 24-2: with no host serving, `--upgrade` starts nothing and says so.
+#[test]
+fn serve_upgrade_without_a_host_refuses_and_starts_none() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let run = run_hekma_agent_with_env(&["serve", "--upgrade"], &ctx.project_dir, state_dir, &[]);
+    assert!(!run.success);
+    assert_eq!(run.code, Some(2), "{}", both(&run));
+    assert!(both(&run).contains("nothing to upgrade"), "{}", both(&run));
+    assert!(
+        !state_dir.join("control.json").exists(),
+        "no host was started"
+    );
+}

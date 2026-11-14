@@ -102,6 +102,27 @@ impl HostLock {
     }
 }
 
+impl HostLock {
+    /// Story 24-2: hold the lock the previous host handed over — `file` is
+    /// its locked `host.lock` (the same open file, so the same lock); the
+    /// holder record is rewritten to this process.
+    pub fn adopt(file: std::fs::File, path: &Path) -> HostLock {
+        let mut guard = &file;
+        let _ = guard.set_len(0);
+        let _ = writeln!(guard, "pid={}", std::process::id());
+        let _ = guard.flush();
+        HostLock {
+            _file: file,
+            path: path.to_path_buf(),
+        }
+    }
+
+    /// Story 24-2: the locked file, for the hand-over.
+    pub fn file(&self) -> &std::fs::File {
+        &self._file
+    }
+}
+
 /// Read the `pid=<n>` holder record from a lock file — `Some(pid)` when the
 /// file exists and its (whitespace-trimmed) content parses; `None` for an
 /// absent file, an unreadable file, or ANY other content (a refuser must

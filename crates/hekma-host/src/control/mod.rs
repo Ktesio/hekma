@@ -88,6 +88,9 @@ pub(crate) struct ApiState {
     /// Story 22-1: the rate-limited count of unresolved presentations,
     /// shared by every listener.
     pub(crate) auth_diagnostics: auth::AuthDiagnostics,
+    /// Story 24-2: an Operator's in-place upgrade request reaches the serve
+    /// loop here.
+    pub(crate) upgrade: Arc<tokio::sync::Notify>,
 }
 
 /// The API's request activity (story 21-4): how many authenticated requests
@@ -328,6 +331,8 @@ fn router(state: ApiState) -> Router {
             "/v0/proxy",
             get(routes::proxy_show).patch(routes::proxy_update),
         )
+        // Story 24-2: hand this host over to a fresh one in place.
+        .route("/v0/host/upgrade", post(routes::host_upgrade))
         // Story 24-4: the retention windows and the compaction state.
         .route(
             "/v0/retention",
@@ -406,6 +411,7 @@ pub(crate) mod test_support {
                 sets: sets::SetStore::new(None),
                 loopback: true,
                 auth_diagnostics: auth::AuthDiagnostics::new(None, auth::AuthDiagnostics::INTERVAL),
+                upgrade: Arc::new(tokio::sync::Notify::new()),
             };
             // Leak the engine (never dropped) and the temp root.
             std::mem::forget(engine);
@@ -436,6 +442,7 @@ pub(crate) mod test_support {
                 sets: sets::SetStore::new(None),
                 loopback: true,
                 auth_diagnostics: auth::AuthDiagnostics::new(None, auth::AuthDiagnostics::INTERVAL),
+                upgrade: Arc::new(tokio::sync::Notify::new()),
             };
             std::mem::forget(engine);
             std::mem::forget(root);
@@ -464,6 +471,8 @@ pub(crate) struct ControlApi {
     accept_tasks: Vec<JoinHandle<()>>,
     /// The request activity clock.
     activity: Activity,
+    /// Story 24-2: the in-place upgrade requests.
+    upgrade: Arc<tokio::sync::Notify>,
 }
 
 /// The Control API's sockets, BOUND but not yet serving (story 21-4): the
@@ -537,7 +546,9 @@ impl BoundListeners {
                 Some(Notifier::over(sink.clone())),
                 auth::AuthDiagnostics::INTERVAL,
             ),
+            upgrade: Arc::new(tokio::sync::Notify::new()),
         };
+        let upgrade = Arc::clone(&state.upgrade);
         let mut tasks = Vec::with_capacity(self.bound.len());
         let mut accept_tasks = Vec::new();
         for (listener, local_addr, tls) in self.bound {
@@ -566,12 +577,18 @@ impl BoundListeners {
             tasks,
             accept_tasks,
             activity,
+            upgrade,
         })
     }
 }
 
 impl ControlApi {
     /// The request activity clock (the auto-started host's idle exit).
+    /// Story 24-2: the in-place upgrade requests (`POST /v0/host/upgrade`).
+    pub(crate) fn upgrade_requests(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.upgrade)
+    }
+
     pub(crate) fn activity(&self) -> Activity {
         self.activity.clone()
     }

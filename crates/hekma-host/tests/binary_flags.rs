@@ -302,3 +302,28 @@ fn the_proxy_flags_parse_and_reach_the_hosts_checks() {
         assert!(!state.exists(), "{args:?} created the state directory");
     }
 }
+
+/// Story 24-2: the internal `--handoff-from` needs its channel, and a
+/// successor launched without its token is refused before it touches the
+/// state directory.
+#[test]
+fn handoff_from_needs_its_channel_and_its_token() {
+    let output = Command::new(env!("CARGO_BIN_EXE_hekma-host"))
+        .arg("--handoff-from")
+        .output()
+        .expect("the binary must run");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--handoff-from needs"));
+    let state = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_hekma-host"))
+        .args(["--handoff-from", "/nonexistent/h.sock", "--state-dir"])
+        .arg(state.path())
+        .env_remove("HEKMA_HANDOFF_TOKEN")
+        .output()
+        .expect("the binary must run");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("HEKMA_HANDOFF_TOKEN"),
+        "{output:?}"
+    );
+}

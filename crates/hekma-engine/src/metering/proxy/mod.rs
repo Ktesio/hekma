@@ -91,6 +91,11 @@ pub struct MeteringProxyOptions {
     /// Story 23-4: the most calls one held Run may have parked; past it a
     /// call gets the retryable hold-full refusal.
     pub max_held_per_run: usize,
+    /// Story 24-2: a listening socket handed over by the Service Host this
+    /// one replaces (an in-place upgrade). When it holds one, the proxy
+    /// serves on it instead of binding, so no connection is refused across
+    /// the hand-over; `port` and `bind` are then ignored.
+    pub inherited_listener: InheritedListener,
     /// cfg(test) seam: one extra trusted root (DER) for the custody tests'
     /// TLS fake upstream.
     #[cfg(test)]
@@ -105,6 +110,71 @@ fn tls_config(options: &MeteringProxyOptions) -> std::sync::Arc<rustls::ClientCo
     }
     let _ = options;
     crate::metering::relay::default_tls_config()
+}
+
+/// Story 24-2: a listening socket handed over to this engine, taken once by
+/// the proxy at start. Clones share the one slot; two options compare equal
+/// when they share it (or both hold none).
+#[derive(Clone, Default)]
+pub struct InheritedListener(Option<Arc<std::sync::Mutex<Option<std::net::TcpListener>>>>);
+
+impl InheritedListener {
+    /// Wrap a listening socket for the proxy to serve on.
+    pub fn new(listener: std::net::TcpListener) -> Self {
+        InheritedListener(Some(Arc::new(std::sync::Mutex::new(Some(listener)))))
+    }
+
+    /// The socket, once.
+    fn take(&self) -> Option<std::net::TcpListener> {
+        self.0
+            .as_ref()
+            .and_then(|slot| slot.lock().unwrap_or_else(|p| p.into_inner()).take())
+    }
+}
+
+impl std::fmt::Debug for InheritedListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "InheritedListener(Some)"
+        } else {
+            "InheritedListener(None)"
+        })
+    }
+}
+
+impl PartialEq for InheritedListener {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for InheritedListener {}
+
+#[cfg(test)]
+mod inherited_tests {
+    use super::InheritedListener;
+
+    #[test]
+    fn an_inherited_socket_is_taken_once_and_compares_by_its_slot() {
+        let none = InheritedListener::default();
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let one = InheritedListener::new(socket);
+        let shared = one.clone();
+        let other = InheritedListener::new(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        assert_eq!(format!("{none:?}"), "InheritedListener(None)");
+        assert_eq!(format!("{one:?}"), "InheritedListener(Some)");
+        assert_eq!(none, InheritedListener::default());
+        assert_eq!(one, shared);
+        assert_ne!(one, other);
+        assert_ne!(one, none);
+        assert!(shared.take().is_some());
+        assert!(one.take().is_none(), "the one slot is shared");
+        assert!(none.take().is_none());
+    }
 }
 
 impl Default for MeteringProxyOptions {
@@ -124,6 +194,7 @@ impl Default for MeteringProxyOptions {
             allowed_origins: Vec::new(),
             leases: crate::domain::runs::lease::LeaseOptions::default(),
             max_held_per_run: hold::DEFAULT_MAX_HELD_PER_RUN,
+            inherited_listener: InheritedListener::default(),
             #[cfg(test)]
             test_root_der: None,
         }
@@ -204,8 +275,11 @@ pub(crate) const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) struct MeteringProxy {
     info: ProxyInfo,
     shared: Arc<forward::ProxyShared>,
-    stop: Option<tokio::sync::watch::Sender<Option<Duration>>>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    /// The stop signal: the grace, and whether to keep the listening
+    /// socket open for a successor (story 24-2) instead of closing it.
+    stop: Option<tokio::sync::watch::Sender<Option<(Duration, bool)>>>,
+    /// The accept loop; it hands the listener back when asked to keep it.
+    task: Option<tokio::task::JoinHandle<Option<TcpListener>>>,
     /// Story 23-2: the Lease sweeper (aborted before the record pump
     /// closes, so the store writer can close).
     sweeper: Option<tokio::task::JoinHandle<()>>,
@@ -240,11 +314,16 @@ impl MeteringProxy {
         if beyond_loopback && options.tls.is_none() {
             return Err(ProxyStartError::NonLoopbackWithoutTls { bind });
         }
-        let std_listener =
-            std::net::TcpListener::bind((bind, port)).map_err(|err| ProxyStartError::Bind {
-                port,
-                reason: err.to_string(),
-            })?;
+        // Story 24-2: a handed-over socket is served as is.
+        let std_listener = match options.inherited_listener.take() {
+            Some(listener) => listener,
+            None => {
+                std::net::TcpListener::bind((bind, port)).map_err(|err| ProxyStartError::Bind {
+                    port,
+                    reason: err.to_string(),
+                })?
+            }
+        };
         let addr: SocketAddr = std_listener
             .local_addr()
             .map_err(|err| ProxyStartError::Bind {
@@ -374,17 +453,33 @@ impl MeteringProxy {
     /// `grace`, abort the rest (recorded `shutdown`), then close the record
     /// pump so the store writer can close.
     pub(crate) async fn shutdown(&mut self, grace: Duration) {
+        let _ = self.stop_with(grace, false).await;
+    }
+
+    /// Story 24-2: [`Self::shutdown`], keeping the listening socket open
+    /// and handing it back (blocking mode off, as bound) for a successor.
+    pub(crate) async fn shutdown_keeping_listener(
+        &mut self,
+        grace: Duration,
+    ) -> Option<std::net::TcpListener> {
+        let kept = self.stop_with(grace, true).await?;
+        kept.into_std().ok()
+    }
+
+    async fn stop_with(&mut self, grace: Duration, keep: bool) -> Option<TcpListener> {
         if let Some(sweeper) = self.sweeper.take() {
             sweeper.abort();
             let _ = sweeper.await;
         }
         if let Some(stop) = self.stop.take() {
-            let _ = stop.send(Some(grace));
+            let _ = stop.send(Some((grace, keep)));
         }
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
+        let kept = match self.task.take() {
+            Some(task) => task.await.ok().flatten(),
+            None => None,
+        };
         self.shared.pump.close();
+        kept
     }
 }
 
@@ -630,16 +725,16 @@ async fn accept_connection(
 async fn accept_loop(
     listener: TcpListener,
     shared: Arc<forward::ProxyShared>,
-    mut stop: tokio::sync::watch::Receiver<Option<Duration>>,
+    mut stop: tokio::sync::watch::Receiver<Option<(Duration, bool)>>,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     peers_as_remote: bool,
-) {
+) -> Option<TcpListener> {
     let mut connections = tokio::task::JoinSet::new();
-    let grace = loop {
+    let (grace, keep) = loop {
         tokio::select! {
             changed = stop.changed() => {
-                let grace = if changed.is_ok() { *stop.borrow() } else { None };
-                break grace.unwrap_or(Duration::ZERO);
+                let asked = if changed.is_ok() { *stop.borrow() } else { None };
+                break asked.unwrap_or((Duration::ZERO, false));
             }
             accepted = listener.accept() => {
                 let Ok((stream, peer)) = accepted else { continue };
@@ -657,7 +752,15 @@ async fn accept_loop(
             }
         }
     };
-    drop(listener);
+    // Story 24-2: a successor takes the socket over — it stays open, so a
+    // connection that arrives meanwhile waits in the kernel's backlog
+    // instead of being refused. Otherwise it closes now.
+    let kept = if keep {
+        Some(listener)
+    } else {
+        drop(listener);
+        None
+    };
     // Story 23-4: stopping from now on — a parked call answers the
     // retryable `hekma_hold_interrupted` within its re-check tick instead
     // of waiting out the grace to be aborted unanswered.
@@ -685,4 +788,5 @@ async fn accept_loop(
         .store(true, std::sync::atomic::Ordering::Release);
     connections.abort_all();
     while connections.join_next().await.is_some() {}
+    kept
 }
