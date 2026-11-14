@@ -112,6 +112,14 @@ pub enum TransitionCause {
     },
     /// Graceful shutdown succeeded within the window: `stopping → stopped`.
     StopGraceful,
+    /// Story 24-3: the previous Service Host stopped (a crash) while this
+    /// instance was `starting` and waiting for its declared readiness
+    /// probe; this engine adopted the live process as `running` without the
+    /// probe's answer, and says so (`starting → running`).
+    AdoptedUnconfirmed {
+        /// Which probe went unanswered.
+        detail: String,
+    },
     /// Story 24-3: the previous Service Host crashed with Handoff Mode off,
     /// and this engine stopped the agent it left running (the orphan
     /// cleanup NFR-1 asks for): both edges of that ordinary stop, and the
