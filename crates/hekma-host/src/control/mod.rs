@@ -91,6 +91,9 @@ pub(crate) struct ApiState {
     /// Story 24-2: an Operator's in-place upgrade request reaches the serve
     /// loop here.
     pub(crate) upgrade: Arc<tokio::sync::Notify>,
+    /// Story 24-2: what `GET /v0/host` answers (this host's mode and the
+    /// service-manager check, settled at start).
+    pub(crate) host: Arc<serde_json::Value>,
 }
 
 /// The API's request activity (story 21-4): how many authenticated requests
@@ -332,6 +335,7 @@ fn router(state: ApiState) -> Router {
             get(routes::proxy_show).patch(routes::proxy_update),
         )
         // Story 24-2: hand this host over to a fresh one in place.
+        .route("/v0/host", get(routes::host_show))
         .route("/v0/host/upgrade", post(routes::host_upgrade))
         // Story 24-4: the retention windows and the compaction state.
         .route(
@@ -412,6 +416,7 @@ pub(crate) mod test_support {
                 loopback: true,
                 auth_diagnostics: auth::AuthDiagnostics::new(None, auth::AuthDiagnostics::INTERVAL),
                 upgrade: Arc::new(tokio::sync::Notify::new()),
+                host: Arc::new(serde_json::json!({ "handoff": false })),
             };
             // Leak the engine (never dropped) and the temp root.
             std::mem::forget(engine);
@@ -443,6 +448,7 @@ pub(crate) mod test_support {
                 loopback: true,
                 auth_diagnostics: auth::AuthDiagnostics::new(None, auth::AuthDiagnostics::INTERVAL),
                 upgrade: Arc::new(tokio::sync::Notify::new()),
+                host: Arc::new(serde_json::json!({ "handoff": false })),
             };
             std::mem::forget(engine);
             std::mem::forget(root);
@@ -528,6 +534,7 @@ impl BoundListeners {
         notes: NoteTap,
         sink: DiagnosticSink,
         set_token_ttl: Option<Duration>,
+        host: serde_json::Value,
     ) -> Result<ControlApi, String> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let activity = Activity::new();
@@ -547,6 +554,7 @@ impl BoundListeners {
                 auth::AuthDiagnostics::INTERVAL,
             ),
             upgrade: Arc::new(tokio::sync::Notify::new()),
+            host: Arc::new(host),
         };
         let upgrade = Arc::clone(&state.upgrade);
         let mut tasks = Vec::with_capacity(self.bound.len());
