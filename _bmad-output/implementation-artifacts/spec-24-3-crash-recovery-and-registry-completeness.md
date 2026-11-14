@@ -231,4 +231,12 @@ The **O-items are Islam's rulings** (product and public-contract choices); the n
     - No SDK-shaped `wire`/`announced` client harness measuring retryable errors client-side. The upgrade's zero-refused-connections poller is the client-side measure that exists.
     - The suite is the existing tests, not a separate `sm7_no_unrequested_stops.rs` file.
     - It runs on every PR wherever those tests run (O3), but they run only on Unix, since the Shim is Unix-only.
+- 2026-11-14 — **phase 5 built** (stacked on phase 4, #429): part of T5's drill (R2), on Unix.
+  - **The drill.** An engine-observed agent in its own Shim, with Handoff on, gets a child Run with a caller label, a bound label, a token ceiling and a hold. The host is SIGKILLed, and the next host (started by the next write) reads the child's `run show --json` back byte-for-byte. It also checks the agent's own Run for status, Anomalies, labels, limits, dispositions and custody. SM-7 finds no unauthorized action. Stable four runs out of four.
+  - **Not covered yet:**
+    - in-flight and parked calls (their `crash` closure and a retried call re-held);
+    - Leases of announced Runs;
+    - the Windows `taskkill /F` leg;
+    - the flush-bound measurement;
+    - the `Recovery` event.
 

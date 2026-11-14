@@ -234,6 +234,12 @@ scenarios:
   not chosen (none);
 - a Shim killed under its agent (none).
 
+A `kill -9` drill (`crates/hekma/tests/shim_cli.rs`) commits labels, a token
+ceiling and a hold on a Run of a running agent, SIGKILLs the host, and
+checks that the next host reads that Run back byte-for-byte, along with the
+agent's own Run. The next host already serves the hold, from its first
+snapshot.
+
 ## Performance budgets (NFR-4)
 
 The NFR-4 budgets — read commands < 1 s on a 25-instance Fleet, supervision overhead ≤ 2% CPU and ≤ 50 MB RSS per running instance — are **measured, not assumed**, by the perf-budgets harness (`crates/hekma-engine/examples/perf-budgets.rs`). It builds a real 25-instance Fleet fixture (manifest agents on the conformance `fake_agent`; 10 RUNNING via the facade `start`, the rest registered-only) on a hermetic temp root, drives the PUBLIC `blocking()` facade only, and measures in a fixed order that keeps the fixture startup entirely outside the timed windows (setup → settle → steady-state window → re-settle → read latency → a subscriber-overhead addendum, below):

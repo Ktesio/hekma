@@ -394,3 +394,113 @@ fn sigterm_with_handoff_off_stops_its_agents_by_the_shutdown_clause_only() {
     );
     sm7_holds(state_dir, &[hekma_conformance::sm7::Clause::VerbOrShutdown]);
 }
+
+/// Story 24-3 (T5, R2): everything committed before a `kill -9` survives
+/// it exactly — a child Run's labels, its limits and a hold set on it, and
+/// the agent's own Run — read back unchanged through the next host, whose
+/// first snapshot already holds the hold.
+#[test]
+fn a_kill_9_loses_nothing_committed_before_it() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let manifest = tempfile::tempdir().unwrap();
+    // Engine-observed, so its Runs have a wire path (and can be held).
+    hekma_conformance::test_support::ManifestFixture::new("svc", &["--linger-ms", "600000"])
+        .guaranteed_on_all_oses("interaction")
+        .metering("engine-observed")
+        .write(manifest.path());
+    let _host = HostGuard(state_dir);
+    let env = [
+        ("HEKMA_SHIM", "1"),
+        ("HEKMA_HANDOFF", "on"),
+        ("DRILL_PROVIDER_KEY", "sk-drill-not-a-real-key"),
+    ];
+    let hekma = |args: &[&str]| run_hekma_agent_with_env(args, &ctx.project_dir, state_dir, &env);
+    let manifest_arg = manifest.path().to_string_lossy().into_owned();
+    assert!(hekma(&["agent", "register", "svc", "--manifest", &manifest_arg]).success);
+    let set = hekma(&[
+        "agent",
+        "config",
+        "set",
+        "svc",
+        "provider.api_key",
+        "secret:DRILL_PROVIDER_KEY",
+    ]);
+    assert!(set.success, "{}", both(&set));
+    let set = hekma(&[
+        "agent",
+        "config",
+        "set",
+        "svc",
+        "metering.upstream_base_url",
+        "http://127.0.0.1:9/v1",
+    ]);
+    assert!(set.success, "{}", both(&set));
+    // Custody off: the (fake) key is delivered to the agent as is.
+    let set = hekma(&["agent", "config", "set", "svc", "provider.custody", "off"]);
+    assert!(set.success, "{}", both(&set));
+    let started = hekma(&["agent", "start", "svc"]);
+    assert!(started.success, "{}", both(&started));
+    let opened = hekma(&[
+        "run", "open", "--parent", "svc", "--label", "job=7", "--json",
+    ]);
+    assert!(opened.success, "{}", both(&opened));
+    let doc: serde_json::Value = serde_json::from_str(&opened.stdout).unwrap();
+    let child = doc["run"]["run_id"].as_str().unwrap().to_string();
+    for args in [
+        vec!["label", "set", child.as_str(), "team=core"],
+        vec!["budget", "set", child.as_str(), "--tokens-per-run", "1000"],
+        vec!["hold", child.as_str()],
+    ] {
+        let run = hekma(&args);
+        assert!(run.success, "{args:?}: {}", both(&run));
+    }
+    let show = |id: &str| -> serde_json::Value {
+        let run = hekma(&["run", "show", id, "--json"]);
+        assert!(run.success, "{}", both(&run));
+        serde_json::from_str(&run.stdout).unwrap()
+    };
+    let before_child = show(&child);
+    let parent = before_child["run"]["parent_run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let before_parent = show(&parent);
+    assert_eq!(before_child["run"]["status"], "held");
+
+    helpers::kill_host(state_dir);
+    // The next write starts a host over the same state directory.
+    assert!(hekma(&["agent", "register", "other", "--manifest", &manifest_arg]).success);
+    let after_child = show(&child);
+    let after_parent = show(&parent);
+    assert_eq!(
+        after_child, before_child,
+        "the child Run is exactly as committed"
+    );
+    for field in [
+        "run_id",
+        "status",
+        "anomalies",
+        "labels",
+        "limits",
+        "dispositions",
+        "custody",
+    ] {
+        assert_eq!(
+            after_parent["run"][field], before_parent["run"][field],
+            "the agent's Run kept {field}"
+        );
+    }
+    // SM-7: the crash took no action (the hold is an Operator verb).
+    let actions = hekma_conformance::sm7::audit_state_dir(state_dir);
+    assert!(
+        hekma_conformance::sm7::unauthorized(&actions).is_empty(),
+        "{actions:?}"
+    );
+    assert!(hekma(&["release", child.as_str()]).success);
+    assert!(hekma(&["agent", "stop", "svc"]).success);
+}
