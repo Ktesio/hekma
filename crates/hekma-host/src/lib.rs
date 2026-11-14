@@ -991,6 +991,7 @@ where
     // with Handoff Mode off asked for its agents to be cleaned up: each is
     // stopped the ordinary way and its Run ends `engine-crash`. On, or not
     // recorded: they were adopted and keep running.
+    let mut recovered: Option<hekma_engine::RecoveryEvent> = None;
     if let Some(recovery) = engine.host_recovery() {
         let (cleaned, failed) = match recovery.previous {
             hekma_engine::PreviousHost::Gone { handoff: false } => {
@@ -1010,11 +1011,10 @@ where
             notifier.note(&note);
         }
         // The one durable summary of this reconcile.
-        if let Err(err) = engine.blocking().commit_recovery(cleaned.len()) {
-            notifier.note(&format!(
-                "the recovery summary could not be recorded ({err}); the agents and calls \
-                 above are settled all the same"
-            ));
+        let (event, note) = recovery_committed(engine.blocking().commit_recovery(cleaned.len()));
+        recovered = event;
+        if let Some(note) = note {
+            notifier.note(&note);
         }
     }
 
@@ -1035,6 +1035,9 @@ where
         "shim": shim_launches,
         "handoff_check": handoff_check.as_str(),
         "handoff_check_detail": handoff_check.detail(),
+        // Story 24-3: what this start reconciled (the `recovery` event it
+        // committed), or null.
+        "recovery": recovered,
     });
 
     // (5.5) The Control API mounts here: AFTER the engine opens and the
@@ -1487,6 +1490,23 @@ fn hand_over(
         .map_err(|err| err.to_string())
 }
 
+/// Story 24-3: what a commit of the `recovery` summary leaves for
+/// `GET /v0/host`, and the note when it could not be recorded.
+fn recovery_committed(
+    result: Result<Option<hekma_engine::RecoveryEvent>, hekma_engine::EngineError>,
+) -> (Option<hekma_engine::RecoveryEvent>, Option<String>) {
+    match result {
+        Ok(event) => (event, None),
+        Err(err) => (
+            None,
+            Some(format!(
+                "the recovery summary could not be recorded ({err}); the agents and calls \
+                 above are settled all the same"
+            )),
+        ),
+    }
+}
+
 /// Story 24-3: the started notice's line about the previous owner's agents.
 fn recovery_note(
     recovery: &hekma_engine::HostRecovery,
@@ -1767,6 +1787,16 @@ mod identity_headers_note_tests {
         assert!(started.elapsed() >= std::time::Duration::from_millis(100));
         // Alone, it closes at once.
         super::close_engine(straggler, std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_recovery_summary_that_cannot_be_recorded_is_noted_and_left_null() {
+        let (event, note) = super::recovery_committed(Err(hekma_engine::EngineError::NotFound {
+            name: "ghost".into(),
+        }));
+        assert!(event.is_none());
+        assert!(note.unwrap().contains("could not be recorded"));
+        assert_eq!(super::recovery_committed(Ok(None)), (None, None));
     }
 
     #[test]
