@@ -305,6 +305,20 @@ struct EngineInner {
     /// Story 21-8: this run's serve-flag override of the stored
     /// identity-header setting (`None` follows the stored setting).
     identity_headers_flag: Option<bool>,
+    /// Story 24-5: inbound telemetry points accepted and skipped since open
+    /// (the exporter's `hekma.telemetry.received`).
+    telemetry_points: [std::sync::atomic::AtomicU64; 2],
+}
+
+/// The counters the OTLP exporter samples at each flush (story 24-5): the
+/// metering proxy's unscented calls and the inbound telemetry points, each
+/// since this engine opened. Counts only — never a value a client sent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExportCounters {
+    pub unscented_served: u64,
+    pub unscented_refused: u64,
+    pub telemetry_accepted: u64,
+    pub telemetry_skipped: u64,
 }
 
 /// Open-time options for the long-running Host (story 17-2) — the additive,
@@ -617,6 +631,7 @@ impl Engine {
             calls_dir,
             leases,
             identity_headers_flag,
+            telemetry_points: Default::default(),
         });
 
         // (1) Orphan adoption on open (AC-B / AI-7 / AI-8). Reconcile BEFORE the
@@ -685,6 +700,7 @@ impl Engine {
             calls_dir,
             leases: crate::domain::runs::lease::LeaseOptions::default(),
             identity_headers_flag: None,
+            telemetry_points: Default::default(),
         });
         Ok(Self {
             rt: Arc::new(rt),
@@ -827,6 +843,34 @@ impl Engine {
             .proxy_port()
             .ok()
             .flatten()
+    }
+
+    /// Story 24-5: record one inbound telemetry batch's accepted and skipped
+    /// points (the Control API's `/v1/metrics` calls this once per batch).
+    pub fn note_telemetry_points(&self, accepted: u64, skipped: u64) {
+        use std::sync::atomic::Ordering;
+        self.inner.telemetry_points[0].fetch_add(accepted, Ordering::Relaxed);
+        self.inner.telemetry_points[1].fetch_add(skipped, Ordering::Relaxed);
+    }
+
+    /// Story 24-5: the counters the OTLP exporter samples (see
+    /// [`ExportCounters`]). Lock-free but for the proxy handle's mutex.
+    pub fn export_counters(&self) -> ExportCounters {
+        use std::sync::atomic::Ordering;
+        let (unscented_served, unscented_refused) = self
+            .inner
+            .metering_proxy
+            .lock()
+            .expect("metering proxy mutex poisoned")
+            .as_ref()
+            .map(|proxy| proxy.unscented_counts())
+            .unwrap_or_default();
+        ExportCounters {
+            unscented_served,
+            unscented_refused,
+            telemetry_accepted: self.inner.telemetry_points[0].load(Ordering::Relaxed),
+            telemetry_skipped: self.inner.telemetry_points[1].load(Ordering::Relaxed),
+        }
     }
 
     /// Whether any binding holds an active proxy-access credential (story

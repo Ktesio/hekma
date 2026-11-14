@@ -19,10 +19,12 @@
 //! host's exit is never held past it. No durable telemetry persistence —
 //! the outbox stays the only durable export surface.
 
+pub mod attributes;
 pub mod client;
 pub(crate) mod intake;
 pub mod payload;
 pub mod task;
+pub mod v2;
 
 // The operator/host-facing types re-exported at the module root (ServeOptions
 // carries OtlpOptions; the serve path builds the exporter handle).
@@ -40,6 +42,35 @@ pub const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 10;
 /// refused everywhere, the stop-window discipline.
 pub const MIN_FLUSH_INTERVAL_SECS: u64 = 1;
 pub const MAX_FLUSH_INTERVAL_SECS: u64 = 3_600;
+
+/// Which exposition the exporter emits (story 24-5): `otlp-metrics v2` by
+/// default; `v1` stays selectable, deprecated, until a major release.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Exposition {
+    /// `otlp-metrics v1` — Run-keyed series (deprecated).
+    V1,
+    /// `otlp-metrics v2` — depth, Policy and allow-listed label attributes.
+    #[default]
+    V2,
+}
+
+impl Exposition {
+    /// The flag and scope-version word.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Exposition::V1 => "v1",
+            Exposition::V2 => "v2",
+        }
+    }
+}
+
+/// The most label keys `--otlp-label-keys` takes.
+pub const MAX_LABEL_KEYS: usize = 8;
+
+/// The per-key distinct-value cap's default and bounds.
+pub const DEFAULT_LABEL_CARDINALITY: u32 = 200;
+pub const MIN_LABEL_CARDINALITY: u32 = 2;
+pub const MAX_LABEL_CARDINALITY: u32 = 10_000;
 
 /// One `--otlp-headers` value — a literal, or a `secret:NAME` reference.
 /// The manual `Debug` NEVER prints the value (the no-leak discipline: the
@@ -98,6 +129,18 @@ pub struct OtlpOptions {
     /// The flush interval override (whole seconds; `None` =
     /// [`DEFAULT_FLUSH_INTERVAL_SECS`]).
     pub flush_interval: Option<u64>,
+    /// Story 24-5 (`--otlp-exposition`): the exposition; `None` is the
+    /// default, `v2`.
+    pub exposition: Option<Exposition>,
+    /// Story 24-5 (`--otlp-label-keys`): the label keys that become
+    /// `hekma.label.<key>` attributes. Empty (the default) exports none.
+    pub label_keys: Vec<String>,
+    /// Story 24-5 (`--otlp-label-cardinality`): each key's distinct-value
+    /// cap; `None` is [`DEFAULT_LABEL_CARDINALITY`].
+    pub label_cardinality: Option<u32>,
+    /// Story 24-5 (`--otlp-ca-file`): a PEM root to trust for an
+    /// `https://` collector, beside the vendored public roots.
+    pub ca_file: Option<std::path::PathBuf>,
 }
 
 impl OtlpOptions {
@@ -170,9 +213,58 @@ impl OtlpOptions {
             endpoint,
             headers,
             flush_interval,
+            ..OtlpOptions::default()
         };
         options.validate()?;
         Ok(options)
+    }
+
+    /// Story 24-5: add the exposition flags to options [`Self::from_flags`]
+    /// parsed (the same single parse site, a second step): the exposition
+    /// (`v1`|`v2`), the label keys (comma-separated), the per-key cap and
+    /// the collector's CA file. Errors are the usage-class refusal.
+    pub fn with_exposition_flags(
+        mut self,
+        exposition: Option<&str>,
+        label_keys: Option<&str>,
+        label_cardinality: Option<u64>,
+        ca_file: Option<std::path::PathBuf>,
+    ) -> Result<Self, String> {
+        self.exposition = match exposition.map(str::trim) {
+            None => None,
+            Some("v1") => Some(Exposition::V1),
+            Some("v2") => Some(Exposition::V2),
+            Some(other) => {
+                return Err(format!(
+                    "invalid --otlp-exposition {other:?}: the exposition is v1 or v2"
+                ))
+            }
+        };
+        if let Some(raw) = label_keys {
+            for key in raw.split(',').map(str::trim).filter(|key| !key.is_empty()) {
+                hekma_engine::validate_label_key(key).map_err(|reason| {
+                    format!("--otlp-label-keys: {key:?} is not a label key ({reason})")
+                })?;
+                if self.label_keys.iter().any(|existing| existing == key) {
+                    return Err(format!("--otlp-label-keys names {key:?} twice"));
+                }
+                self.label_keys.push(key.to_string());
+            }
+        }
+        self.label_cardinality = label_cardinality.map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+        self.ca_file = ca_file;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// The effective exposition (the single defaulting site).
+    pub fn effective_exposition(&self) -> Exposition {
+        self.exposition.unwrap_or_default()
+    }
+
+    /// The effective per-key distinct-value cap.
+    pub fn effective_label_cardinality(&self) -> u32 {
+        self.label_cardinality.unwrap_or(DEFAULT_LABEL_CARDINALITY)
     }
 
     /// Whether the exporter exists (the structural opt-in: endpoint set).
@@ -209,6 +301,47 @@ impl OtlpOptions {
                  export to flush while the exporter is off"
                     .to_string(),
             );
+        }
+        // Story 24-5: every exposition flag is a half-config surface without
+        // an endpoint, refused the same way.
+        if self.endpoint.is_none() {
+            for (set, flag) in [
+                (self.exposition.is_some(), "--otlp-exposition"),
+                (!self.label_keys.is_empty(), "--otlp-label-keys"),
+                (self.label_cardinality.is_some(), "--otlp-label-cardinality"),
+                (self.ca_file.is_some(), "--otlp-ca-file"),
+            ] {
+                if set {
+                    return Err(format!(
+                        "{flag} requires --otlp-endpoint: there is no export while the \
+                         exporter is off"
+                    ));
+                }
+            }
+        }
+        if self.effective_exposition() == Exposition::V1 && !self.label_keys.is_empty() {
+            return Err(
+                "--otlp-label-keys does not apply to --otlp-exposition v1: v1 carries no \
+                 label attributes (drop the flag, or use v2)"
+                    .to_string(),
+            );
+        }
+        if self.label_keys.len() > MAX_LABEL_KEYS {
+            return Err(format!(
+                "--otlp-label-keys takes at most {MAX_LABEL_KEYS} keys (got {})",
+                self.label_keys.len()
+            ));
+        }
+        if let Some(cap) = self.label_cardinality {
+            if !(MIN_LABEL_CARDINALITY..=MAX_LABEL_CARDINALITY).contains(&cap) {
+                return Err(format!(
+                    "invalid --otlp-label-cardinality {cap}: the per-key cap is a whole \
+                     number from {MIN_LABEL_CARDINALITY} to {MAX_LABEL_CARDINALITY}"
+                ));
+            }
+        }
+        if let Some(path) = &self.ca_file {
+            client::load_ca_file(path)?;
         }
         if let Some(secs) = self.flush_interval {
             if !(MIN_FLUSH_INTERVAL_SECS..=MAX_FLUSH_INTERVAL_SECS).contains(&secs) {
@@ -267,6 +400,10 @@ impl fmt::Debug for OtlpOptions {
             .field("endpoint", &self.endpoint)
             .field("headers", &headers)
             .field("flush_interval", &self.flush_interval)
+            .field("exposition", &self.exposition)
+            .field("label_keys", &self.label_keys)
+            .field("label_cardinality", &self.label_cardinality)
+            .field("ca_file", &self.ca_file)
             .finish()
     }
 }

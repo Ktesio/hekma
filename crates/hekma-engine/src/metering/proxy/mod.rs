@@ -346,6 +346,20 @@ impl MeteringProxy {
         &self.info
     }
 
+    /// Story 24-5: the unscented calls served (`shadow`) and refused
+    /// (`enforce`) since start — the exporter samples them at each flush.
+    pub(crate) fn unscented_counts(&self) -> (u64, u64) {
+        let counters = &self.shared.counters;
+        (
+            counters
+                .unscented_served
+                .load(std::sync::atomic::Ordering::Relaxed),
+            counters
+                .unscented_refused
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     /// The shared call state (the seam tests drive its test hooks).
     #[cfg(test)]
     pub(crate) fn shared(&self) -> &Arc<forward::ProxyShared> {

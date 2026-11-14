@@ -59,7 +59,7 @@ pub use lock::{read_holder_pid, HostLock, LockRefusal};
 // The exporter's operator-facing configuration types (AD-21): ServeOptions
 // carries the parsed flags; the parse itself lives on ONE site
 // (`OtlpOptions::from_flags`) both CLI surfaces call.
-pub use otlp::{OtlpExporter, OtlpHeaderValue, OtlpOptions};
+pub use otlp::{Exposition, OtlpExporter, OtlpHeaderValue, OtlpOptions};
 
 /// The engine's diagnostic sink contract, re-used verbatim: one
 /// `Arc<Mutex<Box<dyn Write + Send>>>` the host's (and the engine's)
@@ -1011,6 +1011,17 @@ where
                     otlp_options.effective_flush_interval(),
                 ),
                 service_instance_id: otlp::service_instance_id(&state_root),
+                // Story 24-5: the exposition and its label allow-list, the
+                // collector's CA root, and the engine's counters sampled at
+                // each flush.
+                exposition: otlp_options.effective_exposition(),
+                label_keys: otlp_options.label_keys.clone(),
+                label_cardinality: otlp_options.effective_label_cardinality(),
+                ca_file: otlp_options.ca_file.clone(),
+                counters: Some({
+                    let engine = Arc::clone(&engine);
+                    std::sync::Arc::new(move || engine.export_counters())
+                }),
             };
             let rx = engine.subscribe();
             let exporter =

@@ -727,6 +727,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "rcgen",
  "ring",
@@ -739,6 +740,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "ureq",
+ "webpki-roots",
 ]
 
 [[package]]

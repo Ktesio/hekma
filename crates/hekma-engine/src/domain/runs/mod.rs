@@ -32,6 +32,8 @@ use crate::ports::StoreError;
 
 pub mod announce;
 pub mod bindings;
+pub(crate) mod context;
+pub use context::RunContext;
 pub mod dispositions;
 pub(crate) mod keys;
 pub(crate) mod labels;
