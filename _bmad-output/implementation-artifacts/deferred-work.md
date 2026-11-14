@@ -982,6 +982,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 
 - source_spec: `spec-24-3-crash-recovery-and-registry-completeness.md` (T4: Shim death)
   summary: A lost Shim's child is not probed and supervised directly (`supervised-degraded`), and no new Shim is started for its relaunch.
+  **Partly resolved 2026-11-14 (phase 2):** the child is probed and re-held directly, never relaunched beside itself, and the degradation is noted. Still open: the `supervised-degraded` Anomaly and a `shim lost` event, and updating the spawn record.
   evidence: `crates/hekma-engine/src/domain/supervisor/proc.rs`. Trigger: 24-3 phase 2.
 
 - source_spec: `spec-24-3-crash-recovery-and-registry-completeness.md` (T5, T6, T7)

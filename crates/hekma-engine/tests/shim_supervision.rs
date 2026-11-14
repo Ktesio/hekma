@@ -581,3 +581,89 @@ fn the_next_owner_reads_the_previous_posture_and_cleans_up_after_an_off_crash() 
     let plain = Engine::open(Some(state.path().to_path_buf())).unwrap();
     assert!(plain.host_recovery().is_none());
 }
+
+/// A diagnostic sink capturing into a shared buffer.
+struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn kill9(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status();
+}
+
+/// Story 24-3 (T4): a Shim that dies under a live agent does not make the
+/// agent look crashed (no relaunch beside it): the engine re-holds it
+/// directly, says so, and its stop still ends it. A Shim that dies with
+/// its agent is an exit whose code is unavailable.
+#[test]
+fn a_dead_shim_degrades_to_direct_supervision_and_never_relaunches_its_live_agent() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    manifest(dir.path(), "lone", &["--linger-ms", "600000"]);
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let sink: hekma_engine::DiagnosticSink = std::sync::Arc::new(std::sync::Mutex::new(Box::new(
+        Capture(std::sync::Arc::clone(&captured)),
+    )
+        as Box<dyn std::io::Write + Send>));
+    let lines = || String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+    let engine = Engine::open_with_options(
+        Some(state.path().to_path_buf()),
+        EngineOptions {
+            shim_exe: Some(hekma_conformance::test_support::shim_host_bin()),
+            diagnostics: Some(sink),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter("lone", &AdapterRef::Manifest(dir.path().to_path_buf()))
+        .unwrap();
+    facade.start("lone").unwrap();
+    let (pid, socket) = record(state.path());
+    kill9(shim_pid(&socket).expect("the Shim runs"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !lines().contains("its Shim is gone") {
+        assert!(Instant::now() < deadline, "never noticed: {}", lines());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(alive(pid), "the agent outlives its Shim");
+    let status = facade.instance_status("lone").unwrap();
+    assert_eq!(status.instance.state, LifecycleState::Running, "{status:?}");
+    assert_eq!(status.restart_count, 0, "never relaunched beside itself");
+    facade.stop("lone", Some(Duration::from_secs(5))).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive(pid) {
+        assert!(Instant::now() < deadline, "the direct stop ended it");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Both gone: an exit, its code unavailable.
+    facade.start("lone").unwrap();
+    let (pid, socket) = record(state.path());
+    let shim = shim_pid(&socket).expect("the Shim runs");
+    kill9(pid);
+    kill9(shim);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = facade.instance_status("lone").unwrap().instance.state;
+        if state != LifecycleState::Running {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the exit was never seen");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
