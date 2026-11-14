@@ -260,3 +260,7 @@ The **O-items are Islam's rulings** (product and public-contract choices); the n
     - `runs_*` count agents, one process-owning Run each;
     - a start that found nothing to reconcile (no agent left, no Shim lost, no call left open) records **no** event, unlike the I/O matrix's "second restart → `Recovery` with zero counts" row. A zero-count event on every start added an export row per restart and broke three pinned Control API export tests; the event marks work done. Recorded in the ledger for Islam.
   - **Still open:** the CLI `--json` derived fields.
+- 2026-11-14 — **phase 10 built** (stacked on 24-2 phase 5, #437): the operator read of the summary.
+  - `GET /v0/host` gains `recovery`: the `RecoveryEvent` this start committed, or `null` when it found nothing to reconcile.
+  - The real-binary crash tests in `shim_cli.rs` now assert it for all three modes: off (one agent cleaned), on and unchosen (one kept, posture `on` or `unknown`). They read it over the local endpoint with `control.json`'s token.
+  - This stands in for the spec's "`--json` carries the Recovery-derived fields": `hekma ps --json` already carries each Run's `engine-crash` cause, and the summary belongs to the host, not a Run.

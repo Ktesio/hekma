@@ -991,6 +991,7 @@ where
     // with Handoff Mode off asked for its agents to be cleaned up: each is
     // stopped the ordinary way and its Run ends `engine-crash`. On, or not
     // recorded: they were adopted and keep running.
+    let mut recovered: Option<hekma_engine::RecoveryEvent> = None;
     if let Some(recovery) = engine.host_recovery() {
         let (cleaned, failed) = match recovery.previous {
             hekma_engine::PreviousHost::Gone { handoff: false } => {
@@ -1010,11 +1011,12 @@ where
             notifier.note(&note);
         }
         // The one durable summary of this reconcile.
-        if let Err(err) = engine.blocking().commit_recovery(cleaned.len()) {
-            notifier.note(&format!(
+        match engine.blocking().commit_recovery(cleaned.len()) {
+            Ok(event) => recovered = event,
+            Err(err) => notifier.note(&format!(
                 "the recovery summary could not be recorded ({err}); the agents and calls \
                  above are settled all the same"
-            ));
+            )),
         }
     }
 
@@ -1035,6 +1037,9 @@ where
         "shim": shim_launches,
         "handoff_check": handoff_check.as_str(),
         "handoff_check_detail": handoff_check.detail(),
+        // Story 24-3: what this start reconciled (the `recovery` event it
+        // committed), or null.
+        "recovery": recovered,
     });
 
     // (5.5) The Control API mounts here: AFTER the engine opens and the
