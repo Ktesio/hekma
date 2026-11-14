@@ -201,9 +201,20 @@ own small supervisor, a Shim, which this binary runs as the hidden internal
 command `hekma shim`. The Shim owns the agent's process, so the agent keeps
 running when the host exits or crashes, and the next host reconnects to it.
 Unix only, and ACP agents stay held directly. It is off by default: without
-the variable, nothing changes. What happens to Shim-held agents when the
-host stops (keep them for the next host, or stop them) is still to be
-decided; today a draining host stops them as before.
+the variable, nothing changes.
+
+**Handoff Mode (a preview).** By default a stopping host stops every agent,
+Shim-held or not. Start the host with `--handoff` (or `HEKMA_HANDOFF=on`) and
+a stopping host — on SIGTERM, SIGINT or an auto-started host's idle exit —
+instead releases each agent held through a Shim: it closes the connection
+without sending a stop, so the agent keeps running in its Shim, and notes
+`<name> released to its Shim`. The next host, started by you or by the next
+`hekma` write, reconnects to each one. Agents held directly (ACP agents, or
+any agent while `HEKMA_SHIM` is off) are still stopped, and the started
+notice says so when Handoff Mode is on without Shims. Handing the host over
+to a new binary without a gap (an in-place upgrade) is not built yet: until
+the next host starts, nothing serves the metering proxy or the Control API,
+and calls in that window are refused.
 
 Each Shim also watches its agent's process tree for direct connections to
 known provider hosts, every 5 seconds, and the host records what it finds on

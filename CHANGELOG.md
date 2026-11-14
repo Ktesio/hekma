@@ -4,6 +4,13 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — Handoff Mode, a preview (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **`hekma serve --handoff`** (or `HEKMA_HANDOFF=on`): when the host stops, agents running in their own Shim are released instead of stopped. They keep running, and the next host reconnects to them. Agents held directly are still stopped. Off by default; `--no-handoff` keeps the drain.
+> - **Not yet:** handing the host to a new binary without a gap (the in-place upgrade), service-manager checks, and Windows.
+> - **Engine surface (additive):** `Engine::shutdown_for_handoff` and `HandoffShutdown`. No schema change.
+
 > **Unreleased — bypass detection, a preview for agents in their own Shim (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >

@@ -183,6 +183,11 @@ pub struct ServeOptions {
     /// directly. `hekma serve` sets it when `HEKMA_SHIM=1`, a preview
     /// switch until the Shim is on by default.
     pub shim_exe: Option<PathBuf>,
+    /// Story 24-2: Handoff Mode — at shutdown, agents held through a Shim
+    /// are released (they keep running; the next host reconnects to them)
+    /// instead of stopped. Off by default; agents held directly are always
+    /// stopped.
+    pub handoff: bool,
 }
 
 /// Story 21-4: how long an AUTO-STARTED host waits with no live agent and no
@@ -447,7 +452,9 @@ where
         autostart_idle_override,
         set_token_ttl_override,
         shim_exe,
+        handoff,
     } = options;
+    let shim_launches = shim_exe.is_some();
     let has_caller_sink = diagnostics.is_some();
     let notifier = match diagnostics {
         Some(sink) => Notifier::over(sink.clone()),
@@ -917,6 +924,11 @@ where
         notifier.note(&note);
     }
 
+    // Story 24-2: say what a shutdown will do to the agents.
+    if let Some(note) = handoff_note(handoff, shim_launches) {
+        notifier.note(note);
+    }
+
     // (5.5) The Control API mounts here: AFTER the engine opens and the
     // started notice lands, BEFORE the signal wait. The LOCAL endpoint
     // (story 21-4) always binds; the operator's `--listen` joins it when
@@ -1084,14 +1096,18 @@ where
             }
         }
     };
+    let what = if handoff {
+        "releasing agents in their own Shim and stopping the rest"
+    } else {
+        "stopping running and paused agents"
+    };
     match ending {
         Ending::Signal(name) => notifier.note(&format!(
-            "{name} received; stopping running and paused agents (graceful window {}s) ...",
+            "{name} received; {what} (graceful window {}s) ...",
             window.as_secs_f32()
         )),
         Ending::Auto(reason) => notifier.note(&format!(
-            "auto-started host exiting ({reason}); stopping running and paused agents \
-             (graceful window {}s) ...",
+            "auto-started host exiting ({reason}); {what} (graceful window {}s) ...",
             window.as_secs_f32()
         )),
     }
@@ -1142,7 +1158,22 @@ where
     // re-enumerated once (finding 5), every per-instance outcome noted by
     // the drain itself (AI-18) AND returned (the vec is the API return for
     // programmatic callers).
-    let _outcomes = rt.block_on(drain::drain_and_stop(&engine, window, &notifier.sink));
+    // Story 24-2: in Handoff Mode, agents held through a Shim are released
+    // (they keep running; the next host reconnects), the rest drain.
+    if handoff {
+        let handed = engine
+            .blocking()
+            .shutdown_for_handoff(window, Some(&notifier.sink));
+        if !handed.released.is_empty() {
+            notifier.note(&format!(
+                "{} agent(s) left running in their Shims for the next host: {}",
+                handed.released.len(),
+                handed.released.join(", ")
+            ));
+        }
+    } else {
+        let _outcomes = rt.block_on(drain::drain_and_stop(&engine, window, &notifier.sink));
+    }
     // Review finding 20: the completion notice names what ended the host —
     // the stream reads as one story (X received → ... → complete).
     let label = match ending {
@@ -1155,6 +1186,21 @@ where
     drop(engine);
     drop(rt);
     Ok(())
+}
+
+/// Story 24-2: the started notice's Handoff Mode line, when there is one.
+fn handoff_note(handoff: bool, shim_launches: bool) -> Option<&'static str> {
+    match (handoff, shim_launches) {
+        (true, true) => Some(
+            "Handoff Mode is on: agents in their own Shim keep running when this host stops, \
+             and the next host reconnects to them",
+        ),
+        (true, false) => Some(
+            "Handoff Mode is on, but agents are not launched in their own Shim (set \
+             HEKMA_SHIM=1), so every agent is still stopped when this host stops",
+        ),
+        _ => None,
+    }
 }
 
 /// Why the host's serve wait ended.
@@ -1310,5 +1356,17 @@ mod identity_headers_note_tests {
         assert!(others.contains("socket activation"), "{others}");
         assert!(super::port_squatting_note(Some(0)).contains("no other user accounts"));
         assert!(super::port_squatting_note(None).contains("cannot tell"));
+    }
+
+    #[test]
+    fn the_handoff_note_says_what_a_shutdown_will_do() {
+        assert!(super::handoff_note(false, true).is_none());
+        assert!(super::handoff_note(false, false).is_none());
+        assert!(super::handoff_note(true, true)
+            .unwrap()
+            .contains("keep running when this host stops"));
+        assert!(super::handoff_note(true, false)
+            .unwrap()
+            .contains("every agent is still stopped"));
     }
 }

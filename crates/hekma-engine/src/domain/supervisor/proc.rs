@@ -121,6 +121,12 @@ impl ProcBackend {
         self.bypass = feed;
     }
 
+    /// Story 24-2: whether `handle` is held through a Shim (released, not
+    /// stopped, in Handoff Mode).
+    pub(crate) fn is_shim(&self, handle: &ProcHandle) -> bool {
+        matches!(handle, ProcHandle::Shim(_))
+    }
+
     /// Story 22-4: the newest bypass report a Shim handle has not yet
     /// handed over, once.
     pub(crate) fn take_bypass_report(

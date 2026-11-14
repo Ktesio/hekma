@@ -426,3 +426,42 @@ fn a_shim_reports_a_direct_connection_to_a_listed_host_on_the_run() {
     );
     facade.stop("byp", None).unwrap();
 }
+
+/// Story 24-2: `shutdown_for_handoff` releases a Shim-held agent (no stop),
+/// and the next engine reconnects to it.
+#[test]
+fn a_handoff_shutdown_releases_shim_agents_and_the_next_engine_takes_them_back() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    manifest(dir.path(), "kept", &["--linger-ms", "600000"]);
+    let pid = {
+        let engine = open(state.path());
+        let facade = engine.blocking();
+        facade
+            .register_with_adapter("kept", &AdapterRef::Manifest(dir.path().to_path_buf()))
+            .unwrap();
+        facade.start("kept").unwrap();
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        let pid: i64 = conn
+            .query_row("SELECT pid FROM agent_runtime", [], |row| row.get(0))
+            .unwrap();
+        let pid = pid as u32;
+        let handed = facade.shutdown_for_handoff(Duration::from_secs(5), None);
+        assert_eq!(handed.released, vec!["kept".to_string()]);
+        assert!(handed.outcomes.is_empty(), "nothing was held directly");
+        pid
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(alive(pid), "released, not stopped");
+    let engine = open(state.path());
+    let facade = engine.blocking();
+    let status = facade.instance_status("kept").unwrap();
+    assert_eq!(status.instance.state, LifecycleState::Running, "{status:?}");
+    // A second handoff shutdown with nothing held stops nothing either.
+    facade.stop("kept", None).unwrap();
+    let handed = facade.shutdown_for_handoff(Duration::from_secs(5), None);
+    assert!(handed.released.is_empty() && handed.outcomes.is_empty());
+}

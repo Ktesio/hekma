@@ -82,7 +82,7 @@ use crate::domain::{
     IssuedBindingCredential, RouteSpec,
 };
 use crate::ports::{LogCaptureMode, SpawnRecord};
-use crate::shutdown::DrainOutcome;
+use crate::shutdown::{DrainOutcome, HandoffShutdown};
 
 /// How often the crash-detection reaper polls supervised processes (story 1-6,
 /// `[ASSUMPTION]`). Small enough that a crash is detected promptly, large enough
@@ -2149,6 +2149,42 @@ impl Engine {
         crate::shutdown::drain_and_stop(self, window, &notes).await
     }
 
+    /// Story 24-2 (Handoff Mode): the shutdown that keeps agents running.
+    /// The metering proxy stops first, exactly as in [`Engine::shutdown`];
+    /// then every agent held through a Shim is RELEASED — its connection
+    /// closes and no stop is sent, so the Shim keeps the agent for the next
+    /// engine, which reconnects to it on open — and every agent still held
+    /// directly goes through the same bounded drain as `shutdown` (a direct
+    /// handle has no one to keep it). Each release and each outcome is
+    /// noted on `notes` and returned.
+    pub async fn shutdown_for_handoff(
+        &self,
+        window: Duration,
+        notes: Option<&DiagnosticSink>,
+    ) -> HandoffShutdown {
+        self.stop_metering_proxy(window).await;
+        let notes = crate::shutdown::Notes::over(notes);
+        crate::shutdown::release_and_drain(self, window, &notes).await
+    }
+
+    /// Story 24-2: release every Shim-held agent without stopping it (see
+    /// [`Engine::shutdown_for_handoff`]); the released names, sorted.
+    pub(crate) async fn release_shim_held(&self) -> Vec<String> {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            Ok::<_, std::convert::Infallible>(
+                supervisor
+                    .release_shim_held()
+                    .into_iter()
+                    .map(|name| name.as_str().to_string())
+                    .collect(),
+            )
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     /// Epic 20-1 coverage seam (cfg(test) only — the established
     /// fault-injection idiom, see [`Supervisor`]'s `stop_fault_pids` field
     /// docs): arm the stop fault for a HELD instance's pid, so the shutdown
@@ -4145,6 +4181,17 @@ impl Blocking<'_> {
     /// Blocking [`Engine::stop`].
     pub fn stop(&self, name: &str, window: Option<Duration>) -> Result<AgentInstance, EngineError> {
         self.engine.rt.block_on(self.engine.stop(name, window))
+    }
+
+    /// Blocking [`Engine::shutdown_for_handoff`] (story 24-2).
+    pub fn shutdown_for_handoff(
+        &self,
+        window: Duration,
+        notes: Option<&DiagnosticSink>,
+    ) -> HandoffShutdown {
+        self.engine
+            .rt
+            .block_on(self.engine.shutdown_for_handoff(window, notes))
     }
 
     /// Blocking [`Engine::shutdown`] — the fleet-wide stop ladder for

@@ -233,7 +233,7 @@ development_status:
   epic-23-retrospective: optional
   epic-24: backlog  # Operability at Scale (FR-55, FR-59, NFR-4, NFR-9; AD-18, AD-21, AD-23)
   24-1-one-shim-per-supervised-process: in-progress  # phases 1-2 built: the Shim library; the wiring on Unix, opt-in (HEKMA_SHIM=1) pending O3; Windows, ACP and record-before-launch remain
-  24-2-handoff-mode-and-in-place-upgrades: backlog  # flips Handoff Mode to default on acceptance
+  24-2-handoff-mode-and-in-place-upgrades: in-progress  # flips Handoff Mode to default on acceptance
   24-3-crash-recovery-and-registry-completeness: backlog
   24-4-scale-substrate-and-the-run-scale-benchmark: in-progress  # phases 1-3, 4a and 4b built (retention and compaction; the delta-log snapshot; the Run-scale ladder; AD-18 Steps 0 and 1); Steps 2-4 remain; built before 24-1 phase 2 (it waits on the O3 ruling)
   24-5-otlp-metrics-v2: review  # AI-55 two-pass review; built before 24-1 (only its bypass counter needs 22-4)

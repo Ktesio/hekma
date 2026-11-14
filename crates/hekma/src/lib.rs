@@ -482,6 +482,14 @@ enum Commands {
         /// identity-headers` stored (identity headers are on by default)
         #[arg(long, conflicts_with = "identity_headers")]
         no_identity_headers: bool,
+        /// Handoff Mode: on shutdown, agents running in their own Shim are
+        /// released, not stopped, and the next host reconnects to them
+        /// (overrides HEKMA_HANDOFF; off by default)
+        #[arg(long, conflicts_with = "no_handoff")]
+        handoff: bool,
+        /// Stop every agent on shutdown, whatever HEKMA_HANDOFF says
+        #[arg(long)]
+        no_handoff: bool,
         /// Send x-hekma-run-id and x-hekma-labels to the model provider for
         /// this run only, whatever `hekma proxy set identity-headers` stored
         #[arg(long)]
@@ -1470,6 +1478,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             proxy_tls_key,
             proxy_public_host,
             no_identity_headers,
+            handoff,
+            no_handoff,
             identity_headers,
             proxy_allowed_hosts,
             proxy_allowed_origins,
@@ -1495,6 +1505,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             proxy_tls_key,
             proxy_public_host,
             no_identity_headers,
+            handoff: match (handoff, no_handoff) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
             identity_headers,
             proxy_allowed_hosts,
             proxy_allowed_origins,

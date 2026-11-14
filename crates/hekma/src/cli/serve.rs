@@ -49,6 +49,9 @@ pub struct ServeFlags {
     /// `--identity-headers` (story 21-8): send them for this run only,
     /// over a stored `off`.
     pub identity_headers: bool,
+    /// `--handoff` (`Some(true)`) or `--no-handoff` (`Some(false)`) (story
+    /// 24-2); `None` follows `HEKMA_HANDOFF`.
+    pub handoff: Option<bool>,
     /// `--proxy-allowed-hosts <name,...>` (story 22-2).
     pub proxy_allowed_hosts: Vec<String>,
     /// `--proxy-allowed-origins <origin,...>` (story 22-2).
@@ -158,6 +161,12 @@ pub fn run(flags: ServeFlags) -> Result<(), Box<dyn std::error::Error>> {
         // Story 24-1: the Shim preview — this binary is its own Shim
         // program (the hidden `hekma shim`).
         shim_exe: shim_exe_from_env(),
+        // Story 24-2: the flag, then HEKMA_HANDOFF, then off.
+        handoff: handoff_mode(
+            flags.handoff,
+            std::env::var("HEKMA_HANDOFF").ok().as_deref(),
+        )
+        .map_err(|message| ServeOptionsInvalid { message })?,
     };
     hekma_host::serve(options).map_err(|err| {
         // The typed refusal carries its full holder-naming/remediation text
@@ -229,6 +238,23 @@ fn proxy_allowed_origins(values: Vec<String>) -> Result<Vec<String>, String> {
         origins.push(value.to_ascii_lowercase());
     }
     Ok(origins)
+}
+
+/// Story 24-2: Handoff Mode — `--handoff`/`--no-handoff`, else
+/// `HEKMA_HANDOFF` (`on`/`1` or `off`/`0`), else off.
+fn handoff_mode(flag: Option<bool>, env: Option<&str>) -> Result<bool, String> {
+    if let Some(on) = flag {
+        return Ok(on);
+    }
+    match env.map(str::trim) {
+        None | Some("") => Ok(false),
+        Some("on" | "1") => Ok(true),
+        Some("off" | "0") => Ok(false),
+        Some(other) => Err(format!(
+            "HEKMA_HANDOFF={other} is not a Handoff Mode: use on or off (or the --handoff / \
+             --no-handoff flags)"
+        )),
+    }
 }
 
 /// Story 24-1: `HEKMA_SHIM=1` launches supervised agents through a Shim (this
@@ -307,5 +333,18 @@ mod tests {
             .downcast_ref::<ServeOptionsInvalid>()
             .expect("the InvalidOptions arm maps to the Usage class");
         assert!(mapped.message.contains("--tls-cert"), "{}", mapped.message);
+    }
+
+    #[test]
+    fn handoff_mode_follows_the_flag_then_the_environment_then_off() {
+        assert_eq!(super::handoff_mode(Some(true), Some("off")), Ok(true));
+        assert_eq!(super::handoff_mode(Some(false), Some("on")), Ok(false));
+        assert_eq!(super::handoff_mode(None, Some("on")), Ok(true));
+        assert_eq!(super::handoff_mode(None, Some("1")), Ok(true));
+        assert_eq!(super::handoff_mode(None, Some("off")), Ok(false));
+        assert_eq!(super::handoff_mode(None, Some("")), Ok(false));
+        assert_eq!(super::handoff_mode(None, None), Ok(false));
+        let err = super::handoff_mode(None, Some("maybe")).unwrap_err();
+        assert!(err.contains("HEKMA_HANDOFF=maybe"), "{err}");
     }
 }
