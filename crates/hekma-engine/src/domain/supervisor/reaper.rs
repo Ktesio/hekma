@@ -152,7 +152,7 @@ impl Supervisor {
     pub(crate) fn held_pid(&self, name: &InstanceName) -> Option<u32> {
         self.running
             .get(name)
-            .map(|supervised| self.backend.pid(&supervised.handle))
+            .map(|supervised| self.shared.backend.pid(&supervised.handle))
     }
 
     /// The injected stop result for `pid` at a `backend.stop(Duration::ZERO)`
@@ -303,7 +303,7 @@ impl Supervisor {
                 let pid = self
                     .running
                     .get(name)
-                    .map(|supervised| self.backend.pid(&supervised.handle));
+                    .map(|supervised| self.shared.backend.pid(&supervised.handle));
                 if let Some(err) = pid.and_then(|pid| self.injected_poll_fault(pid)) {
                     outcomes.push((name.clone(), PollOutcome::Errored(err)));
                     continue;
@@ -312,15 +312,15 @@ impl Supervisor {
             let Some(supervised) = self.running.get_mut(name) else {
                 continue;
             };
-            let held_by_shim = self.backend.is_shim(&supervised.handle);
-            let outcome = match self.backend.poll(&mut supervised.handle) {
+            let held_by_shim = self.shared.backend.is_shim(&supervised.handle);
+            let outcome = match self.shared.backend.poll(&mut supervised.handle) {
                 Ok(ProcessStatus::Alive) => PollOutcome::Alive,
                 Ok(ProcessStatus::Exited { code }) => PollOutcome::Exited(code),
                 Err(err) => PollOutcome::Errored(err),
             };
             // Story 24-3 (T4): the Shim died and its agent lives on, now held
             // directly.
-            if held_by_shim && !self.backend.is_shim(&supervised.handle) {
+            if held_by_shim && !self.shared.backend.is_shim(&supervised.handle) {
                 shims_lost.push(name.clone());
             }
             outcomes.push((name.clone(), outcome));
@@ -522,7 +522,7 @@ impl Supervisor {
                     let log_capture = self
                         .running
                         .get(&name)
-                        .and_then(|s| self.backend.log_capture(&s.handle));
+                        .and_then(|s| self.shared.backend.log_capture(&s.handle));
                     // Story 14-1: surface any queued acp notices BEFORE the
                     // connection drops with the handle.
                     self.drain_acp_notices_for(&name);
@@ -581,7 +581,7 @@ impl Supervisor {
             let crash_log_capture = self
                 .running
                 .get(&name)
-                .and_then(|s| self.backend.log_capture(&s.handle));
+                .and_then(|s| self.shared.backend.log_capture(&s.handle));
             // AI-12b: capture the last poll error's text BEFORE the bookkeeping
             // clear below (the cause build needs it).
             let last_poll_error = self.poll_last_errors.get(&name).cloned();
@@ -955,7 +955,7 @@ impl Supervisor {
                     let liveness_log_capture = self
                         .running
                         .get(&name)
-                        .and_then(|s| self.backend.log_capture(&s.handle));
+                        .and_then(|s| self.shared.backend.log_capture(&s.handle));
                     self.drain_acp_notices_for(&name);
                     self.clear_poll_error_streak(&name);
                     // P4 (review round 1): a DETACHED handle has NO
@@ -998,7 +998,7 @@ impl Supervisor {
                                 // did-not-poll-alive skip arm below.
                                 #[cfg(test)]
                                 let poll = {
-                                    let pid = self.backend.pid(&supervised.handle);
+                                    let pid = self.shared.backend.pid(&supervised.handle);
                                     if self.poll_fault_pids.contains(&pid) {
                                         Err(BackendError::Control {
                                             op: "poll",
@@ -1007,11 +1007,11 @@ impl Supervisor {
                                                 .to_string(),
                                         })
                                     } else {
-                                        self.backend.poll(&mut supervised.handle)
+                                        self.shared.backend.poll(&mut supervised.handle)
                                     }
                                 };
                                 #[cfg(not(test))]
-                                let poll = self.backend.poll(&mut supervised.handle);
+                                let poll = self.shared.backend.poll(&mut supervised.handle);
                                 poll
                             };
                             if matches!(poll, Ok(ProcessStatus::Alive)) {
@@ -1022,17 +1022,20 @@ impl Supervisor {
                                 // without staging a real unstoppable process.
                                 #[cfg(test)]
                                 let stop = {
-                                    let pid = self.backend.pid(&supervised.handle);
+                                    let pid = self.shared.backend.pid(&supervised.handle);
                                     match Self::injected_zero_stop(&self.stop_fault_pids, pid) {
                                         Some(injected) => injected,
                                         None => self
+                                            .shared
                                             .backend
                                             .stop(&mut supervised.handle, Duration::ZERO),
                                     }
                                 };
                                 #[cfg(not(test))]
-                                let stop =
-                                    self.backend.stop(&mut supervised.handle, Duration::ZERO);
+                                let stop = self
+                                    .shared
+                                    .backend
+                                    .stop(&mut supervised.handle, Duration::ZERO);
                                 match stop {
                                     Ok(outcome) if !outcome.forced => {
                                         self.emit_diagnostic(&format!(
@@ -1287,7 +1290,8 @@ impl Supervisor {
         // (interim `set_restart_count(name, 0, None)`, then the charge) is
         // GONE — a single write cannot strand a half-reset streak between
         // the two lines if the engine dies in between.
-        let (next, reset) = next_consecutive_failures(current, running_for, self.stable_run_window);
+        let (next, reset) =
+            next_consecutive_failures(current, running_for, self.shared.stable_run_window);
         let crash_detail = match (reset, running_for) {
             (true, Some(run)) => format!(
                 "{crash_detail}; the previous run was stable for {}s — consecutive-failure \
@@ -1313,7 +1317,7 @@ impl Supervisor {
         // Schedule a restart: persist the incremented count + the crash cause,
         // and return the plan with the backoff delay for this attempt.
         let _ = registry.set_restart_count(name, next, Some(&crash_detail));
-        let delay = self.backoff.delay_for(next);
+        let delay = self.shared.backoff.delay_for(next);
         RestartDecision {
             crash_cause: crash_detail,
             plan: Some(RestartPlan {
@@ -1388,7 +1392,7 @@ impl Supervisor {
             .get(name)
             .copied()
             .unwrap_or(0);
-        let delay = self.backoff.delay_for(current + streak + 1);
+        let delay = self.shared.backoff.delay_for(current + streak + 1);
         // The POST-increment depth rides back to the caller so the cause
         // can surface `requested-recycle N` — the pacing is visible, not
         // silent (18-3 review).
@@ -1457,7 +1461,7 @@ impl Supervisor {
         // read once — the identity a record's owner is compared against (a
         // record this process itself spawned or adopted is always adoptable
         // by this process; the boundary only guards OTHER live engines).
-        let self_owner = self.backend.self_fingerprint();
+        let self_owner = self.shared.backend.self_fingerprint();
         let mut adopted = 0;
         // Story 23-1 (Design Notes: Migration): every adopted engine-observed
         // agent is a legacy-root candidate until the decision below sorts them
@@ -1494,7 +1498,7 @@ impl Supervisor {
             if !record.detach {
                 if let Some(owner) = record.owner {
                     let owner_is_self = self_owner.is_some_and(|me| me.matches(&owner));
-                    if !owner_is_self && self.backend.probe_alive(&owner) == Some(true) {
+                    if !owner_is_self && self.shared.backend.probe_alive(&owner) == Some(true) {
                         self.emit_diagnostic(&format!(
                             "{}: supervised by another live engine (pid {}) — its spawn \
                              record is left untouched and THIS engine holds no handle for \
@@ -1539,7 +1543,7 @@ impl Supervisor {
                     let lease_is_self = record.lease.is_some_and(|held| me.matches(&held));
                     if !lease_is_self {
                         if let Some(held) = record.lease {
-                            if self.backend.probe_alive(&held) == Some(true) {
+                            if self.shared.backend.probe_alive(&held) == Some(true) {
                                 self.emit_diagnostic(&format!(
                                     "{}: adopted by another live engine (pid {}) — its spawn \
                                      record is left untouched and THIS engine holds no handle \
@@ -1607,6 +1611,7 @@ impl Supervisor {
             // engine's (skipped, like a live owner); no Shim answering falls
             // back to the child's fingerprint.
             let (reacquired, note) = self
+                .shared
                 .backend
                 .reacquire_shim(&record, registry.paths.state_base());
             if let Some(note) = note {
@@ -1628,7 +1633,9 @@ impl Supervisor {
                     if record.shim.is_some() {
                         self.shims_lost.push(name.clone());
                     }
-                    self.backend.adopt(&record.fingerprint, record.detach)
+                    self.shared
+                        .backend
+                        .adopt(&record.fingerprint, record.detach)
                 }
             };
             match held {

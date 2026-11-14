@@ -300,7 +300,7 @@ impl Supervisor {
                 new_cursor: consumed,
             } => {
                 let block = String::from_utf8_lossy(&tail[range]);
-                let parsed = self.usage_source.drain(&block);
+                let parsed = self.shared.usage_source.drain(&block);
                 // Story 14-3 (T3): a parsed sentinel line on EITHER channel is
                 // the instance's "sentinel: lines seen" state — the honest gap
                 // notice reports it instead of "no lines seen" once any line
@@ -648,7 +648,7 @@ impl Supervisor {
     /// order, under the locks the reaper tick holds. A Run event batch a
     /// proxy job committed (a wire Run's `created`) is published as is.
     pub(crate) fn drain_proxy_inbox(&mut self, registry: &Registry) {
-        for item in self.inbox.drain() {
+        for item in self.shared.inbox.drain() {
             match item {
                 pipeline::InboxItem::RunEvents(events) => self.publish_run_events(events),
                 pipeline::InboxItem::Proxied(commit) => {
