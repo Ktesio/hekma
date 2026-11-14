@@ -123,6 +123,12 @@ fn assert_payload_validates(event: &EngineEvent) {
         EngineEvent::Binding(e) => {
             assert_eq!(e.schema_version, hekma_engine::BINDING_EVENT_SCHEMA_VERSION)
         }
+        EngineEvent::ProxySetting(e) => {
+            assert_eq!(
+                e.schema_version,
+                hekma_engine::PROXY_SETTING_EVENT_SCHEMA_VERSION
+            )
+        }
         EngineEvent::Credential(e) => {
             assert_eq!(
                 e.schema_version,

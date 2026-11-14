@@ -92,6 +92,7 @@ fn the_table_matches_the_longest_prefix_on_a_segment_boundary() {
         labels: Vec::new(),
         created_at: "t".into(),
         updated_at: "t".into(),
+        identity_headers: None,
     };
     let table = table_of(&[
         row("root", "/"),
@@ -170,6 +171,7 @@ fn spec(name: &str, prefix: &str) -> BindingSpec {
         upstream: "https://api.openai.com/v1".into(),
         labels: vec![("team".into(), "core".into())],
         custodied_key: None,
+        identity_headers: None,
     }
 }
 

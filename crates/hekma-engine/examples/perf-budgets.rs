@@ -3251,6 +3251,7 @@ fn proxy_scenario(ci: bool) -> Result<bool, String> {
             upstream: format!("http://127.0.0.1:{upstream}/v1"),
             labels: vec![("team".into(), "bench".into())],
             custodied_key: None,
+            identity_headers: None,
         })
         .map_err(|err| format!("create the binding: {err}"))?;
     // The binding's own Run first (read while it is the only Run), then

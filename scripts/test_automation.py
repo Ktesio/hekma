@@ -1357,6 +1357,26 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn('channel = "1.96.1"', toolchain_toml)
 
 
+    def test_the_gateways_page_states_the_line_two_example_recipes_and_no_support_claim(
+        self,
+    ) -> None:
+        # Hekma in front of a gateway: the not-a-model-gateway sentence
+        # with what stays with gateways, exactly two recipes, every
+        # gateway-side fact marked to verify, and never a validated or
+        # supported claim for the recipes.
+        page = (release_docs.ROOT / "docs" / "gateways.md").read_text(encoding="utf-8")
+        self.assertIn("**Hekma is not a model gateway.**", page)
+        for stays in ("routing", "caching", "fallback chains", "key vault"):
+            self.assertIn(stays, page)
+        self.assertEqual(2, page.count("\n## Recipe "))
+        self.assertGreaterEqual(page.count("to verify against the gateway's docs"), 3)
+        lowered = page.lower()
+        for claim in ("supported integration", "is supported", "are supported", "officially"):
+            self.assertNotIn(claim, lowered)
+        self.assertIn("**examples**", page)
+        attach = (release_docs.ROOT / "docs" / "attach.md").read_text(encoding="utf-8")
+        self.assertIn("(gateways.md)", attach)
+
 class InstallerScriptTests(unittest.TestCase):
     def run_install_sh(
         self,

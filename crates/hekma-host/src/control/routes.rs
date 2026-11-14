@@ -2267,15 +2267,37 @@ pub(crate) async fn binding_credentials(
 pub(crate) async fn proxy_show(
     State(state): State<ApiState>,
 ) -> ApiResult<Json<dto::ProxyDocument>> {
+    let settings = state.engine.proxy_settings().await?;
+    Ok(Json(proxy_document(&state, settings)))
+}
+
+/// `PATCH /v0/proxy` (story 21-8, Operator bearer only) — turn the
+/// outbound identity headers on or off: stored, published before this
+/// answers, so the very next forwarded call follows it. Answers the
+/// effective settings.
+pub(crate) async fn proxy_update(
+    State(state): State<ApiState>,
+    ApiJson(request): ApiJson<dto::ProxySettingsRequest>,
+) -> ApiResult<Json<dto::ProxyDocument>> {
+    let settings = state
+        .engine
+        .set_proxy_identity_headers(request.identity_headers)
+        .await?;
+    Ok(Json(proxy_document(&state, settings)))
+}
+
+fn proxy_document(state: &ApiState, settings: hekma_engine::ProxySettings) -> dto::ProxyDocument {
     let info = state.engine.metering_proxy();
-    let error = state.engine.metering_proxy_error();
-    Ok(Json(dto::ProxyDocument {
+    dto::ProxyDocument {
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
         running: info.is_some(),
         url: info.as_ref().map(|info| info.url.clone()),
         port: info.as_ref().map(|info| info.port),
-        error,
-    }))
+        error: state.engine.metering_proxy_error(),
+        identity_headers: settings.identity_headers,
+        stored_identity_headers: settings.stored_identity_headers,
+        forced_by_flag: settings.forced_by_flag,
+    }
 }
 
 #[cfg(test)]

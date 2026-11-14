@@ -367,7 +367,7 @@ impl Registry {
             // Story 22-1: the key index loads with the Runs.
             let keys = crate::domain::runs::keys::open_keys(ctx.store())?;
             // Story 23-1: the endpoint bindings load with them.
-            let bindings = crate::domain::runs::bindings::table_of(&ctx.store().bindings()?);
+            let bindings = crate::domain::runs::bindings::published_table(ctx.store())?;
             ctx.after_commit(move || {
                 publisher.publish_changes(entries, keys);
                 publisher.publish_bindings(bindings);
@@ -500,6 +500,7 @@ impl Registry {
             EngineEvent::Binding(_) => None,
             // Story 22-2: a reveal names an instance and secrets, no Run.
             EngineEvent::SecretRevealed(_) => None,
+            EngineEvent::ProxySetting(_) => None,
         }
     }
 
@@ -934,7 +935,7 @@ impl Registry {
         self.writer.call(move |ctx| {
             let entries = crate::domain::runs::ops::open_entries(ctx.store())?;
             let keys = crate::domain::runs::keys::open_keys(ctx.store())?;
-            let bindings = crate::domain::runs::bindings::table_of(&ctx.store().bindings()?);
+            let bindings = crate::domain::runs::bindings::published_table(ctx.store())?;
             ctx.after_commit(move || {
                 publisher.publish_reload(entries, keys);
                 publisher.publish_bindings(bindings);

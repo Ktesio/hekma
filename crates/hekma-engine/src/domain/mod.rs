@@ -141,8 +141,9 @@ pub use runs::{OpenedRun, RunActor, MAX_CALLER_OPEN_CHILDREN, MAX_ROOT_OPEN_DESC
 // Story 23-1: Operator endpoint bindings.
 pub use runs::bindings::{
     Binding, BindingChange, BindingCredential, BindingCredentialClass, BindingError, BindingEvent,
-    BindingOutcome, BindingPatch, BindingRoute, BindingSpec, IssuedBindingCredential, RouteSpec,
-    BINDING_EVENT_SCHEMA_VERSION, MAX_BINDINGS, MAX_BINDING_ROUTES,
+    BindingOutcome, BindingPatch, BindingRoute, BindingSpec, IssuedBindingCredential,
+    ProxySettingEvent, ProxySettings, RouteSpec, BINDING_EVENT_SCHEMA_VERSION, MAX_BINDINGS,
+    MAX_BINDING_ROUTES, PROXY_SETTING_EVENT_SCHEMA_VERSION,
 };
 // The resync core is engine-internal glue the facade calls (the story-10-3
 // helper); only the cursor/batch TYPES are public surface.

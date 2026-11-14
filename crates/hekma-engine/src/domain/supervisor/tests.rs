@@ -10599,6 +10599,7 @@ fn one_pre_proxy_adopted_agent_gets_the_legacy_root_route_until_its_run_ends() {
                     upstream: "https://example.com".into(),
                     labels: Vec::new(),
                     custodied_key: None,
+                    identity_headers: None,
                 },
                 legacy.map(|run| run.to_string()),
                 "t",

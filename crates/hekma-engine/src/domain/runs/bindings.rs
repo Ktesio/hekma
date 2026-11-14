@@ -68,6 +68,10 @@ pub struct BindingSpec {
     /// A `secret:NAME` reference, stored only (inert until key custody).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custodied_key: Option<String>,
+    /// Story 21-8: the outbound identity-header override for this
+    /// binding's calls (`None` inherits the root setting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_headers: Option<bool>,
 }
 
 /// A change to a binding (`None` keeps a field).
@@ -88,15 +92,24 @@ pub struct BindingPatch {
         deserialize_with = "present_or_null"
     )]
     pub custodied_key: Option<Option<String>>,
+    /// Story 21-8: `Some(None)` (`null`) returns the binding to the root
+    /// identity-header setting; `Some(Some(on))` overrides it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_or_null"
+    )]
+    pub identity_headers: Option<Option<bool>>,
 }
 
 /// A present field, `null` included, is `Some`: absent is `None`
 /// (unchanged), `null` is `Some(None)` (clear), a value is `Some(Some(v))`.
-fn present_or_null<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+fn present_or_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
 {
-    Option::<String>::deserialize(deserializer).map(Some)
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// A route to put on a binding.
@@ -130,6 +143,9 @@ pub struct Binding {
     pub routes: Vec<BindingRoute>,
     pub created_at: String,
     pub updated_at: String,
+    /// Story 21-8: the identity-header override (`None` inherits the root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_headers: Option<bool>,
 }
 
 /// A per-binding credential's class.
@@ -224,6 +240,10 @@ pub struct BindingEvent {
     pub credential_class: Option<BindingCredentialClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_id: Option<String>,
+    /// Story 21-8: on a change that set the identity-header override, its
+    /// new value: `on`, `off` or `inherit` (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_headers: Option<String>,
     pub at: String,
 }
 
@@ -437,6 +457,7 @@ pub(crate) fn view(
         routes,
         created_at: row.created_at,
         updated_at: row.updated_at,
+        identity_headers: row.identity_headers,
     })
 }
 
@@ -450,9 +471,81 @@ pub(crate) fn table_of(rows: &[BindingRow]) -> BindingTable {
                 upstream: std::sync::Arc::from(row.upstream.as_str()),
                 labels: row.labels.clone(),
                 custodied_key: row.custodied_key.clone(),
+                identity_headers: row.identity_headers,
             })
             .collect(),
     )
+}
+
+/// The binding table the snapshot publishes (story 21-8): the stored
+/// bindings and the root identity-header setting, read together.
+pub(crate) fn published_table(
+    store: &crate::store::SqliteStore,
+) -> Result<BindingTable, StoreError> {
+    Ok(table_of(&store.bindings()?).with_identity_headers(store.proxy_identity_headers()?))
+}
+
+/// The `proxy_setting` event's schema version (story 21-8).
+pub const PROXY_SETTING_EVENT_SCHEMA_VERSION: u32 = 1;
+
+/// One change to a shared-proxy Operator setting (story 21-8, the
+/// `proxy_setting` family on the bus and in the outbox): the setting's
+/// name and its new value — never a credential.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxySettingEvent {
+    pub schema_version: u32,
+    /// `identity-headers`.
+    pub setting: String,
+    /// `on` or `off`.
+    pub value: String,
+    pub at: String,
+}
+
+/// The shared Metering Proxy's Operator settings as a read surface shows
+/// them (story 21-8).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxySettings {
+    /// Whether forwarded calls carry `x-hekma-run-id` and `x-hekma-labels`
+    /// by default on this host run (a binding's override aside).
+    pub identity_headers: bool,
+    /// The stored setting, which every host start reads.
+    pub stored_identity_headers: bool,
+    /// `true` when this host run's serve flag overrides the stored setting.
+    pub forced_by_flag: bool,
+}
+
+impl ProxySettings {
+    /// The settings from the stored value and this run's serve flag.
+    pub(crate) fn of(stored: bool, flag: Option<bool>) -> Self {
+        Self {
+            identity_headers: flag.unwrap_or(stored),
+            stored_identity_headers: stored,
+            forced_by_flag: flag.is_some(),
+        }
+    }
+}
+
+/// Set the root outbound identity-header setting (the writer job, story
+/// 21-8): persisted, one `proxy_setting` event committed with its outbox
+/// row, and the binding table republished with the new root before the
+/// job acknowledges.
+pub(crate) fn set_identity_headers(
+    job: &mut BindingJob<'_, '_>,
+    on: bool,
+    at: &str,
+) -> Result<BindingOutcome, BindingError> {
+    job.ctx.store().set_proxy_identity_headers(on)?;
+    let event = EngineEvent::ProxySetting(ProxySettingEvent {
+        schema_version: PROXY_SETTING_EVENT_SCHEMA_VERSION,
+        setting: "identity-headers".to_string(),
+        value: override_word(Some(on)).to_string(),
+        at: at.to_string(),
+    });
+    let append = job.ctx.store().append_outbox(&event, OUTBOX_MAX_BYTES)?;
+    let mut outcome = BindingOutcome::default();
+    outcome.events.push((event, append));
+    job.publish_table()?;
+    Ok(outcome)
 }
 
 /// What a committed binding job hands back: its view (none after a
@@ -489,6 +582,7 @@ impl BindingJob<'_, '_> {
             route: detail.route,
             credential_class: detail.class,
             token_id: detail.token_id,
+            identity_headers: detail.identity_headers.map(str::to_string),
             at: at.to_string(),
         }));
         let append = self.ctx.store().append_outbox(&event, OUTBOX_MAX_BYTES)?;
@@ -497,7 +591,7 @@ impl BindingJob<'_, '_> {
     }
 
     fn publish_table(&mut self) -> Result<(), StoreError> {
-        let table = table_of(&self.ctx.store().bindings()?);
+        let table = published_table(self.ctx.store())?;
         let publisher = std::sync::Arc::clone(self.publisher);
         self.ctx
             .after_commit(move || publisher.publish_bindings(table));
@@ -522,6 +616,16 @@ struct EventDetail {
     route: Option<String>,
     class: Option<BindingCredentialClass>,
     token_id: Option<String>,
+    identity_headers: Option<&'static str>,
+}
+
+/// The wire word of an identity-header override.
+pub(crate) fn override_word(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "inherit",
+    }
 }
 
 fn check_prefix_free(
@@ -589,6 +693,7 @@ pub(crate) fn create(
         labels: sorted(spec.labels),
         created_at: at.to_string(),
         updated_at: at.to_string(),
+        identity_headers: spec.identity_headers,
     };
     store.put_binding(&row)?;
     let mut outcome = BindingOutcome::default();
@@ -601,6 +706,7 @@ pub(crate) fn create(
         &row.name,
         EventDetail {
             prefix: Some(row.prefix.clone()),
+            identity_headers: row.identity_headers.map(|on| override_word(Some(on))),
             ..EventDetail::default()
         },
         at,
@@ -647,6 +753,9 @@ pub(crate) fn update(
         }
         row.custodied_key = key.clone();
     }
+    if let Some(next) = patch.identity_headers {
+        row.identity_headers = next;
+    }
     let labels_changed = match &patch.labels {
         Some(labels) => {
             validate_labels(labels)?;
@@ -669,6 +778,7 @@ pub(crate) fn update(
         name,
         EventDetail {
             prefix: Some(row.prefix.clone()),
+            identity_headers: patch.identity_headers.map(override_word),
             ..EventDetail::default()
         },
         at,

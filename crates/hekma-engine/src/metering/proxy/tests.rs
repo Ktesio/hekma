@@ -87,6 +87,7 @@ fn openai() -> BindingEntry {
         upstream: Arc::from(BINDING_UPSTREAM),
         labels: labels(),
         custodied_key: None,
+        identity_headers: None,
     }
 }
 
@@ -121,6 +122,7 @@ fn world() -> World {
             upstream: Arc::from(BINDING_UPSTREAM),
             labels: Vec::new(),
             custodied_key: None,
+            identity_headers: None,
         },
     ]);
     let mut identities = HashMap::new();
@@ -660,6 +662,7 @@ fn only_an_eligible_run_key_draws_custody_and_a_binding_key_needs_one_too() {
         upstream: Arc::from("https://api.anthropic.com"),
         labels: labels(),
         custodied_key: Some("secret:VAULT".into()),
+        identity_headers: None,
     };
     let mut entries = vec![openai(), vault.clone()];
     entries.push(BindingEntry {
@@ -668,6 +671,7 @@ fn only_an_eligible_run_key_draws_custody_and_a_binding_key_needs_one_too() {
         upstream: Arc::from(BINDING_UPSTREAM),
         labels: Vec::new(),
         custodied_key: None,
+        identity_headers: None,
     });
     w.snapshot.bindings = Arc::new(BindingTable::new(entries));
     let mut binding_run = run_entry("run_V", None, None);
@@ -836,6 +840,7 @@ fn the_legacy_root_route_catches_what_no_binding_or_run_route_claims() {
             upstream: Arc::from(CATCH_ALL_UPSTREAM),
             labels: Vec::new(),
             custodied_key: None,
+            identity_headers: None,
         },
         openai(),
     ]));
@@ -937,6 +942,7 @@ mod seams {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
                 custodied_key: None,
+                identity_headers: None,
             })
             .unwrap();
         (state, engine, port, served)
@@ -1233,4 +1239,54 @@ mod scent {
         assert_eq!(status, 200, "{answer}");
         assert_eq!(served.load(Ordering::SeqCst), 3);
     }
+}
+
+#[test]
+fn the_identity_header_switch_resolves_binding_then_flag_then_the_stored_root() {
+    // Story 21-8: root on/off x binding unset/on/off/none x flag
+    // absent/off/on — the binding's override wins, then the run's flag,
+    // then the stored root.
+    let entry = |name: &str, prefix: &str, over: Option<bool>| BindingEntry {
+        name: name.into(),
+        prefix: prefix.into(),
+        upstream: Arc::from(BINDING_UPSTREAM),
+        labels: labels(),
+        custodied_key: None,
+        identity_headers: over,
+    };
+    for root in [true, false] {
+        let table = BindingTable::new(vec![
+            entry("inherits", "/a", None),
+            entry("on", "/b", Some(true)),
+            entry("off", "/c", Some(false)),
+        ])
+        .with_identity_headers(root);
+        for flag in [None, Some(false), Some(true)] {
+            let base = flag.unwrap_or(root);
+            for (binding, expected) in [
+                (None, base),
+                (Some("inherits"), base),
+                (Some("ghost"), base),
+                (Some("on"), true),
+                (Some("off"), false),
+            ] {
+                assert_eq!(
+                    table.identity_headers_for(flag, binding),
+                    expected,
+                    "root {root} flag {flag:?} binding {binding:?}"
+                );
+            }
+        }
+    }
+    // An empty table (the default) is on.
+    assert!(BindingTable::default().identity_headers_for(None, None));
+    // The names are the wire contract's, unchanged.
+    assert_eq!(
+        crate::metering::proxy::wire::RUN_ID_HEADER,
+        "x-hekma-run-id"
+    );
+    assert_eq!(
+        crate::metering::proxy::wire::LABELS_HEADER,
+        "x-hekma-labels"
+    );
 }

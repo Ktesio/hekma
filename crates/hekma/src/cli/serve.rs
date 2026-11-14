@@ -40,6 +40,9 @@ pub struct ServeFlags {
     /// `--no-identity-headers` (story 23-1): send neither
     /// `x-hekma-run-id` nor `x-hekma-labels` to the model provider.
     pub no_identity_headers: bool,
+    /// `--identity-headers` (story 21-8): send them for this run only,
+    /// over a stored `off`.
+    pub identity_headers: bool,
     /// `--proxy-allowed-hosts <name,...>` (story 22-2).
     pub proxy_allowed_hosts: Vec<String>,
     /// `--proxy-allowed-origins <origin,...>` (story 22-2).
@@ -98,7 +101,13 @@ pub fn run(flags: ServeFlags) -> Result<(), Box<dyn std::error::Error>> {
         state_base: flags.state_dir.map(PathBuf::from),
         stop_window: flags.stop_window,
         metering_listen_port: flags.metering_listen,
-        identity_headers: !flags.no_identity_headers,
+        // Story 21-8: a flag overrides the stored setting for this run
+        // only; none follows it.
+        identity_headers: match (flags.identity_headers, flags.no_identity_headers) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        },
         proxy_allowed_hosts: proxy_allowed_hosts(flags.proxy_allowed_hosts)
             .map_err(|message| ServeOptionsInvalid { message })?,
         proxy_allowed_origins: proxy_allowed_origins(flags.proxy_allowed_origins)

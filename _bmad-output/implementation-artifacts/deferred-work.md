@@ -827,3 +827,17 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: The disposition event is a Run event (`disposition-changed`, the cause naming the reason and actor), not a separate `EngineEvent::Disposition` family; no wake notification from the writer — parked calls re-read the snapshot every 250 ms.
   evidence: `domain/runs/mod.rs` (`RunEventKind::DispositionChanged`), `metering/proxy/hold.rs` (`RECHECK`). Trigger: a consumer needing the held count on the event.
 
+
+## From spec-21-8 (gateway complement — identity headers and recipes) — build, 2026-11-14
+
+- source_spec: `spec-21-8-gateway-complement.md` (Tasks 7, Ask First O4: the recipes)
+  summary: The LiteLLM and Portkey recipes in `docs/gateways.md` are examples: Hekma's half is tested against the OpenAI-compatible fake upstream, but neither gateway runs in CI (no network), and every gateway-side fact (base URL form, port, key header, whether it reads custom headers for attribution) is marked "to verify against the gateway's docs".
+  evidence: `docs/gateways.md`, the docs probe in `scripts/test_automation.py`. Trigger: a recorded manual pass against a real gateway (the `docs/agents.md` validation pattern), which promotes a recipe to validated.
+
+- source_spec: `spec-21-8-gateway-complement.md` (Ask First O2: labels all or by allow-list)
+  summary: Every label of the Run, bound and Caller, rides `x-hekma-labels`; an Operator allow-list of label keys is not built (the recommended option).
+  evidence: `metering/proxy/forward.rs`, `wire::labels_header_value`. Trigger: Islam ruling O2 (b), or an Operator asking to keep a Caller label off the wire while the headers stay on.
+
+- source_spec: `spec-21-8-gateway-complement.md` (Tasks 6: the CLI)
+  summary: `hekma binding create` takes no `--identity-headers`; a binding's own setting is set with `binding set` (the create body accepts `identity_headers` on the Control API). `hekma proxy show` learns `forced_by_flag` only from a running host, asked with a bounded call and never started; without one it reports the stored setting.
+  evidence: `crates/hekma/src/cli/{binding,proxy}.rs`. Trigger: an Operator asking to create and set in one command.

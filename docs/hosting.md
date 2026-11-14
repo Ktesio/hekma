@@ -411,6 +411,13 @@ start, reaching the proxy through an endpoint binding, needs a fixed address.
 The proxy listens on `127.0.0.1` only, so a sidecar or a published container
 port cannot reach it.
 
+The outbound identity headers (`x-hekma-run-id` and `x-hekma-labels`) are on
+by default. `hekma proxy set identity-headers off` stores the setting in the
+state directory, so it reaches the volume too: every container that mounts it
+follows the setting without a flag in the ENTRYPOINT. `--no-identity-headers`
+in the ENTRYPOINT overrides it for that container's run only. See
+[Hekma in front of a gateway](gateways.md#the-switch).
+
 If the grace is cut short instead, the metadata-mode crash window above is the
 honest description of what remains on the volume — and the next container that
 mounts it resumes from there.

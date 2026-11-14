@@ -255,7 +255,9 @@ fn open(state: &TempDir, identity_headers: bool) -> (Engine, u16) {
         Some(state.path().to_path_buf()),
         EngineOptions {
             metering_proxy: MeteringProxyOptions {
-                identity_headers,
+                // Story 21-8: `false` forces them off for this run (the
+                // serve flag); `true` follows the stored setting (on).
+                identity_headers: (!identity_headers).then_some(false),
                 ..MeteringProxyOptions::default()
             },
             ..EngineOptions::default()
@@ -278,6 +280,7 @@ fn bind(engine: &Engine, name: &str, prefix: &str, upstream: &str, labels: &[(&s
                 .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect(),
             custodied_key: None,
+            identity_headers: None,
         })
         .unwrap();
 }
@@ -711,6 +714,7 @@ fn the_binding_lifecycle_through_the_engine_with_its_refusals_and_the_proxy_in_s
         upstream: upstream.into(),
         labels: Vec::new(),
         custodied_key: key.map(str::to_string),
+        identity_headers: None,
     };
 
     // Create refusals, each with its stable code.
@@ -3121,4 +3125,130 @@ fn a_parked_call_whose_client_leaves_records_a_hold_and_a_rerouted_release_goes_
         dispositions.contains(&("reroute".to_string(), Some("rerouted".to_string()))),
         "{dispositions:?}"
     );
+}
+
+#[test]
+fn the_stored_identity_header_switch_applies_to_the_next_call_and_a_binding_overrides_it() {
+    // Story 21-8: on by default; `set_proxy_identity_headers(false)` is
+    // stored, published before it returns, and the very next call carries
+    // neither header; a binding's own `on` wins over a stored `off`;
+    // `inherit` follows the root again; a client's own `x-hekma-*` headers
+    // never reach the upstream in either position; nothing but the run id
+    // and labels is ever added.
+    use hekma_engine::{BindingPatch, EngineEvent};
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let facade = engine.blocking();
+    let settings = facade.proxy_settings().unwrap();
+    assert!(settings.identity_headers && settings.stored_identity_headers);
+    assert!(!settings.forced_by_flag);
+    let sentinel = "SENTINEL-21-8-CONTENT";
+    let client_headers = [("x-hekma-evil", sentinel), ("x-hekma-run-id", "run_FORGED")];
+    let call = |n: usize| {
+        assert_eq!(post(port, "/openai/chat", &client_headers).status, 200);
+        upstream.served()[n].clone()
+    };
+    let added = |seen: &Seen| -> Vec<String> {
+        let mut names: Vec<String> = seen
+            .headers
+            .iter()
+            .filter(|(key, _)| key.to_ascii_lowercase().starts_with("x-hekma-"))
+            .map(|(key, _)| key.to_ascii_lowercase())
+            .collect();
+        names.sort();
+        names
+    };
+    let no_sentinel = |seen: &Seen| {
+        assert!(
+            seen.headers
+                .iter()
+                .all(|(_, value)| !value.contains(sentinel) && !value.contains("hk_")),
+            "{:?}",
+            seen.headers
+        );
+    };
+
+    let on = call(0);
+    assert_eq!(added(&on), vec!["x-hekma-labels", "x-hekma-run-id"]);
+    assert_eq!(on.header("x-hekma-labels"), Some("team=core"));
+    assert!(on.header("x-hekma-run-id").unwrap().starts_with("run_"));
+    assert_ne!(on.header("x-hekma-run-id"), Some("run_FORGED"));
+    no_sentinel(&on);
+
+    let mut events = engine.subscribe();
+    let settings = facade.set_proxy_identity_headers(false).unwrap();
+    assert!(!settings.identity_headers && !settings.stored_identity_headers);
+    let off = call(1);
+    assert!(added(&off).is_empty(), "{:?}", off.headers);
+    no_sentinel(&off);
+    let event = events.try_recv().expect("one proxy_setting event");
+    match event {
+        EngineEvent::ProxySetting(setting) => {
+            assert_eq!(setting.setting, "identity-headers");
+            assert_eq!(setting.value, "off");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // The binding's own setting wins over the stored root, then inherits.
+    facade
+        .update_binding(
+            "openai",
+            BindingPatch {
+                identity_headers: Some(Some(true)),
+                ..BindingPatch::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        facade.binding("openai").unwrap().unwrap().identity_headers,
+        Some(true)
+    );
+    assert_eq!(added(&call(2)), vec!["x-hekma-labels", "x-hekma-run-id"]);
+    facade
+        .update_binding(
+            "openai",
+            BindingPatch {
+                identity_headers: Some(None),
+                ..BindingPatch::default()
+            },
+        )
+        .unwrap();
+    assert!(added(&call(3)).is_empty());
+
+    // Stored: a reopen of the state directory reads it.
+    drop(engine);
+    let (engine, port) = open(&state, true);
+    assert!(!engine.blocking().proxy_settings().unwrap().identity_headers);
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    assert!(added(&upstream.served()[4]).is_empty());
+}
+
+#[test]
+fn a_serve_flag_overrides_the_stored_identity_header_setting_for_its_run_only() {
+    // Story 21-8: `Some(false)` over a stored `on` sends neither header and
+    // reports `forced_by_flag`; the stored value is untouched.
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, false);
+    bind(&engine, "openai", "/openai", &upstream.base(), &[]);
+    let settings = engine.blocking().proxy_settings().unwrap();
+    assert!(!settings.identity_headers && settings.stored_identity_headers);
+    assert!(settings.forced_by_flag);
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    assert!(upstream.served()[0].header("x-hekma-run-id").is_none());
+    // A Run-route call has no binding: it follows the run's setting too,
+    // and a stored change keeps the flag's value in force.
+    let settings = engine.blocking().set_proxy_identity_headers(true).unwrap();
+    assert!(!settings.identity_headers && settings.stored_identity_headers);
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    assert!(upstream.served()[1].header("x-hekma-run-id").is_none());
 }

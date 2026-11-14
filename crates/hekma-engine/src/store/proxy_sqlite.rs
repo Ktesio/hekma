@@ -181,6 +181,33 @@ impl super::SqliteStore {
         Ok(())
     }
 
+    /// The root outbound identity-header setting (story 21-8): on when no
+    /// row records otherwise.
+    pub(crate) fn proxy_identity_headers(&self) -> Result<bool, StoreError> {
+        let on: Option<i64> = self
+            .conn()
+            .query_row(
+                "SELECT identity_headers FROM proxy_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        Ok(on.is_none_or(|on| on != 0))
+    }
+
+    /// Record the root outbound identity-header setting (a writer job).
+    pub(crate) fn set_proxy_identity_headers(&self, on: bool) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "INSERT INTO proxy_state (id, identity_headers) VALUES (1, ?1) \
+                 ON CONFLICT(id) DO UPDATE SET identity_headers = excluded.identity_headers",
+                [i64::from(on)],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
     /// The database's current change counter as this reader sees it
     /// (story 23-1: `PRAGMA data_version` — it advances when ANY other
     /// connection commits, so the reaper tick can notice a foreign
@@ -281,6 +308,9 @@ pub(crate) struct BindingRow {
     pub labels: Vec<(String, String)>,
     pub created_at: String,
     pub updated_at: String,
+    /// Story 21-8: the outbound identity-header override (`None` inherits
+    /// the root setting).
+    pub identity_headers: Option<bool>,
 }
 
 /// One stored binding route.
@@ -309,7 +339,7 @@ impl super::SqliteStore {
             .conn()
             .prepare(
                 "SELECT name, path_prefix, upstream_base_url, custodied_key, created_at, \
-                 updated_at FROM run_bindings ORDER BY name",
+                 updated_at, identity_headers FROM run_bindings ORDER BY name",
             )
             .map_err(backend)?;
         let rows = stmt
@@ -322,6 +352,7 @@ impl super::SqliteStore {
                     labels: Vec::new(),
                     created_at: row.get(4)?,
                     updated_at: row.get(5)?,
+                    identity_headers: override_of(row.get::<_, Option<String>>(6)?),
                 })
             })
             .map_err(backend)?
@@ -341,7 +372,7 @@ impl super::SqliteStore {
             .conn()
             .query_row(
                 "SELECT name, path_prefix, upstream_base_url, custodied_key, created_at, \
-                 updated_at FROM run_bindings WHERE name = ?1",
+                 updated_at, identity_headers FROM run_bindings WHERE name = ?1",
                 [name],
                 |row| {
                     Ok(BindingRow {
@@ -352,6 +383,7 @@ impl super::SqliteStore {
                         labels: Vec::new(),
                         created_at: row.get(4)?,
                         updated_at: row.get(5)?,
+                        identity_headers: override_of(row.get::<_, Option<String>>(6)?),
                     })
                 },
             )
@@ -384,17 +416,19 @@ impl super::SqliteStore {
         self.conn()
             .execute(
                 "INSERT INTO run_bindings (name, path_prefix, upstream_base_url, custodied_key, \
-                 created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 created_at, updated_at, identity_headers) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(name) DO UPDATE SET path_prefix = excluded.path_prefix, \
                  upstream_base_url = excluded.upstream_base_url, \
-                 custodied_key = excluded.custodied_key, updated_at = excluded.updated_at",
+                 custodied_key = excluded.custodied_key, updated_at = excluded.updated_at, \
+                 identity_headers = excluded.identity_headers",
                 rusqlite::params![
                     row.name,
                     row.prefix,
                     row.upstream,
                     row.custodied_key,
                     row.created_at,
-                    row.updated_at
+                    row.updated_at,
+                    row.identity_headers.map(|on| if on { "on" } else { "off" })
                 ],
             )
             .map_err(backend)?;
@@ -656,6 +690,16 @@ impl super::SqliteStore {
             )
             .map_err(backend)
             .map(|n| n.max(0) as u64)
+    }
+}
+
+/// A stored identity-header override (`on`/`off`; anything else inherits —
+/// the column's CHECK admits only the two).
+fn override_of(raw: Option<String>) -> Option<bool> {
+    match raw.as_deref() {
+        Some("on") => Some(true),
+        Some("off") => Some(false),
+        _ => None,
     }
 }
 

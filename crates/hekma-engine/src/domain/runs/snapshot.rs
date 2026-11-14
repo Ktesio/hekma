@@ -237,6 +237,9 @@ pub(crate) struct BindingEntry {
     /// `secret:NAME` string, never a value; the swap never draws on it
     /// without a custody-eligible credential).
     pub custodied_key: Option<String>,
+    /// Story 21-8: this binding's outbound identity-header override
+    /// (`None` inherits the root setting).
+    pub identity_headers: Option<bool>,
 }
 
 impl BindingEntry {
@@ -252,14 +255,24 @@ impl BindingEntry {
     }
 }
 
-/// Every binding, longest prefix first (so the first match is the longest).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Every binding, longest prefix first (so the first match is the longest),
+/// and the root outbound identity-header setting (story 21-8), published
+/// together so a call resolves both from the one snapshot it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BindingTable {
     entries: Vec<Arc<BindingEntry>>,
+    /// The stored root setting: on unless the Operator turned it off.
+    identity_headers: bool,
+}
+
+impl Default for BindingTable {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 impl BindingTable {
-    /// A table from `entries` in any order.
+    /// A table from `entries` in any order, the root setting on.
     pub(crate) fn new(mut entries: Vec<BindingEntry>) -> Self {
         entries.sort_by(|a, b| {
             b.prefix
@@ -269,7 +282,27 @@ impl BindingTable {
         });
         Self {
             entries: entries.into_iter().map(Arc::new).collect(),
+            identity_headers: true,
         }
+    }
+
+    /// The same table with the stored root identity-header setting.
+    pub(crate) fn with_identity_headers(mut self, on: bool) -> Self {
+        self.identity_headers = on;
+        self
+    }
+
+    /// Whether a call carries the outbound identity headers (story 21-8):
+    /// its binding's override when the call went through a binding that
+    /// sets one; else this host run's serve flag when one was passed; else
+    /// the stored root setting. A Run-route call and the legacy root route
+    /// have no binding and follow the root.
+    pub(crate) fn identity_headers_for(&self, flag: Option<bool>, binding: Option<&str>) -> bool {
+        binding
+            .and_then(|name| self.by_name(name))
+            .and_then(|entry| entry.identity_headers)
+            .or(flag)
+            .unwrap_or(self.identity_headers)
     }
 
     /// The longest binding matching `path` and the rest of the path.
@@ -607,7 +640,8 @@ pub(crate) fn subject_labels(
         EngineEvent::Policy(_)
         | EngineEvent::BreachDefaultUpgraded(_)
         | EngineEvent::Binding(_)
-        | EngineEvent::SecretRevealed(_) => return SubjectLabels::NoSubject,
+        | EngineEvent::SecretRevealed(_)
+        | EngineEvent::ProxySetting(_) => return SubjectLabels::NoSubject,
     };
     match entry {
         Some(entry) => SubjectLabels::Found(entry.labels.clone()),

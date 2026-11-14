@@ -2969,7 +2969,7 @@ fn host_holds_live_capture(name: &str) -> bool {
 /// The state root every routed write targets — resolved through the engine's
 /// path authority (a bad `HEKMA_STATE_DIR` is the same typed diagnostic an
 /// engine open raises), never constructed here.
-fn state_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub(crate) fn state_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let paths = hekma_engine::Registry::resolve_state_paths(None).map_err(map_error)?;
     Ok(paths.state_base().to_path_buf())
 }

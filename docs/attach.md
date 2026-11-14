@@ -34,7 +34,7 @@ Every Run will have a **Control Depth**, a ladder in which each rung includes th
 - **Self-announce.** On main: a flow declares itself through the `x-hekma-announce` header on a call, or one call to `POST /v0/runs/announce`, and gets a [Run Key](run-keys.md) once. See [Announce and Leases](announce.md). Helpers for CrewAI and LangGraph are still planned, and will be documented as supported only once they are validated against real flows.
 - **Leases.** On main: an announced Run keeps a **Lease** alive by heartbeat or by its own traffic. An expired Lease shows the Run's **Run Status** as `silent`, which never stops the Run.
 - **Inbound OTLP.** On main: Hekma accepts OTLP/HTTP+JSON metrics at `/v1/metrics` under a binding's announce credential. Telemetry that names a Run creates or renews an `observed` Run, with usage marked estimated, and never issues a Run Key. See [Inbound telemetry](telemetry.md#inbound-telemetry-v1metrics).
-- **In front of a gateway.** Hekma is not a model gateway. It will add identity headers (run id and labels, never content) so LiteLLM, Portkey or a similar gateway behind it can attribute calls.
+- **In front of a gateway.** On main: Hekma is not a model gateway. It adds identity headers (run id and labels, never content) to the calls it forwards, so LiteLLM, Portkey or a similar gateway behind it can attribute them, and an Operator can turn them off. See [Hekma in front of a gateway](gateways.md).
 
 ## How it will work
 
