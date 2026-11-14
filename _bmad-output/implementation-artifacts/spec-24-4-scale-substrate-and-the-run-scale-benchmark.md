@@ -196,4 +196,11 @@ Each is a public-contract or product choice; the recommendation is the spec's cu
 
     The proxy composition (`run_scale_proxy_p99_le_10ms`) is not built.
   - **Moved to phase 4 with AD-18 Steps 0–4:** the selector-arm composition, the reader pool, and the off-guard log reads.
+- 2026-11-14 — **phase 4a (built): AD-18 Step 0.**
+  - `EngineInner` carries a clone of the state directory's `EnginePaths` outside the registry mutex, so `Engine::agent_home` is pure path arithmetic with no lock; its doc comment is finally true.
+  - `read_agent_log` and `read_agent_log_since` split into `agent_log_paths`, the lookup and paths taken under the guard, and `read_agent_log_at` / `read_agent_log_since_at`, the file reads, which the engine facades run after dropping the guard. The `Supervisor::read_agent_log*` entry points keep their signatures.
+  - The Unix `Drop` `try_wait` item was already in place, as the spec noted.
+  - A test pins both: `agent_home` answers with the registry held by another thread, and the split read returns what the one-piece read returned.
+
+  Steps 1–4 (`TimedMutex` with its adversarial fixture and the tightened 6 s isolation bound; `critical()` scopes over engine.rs's lock sites with the symbol-anchored debt ratchet in CI; the `StoreGate` splits; `SupervisorShared`/`InstanceState`), the selector-arm composition, the reader pool and the proxy composition remain. Each is its own commit and two-pass review, per the archived plan's risk asymmetry.
 

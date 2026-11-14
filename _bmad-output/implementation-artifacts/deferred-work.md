@@ -891,11 +891,11 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 ## From spec-24-4 (scale substrate) — phase 1 build, 2026-11-14
 
 - source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (Phase 3 leftovers)
-  summary: The listing's selector arms still build the match set twice, listing reads still assemble under the registry mutex (no reader pool), whole-file agent-log reads still run under the registry guard, and the ladder does not compose the proxy scenario (`run_scale_proxy_p99_le_10ms`). The ladder, the covering count index and the two scale fixes it found landed in phase 3.
+  summary: The listing's selector arms still build the match set twice, listing reads still assemble under the registry mutex (no reader pool), and the ladder does not compose the proxy scenario (`run_scale_proxy_p99_le_10ms`). The ladder, the covering count index and the two scale fixes it found landed in phase 3.
   evidence: `crates/hekma-engine/src/store/runs_sqlite.rs` (`listing_arms`), `crates/hekma-engine/src/domain/registry.rs` (`list_runs`). Trigger: phase 4, with AD-18 Steps 0–4.
 
 - source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (Phase 4)
-  summary: AD-18 Steps 0–4 (the `EnginePaths` hoist, `TimedMutex`, named scopes with the debt ratchet, the `StoreGate` splits, `SupervisorShared`/`InstanceState`) are not built yet.
+  summary: AD-18 Steps 1–4 (`TimedMutex` and the adversarial fixture, named scopes with the debt ratchet, the `StoreGate` splits, `SupervisorShared`/`InstanceState`) are not built yet. Step 0 (the `EnginePaths` hoist and the off-guard log reads) landed in phase 4a.
   evidence: `crates/hekma-engine/src/engine.rs` (bare `.lock()` sites). Trigger: phase 4 of the story.
 
 - source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (O2: usage events at compaction)
