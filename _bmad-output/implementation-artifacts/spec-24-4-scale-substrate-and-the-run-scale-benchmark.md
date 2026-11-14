@@ -218,4 +218,11 @@ Each is a public-contract or product choice; the recommendation is the spec's cu
     - The spec named closure-shaped `critical()`/`cell_scope()` scopes. The big locks use guard-returning named scopes instead: converting 140 multi-statement sites into closures would rewrite every body for no gain, since `after(&guard)` already makes `&mut Supervisor` unobtainable without a live registry guard.
     - The small cells do use closures.
   - **Not built:** Steps 3 and 4.
+- 2026-11-14 — **phase 4d (built): AD-18 Step 3, first slice** (stacked on phase 4c, #435): the `remove` split, the slice the spec names as the wedge risk.
+  - **The split:** `Registry::remove` becomes `remove_row`, which runs under the gate (name validation, the running-guard, the row and its cascading credentials), plus the free `delete_home(&EnginePaths, &InstanceName)`. `Engine::remove` drops both guards before `delete_home`, using `EngineInner.paths` from Step 0. The public `Registry::remove` keeps its signature and composes the two.
+  - **The abort gate, measured:** `tests/lock_scopes.rs` removes an agent with a 4,000-file home under lock timing and asserts the registry's max hold is under half the remove's wall time. Mutation-checked: with the delete moved back under the lock, it fails, with the registry held 185.0 ms of a 185.1 ms remove. So the histogram shows the max gate hold falling.
+  - **Not built:**
+    - the `StoreGate` forwarding type;
+    - the other mixed DB+FS splits (`effective_config`, `register_with_adapter`, `set_config`, `resolve_secrets`, `write_effective_config_snapshot`). Each is a single-file read or write under the lock, not a recursive tree walk, so none is a wedge on the scale of `remove`;
+    - Step 4.
 

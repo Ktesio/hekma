@@ -1667,11 +1667,19 @@ impl Engine {
                     }
                 }
             }
-            // (2) Delete the row (+ handle the Agent Home per disposition). The
-            // authoritative name validation and the `running` running-guard live
-            // here, so a malformed name / not-found / running-without-force is
-            // reported exactly as before.
-            registry.remove(&name, disposition, force)
+            // (2) Delete the row. The authoritative name validation and the
+            // `running` running-guard live here, so a malformed name /
+            // not-found / running-without-force is reported exactly as
+            // before.
+            let removed = registry.remove_row(&name, force)?;
+            // (3) AD-18 Step 3: the Agent Home is deleted after both locks
+            // drop — a slow recursive delete never holds the store.
+            drop(supervisor);
+            drop(registry);
+            if disposition == RemoveDisposition::Delete {
+                crate::domain::delete_home(&inner.paths, &removed)?;
+            }
+            Ok(())
         })
         .await
     }

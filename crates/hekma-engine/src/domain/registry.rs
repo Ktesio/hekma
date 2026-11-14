@@ -1445,6 +1445,22 @@ impl Registry {
         disposition: RemoveDisposition,
         force: bool,
     ) -> Result<(), RegistryError> {
+        let name = self.remove_row(name, force)?;
+        if disposition == RemoveDisposition::Delete {
+            delete_home(&self.paths, &name)?;
+        }
+        Ok(())
+    }
+
+    /// AD-18 Step 3: the store half of [`Registry::remove`] — validate the
+    /// name, apply the running-guard, and delete the row (its credentials
+    /// cascade). Returns the validated name for [`delete_home`], which the
+    /// engine runs after the registry lock drops.
+    pub(crate) fn remove_row(
+        &self,
+        name: &str,
+        force: bool,
+    ) -> Result<InstanceName, RegistryError> {
         // Validate the name shape so a malformed name yields InvalidName rather
         // than a confusing NotFound.
         let name = InstanceName::new(name).map_err(|reason| RegistryError::InvalidName {
@@ -1487,24 +1503,7 @@ impl Registry {
             ctx.after_commit(move || publisher.publish_changes(Vec::new(), gone));
             Ok(())
         })?;
-
-        // Then handle the Agent Home per disposition.
-        if disposition == RemoveDisposition::Delete {
-            let home = self.paths.agent_home(&name);
-            // Delete the tree directly (no exists() pre-check — that would be a
-            // TOCTOU race). An already-absent home is success: the desired end
-            // state (no home) already holds. Only surface real removal failures.
-            if let Err(err) = std::fs::remove_dir_all(&home) {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    return Err(RegistryError::RemoveLeftoverHome {
-                        name: name.as_str().to_string(),
-                        path: home.to_string_lossy().into_owned(),
-                        detail: err.to_string(),
-                    });
-                }
-            }
-        }
-        Ok(())
+        Ok(name)
     }
 
     /// List the whole Fleet, ordered by name (delegates to the store).
@@ -2979,6 +2978,26 @@ pub(crate) fn set_dotted(
     }
     // Unreachable: an empty key is caught by validate_write's empty-segment guard
     // before set_dotted is called, so the leaf branch above always returns.
+    Ok(())
+}
+
+/// AD-18 Step 3: the filesystem half of [`Registry::remove`] — delete an
+/// Agent Home tree. Runs off the registry lock: a slow or wedged delete
+/// never holds the store. An already-absent home is success.
+pub(crate) fn delete_home(paths: &EnginePaths, name: &InstanceName) -> Result<(), RegistryError> {
+    let home = paths.agent_home(name);
+    // Delete the tree directly (no exists() pre-check — that would be a
+    // TOCTOU race). An already-absent home is success: the desired end
+    // state (no home) already holds. Only surface real removal failures.
+    if let Err(err) = std::fs::remove_dir_all(&home) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(RegistryError::RemoveLeftoverHome {
+                name: name.as_str().to_string(),
+                path: home.to_string_lossy().into_owned(),
+                detail: err.to_string(),
+            });
+        }
+    }
     Ok(())
 }
 

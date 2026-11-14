@@ -113,6 +113,7 @@ pub use outbox::{
     ExportBatch, OutboxCursor, OutboxEntry, BELOW_FLOOR_SENTENCE, EXPORT_BATCH_DEFAULT_MAX,
     EXPORT_BATCH_MAX_CAP, OUTBOX_MAX_BYTES, OUTBOX_SCHEMA_VERSION, PAST_TAIL_SENTENCE,
 };
+pub(crate) use registry::delete_home;
 pub use registry::{Registry, RemoveDisposition};
 pub use registry_policy::{PolicyChange, PolicyOutcome};
 pub use resync::{ResyncBatch, ResyncCursor};
