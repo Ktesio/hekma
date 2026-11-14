@@ -112,6 +112,12 @@ pub enum TransitionCause {
     },
     /// Graceful shutdown succeeded within the window: `stopping → stopped`.
     StopGraceful,
+    /// Story 24-3: the previous Service Host crashed with Handoff Mode off,
+    /// and this engine stopped the agent it left running (the orphan
+    /// cleanup NFR-1 asks for): both edges of that ordinary stop, and the
+    /// Run's end cause (`engine-crash`). A forced escalation still records
+    /// `stop-forced`, with the cleanup named in its detail.
+    EngineCrash,
     /// The graceful window elapsed and the process was force-killed:
     /// `stopping → stopped` after escalation (AC3). Carries the escalation note.
     StopForced {

@@ -119,7 +119,9 @@ use crate::ports::{
 /// v28 (story 22-4): each Run's bypass detection slice —
 /// `runs.bypass_detection` (`unreported` for every existing row),
 /// `bypass_reason` and `bypass_hosts` (additive, no backfill).
-pub(crate) const SCHEMA_VERSION: i64 = 28;
+/// v29 (story 24-3): the host posture row — `host_state` (see
+/// [`super::host_sqlite`]).
+pub(crate) const SCHEMA_VERSION: i64 = 29;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -843,6 +845,11 @@ fn migrate(
     // existing Run honestly reads `unreported`).
     if version < 28 {
         super::runs_sqlite::migrate_runs_step(conn, 28, super::runs_sqlite::V28_DDL)?;
+    }
+    // Story 24-3: v29 adds the host posture row (additive; a directory
+    // without one reads "unknown", and the next open adopts).
+    if version < 29 {
+        super::runs_sqlite::migrate_runs_step(conn, 29, super::host_sqlite::V29_DDL)?;
     }
     Ok(notes)
 }

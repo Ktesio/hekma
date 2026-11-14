@@ -254,3 +254,90 @@ fn serve_upgrade_without_a_host_refuses_and_starts_none() {
         "no host was started"
     );
 }
+
+/// Story 24-3: SIGKILL a host holding a Shim agent, then let the next
+/// `hekma` write start a host, under the dead host's recorded mode.
+/// Returns the agent's pid, the end cause of its Run (`None` while open),
+/// and whether the agent is still alive.
+fn crash_with(mode: Option<&str>) -> (i64, Option<String>, bool, String) {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let manifest = tempfile::tempdir().unwrap();
+    hekma_conformance::test_support::ManifestFixture::new("svc", &["--linger-ms", "600000"])
+        .guaranteed_on_all_oses("interaction")
+        .write(manifest.path());
+    let _host = HostGuard(state_dir);
+    let mut env = vec![("HEKMA_SHIM", "1")];
+    if let Some(mode) = mode {
+        env.push(("HEKMA_HANDOFF", mode));
+    }
+    let hekma = |args: &[&str]| run_hekma_agent_with_env(args, &ctx.project_dir, state_dir, &env);
+    let manifest_arg = manifest.path().to_string_lossy().into_owned();
+    assert!(hekma(&["agent", "register", "svc", "--manifest", &manifest_arg]).success);
+    let run = hekma(&["agent", "start", "svc"]);
+    assert!(run.success, "{}", both(&run));
+    let conn = rusqlite::Connection::open(state_dir.join("state.db")).unwrap();
+    let pid: i64 = conn
+        .query_row("SELECT pid FROM agent_runtime", [], |row| row.get(0))
+        .unwrap();
+    helpers::kill_host(state_dir);
+    assert!(alive(pid), "a SIGKILLed host leaves its Shim agent running");
+    // The next write starts a host, which reads the dead host's record.
+    let run = hekma(&["agent", "register", "other", "--manifest", &manifest_arg]);
+    assert!(run.success, "{}", both(&run));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while mode == Some("off") && alive(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let cause: Option<String> = conn
+        .query_row(
+            "SELECT r.end_cause FROM runs r JOIN agent_instances a ON a.id = r.instance_id \
+             WHERE a.name = 'svc' ORDER BY r.created_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let log = std::fs::read_to_string(state_dir.join("serve.log")).unwrap_or_default();
+    let still = alive(pid);
+    if still {
+        assert!(
+            hekma(&["agent", "send", "svc", "ping"]).success,
+            "reconnected"
+        );
+        assert!(hekma(&["agent", "stop", "svc"]).success);
+    }
+    (pid, cause, still, log)
+}
+
+/// Story 24-3: Handoff Mode explicitly off — the crashed host's agent is
+/// stopped by the next host, the ordinary way, and its Run ends
+/// `engine-crash`, named in the notice.
+#[test]
+fn after_a_crash_with_handoff_off_the_next_host_cleans_up_its_agents() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    let (_pid, cause, alive_after, log) = crash_with(Some("off"));
+    assert!(!alive_after, "cleaned up");
+    assert_eq!(cause.as_deref(), Some("engine-crash"));
+    assert!(
+        log.contains("their Runs end with cause engine-crash"),
+        "{log}"
+    );
+}
+
+/// Story 24-3: Handoff Mode on — reconnected and kept; and with the mode
+/// never chosen — adopted, never stopped.
+#[test]
+fn after_a_crash_with_handoff_on_or_unchosen_the_next_host_keeps_its_agents() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    let (_pid, cause, alive_after, log) = crash_with(Some("on"));
+    assert!(alive_after && cause.is_none(), "kept: {cause:?}");
+    assert!(log.contains("reconnected to its 1 agent(s): svc"), "{log}");
+    let (_pid, cause, alive_after, log) = crash_with(None);
+    assert!(alive_after && cause.is_none(), "kept: {cause:?}");
+    assert!(log.contains("adopted, not stopped: svc"), "{log}");
+}

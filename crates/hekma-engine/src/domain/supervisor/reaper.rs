@@ -1911,6 +1911,11 @@ impl Supervisor {
                         },
                     );
                     adopted += 1;
+                    // Story 24-3: a detached start was asked to outlive any
+                    // host, so it is never an orphan to clean up.
+                    if !record.detach {
+                        self.adopted_names.push(name.clone());
+                    }
                     // Story 21-2: the adoption KEEPS the Run (created here if
                     // the record predates Runs) and re-syncs its wire path
                     // and bound labels from this engine's view.
