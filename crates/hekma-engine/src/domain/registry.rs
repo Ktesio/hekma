@@ -1966,6 +1966,22 @@ impl Registry {
         Ok(self.write(move |store| store.settle_spawn_record(&row))?)
     }
 
+    /// Story 24-3: the recorded data-path owner and its Handoff Mode.
+    pub(crate) fn host_posture(
+        &self,
+    ) -> Result<Option<crate::store::host_sqlite::HostPostureRow>, RegistryError> {
+        Ok(self.store.host_posture()?)
+    }
+
+    /// Story 24-3: record this engine as the data-path owner, with its mode.
+    pub(crate) fn record_host_posture(
+        &self,
+        row: crate::store::host_sqlite::HostPostureRow,
+    ) -> Result<(), RegistryError> {
+        self.write(move |store| store.put_host_posture(&row))?;
+        Ok(())
+    }
+
     /// Story 24-2: clear the supervising owner on an instance's spawn record
     /// (its process was released to its Shim), so the next engine adopts it
     /// at once. One writer job; nothing to do without a record or an owner.

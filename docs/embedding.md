@@ -342,6 +342,16 @@ graceful path is a contract the embedder owns:
   (`InheritedListener::new(socket)`). A connection that arrives in between
   waits in the socket's backlog. `hekma_engine::handoff` is the channel the
   Service Host uses to pass that socket and its host lock to its successor.
+- **After a crash: `EngineOptions::host_posture`.** An engine that owns the
+  data path (a Service Host) passes its Handoff Mode
+  (`HandoffPosture::On`, `Off`, or `Unset` when the Operator chose none).
+  The open records it in the state directory before adopting anything, and
+  first reads what the previous owner recorded: `host_recovery()` returns
+  `HostRecovery { previous, adopted }`, where `previous` is `Unknown`,
+  `Live` or `Gone { handoff }`. When it is `Gone { handoff: false }`, call
+  `clean_up_after_crash(name, window)` for each adopted agent: the
+  ordinary stop, recorded with the `engine-crash` cause. Without
+  `host_posture` nothing is recorded or read, and adoption is unchanged.
 - **Notices are optional.** Pass `Some(&sink)` (a
   [`DiagnosticSink`](#the-diagnostic-sink)) to get the same `[hekma] `
   progress lines `serve` prints at shutdown; pass `None` for return values

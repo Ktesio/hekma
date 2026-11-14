@@ -511,3 +511,73 @@ fn an_upgrade_shutdown_hands_back_the_proxy_socket_and_the_next_engine_serves_on
     second.blocking().stop("kept", None).unwrap();
     drop(first);
 }
+
+fn open_as_host(state: &Path, posture: hekma_engine::HandoffPosture) -> Engine {
+    Engine::open_with_options(
+        Some(state.to_path_buf()),
+        EngineOptions {
+            shim_exe: Some(hekma_conformance::test_support::shim_host_bin()),
+            host_posture: Some(posture),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+/// Story 24-3: the open reads the previous owner's record before adopting:
+/// none → `Unknown`; an owner that chose off and is gone → its orphans are
+/// listed, and `clean_up_after_crash` stops each the ordinary way, ending
+/// its Run `engine-crash`.
+#[test]
+fn the_next_owner_reads_the_previous_posture_and_cleans_up_after_an_off_crash() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    use hekma_engine::{HandoffPosture, PreviousHost};
+    let state = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    manifest(dir.path(), "orph", &["--linger-ms", "600000"]);
+    {
+        let first = open_as_host(state.path(), HandoffPosture::Off);
+        let recovery = first.host_recovery().expect("a host records and reads");
+        assert_eq!(
+            recovery.previous,
+            PreviousHost::Unknown,
+            "nothing recorded yet"
+        );
+        assert!(recovery.adopted.is_empty());
+        let facade = first.blocking();
+        facade
+            .register_with_adapter("orph", &AdapterRef::Manifest(dir.path().to_path_buf()))
+            .unwrap();
+        facade.start("orph").unwrap();
+        // Dropped without a shutdown: the Shim keeps the agent (a crash).
+    }
+    let second = open_as_host(state.path(), HandoffPosture::Unset);
+    let recovery = second.host_recovery().unwrap();
+    assert_eq!(recovery.previous, PreviousHost::Gone { handoff: false });
+    assert_eq!(recovery.adopted, vec!["orph".to_string()]);
+    let run_id = second
+        .blocking()
+        .instance_run("orph")
+        .unwrap()
+        .record
+        .run_id;
+    let stopped = second
+        .blocking()
+        .clean_up_after_crash("orph", Some(Duration::from_secs(5)))
+        .unwrap();
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+    let run = second.blocking().run(run_id.as_str()).unwrap();
+    assert_eq!(run.record.end_cause.as_deref(), Some("engine-crash"));
+    drop(second);
+    // The second owner recorded `unset`: a third sees an unknown wish.
+    let third = open_as_host(state.path(), HandoffPosture::On);
+    assert_eq!(
+        third.host_recovery().unwrap().previous,
+        PreviousHost::Unknown
+    );
+    // An engine that owns no data path records and reads nothing.
+    let plain = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    assert!(plain.host_recovery().is_none());
+}

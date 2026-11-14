@@ -791,6 +791,10 @@ pub struct Supervisor {
     backend: proc::ProcBackend,
     /// Story 22-4: the provider-host list (set when Shim launches are on).
     bypass_feed: Option<std::sync::Arc<crate::domain::bypass::BypassFeed>>,
+    /// Story 24-3: the instances the latest adoption pass took over.
+    adopted_names: Vec<InstanceName>,
+    /// Story 24-3: the stop in progress cleans up after a crashed host.
+    crash_cleanup: bool,
     running: HashMap<InstanceName, Supervised>,
     usage_source: SelfReportedUsageSource,
     backoff: BackoffSchedule,
@@ -1083,6 +1087,78 @@ impl Supervisor {
         self.backend.set_bypass_feed(feed);
     }
 
+    /// Story 24-3: what the recorded data-path owner was, as seen now —
+    /// none recorded, still alive (another engine, or this one), or gone
+    /// (crashed, or exited) with its Handoff Mode.
+    pub(crate) fn previous_host(&self, registry: &Registry) -> crate::PreviousHost {
+        let row = match registry.host_posture() {
+            Ok(Some(row)) => row,
+            Ok(None) | Err(_) => return crate::PreviousHost::Unknown,
+        };
+        let owner = crate::ports::ProcessFingerprint::new(row.pid, row.start_time);
+        let is_self = self
+            .backend
+            .self_fingerprint()
+            .is_some_and(|me| me.matches(&owner));
+        if !is_self && self.backend.probe_alive(&owner) == Some(true) {
+            return crate::PreviousHost::Live;
+        }
+        match row.handoff {
+            Some(handoff) => crate::PreviousHost::Gone { handoff },
+            // It ran the default without choosing: its wish is unknown.
+            None => crate::PreviousHost::Unknown,
+        }
+    }
+
+    /// Story 24-3: record this engine as the data-path owner with `handoff`
+    /// (`None`: the default, not chosen).
+    pub(crate) fn record_host_posture(&self, registry: &Registry, handoff: Option<bool>) {
+        let Some(me) = self.backend.self_fingerprint() else {
+            self.emit_diagnostic(
+                "this engine's own process could not be identified, so its Handoff Mode is not \
+                 recorded; after a crash the next host adopts its agents",
+            );
+            return;
+        };
+        let row = crate::store::host_sqlite::HostPostureRow {
+            pid: me.pid,
+            start_time: me.start_time,
+            handoff,
+            started_at: crate::time::now_rfc3339(),
+        };
+        if let Err(err) = registry.record_host_posture(row) {
+            self.emit_diagnostic(&format!(
+                "this host's Handoff Mode could not be recorded ({err}); after a crash the next \
+                 host adopts its agents"
+            ));
+        }
+    }
+
+    /// Story 24-3: the instances the latest adoption pass took over, once.
+    pub(crate) fn take_adopted_names(&mut self) -> Vec<InstanceName> {
+        std::mem::take(&mut self.adopted_names)
+    }
+
+    /// Story 24-3: stop an agent a crashed host left running (its mode was
+    /// off): the ordinary stop ladder, with `engine-crash` as its cause.
+    pub(crate) fn stop_after_crash(
+        &mut self,
+        registry: &Registry,
+        name: &str,
+        window: Option<Duration>,
+    ) -> Result<AgentInstance, EngineError> {
+        self.crash_cleanup = true;
+        let stopped = self.stop_inner(
+            registry,
+            name,
+            window,
+            Some(TransitionCause::EngineCrash),
+            None,
+        );
+        self.crash_cleanup = false;
+        stopped
+    }
+
     /// Story 24-2 (Handoff Mode): let go of every process held through a
     /// Shim WITHOUT stopping it — the handle is dropped (its connection
     /// closes) and the Shim keeps the process for the next engine, which
@@ -1174,6 +1250,8 @@ impl Supervisor {
         Self {
             backend: proc::ProcBackend::new(),
             bypass_feed: None,
+            adopted_names: Vec::new(),
+            crash_cleanup: false,
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff: BackoffSchedule::production(),
@@ -1234,6 +1312,8 @@ impl Supervisor {
         Self {
             backend: proc::ProcBackend::new(),
             bypass_feed: None,
+            adopted_names: Vec::new(),
+            crash_cleanup: false,
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff: BackoffSchedule::production(),
@@ -1293,6 +1373,8 @@ impl Supervisor {
         Self {
             backend: proc::ProcBackend::new(),
             bypass_feed: None,
+            adopted_names: Vec::new(),
+            crash_cleanup: false,
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff,
@@ -2247,6 +2329,7 @@ fn cause_suffix(cause: &TransitionCause) -> String {
         TransitionCause::AdapterReady => String::new(),
         TransitionCause::LaunchError { detail } => format!(" (launch error: {detail})"),
         TransitionCause::StopGraceful => String::new(),
+        TransitionCause::EngineCrash => " (cleanup after the previous host crashed)".to_string(),
         TransitionCause::StopForced { detail } => format!(" (forced: {detail})"),
         TransitionCause::PauseBestEffort { detail } => format!(" (best-effort: {detail})"),
         TransitionCause::ResumeBestEffort { detail } => format!(" (best-effort: {detail})"),

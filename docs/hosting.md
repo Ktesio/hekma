@@ -229,6 +229,20 @@ it as `handoff_check`:
 Hekma never refuses to start on `unsafe`: it warns, and stopping every agent
 with the host remains a working configuration.
 
+**After a crash.** A host that is killed (`kill -9`, out of memory, a power
+cut) cannot stop anything. Each host records in the state directory, before
+it adopts anything, which Handoff Mode it runs, and the next host acts on
+what the dead one recorded:
+
+| The crashed host ran | Its agents in their Shims (or detached) |
+|---|---|
+| `--handoff` (or `HEKMA_HANDOFF=on`) | Kept: the next host reconnects to each and says how many. |
+| `--no-handoff` (or `HEKMA_HANDOFF=off`) | Cleaned up: the next host stops each one the ordinary way (the graceful signal, then the forced kill after the stop window), its Run ends with cause `engine-crash`, and the started notice names them. A detached start is never cleaned up: it was asked to outlive any host. |
+| No mode chosen (the default), or a state directory from before this record | Kept: an unknown wish never stops anything, and the notice says so. |
+
+Agents held directly die with the host only if the operating system takes
+their process group with it; those that survive are treated the same way.
+
 **In-place upgrades (a preview, Unix).** After installing a new `hekma`, run
 `hekma serve --upgrade` (or `POST /v0/host/upgrade`) to move the running host
 onto it without stopping agents or refusing a connection:

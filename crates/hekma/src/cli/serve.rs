@@ -129,6 +129,12 @@ pub fn run(flags: ServeFlags) -> Result<(), Box<dyn std::error::Error>> {
         )
     })
     .map_err(|message| ServeOptionsInvalid { message })?;
+    // Story 24-3: whether the Operator chose a mode, and which.
+    let chosen_handoff = handoff_mode(
+        flags.handoff,
+        std::env::var("HEKMA_HANDOFF").ok().as_deref(),
+    )
+    .map_err(|message| ServeOptionsInvalid { message })?;
     let options = hekma_host::ServeOptions {
         state_base: flags.state_dir.map(PathBuf::from),
         stop_window: flags.stop_window,
@@ -178,11 +184,8 @@ pub fn run(flags: ServeFlags) -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|_| take_handoff_token()),
         handoff_from: flags.handoff_from,
         // Story 24-2: the flag, then HEKMA_HANDOFF, then off.
-        handoff: handoff_mode(
-            flags.handoff,
-            std::env::var("HEKMA_HANDOFF").ok().as_deref(),
-        )
-        .map_err(|message| ServeOptionsInvalid { message })?,
+        handoff: chosen_handoff.unwrap_or(false),
+        handoff_chosen: chosen_handoff.is_some(),
     };
     hekma_host::serve(options).map_err(|err| {
         // The typed refusal carries its full holder-naming/remediation text
@@ -333,15 +336,16 @@ fn take_handoff_token() -> Option<String> {
 }
 
 /// Story 24-2: Handoff Mode — `--handoff`/`--no-handoff`, else
-/// `HEKMA_HANDOFF` (`on`/`1` or `off`/`0`), else off.
-fn handoff_mode(flag: Option<bool>, env: Option<&str>) -> Result<bool, String> {
+/// `HEKMA_HANDOFF` (`on`/`1` or `off`/`0`), else not chosen (`None`: off by
+/// default).
+fn handoff_mode(flag: Option<bool>, env: Option<&str>) -> Result<Option<bool>, String> {
     if let Some(on) = flag {
-        return Ok(on);
+        return Ok(Some(on));
     }
     match env.map(str::trim) {
-        None | Some("") => Ok(false),
-        Some("on" | "1") => Ok(true),
-        Some("off" | "0") => Ok(false),
+        None | Some("") => Ok(None),
+        Some("on" | "1") => Ok(Some(true)),
+        Some("off" | "0") => Ok(Some(false)),
         Some(other) => Err(format!(
             "HEKMA_HANDOFF={other} is not a Handoff Mode: use on or off (or the --handoff / \
              --no-handoff flags)"
@@ -429,13 +433,16 @@ mod tests {
 
     #[test]
     fn handoff_mode_follows_the_flag_then_the_environment_then_off() {
-        assert_eq!(super::handoff_mode(Some(true), Some("off")), Ok(true));
-        assert_eq!(super::handoff_mode(Some(false), Some("on")), Ok(false));
-        assert_eq!(super::handoff_mode(None, Some("on")), Ok(true));
-        assert_eq!(super::handoff_mode(None, Some("1")), Ok(true));
-        assert_eq!(super::handoff_mode(None, Some("off")), Ok(false));
-        assert_eq!(super::handoff_mode(None, Some("")), Ok(false));
-        assert_eq!(super::handoff_mode(None, None), Ok(false));
+        assert_eq!(super::handoff_mode(Some(true), Some("off")), Ok(Some(true)));
+        assert_eq!(
+            super::handoff_mode(Some(false), Some("on")),
+            Ok(Some(false))
+        );
+        assert_eq!(super::handoff_mode(None, Some("on")), Ok(Some(true)));
+        assert_eq!(super::handoff_mode(None, Some("1")), Ok(Some(true)));
+        assert_eq!(super::handoff_mode(None, Some("off")), Ok(Some(false)));
+        assert_eq!(super::handoff_mode(None, Some("")), Ok(None));
+        assert_eq!(super::handoff_mode(None, None), Ok(None));
         let err = super::handoff_mode(None, Some("maybe")).unwrap_err();
         assert!(err.contains("HEKMA_HANDOFF=maybe"), "{err}");
     }

@@ -317,6 +317,8 @@ struct EngineInner {
     /// Story 22-4: the provider-host list Shims compare against (`None`
     /// when launches are direct).
     bypass_feed: Option<Arc<crate::domain::bypass::BypassFeed>>,
+    /// Story 24-3: what the open found of the previous data-path owner.
+    recovery: Mutex<Option<HostRecovery>>,
 }
 
 impl EngineInner {
@@ -336,6 +338,48 @@ impl EngineInner {
                 .push_bypass_hosts(&config);
         }
     }
+}
+
+/// Story 24-3: the Handoff Mode a data-path owner records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandoffPosture {
+    /// The Operator chose Handoff Mode: after a crash, keep the agents.
+    On,
+    /// The Operator chose against it: after a crash, clean them up.
+    Off,
+    /// The default, not chosen: after a crash, keep the agents (an unknown
+    /// wish never stops anything).
+    Unset,
+}
+
+/// Story 24-3: what the previous data-path owner recorded, as seen at this
+/// engine's open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviousHost {
+    /// No owner was recorded (a state directory from before the record, or
+    /// an embedder that keeps none), or it ran the default Handoff Mode
+    /// without choosing one: its agents are adopted, never stopped.
+    Unknown,
+    /// The recorded owner is still alive (an in-place upgrade's
+    /// predecessor, mid-hand-over).
+    Live,
+    /// The recorded owner is gone — crashed, or exited — and ran with this
+    /// Handoff Mode. Agents it left running are its orphans.
+    Gone {
+        /// Its Handoff Mode: on asks for them to be kept; off asks for them
+        /// to be cleaned up.
+        handoff: bool,
+    },
+}
+
+/// Story 24-3: what this engine found of the previous owner at open, and
+/// which agents its open adopted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostRecovery {
+    /// The previous owner.
+    pub previous: PreviousHost,
+    /// The agents this engine's open took over (still running), sorted.
+    pub adopted: Vec<String>,
 }
 
 /// The counters the OTLP exporter samples at each flush (story 24-5): the
@@ -413,6 +457,13 @@ pub struct EngineOptions {
     /// `#[doc(hidden)]` so it never reads as one.
     #[doc(hidden)]
     pub pause_command_cap_override: Option<Duration>,
+    /// Story 24-3: this engine owns the data path (a Service Host) — its
+    /// Handoff Mode is recorded in the state directory at open, before any
+    /// agent is adopted, so the next open knows what a crashed owner asked
+    /// for. The open also reads the previous owner's record (see
+    /// [`Engine::host_recovery`]). `None` (the default): nothing is recorded
+    /// or read.
+    pub host_posture: Option<HandoffPosture>,
     /// Story 24-1: the Shim program (a binary that runs the engine's Shim
     /// entry for `shim --listen … --expect-secret-hash … --launch-id …`,
     /// such as `hekma`). `Some`: every supervised launch (except an ACP
@@ -582,6 +633,7 @@ impl Engine {
             stable_run_window_override,
             pause_command_cap_override,
             shim_exe,
+            host_posture,
         } = options;
         let registry = Registry::open(base)?;
         let rt = Self::build_runtime()?;
@@ -694,6 +746,7 @@ impl Engine {
             identity_headers_flag,
             telemetry_points: Default::default(),
             bypass_feed,
+            recovery: Mutex::new(None),
         });
 
         // (1) Orphan adoption on open (AC-B / AI-7 / AI-8). Reconcile BEFORE the
@@ -702,7 +755,29 @@ impl Engine {
         {
             let mut registry = inner.registry.lock().expect("registry mutex poisoned");
             let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            // Story 24-3: read the previous owner's record, then replace it
+            // with this one's, BEFORE adopting anything.
+            let previous = host_posture.map(|posture| {
+                let previous = supervisor.previous_host(&registry);
+                let handoff = match posture {
+                    HandoffPosture::On => Some(true),
+                    HandoffPosture::Off => Some(false),
+                    HandoffPosture::Unset => None,
+                };
+                supervisor.record_host_posture(&registry, handoff);
+                previous
+            });
             supervisor.adopt_orphans(&registry);
+            let mut adopted: Vec<String> = supervisor
+                .take_adopted_names()
+                .into_iter()
+                .map(|name| name.as_str().to_string())
+                .collect();
+            adopted.sort();
+            if let Some(previous) = previous {
+                *inner.recovery.lock().expect("recovery mutex poisoned") =
+                    Some(HostRecovery { previous, adopted });
+            }
             // Story 21-3: publish what the open produced (the policy sweep's
             // Run events, the FR-21 upgrade's one event) on the bus — they
             // are already durable in the outbox; this makes them live too
@@ -776,6 +851,7 @@ impl Engine {
             identity_headers_flag: None,
             telemetry_points: Default::default(),
             bypass_feed: None,
+            recovery: Mutex::new(None),
         });
         Ok(Self {
             rt: Arc::new(rt),
@@ -2191,6 +2267,38 @@ impl Engine {
         let notes = crate::shutdown::Notes::over(notes);
         let handed = crate::shutdown::release_and_drain(self, window, &notes).await;
         (handed, listener)
+    }
+
+    /// Story 24-3: what this engine's open found of the previous data-path
+    /// owner and which agents it adopted — `None` unless the engine was
+    /// opened with [`EngineOptions::host_posture`].
+    pub fn host_recovery(&self) -> Option<HostRecovery> {
+        self.inner
+            .recovery
+            .lock()
+            .expect("recovery mutex poisoned")
+            .clone()
+    }
+
+    /// Story 24-3: stop an agent that a crashed owner left running while
+    /// its Handoff Mode was off — the ordinary stop ladder, recorded with
+    /// the `engine-crash` cause, which is also its Run's end cause. The
+    /// Service Host calls it for each adopted agent when
+    /// [`HostRecovery::previous`] is `Gone { handoff: false }`.
+    pub async fn clean_up_after_crash(
+        &self,
+        name: &str,
+        window: Option<Duration>,
+    ) -> Result<AgentInstance, EngineError> {
+        self.refuse_if_read_only().map_err(EngineError::Store)?;
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.stop_after_crash(&registry, &name, window)
+        })
+        .await
     }
 
     /// Story 24-2: release every Shim-held agent without stopping it (see
@@ -4208,6 +4316,17 @@ impl Blocking<'_> {
     /// Blocking [`Engine::stop`].
     pub fn stop(&self, name: &str, window: Option<Duration>) -> Result<AgentInstance, EngineError> {
         self.engine.rt.block_on(self.engine.stop(name, window))
+    }
+
+    /// Blocking [`Engine::clean_up_after_crash`] (story 24-3).
+    pub fn clean_up_after_crash(
+        &self,
+        name: &str,
+        window: Option<Duration>,
+    ) -> Result<AgentInstance, EngineError> {
+        self.engine
+            .rt
+            .block_on(self.engine.clean_up_after_crash(name, window))
     }
 
     /// Blocking [`Engine::shutdown_for_upgrade`] (story 24-2).
