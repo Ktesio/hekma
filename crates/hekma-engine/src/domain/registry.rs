@@ -330,6 +330,15 @@ impl Registry {
                 let probe = |fingerprint: &crate::ports::ProcessFingerprint| {
                     crate::ports::ProcessBackend::probe_alive(&backend, fingerprint)
                 };
+                // Story 24-4: open calls a dead owner left in an older daily
+                // file move to the head first, so the closure below closes
+                // them too.
+                if let Err(err) = write_store.absorb_open_calls(&paths.calls_dir(), &probe) {
+                    notes.push(format!(
+                        "the proxied calls left open in older per-call record files could not \
+                         all be read ({err}); they are closed at a later start"
+                    ));
+                }
                 match write_store.close_orphaned_calls(&probe) {
                     Ok((0, 0)) => {}
                     Ok((crashed, recovered)) => notes.push(format!(
@@ -563,6 +572,41 @@ impl Registry {
             .snapshot(|store| Ok(crate::domain::runs::ops::view(store, run_id)))?
     }
 
+    /// The retention windows and the compaction state (story 24-4), read
+    /// on the read-only connection.
+    pub(crate) fn retention_view(
+        &self,
+    ) -> Result<crate::domain::runs::retention::RetentionView, StoreError> {
+        self.store.snapshot(|store| {
+            Ok(crate::domain::runs::retention::RetentionView {
+                settings: store.retention_settings()?,
+                compaction: store.compaction_state()?,
+            })
+        })
+    }
+
+    /// Change the retention windows (story 24-4): one writer job.
+    pub(crate) fn set_retention(
+        &self,
+        change: crate::domain::runs::retention::RetentionChange,
+    ) -> Result<crate::domain::runs::retention::RetentionView, StoreError> {
+        let at = crate::time::now_rfc3339();
+        self.writer().call(move |ctx| {
+            ctx.store().set_retention(&change, &at)?;
+            Ok(())
+        })?;
+        self.retention_view()
+    }
+
+    /// A compacted Run's summary (story 24-4), read on the read-only
+    /// connection; `None` when the id was never compacted.
+    pub(crate) fn compacted_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::domain::runs::retention::CompactedRun>, StoreError> {
+        self.store.snapshot(|store| store.compacted_run(run_id))
+    }
+
     /// One Run's row, read on the read-only connection (story 21-9).
     pub(crate) fn run_record(
         &self,
@@ -712,11 +756,19 @@ impl Registry {
         query: &crate::domain::runs::ListRunsQuery,
     ) -> Result<crate::domain::runs::RunListing, crate::domain::RunError> {
         use crate::domain::runs::listing;
-        let cutoff = listing::ended_run_cutoff(crate::time::now_unix_secs());
+        let now = crate::time::now_unix_secs();
         let after = query.after_key()?;
         self.store
             .snapshot(|store| {
                 use crate::ports::RunRecords as _;
+                // Story 24-4: the stored Run window drives the listing's
+                // cutoff (the compaction pass reads the same row); an
+                // unreadable row keeps the 7-day default.
+                let days = store
+                    .retention_settings()
+                    .map(|settings| settings.run_retention_days)
+                    .unwrap_or(crate::domain::runs::retention::RETENTION_DEFAULT_DAYS);
+                let cutoff = crate::domain::runs::retention::cutoff_for(now, days);
                 let limit = query.clamped_limit();
                 let (records, next_key) = store.list_runs(
                     query.view,

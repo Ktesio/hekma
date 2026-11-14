@@ -42,6 +42,7 @@ pub(crate) mod limits;
 pub(crate) mod listing;
 pub(crate) mod ops;
 pub(crate) mod policy;
+pub mod retention;
 pub mod selector;
 pub(crate) mod snapshot;
 pub mod telemetry;

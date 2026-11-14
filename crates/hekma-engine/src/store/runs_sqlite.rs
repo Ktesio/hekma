@@ -883,7 +883,11 @@ pub(super) fn migrate_v21(conn: &Connection) -> Result<(), StoreError> {
 
 /// One crash-atomic runs-schema step: the DDL and its `user_version` stamp
 /// in one `BEGIN IMMEDIATE`, skipped when another process already ran it.
-fn migrate_runs_step(conn: &Connection, version: i64, ddl: &str) -> Result<(), StoreError> {
+pub(super) fn migrate_runs_step(
+    conn: &Connection,
+    version: i64,
+    ddl: &str,
+) -> Result<(), StoreError> {
     conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
     let body = || -> Result<bool, StoreError> {
         let current: i64 = conn

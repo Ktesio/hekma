@@ -225,6 +225,9 @@ fn every_route(addr: &str) -> Vec<(&'static str, String)> {
         // Story 21-8: the proxy's settings.
         ("GET", format!("http://{addr}/v0/proxy")),
         ("PATCH", format!("http://{addr}/v0/proxy")),
+        // Story 24-4: the retention windows.
+        ("GET", format!("http://{addr}/v0/retention")),
+        ("PUT", format!("http://{addr}/v0/retention")),
         ("GET", format!("http://{addr}/v0/fleet")),
         ("GET", format!("http://{addr}/v0/events")),
         ("POST", format!("http://{addr}/v0/instances")),
@@ -408,7 +411,9 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
         // listing too (the by-id read keeps its 404).
         || (method == "GET" && url.ends_with("/v0/calls"))
         // Story 21-8: the proxy's settings read answers 200.
-        || (method == "GET" && url.ends_with("/v0/proxy"));
+        || (method == "GET" && url.ends_with("/v0/proxy"))
+        // Story 24-4: the retention read answers 200.
+        || (method == "GET" && url.ends_with("/v0/retention"));
         let register = method == "POST" && url.ends_with("/v0/instances");
         // The ack POST reached its handler but this loop's register-shaped
         // body carries no `seq` — the Json extractor's 422 is the
@@ -425,7 +430,9 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
         .any(|route| url.ends_with(&format!("/v0/runs/{route}")))
             || (method == "PATCH" && url.ends_with("/run_ghost/limits"))
             // Story 21-8: the proxy PATCH denies unknown fields too.
-            || (method == "PATCH" && url.ends_with("/v0/proxy"));
+            || (method == "PATCH" && url.ends_with("/v0/proxy"))
+            // Story 24-4: the retention PUT denies unknown fields too.
+            || (method == "PUT" && url.ends_with("/v0/retention"));
         let ack_wrong_body = ack_wrong_body || set_wrong_body;
         // The Run open POST reached its handler: the register-shaped body
         // names no parent, so the exactly-one-parent rule answers 400.
@@ -5727,6 +5734,106 @@ fn the_calls_routes_refuse_every_credential_class_but_the_operator_bearer() {
         let _ = json_body(&mut response);
     }
 
+    server.stop().unwrap();
+}
+
+#[test]
+fn the_retention_route_is_operator_only_and_moves_either_window() {
+    // Story 24-4: GET /v0/retention reads both windows (7 days each by
+    // default) and the compaction state; PUT changes either, refusing a
+    // window outside 1..=3650 days (400 invalid-retention), a change that
+    // names none (400), and a wrong shape (422); a Run Key is refused.
+    let state = tempfile::tempdir().unwrap();
+    drop(hekma_engine::Engine::open(Some(state.path().to_path_buf())).unwrap());
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+             process_owner, created_at, updated_at) \
+             VALUES ('run_ROOT', 'announced', 0, 'active', '', 0, 't', 't');",
+        )
+        .unwrap();
+    }
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle.clone());
+    let client = client();
+    let url = format!("http://{}/v0/retention", server.addr);
+
+    let mut response = get_ok(&client, &server.addr, "/v0/retention");
+    let shown = json_body(&mut response);
+    assert_eq!(shown["settings"]["run_retention_days"], 7, "{shown}");
+    assert_eq!(shown["settings"]["calls_retention_days"], 7, "{shown}");
+    assert_eq!(shown["compaction"]["runs_compacted"], 0, "{shown}");
+
+    let mut response = call(
+        &client,
+        "PUT",
+        &url,
+        Some(serde_json::json!({"run_retention_days": 30})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let set = json_body(&mut response);
+    assert_eq!(set["settings"]["run_retention_days"], 30, "{set}");
+    assert_eq!(set["settings"]["calls_retention_days"], 7, "{set}");
+    assert!(set["settings"]["updated_at"].is_string(), "{set}");
+    let mut response = call(
+        &client,
+        "PUT",
+        &url,
+        Some(serde_json::json!({"calls_retention_days": 3650})),
+    );
+    let set = json_body(&mut response);
+    assert_eq!(set["settings"]["run_retention_days"], 30, "{set}");
+    assert_eq!(set["settings"]["calls_retention_days"], 3650, "{set}");
+
+    for body in [
+        serde_json::json!({"run_retention_days": 0}),
+        serde_json::json!({"calls_retention_days": 3651}),
+        serde_json::json!({}),
+    ] {
+        let mut response = call(&client, "PUT", &url, Some(body.clone()));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let refused = json_body(&mut response);
+        assert_eq!(refused["error"]["code"], "invalid-retention", "{refused}");
+    }
+    for body in [
+        serde_json::json!({"run_retention_days": -1}),
+        serde_json::json!({"run_retention_days": "seven"}),
+        serde_json::json!({"days": 7}),
+    ] {
+        let response = call(&client, "PUT", &url, Some(body.clone()));
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{body}"
+        );
+    }
+
+    // A Run Key is not an Operator.
+    let mut response = client
+        .post(format!("http://{}/v0/runs", server.addr))
+        .header("Authorization", format!("Bearer {BEARER_VALUE}"))
+        .send_json(serde_json::json!({"parent_run_id": "run_ROOT"}))
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let opened = json_body(&mut response);
+    let key = opened["credentials"]["run_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = client
+        .put(&url)
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Content-Type", "application/json")
+        .send(r#"{"run_retention_days":1}"#)
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let mut response = get_ok(&client, &server.addr, "/v0/retention");
+    assert_eq!(
+        json_body(&mut response)["settings"]["run_retention_days"],
+        30,
+        "nothing a Run Key sent was stored"
+    );
     server.stop().unwrap();
 }
 

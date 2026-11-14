@@ -405,6 +405,9 @@ fn batch_failure(err: &StoreError) -> StoreError {
 /// The writer loop: one batch at a time until every handle is dropped.
 fn run(store: &SqliteStore, rx: &Receiver<Job>, stats: &WriterStats) {
     while let Some(batch) = next_batch(rx) {
+        // Story 24-4: the calls store rolls to a new daily segment between
+        // batches, never inside one.
+        store.rotate_calls_if_due();
         commit_batch(store, batch, stats);
     }
 }

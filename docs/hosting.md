@@ -193,6 +193,10 @@ The Service Host that owns the metering proxy also runs its **sweeper**: every 5
 
 A Host embedding the engine sets the windows in `MeteringProxyOptions.leases` (`LeaseOptions { lease_secs, wire_inactivity_secs, silent_window_secs, sweep_interval_secs }`, defaults 60, 900, 3600 and 5). They are host settings, not Policy limits.
 
+## Retention
+
+The same host keeps the state directory from growing without bound. An ended Run keeps its full detail for seven days, then is reduced to its totals, labels and end cause; per-call records are kept for seven days, then their daily file is deleted whole. The host does this when it starts and then once a day. Change either window with `hekma run retention --runs <days>` or `--calls <days>`, or `PUT /v0/retention`, from 1 to 3650 days; usage records, events and the export outbox are not touched.
+
 ## The meter is cooperative — the container is not a fence
 
 Engine-observed metering works inside the container as it does on a machine.

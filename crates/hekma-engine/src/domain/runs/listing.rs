@@ -9,10 +9,10 @@
 //! `run_id` DESC (newest first — ULID ids encode creation time, and the
 //! primary key is the index), with an opaque versioned cursor.
 //!
-//! [`ENDED_RUN_RETENTION_DAYS`] is the READ-side bound on ended Runs: how
-//! long a listing still shows them. Deleting their detail rows (compaction)
-//! and the knob for the window belong to the scale story; a knob with no
-//! enforcement behind it would hide rows without removing them.
+//! The ended-Run window is the stored Run retention window (default
+//! [`ENDED_RUN_RETENTION_DAYS`]): a listing shows an ended Run while it is
+//! inside the window, and the compaction pass reduces it once it is past
+//! (see [`super::retention`]).
 //!
 //! Headroom is computed against each Run's STORED resolution
 //! ([`PolicyResolution`], never instance configuration alone), so a Policy
@@ -36,8 +36,8 @@ use super::policy::RunPolicy;
 #[cfg(test)]
 use crate::domain::cost::Micros;
 
-/// How long a listing still shows an ended Run (read-side; PRD FR-49's
-/// assumed default until compaction lands with its knob).
+/// The default ended-Run window, in days (the stored Run retention window
+/// overrides it).
 pub const ENDED_RUN_RETENTION_DAYS: u64 = 7;
 
 /// The page size `hekma ps` and `GET /v0/runs` serve when none is given.
