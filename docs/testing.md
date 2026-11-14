@@ -213,6 +213,27 @@ The crash-window backfill (`Engine::resync_events` / `Blocking::resync_events`, 
 
 The host's test spine is four suites, each owning one layer of the serve contract. **`crates/hekma-engine/tests/serve_host.rs`** proves the ENGINE seams through the public `EngineOptions`/`open_with_options` with the real `fake_agent`: a fixed `metering_listen_port` binds and injects that port (the dump proof), a host restart re-binds the SAME port, an ADOPTED observed instance is re-bound live with no stop/start (the adopted-observed re-bind closure) while an ephemeral open keeps the stranded-listener diagnostic byte-for-byte; the supervisor-path collision pin holds a raw `TcpListener` on the pinned port and asserts the typed `ObservedMetering` start refusal NAMES the port (the never-a-silent-hop contract, driven through the full start path so an ephemeral-fallback mutation ships red); and the env-allowlist legs prove a `child_env_allowlist` child sees EXACTLY its declared mappings plus the OS-baseline floor (Unix `PATH`/`HOME` — nothing else ambient) while the default open inherits byte-identically. The re-bind DECISION itself is a pure seam (`supervisor::adoption_rebind_decision`) unit-tested on every OS — the process-level re-bind legs skip on the x86-64 Linux CI runner (#109) and tarpaulin runs ONLY on linux, so the coverage job reaches the decision logic through the pure seam, not only the OS-gated e2e. **`crates/hekma-host/tests/drain_subprocess.rs`** drives the real-process drain: a cooperative agent stops gracefully inside the window, a SIGTERM-ignoring agent (`trap '' TERM`) escalates after it with the elapsed time pinned, a full `serve_with_signal` run adopts a DETACHED agent at open and drains it — and the exit-0-on-escalated-stop contract is pinned end to end (an escalated outcome still returns `Ok(())`, so a "harden the exit code" regression ships red). **`crates/hekma/tests/serve_cli.rs`** is the CLI-first surface against the REAL binary: SIGTERM stops a running agent and exits 0; a second serve is refused with exit 2 naming the live holder PID and the stop-it-or-switch-roots remediation (and NEVER file-removal advice); a repeated SIGTERM is idempotent; `--state-dir` serves the flagged root; `--metering-listen` pins an adopted observed instance's listener on that port (the re-exec helper pattern builds the crashed-host shape — the detached-start refusal rightly forbids building it with `--detach` for observed instances); and the parse pins refuse `--stop-window 0` and `86401` at clap level. The POSIX-shaped legs runtime-skip on Windows via the data-driven OS id (no `#[cfg]` — outside the backends/ allowlist); the real Windows Ctrl+C e2e needs a console-event harness (see `deferred-work.md`). **`crates/hekma-host/src/signals.rs`** unit-tests the REAL kernel path in-process: arming resolves a delivered SIGTERM to its name, and a second SIGTERM during the "drain" is swallowed with a sink note instead of killing the process (the drain-time repeat-swallow contract; registration failure is a typed error by construction — no `.expect` remains in the module). Two pure guards complete the layer: the drain planner/`StopResult` wording tests (only `Running` rows, honest failed/exited-on-its-own wordings) in `crates/hekma-host/src/drain.rs`, and the serve-options open-time-only guard in the supervisor (`set_serve_options` refuses an already-applied supervisor and — pinned with a real spawn — one whose lifecycle has begun).
 
+### No unrequested stops
+
+`hekma_conformance::sm7` audits a state directory's durable event record
+(the export outbox) and maps every action that stops, pauses or blocks
+anything to the only reasons Hekma may take one:
+
+1. an Operator or Host verb, or a shutdown with Handoff Mode off;
+2. a configured Breach Action;
+3. a failed start or a declared probe's failure;
+4. cleaning up after a crashed host that ran with Handoff Mode off.
+
+It fails a test on any action that maps to none of these, naming the event. The
+end-to-end tests assert it, with the exact actions expected, in these
+scenarios:
+
+- SIGTERM with Handoff Mode on (none) and off (the shutdown's stop);
+- an in-place upgrade (none);
+- `kill -9` of the host with Handoff Mode off (the cleanup), on (none) and
+  not chosen (none);
+- a Shim killed under its agent (none).
+
 ## Performance budgets (NFR-4)
 
 The NFR-4 budgets — read commands < 1 s on a 25-instance Fleet, supervision overhead ≤ 2% CPU and ≤ 50 MB RSS per running instance — are **measured, not assumed**, by the perf-budgets harness (`crates/hekma-engine/examples/perf-budgets.rs`). It builds a real 25-instance Fleet fixture (manifest agents on the conformance `fake_agent`; 10 RUNNING via the facade `start`, the rest registered-only) on a hermetic temp root, drives the PUBLIC `blocking()` facade only, and measures in a fixed order that keeps the fixture startup entirely outside the timed windows (setup → settle → steady-state window → re-settle → read latency → a subscriber-overhead addendum, below):

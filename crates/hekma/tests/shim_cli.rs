@@ -70,6 +70,17 @@ fn hekma_shim_1_launches_agents_through_a_shim_and_a_stop_ends_them() {
     }
 }
 
+/// SM-7: every stop, pause or block in the state directory's durable
+/// record maps to an NFR-9 clause, and the actions taken are exactly
+/// `expected` (in order).
+fn sm7_holds(state_dir: &Path, expected: &[hekma_conformance::sm7::Clause]) {
+    let actions = hekma_conformance::sm7::audit_state_dir(state_dir);
+    let unauthorized = hekma_conformance::sm7::unauthorized(&actions);
+    assert!(unauthorized.is_empty(), "unauthorized: {unauthorized:?}");
+    let taken: Vec<_> = actions.iter().filter_map(|action| action.clause).collect();
+    assert_eq!(taken, expected, "{actions:?}");
+}
+
 fn alive(pid: i64) -> bool {
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -126,6 +137,7 @@ fn a_handoff_mode_host_leaves_shim_agents_running_for_the_next_host() {
         alive(pid),
         "a Handoff-Mode shutdown must not stop a Shim-held agent"
     );
+    sm7_holds(state_dir, &[]);
     assert!(
         logged(state_dir, "svc released to its Shim"),
         "the host notes the release"
@@ -222,6 +234,7 @@ fn serve_upgrade_hands_the_host_over_without_a_refused_connection() {
         refused, 0,
         "no connection refused across the upgrade ({ok} reached it)"
     );
+    sm7_holds(state_dir, &[]);
     let after = control_doc(state_dir);
     assert_ne!(
         after["pid"].as_i64().unwrap(),
@@ -299,6 +312,14 @@ fn crash_with(mode: Option<&str>) -> (i64, Option<String>, bool, String) {
         )
         .unwrap();
     let log = std::fs::read_to_string(state_dir.join("serve.log")).unwrap_or_default();
+    // SM-7: the only stop the crash recovery may take is the cleanup of
+    // an explicit off-mode host's agent.
+    let cleanup: &[hekma_conformance::sm7::Clause] = if mode == Some("off") {
+        &[hekma_conformance::sm7::Clause::OrphanCleanup]
+    } else {
+        &[]
+    };
+    sm7_holds(state_dir, cleanup);
     let still = alive(pid);
     if still {
         assert!(
@@ -340,4 +361,36 @@ fn after_a_crash_with_handoff_on_or_unchosen_the_next_host_keeps_its_agents() {
     let (_pid, cause, alive_after, log) = crash_with(None);
     assert!(alive_after && cause.is_none(), "kept: {cause:?}");
     assert!(log.contains("adopted, not stopped: svc"), "{log}");
+}
+
+/// SM-7 (story 24-3): SIGTERM with Handoff Mode off stops the agent — the
+/// one action NFR-9's shutdown clause authorizes, and nothing else.
+#[test]
+fn sigterm_with_handoff_off_stops_its_agents_by_the_shutdown_clause_only() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let manifest = tempfile::tempdir().unwrap();
+    hekma_conformance::test_support::ManifestFixture::new("svc", &["--linger-ms", "600000"])
+        .guaranteed_on_all_oses("interaction")
+        .write(manifest.path());
+    let _host = HostGuard(state_dir);
+    let env = [("HEKMA_SHIM", "1"), ("HEKMA_HANDOFF", "off")];
+    let hekma = |args: &[&str]| run_hekma_agent_with_env(args, &ctx.project_dir, state_dir, &env);
+    let manifest_arg = manifest.path().to_string_lossy().into_owned();
+    assert!(hekma(&["agent", "register", "svc", "--manifest", &manifest_arg]).success);
+    assert!(hekma(&["agent", "start", "svc"]).success);
+    let conn = rusqlite::Connection::open(state_dir.join("state.db")).unwrap();
+    let pid: i64 = conn
+        .query_row("SELECT pid FROM agent_runtime", [], |row| row.get(0))
+        .unwrap();
+    stop_host(state_dir);
+    assert!(
+        !alive(pid),
+        "Handoff Mode off: the shutdown stops the agent"
+    );
+    sm7_holds(state_dir, &[hekma_conformance::sm7::Clause::VerbOrShutdown]);
 }
