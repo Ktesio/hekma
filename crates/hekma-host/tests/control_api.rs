@@ -7002,4 +7002,8 @@ fn the_host_route_names_the_mode_and_the_service_manager_check() {
     assert!(host["handoff_check_detail"]
         .as_str()
         .is_some_and(|d| !d.is_empty()));
+    assert!(
+        host["recovery"].is_null(),
+        "a fresh start reconciles nothing: {host}"
+    );
 }

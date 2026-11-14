@@ -272,6 +272,26 @@ fn serve_upgrade_without_a_host_refuses_and_starts_none() {
 /// `hekma` write start a host, under the dead host's recorded mode.
 /// Returns the agent's pid, the end cause of its Run (`None` while open),
 /// and whether the agent is still alive.
+/// `GET /v0/host` from the running host, with the local Operator token.
+fn host_doc(state_dir: &Path) -> serde_json::Value {
+    use std::io::{Read, Write};
+    let control = control_doc(state_dir);
+    let addr = control["addr"].as_str().unwrap().to_string();
+    let token = control["token"].as_str().unwrap().to_string();
+    let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+    write!(
+        stream,
+        "GET /v0/host HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\
+         Connection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).unwrap();
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    let body = &answer[answer.find("\r\n\r\n").unwrap() + 4..];
+    serde_json::from_str(body.trim()).unwrap()
+}
+
 fn crash_with(mode: Option<&str>) -> (i64, Option<String>, bool, String) {
     let ctx = TestContext::new();
     let state = TestContext::new();
@@ -320,6 +340,17 @@ fn crash_with(mode: Option<&str>) -> (i64, Option<String>, bool, String) {
         &[]
     };
     sm7_holds(state_dir, cleanup);
+    // Story 24-3: the new host's one summary of what it reconciled.
+    let recovery = &host_doc(state_dir)["recovery"];
+    let (posture, kept, cleaned) = match mode {
+        Some("off") => ("off", 0, 1),
+        Some("on") => ("on", 1, 0),
+        _ => ("unknown", 1, 0),
+    };
+    assert_eq!(recovery["change"], "recovered", "{recovery}");
+    assert_eq!(recovery["posture"], posture, "{recovery}");
+    assert_eq!(recovery["runs_adopted"], kept, "{recovery}");
+    assert_eq!(recovery["runs_cleaned"], cleaned, "{recovery}");
     let still = alive(pid);
     if still {
         assert!(
