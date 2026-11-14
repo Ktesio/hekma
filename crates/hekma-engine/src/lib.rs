@@ -101,6 +101,9 @@ mod sha256;
 // The shutdown drain (issue #328 item 3): the fleet-wide stop ladder behind
 // `Engine::shutdown` — engine-owned so a plain embedding gets the graceful
 // path without the host crate (`serve`'s drain delegates here).
+/// Story 24-1: the Shim — one small process per supervised agent that owns
+/// its process (phase 1: the library, the protocol and the Unix transport).
+pub mod shim;
 mod shutdown;
 mod store;
 mod time;

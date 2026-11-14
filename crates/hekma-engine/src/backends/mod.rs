@@ -55,6 +55,44 @@ pub fn current() -> Backend {
 /// OS-agnostic file resolver ([`crate::ports::FileSecretResolver`]) calls THIS, so
 /// no `#[cfg]` leaks out of `backends/`. Re-exported cfg-selected exactly like
 /// [`Backend`].
+/// Story 24-1: listen for an engine on the Shim socket at `path` (its
+/// directory is created owner-only). Unix only for now; the Windows named
+/// pipe arrives with the Shim's wiring.
+pub fn shim_listen(
+    path: &std::path::Path,
+) -> std::io::Result<Box<dyn crate::shim::server::ShimListener>> {
+    #[cfg(unix)]
+    {
+        Ok(Box::new(unix::shim::listen(path)?))
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the Shim's Windows transport is not built yet",
+        ))
+    }
+}
+
+/// Story 24-1: connect to the Shim socket at `path`.
+pub fn shim_connect(
+    path: &std::path::Path,
+) -> std::io::Result<Box<dyn crate::shim::server::ShimStream>> {
+    #[cfg(unix)]
+    {
+        unix::shim::connect(path)
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the Shim's Windows transport is not built yet",
+        ))
+    }
+}
+
 /// Story 22-5: how many OTHER accounts could log in on this machine, read
 /// from the OS's account list; `None` when this cannot be told (Windows,
 /// or an account list that does not name the current user, as on macOS or

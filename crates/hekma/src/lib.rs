@@ -403,6 +403,21 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Internal: the Shim that owns one supervised process. Started by the
+    /// Service Host, never by hand; its arguments and protocol (shim-rpc
+    /// 1.0) are internal and versioned.
+    #[command(hide = true)]
+    Shim {
+        /// The socket to listen on (given by the host)
+        #[arg(long, value_name = "PATH")]
+        listen: std::path::PathBuf,
+        /// The SHA-256 of the connection secret, in hex (given by the host)
+        #[arg(long, value_name = "HEX")]
+        expect_secret_hash: String,
+        /// The launch this Shim serves (given by the host)
+        #[arg(long, value_name = "ID")]
+        launch_id: String,
+    },
     /// Serve a state directory as a long-running host
     #[command(
         about = "Serve a state directory as a long-running host",
@@ -1369,6 +1384,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Commands::SelfUpdate) => cli::self_update::run(),
+        // Story 24-1: the Shim (internal). It touches no state.db; a bad
+        // argument is a usage refusal.
+        Some(Commands::Shim {
+            listen,
+            expect_secret_hash,
+            launch_id: _,
+        }) => hekma_engine::shim::run(&listen, &expect_secret_hash)
+            .map(|_| ())
+            .map_err(|message| {
+                Box::new(crate::error::ServeOptionsInvalid {
+                    message: format!(
+                        "{message} (hekma shim is internal: the Service Host starts it)"
+                    ),
+                }) as Box<dyn std::error::Error>
+            }),
         Some(Commands::Serve {
             stop_window,
             metering_listen,
@@ -1878,7 +1908,7 @@ fn lifecycle_args(
 }
 
 fn should_check_for_updates(command: &Option<Commands>) -> bool {
-    matches!(command, Some(command) if !matches!(command, Commands::SelfUpdate | Commands::Serve { .. }))
+    matches!(command, Some(command) if !matches!(command, Commands::SelfUpdate | Commands::Serve { .. } | Commands::Shim { .. }))
 }
 
 /// Classify a returned diagnostic into the documented, stable numeric exit
