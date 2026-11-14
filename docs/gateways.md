@@ -11,7 +11,7 @@ description: "Hekma is not a model gateway. Put it in front of LiteLLM, Portkey 
 
 **Hekma is not a model gateway.** It meters every model call it forwards, attributes it to a [Run](runs.md), checks it against that Run's budgets, and lets an Operator hold, reroute or refuse a Run's calls. Multi-provider routing, response caching, fallback chains and an organisation-wide key vault stay with a gateway such as LiteLLM or Portkey. The two work together: the client calls Hekma's [metering proxy](metering-proxy.md), and the proxy forwards to the gateway.
 
-## What the gateway sees {#what-the-gateway-sees}
+## What the gateway sees
 
 By default every call the proxy forwards carries two **identity headers**:
 
@@ -28,7 +28,7 @@ The identity headers never carry request or response content. Hekma never sends 
 
 Every `x-hekma-*` header a client sends is removed before the call is forwarded, whether the identity headers are on or off.
 
-## Turning the identity headers off {#the-switch}
+## Turning the identity headers off
 
 The headers send each call's Run id and labels to whatever the call already goes to. Turn them off when that destination should not see them. There are three levels, and the most specific one wins:
 
@@ -38,7 +38,7 @@ The headers send each call's Run id and labels to whatever the call already goes
 
 All three are Operator surfaces. An agent cannot change them: none of them is an agent configuration key.
 
-## Recipe A: a binding in front of a gateway {#recipe-a}
+## Recipe A: a binding in front of a gateway
 
 For a client that can only change its base URL.
 
@@ -55,7 +55,7 @@ For a client that can only change its base URL.
 
 The first call creates the binding's `wire` Run, which carries `team=core`.
 
-## Recipe B: a supervised agent in front of a gateway {#recipe-b}
+## Recipe B: a supervised agent in front of a gateway
 
 For an agent Hekma starts, metered on the wire (`engine-observed`).
 
@@ -68,11 +68,11 @@ For an agent Hekma starts, metered on the wire (`engine-observed`).
 2. Configure the gateway's key as the instance's provider secret, as for any engine-observed agent. For a gateway on plain `http`, also set `provider.custody = "off"`: key custody only sends a key over `https`.
 3. Start the agent. Its calls reach the gateway through the proxy, on its Run route, and carry the proxy setting's identity headers.
 
-## Key custody through a gateway {#key-custody-through-a-gateway}
+## Key custody through a gateway
 
 [Key custody](run-keys.md#key-custody-preview--not-yet-supported) is a preview. A held key is only ever sent over `https` to an origin and paths pinned for it. A gateway is not in the built-in provider table, so declare its origin, and the paths it serves, beside the key in the secrets file. A reroute route carries its own key or none.
 
-## What these recipes are {#what-these-recipes-are}
+## What these recipes are
 
 Examples. Hekma's half of each recipe is tested against an OpenAI-compatible fake upstream. Neither gateway is run in Hekma's CI, which has no network, so every gateway-side fact here is marked "to verify against the gateway's docs". A recipe will be called validated only after a recorded pass against the real gateway.
 

@@ -416,7 +416,7 @@ by default. `hekma proxy set identity-headers off` stores the setting in the
 state directory, so it reaches the volume too: every container that mounts it
 follows the setting without a flag in the ENTRYPOINT. `--no-identity-headers`
 in the ENTRYPOINT overrides it for that container's run only. See
-[Hekma in front of a gateway](gateways.md#the-switch).
+[Hekma in front of a gateway](gateways.md#turning-the-identity-headers-off).
 
 If the grace is cut short instead, the metadata-mode crash window above is the
 honest description of what remains on the volume — and the next container that

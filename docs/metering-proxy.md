@@ -85,7 +85,7 @@ This Run Key never draws key custody. Past a cap, the call stays on the parent o
   - `x-hekma-run-id`, the Run's id;
   - `x-hekma-labels`, the Run's labels as sorted, percent-encoded `key=value` items joined by commas.
 
-  Neither ever carries a token, a token id or request content. **They are on by default, so your model provider receives each call's Run id and labels.** Turn them off if that is not what you want: `hekma proxy set identity-headers off` stores the setting and applies it to the very next call, `hekma binding set <name> --identity-headers on|off|inherit` sets one binding's own, and `hekma serve --no-identity-headers` or `--identity-headers` overrides the stored setting for one run. A binding's own setting wins, then the serve flag, then the stored setting. See [Hekma in front of a gateway](gateways.md#the-switch).
+  Neither ever carries a token, a token id or request content. **They are on by default, so your model provider receives each call's Run id and labels.** Turn them off if that is not what you want: `hekma proxy set identity-headers off` stores the setting and applies it to the very next call, `hekma binding set <name> --identity-headers on|off|inherit` sets one binding's own, and `hekma serve --no-identity-headers` or `--identity-headers` overrides the stored setting for one run. A binding's own setting wins, then the serve flag, then the stored setting. See [Hekma in front of a gateway](gateways.md#turning-the-identity-headers-off).
 
 **Under key custody** (a preview; see [Run Keys and key custody](run-keys.md#key-custody-preview--not-yet-supported)):
 - The call must be presented with a Run Key issued to a supervised agent or a credentialed open. Its Run, a Run above it, or its binding, must hold a provider key.

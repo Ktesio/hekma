@@ -226,7 +226,7 @@ The binding credentials are issued and listed now. The announce credential is ac
 - `stored_identity_headers`: the stored setting;
 - `forced_by_flag`: `true` when this run was started with `--identity-headers` or `--no-identity-headers`, which override the stored setting until the host stops.
 
-Each change is one `proxy_setting` event (`setting: "identity-headers"`, `value: "on"|"off"`), committed with its outbox row and published on `GET /v0/events`. A binding's own setting is its `identity_headers` field (`true`, `false`, or `null` to follow the proxy setting) on `POST` and `PATCH /v0/bindings`, and a change carries the new value in the `binding` event's `identity_headers` (`on`, `off` or `inherit`). See [Hekma in front of a gateway](gateways.md#the-switch).
+Each change is one `proxy_setting` event (`setting: "identity-headers"`, `value: "on"|"off"`), committed with its outbox row and published on `GET /v0/events`. A binding's own setting is its `identity_headers` field (`true`, `false`, or `null` to follow the proxy setting) on `POST` and `PATCH /v0/bindings`, and a change carries the new value in the `binding` event's `identity_headers` (`on`, `off` or `inherit`). See [Hekma in front of a gateway](gateways.md#turning-the-identity-headers-off).
 
 ## Per-call records
 
