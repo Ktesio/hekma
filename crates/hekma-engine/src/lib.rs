@@ -222,7 +222,8 @@ pub use domain::{
     ScentCheckMode, UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
 };
 pub use engine::{
-    Blocking, DrainReport, Engine, EngineOptions, EventSubscription, ExportCounters, InstanceStatus,
+    Blocking, DrainReport, Engine, EngineOptions, EventSubscription, ExportCounters,
+    HandoffPosture, HostRecovery, InstanceStatus, PreviousHost,
 };
 // Story 22-1: Run Keys — the credential classes, the one-time issued pair,
 // the snapshot's match, the metadata listing and revocation report, the

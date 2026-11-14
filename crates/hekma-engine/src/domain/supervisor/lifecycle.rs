@@ -630,12 +630,16 @@ impl Supervisor {
                     if completed { "COMPLETED" } else { "timed out" },
                 ));
             }
+            if self.crash_cleanup {
+                detail.push_str("; cleanup after the previous host crashed");
+            }
             TransitionCause::stop_forced(detail)
         } else {
             match terminal_drain {
                 Some((completed, waited_ms)) => {
                     TransitionCause::drain_stopped(completed, waited_ms)
                 }
+                None if self.crash_cleanup => TransitionCause::EngineCrash,
                 None => TransitionCause::StopGraceful,
             }
         };

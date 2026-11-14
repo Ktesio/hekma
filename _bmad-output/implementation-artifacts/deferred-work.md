@@ -968,3 +968,27 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
     - the default flip.
   evidence: the spec's phase logs. Trigger: the next 24-2 phases, in that order.
 
+## From spec-24-3 (crash recovery and registry completeness) — build, 2026-11-14
+
+- source_spec: `spec-24-3-crash-recovery-and-registry-completeness.md` (T3: the completeness reconcile)
+  summary: Not built yet:
+    - the mid-probe-wait `starting`-row arm;
+    - the `Recovery` summary event;
+    - the estate-wide R1–R8 invariant check (open calls closed once, holds, Leases, latches and tokens intact, no claim naming a dead engine).
+
+  The existing open-time reconciles still run.
+  evidence: `crates/hekma-engine/src/domain/supervisor/reaper.rs`. Trigger: 24-3 phase 2.
+
+- source_spec: `spec-24-3-crash-recovery-and-registry-completeness.md` (T4: Shim death)
+  summary: A lost Shim's child is not probed and supervised directly (`supervised-degraded`), and no new Shim is started for its relaunch.
+  evidence: `crates/hekma-engine/src/domain/supervisor/proc.rs`. Trigger: 24-3 phase 2.
+
+- source_spec: `spec-24-3-crash-recovery-and-registry-completeness.md` (T5, T6, T7)
+  summary: Not built yet:
+    - the full `kill -9` drill matrix (a parked hold, in-flight calls, Leases and `wire`/`announced` Runs, both modes, the Windows `taskkill /F` leg);
+    - SM-7's auditor and its seven scenarios;
+    - the flush-bound measurement and its docs.
+
+  Phase 1 tests the posture split with a real SIGKILL on Unix only.
+  evidence: `crates/hekma/tests/shim_cli.rs`. Trigger: 24-3 phase 2 and 3.
+
