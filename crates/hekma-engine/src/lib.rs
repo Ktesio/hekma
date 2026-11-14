@@ -185,6 +185,8 @@ pub use domain::{
     RunSummary, ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT,
     RUN_LISTING_SCHEMA_VERSION,
 };
+// Story 24-4 (AD-18 Step 1): lock hold timing, a diagnostic surface.
+pub use domain::timed_mutex::LockHoldStats;
 // Story 19-5: reconciliation — a Run's confirmed usage beside its
 // estimated figures.
 pub use domain::runs::reconcile::{
