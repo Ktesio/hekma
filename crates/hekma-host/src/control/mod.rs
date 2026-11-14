@@ -242,6 +242,11 @@ fn router(state: ApiState) -> Router {
         // Story 23-3: inbound OTLP/HTTP+JSON under an announce credential.
         .route("/v1/metrics", post(crate::otlp::intake::metrics_intake))
         .route("/v0/runs/{id}/heartbeat", post(routes::run_heartbeat))
+        // Story 19-5: a Run's confirmed usage (Operator bearer only).
+        .route(
+            "/v0/runs/{id}/reconciliation",
+            get(routes::run_reconciliations).post(routes::run_reconcile),
+        )
         // Story 23-4: the hold family, single-Run and set forms.
         .route("/v0/runs/{id}/hold", post(routes::run_hold))
         .route("/v0/runs/{id}/release", post(routes::run_release))

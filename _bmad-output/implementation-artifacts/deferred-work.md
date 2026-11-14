@@ -910,3 +910,13 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: Outbox and export retention at Run scale; a calls-file size cap (with names that sort after the day's first file); `ANALYZE`, which the engine never runs.
   evidence: the spec's Design Notes. Trigger: a Host report of outbox growth or of a daily calls file above a stated size; the Run-scale ladder showing a planner miss.
 
+## From spec-19-5 (reconciliation ingestion) — build, 2026-11-14
+
+- source_spec: `spec-19-5-reconciliation-ingestion.md` (Telemetry)
+  summary: The OTLP exporter does not yet emit a reconciled figure as a new `estimate_state="reconciled"` point; the `reconciled` Run event it would read from exists.
+  evidence: `crates/hekma-host/src/otlp/v2.rs`. Trigger: a Host asking for reconciled figures in its dashboards.
+
+- source_spec: `spec-19-5-reconciliation-ingestion.md` (Authority)
+  summary: The Control API cannot tell a Host from the Operator (one bearer class), so API submissions record `operator`.
+  evidence: `crates/hekma-host/src/control/routes.rs` (`run_reconcile`). Trigger: a separate Host credential class (AD-20).
+

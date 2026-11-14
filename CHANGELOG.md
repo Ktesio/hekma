@@ -4,6 +4,20 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — reconciliation: confirmed usage beside the estimate (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **`hekma run reconcile <run-id> --input N --output N [--cached N] [--dollars D] [--source provider|host] [--ref ID]`** and **`POST`/`GET /v0/runs/{id}/reconciliation`** (Operator only) submit a Run's confirmed totals, from the provider's invoice or your gateway.
+> - **Stored beside the estimate, never over it.** The newest submission is the Run's `reconciled` figure. `hekma run show` and the Run document (`reconciled: {current, submissions, drift}`) label each figure and report the drift.
+> - **Retries are safe:** the same reference and figures change nothing, and the same reference with other figures is `409 reconciliation-conflict` (exit `4`).
+> - **Unchanged:** budgets keep acting on estimated figures.
+> - **Events:** one `reconciled` Run event per accepted submission.
+> - **Engine surface:**
+>   - additive: `Engine::reconcile_run`, `Engine::run_reconciliations`, the `Reconcile*` types, and `RunView.reconciled`;
+>   - breaking within the unreleased 0.12.0: `RunEventKind` gains `Reconciled` and `RunError` gains `ReconciliationConflict`.
+>
+>   `state.db` migrates one way to schema 26.
+
 > **Unreleased — retention and compaction (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >

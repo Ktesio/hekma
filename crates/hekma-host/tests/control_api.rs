@@ -5738,6 +5738,130 @@ fn the_calls_routes_refuse_every_credential_class_but_the_operator_bearer() {
 }
 
 #[test]
+fn the_reconciliation_route_stores_beside_the_estimate_replays_and_refuses() {
+    // Story 19-5: POST /v0/runs/{id}/reconciliation stores a Run's confirmed
+    // usage (200, `replayed: false`), a retry is a replay, a reused
+    // reference with other figures is 409, an unknown Run 404, a bad
+    // source 400, a wrong shape 422, and a Run Key 403; GET lists the
+    // submissions newest first; GET /v0/runs/{id} carries the drift.
+    let state = tempfile::tempdir().unwrap();
+    drop(hekma_engine::Engine::open(Some(state.path().to_path_buf())).unwrap());
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+             process_owner, created_at, updated_at) \
+             VALUES ('run_ROOT', 'announced', 0, 'active', '', 0, 't', 't');
+             INSERT INTO usage_rollup_run (run_id, events, input_tokens, output_tokens, \
+             cached_tokens, cached_unknown, cost_micros) \
+             VALUES ('run_ROOT', 1, 900, 250, 0, 1, 4000);",
+        )
+        .unwrap();
+    }
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle.clone());
+    let client = client();
+    let url = format!("http://{}/v0/runs/run_ROOT/reconciliation", server.addr);
+    let body = serde_json::json!({
+        "reference": "inv-1", "source": "provider", "input_tokens": 1000,
+        "output_tokens": 200, "cost_micros": 5000, "note": "November",
+    });
+
+    let mut response = call(&client, "POST", &url, Some(body.clone()));
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored = json_body(&mut response);
+    assert_eq!(stored["replayed"], false, "{stored}");
+    assert_eq!(
+        stored["reconciliation"]["estimate"], "reconciled",
+        "{stored}"
+    );
+    assert_eq!(
+        stored["reconciliation"]["submitted_by"], "operator",
+        "{stored}"
+    );
+    let mut response = call(&client, "POST", &url, Some(body.clone()));
+    assert_eq!(json_body(&mut response)["replayed"], true);
+    let mut changed = body.clone();
+    changed["input_tokens"] = serde_json::json!(1234);
+    let mut response = call(&client, "POST", &url, Some(changed));
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "reconciliation-conflict"
+    );
+    let mut second = body.clone();
+    second["reference"] = serde_json::json!("inv-2");
+    second.as_object_mut().unwrap().remove("source");
+    let mut response = call(&client, "POST", &url, Some(second));
+    assert_eq!(
+        json_body(&mut response)["reconciliation"]["source"],
+        "host",
+        "the source defaults to host"
+    );
+
+    let mut response = get_ok(&client, &server.addr, "/v0/runs/run_ROOT/reconciliation");
+    let listed = json_body(&mut response);
+    let references: Vec<&str> = listed["reconciliations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["reference"].as_str().unwrap())
+        .collect();
+    assert_eq!(references, ["inv-2", "inv-1"], "{listed}");
+    let mut response = get_ok(&client, &server.addr, "/v0/runs/run_ROOT");
+    let run = json_body(&mut response);
+    assert_eq!(run["run"]["usage"]["estimate"], "estimated", "{run}");
+    assert_eq!(run["run"]["reconciled"]["submissions"], 2, "{run}");
+    assert_eq!(
+        run["run"]["reconciled"]["drift"]["input_tokens"], 100,
+        "{run}"
+    );
+
+    let response = call(
+        &client,
+        "POST",
+        &format!("http://{}/v0/runs/run_GHOST/reconciliation", server.addr),
+        Some(body.clone()),
+    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let mut bad = body.clone();
+    bad["source"] = serde_json::json!("vendor");
+    let response = call(&client, "POST", &url, Some(bad));
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let mut negative = body.clone();
+    negative["input_tokens"] = serde_json::json!(-1);
+    for shape in [
+        negative,
+        serde_json::json!({"reference": "x"}),
+        serde_json::json!({
+            "reference": "x", "input_tokens": 1, "output_tokens": 1, "extra": true,
+        }),
+    ] {
+        let response = call(&client, "POST", &url, Some(shape.clone()));
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{shape}"
+        );
+    }
+
+    // A Run Key is not an Operator.
+    let mut response = client
+        .post(format!("http://{}/v0/runs", server.addr))
+        .header("Authorization", format!("Bearer {BEARER_VALUE}"))
+        .send_json(serde_json::json!({"parent_run_id": "run_ROOT"}))
+        .unwrap();
+    let opened = json_body(&mut response);
+    let key = opened["credentials"]["run_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = call_as(&client, &key, "POST", &url, &body.to_string());
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_retention_route_is_operator_only_and_moves_either_window() {
     // Story 24-4: GET /v0/retention reads both windows (7 days each by
     // default) and the compaction state; PUT changes either, refusing a

@@ -549,6 +549,28 @@ write. A change commits one `labels-changed` Run
 event; repeating it changes nothing and emits nothing.
 `GET /v0/runs/{id}/labels` answers `{"schema_version": 1, "run_id", "labels"}`.
 
+### Reconciliation
+
+`POST /v0/runs/{id}/reconciliation` submits a Run's confirmed usage, the
+totals for the Run and its descendants; `GET` lists every submission, newest
+first. Operator bearer only (a Run Key is `403`).
+
+```json
+{"reference": "inv-2026-11", "source": "provider", "input_tokens": 120000,
+ "output_tokens": 18000, "cached_tokens": 40000, "cost_micros": 2410000,
+ "note": "November invoice"}
+```
+
+- **The body.** `source` is `provider` or `host` (default `host`). `cached_tokens`, `cost_micros` and `note` are optional, and unknown fields are refused.
+- **The answer.** `{"schema_version": 1, "reconciliation": {…, "submitted_by", "submitted_at", "estimate": "reconciled"}, "replayed": false}`. A retry with the same reference and figures answers `replayed: true` and stores nothing.
+- **Refusals:**
+  - `409` code `reconciliation-conflict`: the same reference with different figures;
+  - `404` code `run-not-found`: no Run has the id;
+  - `400` code `invalid-request`: a bad source, reference or note;
+  - `422`: a wrong shape.
+- **The Run document.** `GET /v0/runs/{id}` carries `reconciled: {current, submissions, drift}` beside `usage` (labelled `estimated`), where `drift` is reconciled − estimated per dimension. `cached_tokens` and `cost_micros` appear only when both figures know them.
+- **Events and budgets.** Each accepted submission is one `reconciled` Run event. Budgets act on estimated figures only.
+
 ### Retention
 
 `GET /v0/retention` reads the two retention windows and what compaction has
