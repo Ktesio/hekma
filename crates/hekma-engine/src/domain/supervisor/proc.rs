@@ -318,6 +318,23 @@ impl ProcBackend {
     }
 }
 
+/// Story 24-3: whether a failed request means the Shim itself is gone (its
+/// connection closed), rather than a slow or refusing Shim.
+fn shim_gone(err: &ShimClientError) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        err,
+        ShimClientError::Io(io) if matches!(
+            io.kind(),
+            ErrorKind::UnexpectedEof
+                | ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::NotConnected
+        )
+    )
+}
+
 /// A Shim's report as the Run's stored slice; `None` for a 1.0 Shim's
 /// absent report.
 fn report_row(report: crate::shim::proto::BypassReport) -> Option<crate::ports::RunBypassRow> {
@@ -348,6 +365,10 @@ fn connect_with_retry(
 
 impl ShimHandle {
     fn poll(&mut self) -> Result<ProcessStatus, BackendError> {
+        self.poll_raw().map_err(|err| control("poll", err))
+    }
+
+    fn poll_raw(&mut self) -> Result<ProcessStatus, ShimClientError> {
         if let Some(code) = self.exited {
             return Ok(ProcessStatus::Exited { code });
         }
@@ -356,7 +377,7 @@ impl ShimHandle {
             let _ = self.client.ack_exit();
             return Ok(ProcessStatus::Exited { code: exit.code });
         }
-        match self.client.poll().map_err(|err| control("poll", err))? {
+        match self.client.poll()? {
             Some(exit) => {
                 self.exited = Some(exit.code);
                 // The exit is taken: the Shim may leave.
@@ -404,9 +425,35 @@ impl ProcessBackend for ProcBackend {
     }
 
     fn poll(&self, handle: &mut ProcHandle) -> Result<ProcessStatus, BackendError> {
-        match handle {
-            ProcHandle::Direct(handle) => self.direct.poll(handle),
-            ProcHandle::Shim(shim) => shim.poll(),
+        let child = match handle {
+            ProcHandle::Direct(handle) => return self.direct.poll(handle),
+            ProcHandle::Shim(shim) => match shim.poll_raw() {
+                Ok(status) => return Ok(status),
+                Err(err) if !shim_gone(&err) => return Err(control("poll", err)),
+                Err(_) => shim.child,
+            },
+        };
+        // Story 24-3 (T4): the Shim is gone. Its child may live on: then it
+        // is re-held directly by its fingerprint (degraded — no stdin, and
+        // it no longer outlives this engine), never relaunched beside
+        // itself. A child that is gone too is an exit whose code died with
+        // the Shim.
+        let direct = match self.direct.probe_alive(&child) {
+            Some(false) => None,
+            // Alive, or unknown: re-hold it (`None` when it exited between).
+            _ => self.direct.adopt(&child, false)?,
+        };
+        match direct {
+            Some(direct) => {
+                *handle = ProcHandle::Direct(direct);
+                Ok(ProcessStatus::Alive)
+            }
+            None => {
+                if let ProcHandle::Shim(shim) = handle {
+                    shim.exited = Some(None);
+                }
+                Ok(ProcessStatus::Exited { code: None })
+            }
         }
     }
 
@@ -727,13 +774,34 @@ mod tests {
             .status()
             .unwrap();
         std::thread::sleep(Duration::from_millis(200));
-        let err = backend.poll(&mut handle).unwrap_err().to_string();
-        assert!(err.contains("the agent's Shim"), "{err}");
-        // The child outlived its Shim; end it directly.
-        let child = backend.fingerprint(&handle);
-        if let Ok(Some(mut direct)) = backend.adopt(&child, false) {
-            let _ = backend.stop(&mut direct, Duration::from_millis(500));
+        // Story 24-3: the child outlived its Shim, so the poll re-holds it
+        // directly instead of failing (never a relaunch beside it).
+        assert!(backend.is_shim(&handle));
+        assert!(matches!(
+            backend.poll(&mut handle),
+            Ok(ProcessStatus::Alive)
+        ));
+        assert!(!backend.is_shim(&handle), "re-held directly");
+        assert!(!backend.has_stdin(&handle), "its stdin died with the Shim");
+        let _ = backend.stop(&mut handle, Duration::from_millis(500));
+        assert!(matches!(
+            backend.poll(&mut handle),
+            Ok(ProcessStatus::Exited { .. })
+        ));
+        // Only a closed connection is a lost Shim; a slow or refusing one
+        // stays a typed control error on the poll-error path.
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+        ] {
+            assert!(shim_gone(&ShimClientError::Io(Error::from(kind))));
         }
+        assert!(!shim_gone(&ShimClientError::Io(Error::from(
+            ErrorKind::TimedOut
+        ))));
+        assert!(!shim_gone(&ShimClientError::Unexpected));
         // Direct handles hand their pipes over.
         let plain = ProcBackend::new();
         let mut direct = plain.spawn(&spec(false)).unwrap();

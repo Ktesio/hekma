@@ -272,6 +272,13 @@ host that reconnects to them. Calls that were in flight or held at the
 proxy when the old host stopped get the same retryable answer as at any
 shutdown.
 
+If a Shim dies while its agent keeps running, the host does not treat the
+agent as crashed and never starts a second copy: it holds the agent directly
+from then on, notes `<name>: its Shim is gone`, and its stop still ends it.
+Held that way, the agent takes no input over stdin and no longer outlives
+the host. If the agent died with its Shim, the host records an exit whose
+code is unavailable and the Restart Policy applies as for any exit.
+
 Each Shim also watches its agent's process tree for direct connections to
 known provider hosts, every 5 seconds, and the host records what it finds on
 the agent's Run: [bypass detection](run-keys.md#bypass-detection-preview).

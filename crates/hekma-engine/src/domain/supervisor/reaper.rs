@@ -248,6 +248,7 @@ impl Supervisor {
         // un-pollable HANDLE amid readable peers is exactly the crash signal
         // AI-12 exists to surface.
         let mut outcomes: Vec<(InstanceName, PollOutcome)> = Vec::with_capacity(names.len());
+        let mut shims_lost: Vec<InstanceName> = Vec::new();
         for name in &names {
             // AI-12 wiring seam (cfg(test)): the armed pid's poll fails with an
             // injected error — the fault-injection front for the backend's poll
@@ -268,12 +269,25 @@ impl Supervisor {
             let Some(supervised) = self.running.get_mut(name) else {
                 continue;
             };
+            let held_by_shim = self.backend.is_shim(&supervised.handle);
             let outcome = match self.backend.poll(&mut supervised.handle) {
                 Ok(ProcessStatus::Alive) => PollOutcome::Alive,
                 Ok(ProcessStatus::Exited { code }) => PollOutcome::Exited(code),
                 Err(err) => PollOutcome::Errored(err),
             };
+            // Story 24-3 (T4): the Shim died and its agent lives on, now held
+            // directly.
+            if held_by_shim && !self.backend.is_shim(&supervised.handle) {
+                shims_lost.push(name.clone());
+            }
             outcomes.push((name.clone(), outcome));
+        }
+        for name in shims_lost {
+            self.emit_diagnostic(&format!(
+                "{}: its Shim is gone, but the agent is still running; it is supervised directly \
+                 from now on (no input over stdin, and it no longer outlives this host)",
+                name.as_str()
+            ));
         }
 
         // PHASE 2 — same-tick corroboration (AI-12 amendment a). Count how many
