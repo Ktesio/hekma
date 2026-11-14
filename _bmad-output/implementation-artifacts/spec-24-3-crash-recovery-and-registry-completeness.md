@@ -245,4 +245,9 @@ The **O-items are Islam's rulings** (product and public-contract choices); the n
     - **(2)** The per-call record's `outcome`, `disposition` and `status_class` serialized as Rust variant names (`"Crash"`, `"Pass"`, `"TransportError"`) in `hekma calls list --json` and `/v0/calls`, against the documented `crash` / `pass` / `transport-error`. The enums now carry kebab-case (and `2xx`…`5xx`) serde names; `Other(raw)` stays raw.
   - **Drift:** a held mark is not carried when an open call moves to the next day's file at rotation (rare: a call parked across UTC midnight); such a call closes as `pass`.
 - 2026-11-14 — **phase 7 built** (stacked on phase 6, #431): Leases across a `kill -9`. A binding issues an announce credential, and a client announces a Run over the local endpoint (`201`, with a Lease). The host is SIGKILLed. The next host, started by the next write, shows the same Run id, status, depth, Anomalies and `lease_expires_at`. SM-7 finds no unauthorized action. **Not covered:** the sweeper's resumption across the crash (a Lease that lapses while the host is dead goes `silent` at the next sweep; there is no drill for it); the Windows leg; the `Recovery` event; the flush-bound measurement.
+- 2026-11-14 — **phase 8 built** (stacked on phase 7, #432): T7, the flush-bound statement, on O1's recommended option (a). `docs/hosting.md` states what a crash can and cannot lose:
+  - **Cannot lose:** every governance row is committed before the command answers.
+  - **Can lose:** the unacked per-call stream, batched at ≤ 250 ms or 512 records. A lost call surfaces as a `crash` record (an under-count, never a double count), and held calls lose their bytes, not their records.
+
+  FR-10's 5 s is the outer bound. A writer unit test pins the batch bounds inside it. Re-wording FR-10's placeholder in the PRD (O1's option c) is Islam's call and is not done.
 
