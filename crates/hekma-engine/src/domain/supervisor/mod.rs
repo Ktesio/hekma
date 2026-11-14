@@ -793,6 +793,9 @@ pub struct Supervisor {
     bypass_feed: Option<std::sync::Arc<crate::domain::bypass::BypassFeed>>,
     /// Story 24-3: the instances the latest adoption pass took over.
     adopted_names: Vec<InstanceName>,
+    /// Story 24-3: the instances whose recorded Shim was gone when the
+    /// latest adoption pass looked for it.
+    shims_lost: Vec<InstanceName>,
     /// Story 24-3: the stop in progress cleans up after a crashed host.
     crash_cleanup: bool,
     running: HashMap<InstanceName, Supervised>,
@@ -1139,6 +1142,12 @@ impl Supervisor {
         std::mem::take(&mut self.adopted_names)
     }
 
+    /// Story 24-3: the instances whose Shim the latest adoption pass found
+    /// gone, once.
+    pub(crate) fn take_shims_lost(&mut self) -> Vec<InstanceName> {
+        std::mem::take(&mut self.shims_lost)
+    }
+
     /// Story 24-3: stop an agent a crashed host left running (its mode was
     /// off): the ordinary stop ladder, with `engine-crash` as its cause.
     pub(crate) fn stop_after_crash(
@@ -1251,6 +1260,7 @@ impl Supervisor {
             backend: proc::ProcBackend::new(),
             bypass_feed: None,
             adopted_names: Vec::new(),
+            shims_lost: Vec::new(),
             crash_cleanup: false,
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
@@ -1313,6 +1323,7 @@ impl Supervisor {
             backend: proc::ProcBackend::new(),
             bypass_feed: None,
             adopted_names: Vec::new(),
+            shims_lost: Vec::new(),
             crash_cleanup: false,
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
@@ -1374,6 +1385,7 @@ impl Supervisor {
             backend: proc::ProcBackend::new(),
             bypass_feed: None,
             adopted_names: Vec::new(),
+            shims_lost: Vec::new(),
             crash_cleanup: false,
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),

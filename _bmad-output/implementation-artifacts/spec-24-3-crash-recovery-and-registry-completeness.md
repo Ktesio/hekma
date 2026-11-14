@@ -251,3 +251,12 @@ The **O-items are Islam's rulings** (product and public-contract choices); the n
 
   FR-10's 5 s is the outer bound. A writer unit test pins the batch bounds inside it. Re-wording FR-10's placeholder in the PRD (O1's option c) is Islam's call and is not done.
 
+- 2026-11-14 — **phase 9 built** (stacked on phase 8, #433): the `Recovery` summary event, on Ask First item 3's recommended shape.
+  - **The event:** `EngineEvent::Recovery(RecoveryEvent {schema_version 1, change: recovered, posture: on|off|unknown, runs_adopted, runs_cleaned, calls_closed_crash, calls_closed_recovered, shims_lost, at})`. It is outbox-committed and published, and the OTLP v1 and v2 exporters ignore it.
+  - **The counts:** `HostRecovery` gains `shims_lost` (records whose Shim no longer answered at adoption) and the open's dead-owner call closures.
+  - **Committing it:** `Engine::commit_recovery(runs_cleaned)` commits the event, and the Service Host calls it once after its cleanup.
+  - **Drift:**
+    - an in-place upgrade (the previous owner `Live`) records none;
+    - `runs_*` count agents, one process-owning Run each;
+    - a start after a clean stop records zero counts, which matches the I/O matrix's "second restart" row.
+  - **Still open:** the CLI `--json` derived fields.

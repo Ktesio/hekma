@@ -1622,7 +1622,14 @@ impl Supervisor {
                     ));
                     continue;
                 }
-                proc::ShimReacquire::None => self.backend.adopt(&record.fingerprint, record.detach),
+                proc::ShimReacquire::None => {
+                    // Story 24-3: a recorded Shim that no longer answers is
+                    // lost, whatever became of its agent.
+                    if record.shim.is_some() {
+                        self.shims_lost.push(name.clone());
+                    }
+                    self.backend.adopt(&record.fingerprint, record.detach)
+                }
             };
             match held {
                 Ok(Some(handle)) => {

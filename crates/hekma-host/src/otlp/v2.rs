@@ -296,13 +296,14 @@ impl MetricStateV2 {
                 }
             }
             // No series: Policy changes, the default upgrade, credentials,
-            // bindings, reveals, proxy settings.
+            // bindings, reveals, proxy settings, reconcile summaries.
             EngineEvent::Policy(_)
             | EngineEvent::BreachDefaultUpgraded(_)
             | EngineEvent::Credential(_)
             | EngineEvent::Binding(_)
             | EngineEvent::SecretRevealed(_)
-            | EngineEvent::ProxySetting(_) => {}
+            | EngineEvent::ProxySetting(_)
+            | EngineEvent::Recovery(_) => {}
         }
     }
 

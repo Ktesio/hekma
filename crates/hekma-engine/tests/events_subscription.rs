@@ -164,6 +164,9 @@ fn assert_payload_validates(event: &EngineEvent) {
                 hekma_engine::SECRET_REVEALED_SCHEMA_VERSION
             );
         }
+        EngineEvent::Recovery(e) => {
+            assert_eq!(e.schema_version, hekma_engine::RECOVERY_SCHEMA_VERSION);
+        }
         EngineEvent::BreachDefaultUpgraded(e) => {
             assert_eq!(e.schema_version, hekma_engine::POLICY_EVENT_SCHEMA_VERSION);
         }
@@ -339,6 +342,9 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
             // Story 22-2: this flow reveals nothing.
             EngineEvent::SecretRevealed(_) => {
                 panic!("unexpected reveal event in this flow: {event:?}")
+            }
+            EngineEvent::Recovery(_) => {
+                panic!("unexpected recovery event in this flow: {event:?}")
             }
         };
         assert_eq!(
