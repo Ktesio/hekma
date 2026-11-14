@@ -1280,4 +1280,16 @@ mod identity_headers_note_tests {
         assert!(identity_headers_note(&settings(true, true, true)).is_none());
         assert!(identity_headers_note(&settings(false, false, false)).is_none());
     }
+
+    #[test]
+    fn the_port_squatting_line_says_what_the_account_list_shows() {
+        let others = super::port_squatting_note(Some(2));
+        assert!(
+            others.contains("other user accounts that can log in"),
+            "{others}"
+        );
+        assert!(others.contains("socket activation"), "{others}");
+        assert!(super::port_squatting_note(Some(0)).contains("no other user accounts"));
+        assert!(super::port_squatting_note(None).contains("cannot tell"));
+    }
 }

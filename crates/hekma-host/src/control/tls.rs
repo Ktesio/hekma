@@ -181,6 +181,10 @@ mod tests {
         std::fs::write(&cert, one.cert.pem()).unwrap();
         std::fs::write(&key, one.signing_key.serialize_pem()).unwrap();
         std::fs::write(&other_key, two.signing_key.serialize_pem()).unwrap();
+        // Story 22-5: TLS files must be owner-only.
+        for path in [&cert, &key, &other_key] {
+            hekma_engine::restrict_to_owner(path).unwrap();
+        }
         assert!(load_server_config(&cert, &key).is_ok());
         let err = load_server_config(&cert, &other_key).unwrap_err();
         // The message is not echoed: it names the key file (a test fixture,

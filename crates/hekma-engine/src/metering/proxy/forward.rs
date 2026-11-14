@@ -1656,6 +1656,76 @@ impl super::identify::Target {
 mod custody_tests {
     use super::*;
 
+    #[test]
+    fn beyond_loopback_a_configured_list_applies_and_an_empty_one_restricts_nothing() {
+        // Story 22-5: the guard for a remote peer on a wide bind.
+        let headers = |host: &str, origin: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", HeaderValue::from_str(host).unwrap());
+            if let Some(origin) = origin {
+                headers.insert("origin", HeaderValue::from_str(origin).unwrap());
+            }
+            headers
+        };
+        let none: Vec<String> = Vec::new();
+        let hosts = vec!["proxy.example".to_string()];
+        let origins = vec!["https://app.example".to_string()];
+        assert!(remote_host_origin_ok(
+            &headers("anything:8400", Some("https://x")),
+            &none,
+            &none
+        ));
+        assert!(remote_host_origin_ok(
+            &headers("proxy.example:8400", None),
+            &hosts,
+            &none
+        ));
+        assert!(remote_host_origin_ok(
+            &headers("proxy.example", None),
+            &hosts,
+            &none
+        ));
+        assert!(!remote_host_origin_ok(
+            &headers("other.example", None),
+            &hosts,
+            &none
+        ));
+        assert!(remote_host_origin_ok(
+            &headers("x", Some("https://app.example")),
+            &none,
+            &origins
+        ));
+        assert!(!remote_host_origin_ok(
+            &headers("x", Some("https://evil.example")),
+            &none,
+            &origins
+        ));
+        assert!(remote_host_origin_ok(&headers("x", None), &none, &origins));
+        // The TLS wrapper's identity comparison, and a Debug that prints
+        // nothing of the configuration.
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certified.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    certified.signing_key.serialize_der().into(),
+                ),
+            )
+            .unwrap();
+        let one = super::super::ProxyTls(Arc::new(config));
+        assert_eq!(one, one.clone());
+        assert_eq!(format!("{one:?}"), "ProxyTls(..)");
+        // An unreadable file is named, never read.
+        let missing = std::path::Path::new("/nonexistent/hekma/key.pem");
+        assert!(crate::check_owner_only_file(missing)
+            .unwrap_err()
+            .contains("key.pem"));
+    }
+
     const KEY: &str = "sk-live-0123456789abcdef";
 
     #[test]

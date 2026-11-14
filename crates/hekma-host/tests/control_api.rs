@@ -1965,14 +1965,15 @@ fn the_api_is_off_by_default_and_the_flag_pair_is_validated() {
         "no operator listener exists by default:\n{text}"
     );
     // The notice SEQUENCE, pinned exactly (review item 27's discipline):
-    // started, the shared metering proxy's address, the local endpoint,
+    // started, the shared metering proxy's address, its port-squatting
+    // line (story 22-5), the local endpoint,
     // signal, the API stop, the drain's zero-agent outcome, complete — in
     // order, and NOTHING else.
     let notices: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(
         notices.len(),
-        7,
-        "a listener-less serve emits exactly seven notices:\n{text}"
+        8,
+        "a listener-less serve emits exactly eight notices:\n{text}"
     );
     assert!(
         notices[0].starts_with("[hekma] host started; state root "),
@@ -1982,6 +1983,17 @@ fn the_api_is_off_by_default_and_the_flag_pair_is_validated() {
         notices[1].starts_with("[hekma] the metering proxy is listening on http://127.0.0.1:"),
         "the second notice names the shared metering proxy on loopback:\n{text}"
     );
+    assert!(
+        [
+            "[hekma] this machine has other user accounts that can log in.",
+            "[hekma] this machine has no other user accounts that can log in,",
+            "[hekma] Hekma cannot tell whether this machine has other interactive users.",
+        ]
+        .iter()
+        .any(|start| notices[2].starts_with(start)),
+        "the third notice is the port-squatting line:\n{text}"
+    );
+    let notices = [&notices[..2], &notices[3..]].concat();
     assert!(
         notices[2].starts_with(&format!(
             "[hekma] local control endpoint on {} (loopback, for the hekma CLI;",
