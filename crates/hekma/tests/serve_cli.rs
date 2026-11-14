@@ -1300,3 +1300,60 @@ fn served_clean_exit_lands_stopped_and_show_reports_it() {
         logs.stderr
     );
 }
+
+#[test]
+fn a_serve_flag_overrides_the_stored_identity_header_setting_and_says_so() {
+    // Story 21-8: a stored `off`, then `hekma serve --identity-headers`:
+    // the started notice names the disagreement, `hekma proxy show` reports
+    // the flag, and `hekma proxy set` stores the value while noting that the
+    // flag still decides this run.
+    if is_windows() {
+        return; // POSIX `kill`-based stop, as the other serve legs.
+    }
+    let ctx = TestContext::new();
+    let state_dir = ctx.project_dir.join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    {
+        let engine = hekma_engine::Engine::open(Some(state_dir.clone())).unwrap();
+        engine.blocking().set_proxy_identity_headers(false).unwrap();
+    }
+    let (mut child, drainer) = spawn_serve_with(&state_dir, &["--identity-headers"]);
+
+    let shown = run_hekma_agent(&["proxy", "show"], &ctx.project_dir, &state_dir);
+    assert!(shown.success, "{}", shown.stderr);
+    assert!(
+        shown
+            .stdout
+            .contains("identity-headers on (forced by a serve flag; the stored setting is off)"),
+        "{}",
+        shown.stdout
+    );
+    let set = run_hekma_agent(
+        &["proxy", "set", "identity-headers", "off"],
+        &ctx.project_dir,
+        &state_dir,
+    );
+    assert!(set.success, "{}", set.stderr);
+    assert!(
+        set.stderr.contains("keeps identity headers on"),
+        "{}",
+        set.stderr
+    );
+
+    let status = signal_and_wait(&mut child, "identity-header flag");
+    assert!(status.success());
+    let stderr = drainer.join().unwrap();
+    assert!(
+        stderr.contains("outbound identity headers are on for this run (a serve flag)"),
+        "{stderr}"
+    );
+    // The flag was never stored: the stored setting is still off.
+    let engine = hekma_engine::Engine::open(Some(state_dir.clone())).unwrap();
+    assert!(
+        !engine
+            .blocking()
+            .proxy_settings()
+            .unwrap()
+            .stored_identity_headers
+    );
+}
