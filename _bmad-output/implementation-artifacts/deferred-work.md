@@ -874,3 +874,16 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: `hekma.run.anomalies` counts a flag once when a Run gains it; the exporter keeps each open Run's current flags (only Runs with a flag) and forgets a Run when it ends, so memory grows with the number of open Runs carrying an Anomaly.
   evidence: `crates/hekma-host/src/otlp/v2.rs` (`run_anomalies`). Trigger: the Run-scale benchmark (24-4) measuring exporter memory.
 
+## From spec-24-1 (one Shim per supervised process) — phase 1 build, 2026-11-14
+
+- source_spec: `spec-24-1-one-shim-per-supervised-process.md` (Phase 2: the wiring)
+  summary: The Shim library and the hidden `hekma shim` command ship unused; the supervisor still holds processes directly. Phase 2 adds `ProcHandle`/`ShimBackend`, record-before-launch, the claim rename and Shim columns, adoption by reconnect and `EngineEvent::Shim`.
+  evidence: `crates/hekma-engine/src/shim/`, `docs/architecture.md` (The Shim). Trigger: phase 2 of the story (next build).
+
+- source_spec: `spec-24-1-one-shim-per-supervised-process.md` (Phase 2: the Windows transport)
+  summary: `backends::shim_listen`/`shim_connect` return `Unsupported` on Windows; the named pipe with an owner-only DACL lands with the wiring.
+  evidence: `crates/hekma-engine/src/backends/mod.rs`. Trigger: phase 2.
+
+- source_spec: `spec-24-1-one-shim-per-supervised-process.md` (Phase 2: ACP stdio across a restart)
+  summary: shim-rpc v1 has `write_stdin` but no `subscribe_stdout` push frames yet, so an ACP session's stdout cannot ride a Shim.
+  evidence: `crates/hekma-engine/src/shim/proto.rs`. Trigger: phase 2 (the ACP backend moving onto the Shim).
