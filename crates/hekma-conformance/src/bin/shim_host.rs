@@ -4,6 +4,11 @@
 //! engine opened with `EngineOptions::shim_exe` pointing here launches its
 //! agents through real Shim processes.
 
+// This binary runs only as a SPAWNED SUBPROCESS of the engine's Shim tests,
+// so a coverage harness instrumenting the test process never records its
+// lines — the `hermes_shim` and `fake_agent` rationale. Its behaviour is
+// proven by the tests that spawn it.
+#[cfg(not(tarpaulin_include))]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let value = |flag: &str| {
