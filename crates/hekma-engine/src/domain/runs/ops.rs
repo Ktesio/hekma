@@ -827,6 +827,24 @@ fn write_labels<S: RunRecords + ?Sized>(
     Ok(())
 }
 
+/// Note an accepted reconciliation on `record` (story 19-5): one
+/// `reconciled` event whose cause names the source and the reference.
+pub(crate) fn note_reconciled<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    record: &RunRecord,
+    cause: String,
+) -> Result<(), StoreError> {
+    note(
+        store,
+        changes,
+        record,
+        RunEventKind::Reconciled,
+        Prior::default(),
+        Some(cause),
+    )
+}
+
 /// Note a disposition change on `record` (story 23-4): one
 /// `disposition-changed` event whose cause names the reason and the change.
 pub(crate) fn note_disposition<S: RunRecords + ?Sized>(
@@ -1308,6 +1326,7 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
         limits: store.run_limits(run_id)?,
         policy: store.run_policy(run_id)?.map(|row| row.resolution),
         open_children: store.open_children(run_id)?,
+        reconciled: None,
         usage,
         record,
         custody,

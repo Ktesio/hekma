@@ -1356,6 +1356,39 @@ pub(crate) struct ProxySettingsRequest {
     pub identity_headers: bool,
 }
 
+/// The `POST /v0/runs/{id}/reconciliation` body (story 19-5). Unknown
+/// fields are refused.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReconcileBody {
+    pub reference: String,
+    #[serde(default)]
+    pub source: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub cost_micros: Option<i64>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// The `POST /v0/runs/{id}/reconciliation` answer.
+#[derive(Serialize)]
+pub(crate) struct ReconcileDocument {
+    pub schema_version: u32,
+    pub reconciliation: hekma_engine::Reconciliation,
+    pub replayed: bool,
+}
+
+/// The `GET /v0/runs/{id}/reconciliation` answer, newest first.
+#[derive(Serialize)]
+pub(crate) struct ReconciliationsDocument {
+    pub schema_version: u32,
+    pub reconciliations: Vec<hekma_engine::Reconciliation>,
+}
+
 /// `GET`/`PUT /v0/retention` (story 24-4): the two windows and what the
 /// compaction passes have done.
 #[derive(Serialize)]

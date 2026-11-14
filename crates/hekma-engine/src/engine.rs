@@ -2502,6 +2502,61 @@ impl Engine {
         .await
     }
 
+    /// Submit a Run's confirmed usage (story 19-5, PRD FR-45): totals for
+    /// the Run and its descendants, as a provider or the Host confirmed
+    /// them. Stored beside the estimated figures, never over them; the
+    /// newest submission is the Run's reconciled figure. A retry with the
+    /// same reference and figures is a replay (`replayed`, nothing stored);
+    /// with different figures [`RunError::ReconciliationConflict`]. Only the
+    /// Operator or a Host may submit: a Run's own Caller is refused
+    /// ([`RunError::RunOutOfScope`]). Budgets keep acting on estimated
+    /// figures.
+    pub async fn reconcile_run(
+        &self,
+        run_id: &str,
+        request: crate::domain::runs::reconcile::ReconcileRequest,
+        actor: crate::RunActor,
+    ) -> Result<crate::domain::runs::reconcile::ReconcileOutcome, RunError> {
+        let submitted_by = match actor {
+            crate::RunActor::Operator => "operator",
+            crate::RunActor::Host => "host",
+            crate::RunActor::Caller { .. } => {
+                return Err(RunError::RunOutOfScope {
+                    run_id: run_id.to_string(),
+                })
+            }
+        };
+        self.refuse_if_read_only().map_err(RunError::Store)?;
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let (outcome, events) = registry.reconcile_run(&run_id, request, submitted_by)?;
+            supervisor.publish_run_events(events);
+            Ok(outcome)
+        })
+        .await
+    }
+
+    /// Every confirmed-usage submission for a Run, newest first (story
+    /// 19-5). Reads only.
+    pub async fn run_reconciliations(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<crate::domain::runs::reconcile::Reconciliation>, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .run_reconciliations(&run_id)
+        })
+        .await
+    }
+
     /// A compacted Run's summary (story 24-4): what an ended Run keeps once
     /// it is past the Run retention window — its id, usage totals, labels,
     /// end cause, Control Depth and timestamps. `None` when `run_id` was
@@ -4194,6 +4249,28 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.run(run_id))
     }
 
+    /// Blocking twin of [`Engine::reconcile_run`].
+    pub fn reconcile_run(
+        &self,
+        run_id: &str,
+        request: crate::domain::runs::reconcile::ReconcileRequest,
+        actor: crate::RunActor,
+    ) -> Result<crate::domain::runs::reconcile::ReconcileOutcome, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.reconcile_run(run_id, request, actor))
+    }
+
+    /// Blocking twin of [`Engine::run_reconciliations`].
+    pub fn run_reconciliations(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<crate::domain::runs::reconcile::Reconciliation>, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.run_reconciliations(run_id))
+    }
+
     /// Blocking twin of [`Engine::compacted_run`].
     pub fn compacted_run(
         &self,
@@ -5866,5 +5943,34 @@ mod tests {
         assert!(
             Supervisor::agent_log_paths(&engine.inner.registry.lock().unwrap(), "ghost").is_err()
         );
+    }
+
+    #[test]
+    fn a_runs_own_caller_cannot_attest_its_usage() {
+        // Story 19-5 (O2's recommendation): only the Operator or a Host
+        // submits confirmed usage.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let caller = crate::RunActor::Caller {
+            run_id: RunId::from_wire("run_C"),
+            token_hash: crate::domain::credential::TokenHash::from_bytes([7; 32]),
+        };
+        let refused = engine
+            .blocking()
+            .reconcile_run(
+                "run_C",
+                crate::domain::runs::reconcile::ReconcileRequest {
+                    reference: "r".to_string(),
+                    source: crate::domain::runs::reconcile::ReconcileSource::Host,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_tokens: None,
+                    cost_micros: None,
+                    note: None,
+                },
+                caller,
+            )
+            .unwrap_err();
+        assert!(matches!(refused, RunError::RunOutOfScope { .. }));
     }
 }

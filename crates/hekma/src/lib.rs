@@ -154,6 +154,16 @@ Examples:
   hekma label set --selector team=core,env=prod tier=gold --dry-run
   hekma label remove --selector team=core tier --yes";
 
+const RECONCILE_AFTER_HELP: &str = "\
+Details:
+  The figures are the Run's confirmed totals for the Run and its descendants,
+  as a provider's invoice or your own gateway states them. They are stored
+  beside Hekma's estimated figures and never replace them; `hekma run show`
+  prints both, each labelled, with the drift between them. The newest
+  submission is the current one. Resubmitting the same --ref with the same
+  figures changes nothing; with different figures it is refused (exit 4).
+  Budgets keep acting on the estimated figures.";
+
 const RETENTION_AFTER_HELP: &str = "\
 Details:
   With no option, prints both windows and what compaction has done; it reads
@@ -644,6 +654,37 @@ enum RunCommands {
         /// The run id
         run_id: String,
         /// Print the Run as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit a Run's confirmed usage (from the provider or the Host)
+    #[command(after_help = RECONCILE_AFTER_HELP)]
+    Reconcile {
+        /// The run id
+        run_id: String,
+        /// Confirmed input tokens (the Run and its descendants)
+        #[arg(long, value_name = "TOKENS")]
+        input: u64,
+        /// Confirmed output tokens (the Run and its descendants)
+        #[arg(long, value_name = "TOKENS")]
+        output: u64,
+        /// Confirmed cached input tokens
+        #[arg(long, value_name = "TOKENS")]
+        cached: Option<u64>,
+        /// Confirmed cost in dollars ("3.00")
+        #[arg(long, value_name = "DOLLARS")]
+        dollars: Option<String>,
+        /// Who confirmed the figures: provider or host
+        #[arg(long, value_name = "SOURCE", default_value = "host")]
+        source: String,
+        /// A reference that makes a retry safe (an invoice id); defaults to
+        /// one built from the figures
+        #[arg(long = "ref", value_name = "ID")]
+        reference: Option<String>,
+        /// A note kept with the submission
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+        /// Print the stored submission as JSON
         #[arg(long)]
         json: bool,
     },
@@ -1576,6 +1617,27 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 timeout_ms: None,
             }),
             RunCommands::Show { run_id, json } => cli::run::show(&run_id, json),
+            RunCommands::Reconcile {
+                run_id,
+                input,
+                output,
+                cached,
+                dollars,
+                source,
+                reference,
+                note,
+                json,
+            } => cli::run::reconcile(cli::run::ReconcileArgs {
+                run_id,
+                input,
+                output,
+                cached,
+                dollars,
+                source,
+                reference,
+                note,
+                json,
+            }),
             RunCommands::Retention { runs, calls, json } => cli::run::retention(runs, calls, json),
             RunCommands::Keys { run_id, json } => cli::run::keys(&run_id, json),
             RunCommands::RevokeKeys {

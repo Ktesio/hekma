@@ -185,6 +185,12 @@ pub use domain::{
     RunSummary, ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT,
     RUN_LISTING_SCHEMA_VERSION,
 };
+// Story 19-5: reconciliation — a Run's confirmed usage beside its
+// estimated figures.
+pub use domain::runs::reconcile::{
+    ReconcileDrift, ReconcileOutcome, ReconcileRequest, ReconcileSource, ReconciledView,
+    Reconciliation, RECONCILE_NOTE_MAX, RECONCILE_REFERENCE_MAX,
+};
 // Story 24-4: the retention windows, the compaction state and what a
 // compacted Run keeps.
 pub use domain::runs::retention::{

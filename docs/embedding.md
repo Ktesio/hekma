@@ -165,7 +165,9 @@ Four rules cover the whole contract:
 2. **Payloads are versioned structs.** Every event carries a `schema_version`
    and is one of: a lifecycle transition, a budget breach, a committed usage
    measurement, or a Run event (`EngineEvent::Run`: a Run created, its depth,
-   status, Anomalies or bound labels changed, or ended — published right after
+   status, Anomalies or bound labels changed, a confirmed usage figure was
+   submitted (`reconciled`, whose cause names the source and the reference), or
+   it ended — published right after
    the event that caused it; a `labels-changed` event carries the bound labels
    after and before (`prior_labels`) and its cause, `label-verb` or `config`),
    or a reveal (`EngineEvent::SecretRevealed`: a custodied provider key was

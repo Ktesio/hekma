@@ -577,13 +577,116 @@ impl Registry {
             .map_err(crate::domain::RunError::Store)?
     }
 
-    /// One Run's facade view, read on the read-only connection.
+    /// One Run's facade view, read on the read-only connection. Story
+    /// 19-5: with its newest reconciled figure and the drift, when it has
+    /// one.
     pub(crate) fn run_view(
         &self,
         run_id: &crate::domain::RunId,
     ) -> Result<crate::domain::RunView, crate::domain::RunError> {
-        self.store
-            .snapshot(|store| Ok(crate::domain::runs::ops::view(store, run_id)))?
+        self.store.snapshot(|store| {
+            Ok(
+                crate::domain::runs::ops::view(store, run_id).and_then(|mut view| {
+                    view.reconciled =
+                        store
+                            .current_reconciliation(run_id)?
+                            .map(|(current, submissions)| {
+                                crate::domain::runs::reconcile::ReconciledView::of(
+                                    current,
+                                    submissions,
+                                    &view.usage,
+                                )
+                            });
+                    Ok(view)
+                }),
+            )
+        })?
+    }
+
+    /// Accept a Run's confirmed usage (story 19-5): one writer job. An
+    /// unknown Run is `NotFound`; a stored `(run, reference)` with the same
+    /// figures is a replay (nothing stored, no event), with different
+    /// figures `ReconciliationConflict`; an accepted one is stored and
+    /// commits one `reconciled` Run event.
+    pub(crate) fn reconcile_run(
+        &self,
+        run_id: &crate::domain::RunId,
+        request: crate::domain::runs::reconcile::ReconcileRequest,
+        submitted_by: &'static str,
+    ) -> Result<
+        (
+            crate::domain::runs::reconcile::ReconcileOutcome,
+            Vec<crate::domain::runs::ops::CommittedRunEvent>,
+        ),
+        crate::domain::RunError,
+    > {
+        use crate::domain::runs::reconcile::{ReconcileOutcome, Reconciliation};
+        use crate::ports::RunRecords as _;
+        request.validate()?;
+        let id = run_id.clone();
+        self.run_job(move |store| {
+            let mut changes = crate::domain::runs::ops::RunChanges::default();
+            let record =
+                store
+                    .run_record(&id)?
+                    .ok_or_else(|| crate::domain::RunError::NotFound {
+                        run_id: id.as_str().to_string(),
+                    })?;
+            if let Some(stored) = store.reconciliation(&id, &request.reference)? {
+                if stored.figures == request {
+                    return Ok((
+                        ReconcileOutcome {
+                            reconciliation: stored,
+                            replayed: true,
+                        },
+                        changes,
+                    ));
+                }
+                return Err(crate::domain::RunError::ReconciliationConflict {
+                    run_id: id.as_str().to_string(),
+                    reference: request.reference.clone(),
+                });
+            }
+            let row = Reconciliation {
+                run_id: id.clone(),
+                figures: request,
+                submitted_by: submitted_by.to_string(),
+                submitted_at: crate::time::now_rfc3339(),
+                estimate: crate::domain::cost::EstimateLabel::Reconciled,
+            };
+            store.insert_reconciliation(&row)?;
+            crate::domain::runs::ops::note_reconciled(
+                store,
+                &mut changes,
+                &record,
+                format!("{} {}", row.figures.source.as_str(), row.figures.reference),
+            )?;
+            Ok((
+                ReconcileOutcome {
+                    reconciliation: row,
+                    replayed: false,
+                },
+                changes,
+            ))
+        })
+    }
+
+    /// Every submission for a Run, newest first (story 19-5). An unknown
+    /// Run is `NotFound`.
+    pub(crate) fn run_reconciliations(
+        &self,
+        run_id: &crate::domain::RunId,
+    ) -> Result<Vec<crate::domain::runs::reconcile::Reconciliation>, crate::domain::RunError> {
+        use crate::ports::RunRecords as _;
+        let found = self.store.snapshot(|store| {
+            if store.run_record(run_id)?.is_none() {
+                return Ok(None);
+            }
+            store.reconciliations(run_id).map(Some)
+        })?;
+        found.ok_or_else(|| crate::domain::RunError::NotFound {
+            run_id: run_id.as_str().to_string(),
+        })
     }
 
     /// The retention windows and the compaction state (story 24-4), read

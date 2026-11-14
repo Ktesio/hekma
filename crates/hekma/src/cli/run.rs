@@ -286,6 +286,148 @@ pub fn show(run_id: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> 
     render(&view, json, "")
 }
 
+/// The flags of `hekma run reconcile`.
+pub struct ReconcileArgs {
+    pub run_id: String,
+    pub input: u64,
+    pub output: u64,
+    pub cached: Option<u64>,
+    pub dollars: Option<String>,
+    pub source: String,
+    pub reference: Option<String>,
+    pub note: Option<String>,
+    pub json: bool,
+}
+
+/// `hekma run reconcile` (story 19-5): submit a Run's confirmed usage
+/// through the local Service Host (`POST /v0/runs/{id}/reconciliation`).
+pub fn reconcile(args: ReconcileArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if hekma_engine::ReconcileSource::from_wire(&args.source).is_none() {
+        return Err(invalid(format!(
+            "--source must be `provider` or `host` (got `{}`)",
+            args.source
+        )));
+    }
+    let cost_micros = match &args.dollars {
+        Some(raw) => Some(
+            hekma_engine::parse_dollars_to_micros(raw)
+                .map_err(|err| invalid(format!("--dollars: {err}")))?
+                .get(),
+        ),
+        None => None,
+    };
+    // Without --ref the figures themselves name the submission, so an
+    // identical retry is a replay and a corrected one is a new submission.
+    let reference = args.reference.clone().unwrap_or_else(|| {
+        format!(
+            "cli-{}-{}-{}-{}",
+            args.input,
+            args.output,
+            args.cached
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "x".into()),
+            cost_micros
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "x".into())
+        )
+    });
+    let routed = route(
+        "POST",
+        &format!("/v0/runs/{}/reconciliation", segment(&args.run_id)),
+        Some(json!({
+            "reference": reference,
+            "source": args.source,
+            "input_tokens": args.input,
+            "output_tokens": args.output,
+            "cached_tokens": args.cached,
+            "cost_micros": cost_micros,
+            "note": args.note,
+        })),
+    )
+    .map_err(|err| match err {
+        RoutedError::Call(CallError::Coded { code, message }) => map_run_code(&code, message),
+        other => other.into_diagnostic(),
+    })?;
+    let document = routed.value.unwrap_or(Value::Null);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        return Ok(());
+    }
+    let replayed = document["replayed"].as_bool().unwrap_or(false);
+    if replayed {
+        println!(
+            "Run {} already has this reconciliation ({}); nothing changed",
+            args.run_id, reference
+        );
+    } else {
+        println!(
+            "✓ Run {} reconciled: {} in / {} out{} ({}, reference {})",
+            args.run_id,
+            args.input,
+            args.output,
+            cost_micros
+                .map(|micros| format!(
+                    ", {}",
+                    hekma_engine::render_dollars(
+                        hekma_engine::Micros(micros),
+                        hekma_engine::EstimateLabel::Reconciled
+                    )
+                ))
+                .unwrap_or_default(),
+            args.source,
+            reference
+        );
+        println!("  Show the drift with: hekma run show {}", args.run_id);
+    }
+    Ok(())
+}
+
+/// The RECONCILED line of `hekma run show` (story 19-5).
+pub(crate) fn render_reconciled(view: &hekma_engine::ReconciledView) -> String {
+    let figures = &view.current.figures;
+    let signed = |value: i64| {
+        if value > 0 {
+            format!("+{value}")
+        } else {
+            value.to_string()
+        }
+    };
+    let cost = figures
+        .cost_micros
+        .map(|cost| {
+            format!(
+                ", {}",
+                hekma_engine::render_dollars(cost, hekma_engine::EstimateLabel::Reconciled)
+            )
+        })
+        .unwrap_or_default();
+    let mut drift = format!(
+        "{} in / {} out",
+        signed(view.drift.input_tokens),
+        signed(view.drift.output_tokens)
+    );
+    if let Some(cost) = view.drift.cost_micros {
+        let sign = if cost >= 0 { "+" } else { "-" };
+        drift.push_str(&format!(
+            ", {sign}{}",
+            hekma_engine::render_dollars_bare(hekma_engine::Micros(cost.abs()))
+        ));
+    }
+    format!(
+        "  RECONCILED   {} tokens ({} in / {} out){cost} — {}, {}; drift {drift}{}\n",
+        figures.input_tokens + figures.output_tokens,
+        figures.input_tokens,
+        figures.output_tokens,
+        figures.source.as_str(),
+        figures.reference,
+        if view.submissions > 1 {
+            format!(" ({} submissions)", view.submissions)
+        } else {
+            String::new()
+        }
+    )
+}
+
 /// The `--json` document for a compacted Run.
 #[derive(Serialize)]
 struct CompactedDocument<'a> {
@@ -491,7 +633,9 @@ pub(crate) fn map_run_code(code: &str, message: String) -> Box<dyn std::error::E
         "no-open-run" | "parent-ended" | "owns-process" | "run-ended" | "label-from-config"
         | "label-not-bound" | "label-bound"
         // Story 21-6.
-        | "verb-unavailable" | "raise-forbidden" => RunInvalidState { message }.into(),
+        | "verb-unavailable" | "raise-forbidden"
+        // Story 19-5.
+        | "reconciliation-conflict" => RunInvalidState { message }.into(),
         _ => AgentStore { message }.into(),
     }
 }
@@ -613,7 +757,9 @@ pub(crate) fn run_error_class(err: &RunError, message: String) -> Box<dyn std::e
         // Story 21-6: the Run's depth does not serve the verb yet, and a
         // Caller may only tighten (the Run's state forbids the change).
         | RunError::VerbUnavailable { .. }
-        | RunError::RaiseForbidden { .. } => RunInvalidState { message }.into(),
+        | RunError::RaiseForbidden { .. }
+        // Story 19-5: the reference is already stored with other figures.
+        | RunError::ReconciliationConflict { .. } => RunInvalidState { message }.into(),
         // Story 21-6: a limit scope the Run cannot carry (the request).
         RunError::ScopeUnavailable { .. } => RunInvalid { message }.into(),
         // Story 22-1: a credential refusal or the Caller breadth cap is a
@@ -715,6 +861,10 @@ fn render_text(view: &RunView, verb: &str) -> String {
     row("CHILDREN", format!("{} open", view.open_children));
     if let Some(cause) = &record.end_cause {
         row("ENDED", cause.clone());
+    }
+    // Story 19-5: the confirmed figure beside the estimated one.
+    if let Some(reconciled) = &view.reconciled {
+        out.push_str(&render_reconciled(reconciled));
     }
     out
 }
