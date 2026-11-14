@@ -265,6 +265,9 @@ pub struct Registry {
     /// Import notes from a v12 upgrade on this open, drained once by the
     /// engine onto its diagnostic surface.
     pub(crate) open_notes: std::sync::Mutex<Vec<String>>,
+    /// Story 24-3: the proxied calls this open closed for a dead owner, as
+    /// (crash, recovered) — the `Recovery` event's call counts.
+    pub(crate) closed_calls: (u64, u64),
     /// The published Run snapshot (story 21-2, AD-25). Only store-writer
     /// post-commit hooks publish into it.
     pub(crate) run_snapshot: std::sync::Arc<crate::domain::runs::snapshot::SnapshotPublisher>,
@@ -327,6 +330,7 @@ impl Registry {
         // their usage, else `crash` — before anything else runs. A live
         // owner's rows (another engine on this state dir) are left alone.
         let mut notes = notes;
+        let mut closed_calls = (0, 0);
         match crate::store::calls_sqlite::segment_path(&paths.calls_dir())
             .and_then(|segment| write_store.attach_calls(Some(&segment)))
         {
@@ -346,10 +350,14 @@ impl Registry {
                 }
                 match write_store.close_orphaned_calls(&probe) {
                     Ok((0, 0)) => {}
-                    Ok((crashed, recovered)) => notes.push(format!(
-                        "{crashed} proxied call(s) in flight when the previous host stopped were \
-                         closed as crashed (their usage is unknown) and {recovered} as recovered"
-                    )),
+                    Ok((crashed, recovered)) => {
+                        closed_calls = (crashed, recovered);
+                        notes.push(format!(
+                            "{crashed} proxied call(s) in flight when the previous host stopped \
+                             were closed as crashed (their usage is unknown) and {recovered} as \
+                             recovered"
+                        ))
+                    }
                     Err(err) => notes.push(format!(
                         "the proxied calls left open by a stopped host could not be closed \
                          ({err}); they stay open until the next start"
@@ -398,6 +406,7 @@ impl Registry {
             store,
             writer,
             open_notes: std::sync::Mutex::new(notes),
+            closed_calls,
             run_snapshot,
             policies: std::sync::Arc::new(crate::domain::runs::policy::PolicyCache::default()),
             open_events: std::sync::Mutex::new(Vec::new()),
@@ -524,6 +533,8 @@ impl Registry {
             // Story 22-2: a reveal names an instance and secrets, no Run.
             EngineEvent::SecretRevealed(_) => None,
             EngineEvent::ProxySetting(_) => None,
+            // Story 24-3: a reconcile summary names no Run.
+            EngineEvent::Recovery(_) => None,
         }
     }
 
@@ -942,6 +953,7 @@ impl Registry {
             store,
             writer: StoreWriter::closed(),
             open_notes: std::sync::Mutex::new(Vec::new()),
+            closed_calls: (0, 0),
             // A read-only registry serves no data path: its Run snapshot
             // stays empty (only a store writer publishes, AD-25).
             run_snapshot: std::sync::Arc::new(

@@ -811,7 +811,9 @@ engine's own kind-tagged JSON (`{"kind":"transition",…}`,
 `{"kind":"budget_breach",…}`, `{"kind":"usage_update",…}`, and
 `{"kind":"run",…}` for a Run created, ended or changed, and
 `{"kind":"secret_revealed",…}` when a custodied provider key is revealed,
-naming the instance and the secret, never its value) — never re-shaped.
+naming the instance and the secret, never its value, and one
+`{"kind":"recovery",…}` per host start summing up what the previous host
+left; see [hosting](hosting.md)) — never re-shaped.
 Every event frame also carries `id: <seq>` — the event's position in the
 global outbox, the same `seq` `GET /v0/export` serves. A client that falls
 behind the bus gets an in-stream `{"kind":"lagged","skipped":N}` frame

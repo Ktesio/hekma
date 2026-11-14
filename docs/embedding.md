@@ -350,8 +350,14 @@ graceful path is a contract the embedder owns:
   `HostRecovery { previous, adopted }`, where `previous` is `Unknown`,
   `Live` or `Gone { handoff }`. When it is `Gone { handoff: false }`, call
   `clean_up_after_crash(name, window)` for each adopted agent: the
-  ordinary stop, recorded with the `engine-crash` cause. Without
-  `host_posture` nothing is recorded or read, and adoption is unchanged.
+  ordinary stop, recorded with the `engine-crash` cause. `HostRecovery`
+  also names the agents whose Shim was gone (`shims_lost`) and counts the
+  proxied calls the open closed (`calls_closed_crash`,
+  `calls_closed_recovered`). Then call `commit_recovery(runs_cleaned)` once:
+  it commits and publishes one `EngineEvent::Recovery` summing it up, or
+  returns `None` when the previous owner is still alive (an upgrade).
+  Without `host_posture` nothing is recorded or read, and adoption is
+  unchanged.
 - **Notices are optional.** Pass `Some(&sink)` (a
   [`DiagnosticSink`](#the-diagnostic-sink)) to get the same `[hekma] `
   progress lines `serve` prints at shutdown; pass `None` for return values
