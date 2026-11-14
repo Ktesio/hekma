@@ -3400,6 +3400,7 @@ mod tests {
             run_id: None,
             owner: None,
             lease: None,
+            shim: None,
         };
         reg.write_spawn_record(&record).unwrap();
         assert_eq!(reg.spawn_record(&name).unwrap(), Some(record));

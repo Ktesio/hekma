@@ -391,6 +391,15 @@ pub struct EngineOptions {
     /// `#[doc(hidden)]` so it never reads as one.
     #[doc(hidden)]
     pub pause_command_cap_override: Option<Duration>,
+    /// Story 24-1: the Shim program (a binary that runs the engine's Shim
+    /// entry for `shim --listen … --expect-secret-hash … --launch-id …`,
+    /// such as `hekma`). `Some`: every supervised launch (except an ACP
+    /// agent's) goes through a per-process Shim that owns the child, so the
+    /// child outlives this engine and a later engine reconnects to it — and
+    /// dropping this engine does NOT stop it. `None` (the default): launches
+    /// are held directly, exactly as before. Unix only for now; elsewhere
+    /// it is ignored.
+    pub shim_exe: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for EngineOptions {
@@ -410,6 +419,7 @@ impl std::fmt::Debug for EngineOptions {
                 "pause_command_cap_override",
                 &self.pause_command_cap_override,
             )
+            .field("shim_exe", &self.shim_exe)
             .finish()
     }
 }
@@ -549,6 +559,7 @@ impl Engine {
             diagnostics,
             stable_run_window_override,
             pause_command_cap_override,
+            shim_exe,
         } = options;
         let registry = Registry::open(base)?;
         let rt = Self::build_runtime()?;
@@ -602,6 +613,11 @@ impl Engine {
             .map_err(|err| RegistryError::ServeOptionsOpenTimeOnly {
                 detail: err.to_string(),
             })?;
+        // Story 24-1: launches go through a Shim when one is configured.
+        supervisor.set_shim_launcher(shim_exe.map(|exe| crate::domain::ShimLauncher {
+            exe,
+            state_dir: registry.paths.state_base().to_path_buf(),
+        }));
         // Story 18-3: thread the TEST SCALING SEAM through — `None` (every
         // production caller) leaves the pinned 30 s window untouched.
         if let Some(window) = stable_run_window_override {

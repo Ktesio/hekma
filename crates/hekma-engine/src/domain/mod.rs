@@ -156,6 +156,7 @@ pub use supervisor::{DiagnosticSink, DrainOutcome, RestartPlan, Supervisor, DEFA
 // cfg(test) only (epic 20-1 coverage seam): the stop-fault vocabulary the
 // engine-level test arming (`Engine::arm_test_stop_fault`) names — never
 // compiled into production binaries.
+pub(crate) use supervisor::proc::ShimLauncher;
 #[cfg(test)]
 pub(crate) use supervisor::StopFault;
 pub use transition::{next_state, LifecycleCommand, LifecycleError};

@@ -45,5 +45,11 @@ path = "src/bin/hermes_shim.rs"
 name = "fake_acp_agent"
 path = "src/bin/fake_acp_agent.rs"
 
+# Story 24-1: a Shim program for the engine's tests (runs the engine's Shim
+# entry, as `hekma shim` does).
+[[bin]]
+name = "shim_host"
+path = "src/bin/shim_host.rs"
+
 [lints]
 workspace = true

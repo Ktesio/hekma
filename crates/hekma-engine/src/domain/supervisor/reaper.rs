@@ -1542,7 +1542,29 @@ impl Supervisor {
             // (its Drop does not kill), so this engine's clean exit leaves the
             // agent alive for the command after it; a supervised spawn's
             // handle keeps the story 1-6 kill-on-drop guarantee.
-            match self.backend.adopt(&record.fingerprint, record.detach) {
+            // Story 24-1: a process launched through a Shim is re-held by
+            // reconnecting to its Shim; a Shim another engine holds is that
+            // engine's (skipped, like a live owner); no Shim answering falls
+            // back to the child's fingerprint.
+            let (reacquired, note) = self
+                .backend
+                .reacquire_shim(&record, registry.paths.state_base());
+            if let Some(note) = note {
+                self.emit_diagnostic(&format!("{}: {note}", name.as_str()));
+            }
+            let held = match reacquired {
+                proc::ShimReacquire::Held(handle) => Ok(Some(handle)),
+                proc::ShimReacquire::Busy => {
+                    self.emit_diagnostic(&format!(
+                        "{}: its Shim is held by another engine — THIS engine holds no \
+                         handle for it",
+                        name.as_str(),
+                    ));
+                    continue;
+                }
+                proc::ShimReacquire::None => self.backend.adopt(&record.fingerprint, record.detach),
+            };
+            match held {
                 Ok(Some(handle)) => {
                     // Live match: re-hold the handle. State stays as persisted
                     // (running/paused). AI-7: a paused process is now resumable.

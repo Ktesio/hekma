@@ -178,6 +178,11 @@ pub struct ServeOptions {
     /// keeps 10 minutes. Not an operator surface.
     #[doc(hidden)]
     pub set_token_ttl_override: Option<std::time::Duration>,
+    /// Story 24-1: the Shim program supervised processes launch through
+    /// (see `EngineOptions::shim_exe`); `None` (the default) holds them
+    /// directly. `hekma serve` sets it when `HEKMA_SHIM=1`, a preview
+    /// switch until the Shim is on by default.
+    pub shim_exe: Option<PathBuf>,
 }
 
 /// Story 21-4: how long an AUTO-STARTED host waits with no live agent and no
@@ -441,6 +446,7 @@ where
         build_version,
         autostart_idle_override,
         set_token_ttl_override,
+        shim_exe,
     } = options;
     let has_caller_sink = diagnostics.is_some();
     let notifier = match diagnostics {
@@ -853,6 +859,8 @@ where
                 // standalone pause-command cap (the test-only seam stays
                 // `None`).
                 pause_command_cap_override: None,
+                // Story 24-1: the Shim program, when the host was given one.
+                shim_exe,
                 // Route the ENGINE's own diagnostics (adoption notes, the
                 // re-bind notes, enforcement breadcrumbs) through the SAME
                 // sink the host notices use — one interleaved, honest stream.

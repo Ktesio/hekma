@@ -31,6 +31,18 @@ use super::{ProcessFingerprint, StoreError};
 /// read it), and the last-known transition cause (so a reconcile-to-`failed` can
 /// name why). It lives in the one SQLite state store (AD-6), keyed by instance
 /// name; it is CLEARED on a clean stop so a normally-stopped instance is never
+/// Story 24-1: the Shim a supervised process was launched through — its
+/// socket and the launch id its connection secret derives from (the secret
+/// itself is never stored; any engine holding the state directory's host
+/// key recomputes it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShimRecord {
+    /// The Shim's socket.
+    pub socket: std::path::PathBuf,
+    /// The launch id.
+    pub launch_id: String,
+}
+
 /// later mistaken for an orphan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpawnRecord {
@@ -134,6 +146,10 @@ pub struct SpawnRecord {
     /// exactly as they ignore the owner (their adoption is disarmed, so the
     /// double-armed-handle race cannot bite). `None` for pre-v11 records.
     pub lease: Option<ProcessFingerprint>,
+    /// Story 24-1: where the process's Shim listens, when it was launched
+    /// through one. `None` for a process held directly (every record
+    /// written before Shims, and every launch with no Shim configured).
+    pub shim: Option<ShimRecord>,
 }
 
 /// Persistence port for registry + lifecycle + the Usage Ledger.
