@@ -245,14 +245,8 @@ impl Drop for Engine {
         // abort the whole process, and the release pass is best-effort by
         // contract.
         let inner = Arc::clone(&self.inner);
-        let registry = inner
-            .registry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut supervisor = inner
-            .supervisor
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let registry = inner.registry.critical_recovering();
+        let mut supervisor = inner.supervisor.after_recovering(&registry);
         supervisor.release_detached_paused(&registry);
     }
 }
@@ -282,8 +276,8 @@ struct EngineInner {
     paths: crate::paths::EnginePaths,
     /// Story 24-4 (AD-18 Step 1): the two engine locks record their holds
     /// per call site when lock timing is on ([`Engine::set_lock_timing`]).
-    registry: crate::domain::timed_mutex::TimedMutex<Registry>,
-    supervisor: crate::domain::timed_mutex::TimedMutex<Supervisor>,
+    registry: crate::domain::bounded::RegistryCell,
+    supervisor: crate::domain::bounded::SupervisorCell,
     lock_timing: Arc<crate::domain::timed_mutex::LockTiming>,
     /// The supervisor's event bus clone (story 7-2): held OUTSIDE the mutex so
     /// [`Engine::subscribe`] hands out receivers without ever contending on
@@ -332,10 +326,7 @@ impl EngineInner {
         };
         let snapshot = self.run_snapshot.current();
         if let Some(config) = feed.refresh(&snapshot) {
-            self.supervisor
-                .lock()
-                .expect("supervisor mutex poisoned")
-                .push_bypass_hosts(&config);
+            self.supervisor.alone().push_bypass_hosts(&config);
         }
     }
 }
@@ -733,15 +724,19 @@ impl Engine {
             metering_proxy_error: proxy_error,
             read_only: false,
             paths,
-            registry: crate::domain::timed_mutex::TimedMutex::new(
-                "registry",
-                Arc::clone(&lock_timing),
-                registry,
+            registry: crate::domain::bounded::RegistryCell::new(
+                crate::domain::timed_mutex::TimedMutex::new(
+                    "registry",
+                    Arc::clone(&lock_timing),
+                    registry,
+                ),
             ),
-            supervisor: crate::domain::timed_mutex::TimedMutex::new(
-                "supervisor",
-                Arc::clone(&lock_timing),
-                supervisor,
+            supervisor: crate::domain::bounded::SupervisorCell::new(
+                crate::domain::timed_mutex::TimedMutex::new(
+                    "supervisor",
+                    Arc::clone(&lock_timing),
+                    supervisor,
+                ),
             ),
             lock_timing,
             events,
@@ -759,8 +754,8 @@ impl Engine {
         // reaper starts so an adopted process is already held when the first poll
         // runs (and a phantom row is already `failed`).
         {
-            let mut registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let mut registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             // Story 24-3: read the previous owner's record, then replace it
             // with this one's, BEFORE adopting anything.
             let previous = host_posture.map(|posture| {
@@ -788,12 +783,15 @@ impl Engine {
             shims_lost.sort();
             if let Some(previous) = previous {
                 let (calls_closed_crash, calls_closed_recovered) = registry.closed_calls;
-                *inner.recovery.lock().expect("recovery mutex poisoned") = Some(HostRecovery {
+                let found = HostRecovery {
                     previous,
                     adopted,
                     shims_lost,
                     calls_closed_crash,
                     calls_closed_recovered,
+                };
+                crate::domain::bounded::cell_scope(&inner.recovery, "recovery", |recovery| {
+                    *recovery = Some(found)
                 });
             }
             // Story 21-3: publish what the open produced (the policy sweep's
@@ -850,15 +848,19 @@ impl Engine {
             metering_proxy_error: None,
             read_only: true,
             paths,
-            registry: crate::domain::timed_mutex::TimedMutex::new(
-                "registry",
-                Arc::clone(&lock_timing),
-                registry,
+            registry: crate::domain::bounded::RegistryCell::new(
+                crate::domain::timed_mutex::TimedMutex::new(
+                    "registry",
+                    Arc::clone(&lock_timing),
+                    registry,
+                ),
             ),
-            supervisor: crate::domain::timed_mutex::TimedMutex::new(
-                "supervisor",
-                Arc::clone(&lock_timing),
-                supervisor,
+            supervisor: crate::domain::bounded::SupervisorCell::new(
+                crate::domain::timed_mutex::TimedMutex::new(
+                    "supervisor",
+                    Arc::clone(&lock_timing),
+                    supervisor,
+                ),
             ),
             lock_timing,
             events,
@@ -982,22 +984,16 @@ impl Engine {
     pub(crate) fn proxy_shared_for_tests(
         &self,
     ) -> Option<Arc<crate::metering::proxy::forward::ProxyShared>> {
-        self.inner
-            .metering_proxy
-            .lock()
-            .expect("metering proxy mutex poisoned")
-            .as_ref()
-            .map(|proxy| Arc::clone(proxy.shared()))
+        crate::domain::bounded::cell_scope(&self.inner.metering_proxy, "metering proxy", |proxy| {
+            proxy.as_ref().map(|proxy| Arc::clone(proxy.shared()))
+        })
     }
 
     /// Where the shared Metering Proxy listens (story 23-1), when it runs.
     pub fn metering_proxy(&self) -> Option<crate::metering::proxy::ProxyInfo> {
-        self.inner
-            .metering_proxy
-            .lock()
-            .expect("metering proxy mutex poisoned")
-            .as_ref()
-            .map(|proxy| proxy.info().clone())
+        crate::domain::bounded::cell_scope(&self.inner.metering_proxy, "metering proxy", |proxy| {
+            proxy.as_ref().map(|proxy| proxy.info().clone())
+        })
     }
 
     /// The metering proxy port RECORDED for this state directory (story
@@ -1007,8 +1003,7 @@ impl Engine {
     pub fn recorded_metering_port(&self) -> Option<u16> {
         self.inner
             .registry
-            .lock()
-            .expect("registry mutex poisoned")
+            .critical()
             .reader()
             .proxy_port()
             .ok()
@@ -1027,14 +1022,16 @@ impl Engine {
     /// [`ExportCounters`]). Lock-free but for the proxy handle's mutex.
     pub fn export_counters(&self) -> ExportCounters {
         use std::sync::atomic::Ordering;
-        let (unscented_served, unscented_refused) = self
-            .inner
-            .metering_proxy
-            .lock()
-            .expect("metering proxy mutex poisoned")
-            .as_ref()
-            .map(|proxy| proxy.unscented_counts())
-            .unwrap_or_default();
+        let (unscented_served, unscented_refused) = crate::domain::bounded::cell_scope(
+            &self.inner.metering_proxy,
+            "metering proxy",
+            |proxy| {
+                proxy
+                    .as_ref()
+                    .map(|proxy| proxy.unscented_counts())
+                    .unwrap_or_default()
+            },
+        );
         ExportCounters {
             unscented_served,
             unscented_refused,
@@ -1065,12 +1062,11 @@ impl Engine {
     /// accepting, let in-flight calls finish within `grace`, abort the rest
     /// (recorded `shutdown`), then close its record pump. Idempotent.
     pub async fn stop_metering_proxy(&self, grace: Duration) {
-        let proxy = self
-            .inner
-            .metering_proxy
-            .lock()
-            .expect("metering proxy mutex poisoned")
-            .take();
+        let proxy = crate::domain::bounded::cell_scope(
+            &self.inner.metering_proxy,
+            "metering proxy",
+            Option::take,
+        );
         if let Some(mut proxy) = proxy {
             proxy.shutdown(grace).await;
         }
@@ -1102,15 +1098,11 @@ impl Engine {
             + Send
             + 'static,
     ) -> Result<crate::domain::runs::bindings::BindingOutcome, BindingError> {
-        inner
-            .registry
-            .lock()
-            .expect("registry mutex poisoned")
-            .run_binding(op)
-            .inspect(|outcome| {
-                let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
-                supervisor.publish_run_events(outcome.events.clone());
-            })
+        let registry = inner.registry.critical();
+        registry.run_binding(op).inspect(|outcome| {
+            let supervisor = inner.supervisor.after(&registry);
+            supervisor.publish_run_events(outcome.events.clone());
+        })
     }
 
     /// Story 22-2 (P7): a binding naming a custodied key must send it only
@@ -1144,8 +1136,7 @@ impl Engine {
         }
         let declared = inner
             .registry
-            .lock()
-            .expect("registry mutex poisoned")
+            .critical()
             .custody_pin(name)
             .map_err(|err| invalid(err.to_string()))?;
         crate::domain::custody::resolve_origin(
@@ -1187,8 +1178,7 @@ impl Engine {
         self.run_blocking(move || {
             let stored = inner
                 .registry
-                .lock()
-                .expect("registry mutex poisoned")
+                .critical()
                 .reader()
                 .proxy_identity_headers()?;
             Ok(crate::domain::ProxySettings::of(
@@ -1237,7 +1227,7 @@ impl Engine {
             // touches its key or its upstream.
             if patch.custodied_key.is_some() || patch.upstream.is_some() {
                 let current = {
-                    let registry = inner.registry.lock().expect("registry mutex poisoned");
+                    let registry = inner.registry.critical();
                     registry.reader().binding(&name)?
                 };
                 if let Some(current) = current {
@@ -1376,7 +1366,7 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             match registry.reader().binding(&name)? {
                 Some(row) => crate::domain::runs::bindings::view(registry.reader(), row)
                     .map(Some)
@@ -1397,7 +1387,7 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let after = after.map(str::to_string);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             crate::domain::runs::bindings::list(registry.reader(), after.as_deref(), limit)
                 .map_err(BindingError::Store)
         })
@@ -1414,7 +1404,7 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             crate::domain::runs::bindings::credentials(registry.reader(), &name)
         })
         .await
@@ -1443,11 +1433,8 @@ impl Engine {
                 }
                 let poll_inner = Arc::clone(&inner);
                 let plans = tokio::task::spawn_blocking(move || {
-                    let registry = poll_inner.registry.lock().expect("registry mutex poisoned");
-                    let mut supervisor = poll_inner
-                        .supervisor
-                        .lock()
-                        .expect("supervisor mutex poisoned");
+                    let registry = poll_inner.registry.critical();
+                    let mut supervisor = poll_inner.supervisor.after(&registry);
                     supervisor.poll_once(&registry)
                 })
                 .await
@@ -1462,14 +1449,8 @@ impl Engine {
                         tokio::time::sleep(plan.delay).await;
                         let name = plan.name.as_str().to_string();
                         let _ = tokio::task::spawn_blocking(move || {
-                            let registry = restart_inner
-                                .registry
-                                .lock()
-                                .expect("registry mutex poisoned");
-                            let mut supervisor = restart_inner
-                                .supervisor
-                                .lock()
-                                .expect("supervisor mutex poisoned");
+                            let registry = restart_inner.registry.critical();
+                            let mut supervisor = restart_inner.supervisor.after(&registry);
                             supervisor.restart(&registry, &name, plan.attempt, plan.delay)
                         })
                         .await;
@@ -1519,11 +1500,7 @@ impl Engine {
     /// reaper-fired diagnostics for adopted instances in the open-to-install
     /// window, prefer [`Engine::open_with_diagnostics`].
     pub fn with_diagnostics(&self, sink: DiagnosticSink) {
-        self.inner
-            .supervisor
-            .lock()
-            .expect("supervisor mutex poisoned")
-            .install_diagnostics(sink);
+        self.inner.supervisor.alone().install_diagnostics(sink);
     }
 
     /// Subscribe to the engine's committed-event stream (story 7-2, FR-33).
@@ -1597,14 +1574,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         let kind = kind.to_string();
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .register(&name, &kind)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().register(&name, &kind))
+            .await
     }
 
     /// Register a new Agent Instance, resolving `reference` to an adapter first.
@@ -1620,8 +1591,7 @@ impl Engine {
         self.run_blocking(move || {
             inner
                 .registry
-                .lock()
-                .expect("registry mutex poisoned")
+                .critical()
                 .register_with_adapter(&name, &reference)
         })
         .await
@@ -1671,8 +1641,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             // (1) Stop a live/adopted instance FIRST so no unsupervised process is
             // ever orphaned (AI-11). Only when we will actually delete the row —
             // i.e. `force`, or a live state other than `running` (a `running`
@@ -1709,14 +1679,8 @@ impl Engine {
     /// List the whole Fleet, ordered by name.
     pub async fn list(&self) -> Result<Vec<AgentInstance>, RegistryError> {
         let inner = Arc::clone(&self.inner);
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .list()
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().list())
+            .await
     }
 
     /// The whole Fleet as serializable [`FleetEntry`] rows (story 1-7, FR-4 /
@@ -1754,8 +1718,8 @@ impl Engine {
     pub async fn fleet(&self) -> Result<Vec<FleetEntry>, RegistryError> {
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             let instances = registry.list()?;
             // AI-16: ONE batched spawn-record read while the locks are held,
             // keyed by name and threaded into `fleet_entry_for` — replacing the
@@ -1815,8 +1779,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             let iname = InstanceName::new(&name).map_err(|reason| RegistryError::InvalidName {
                 name: name.clone(),
                 reason,
@@ -2127,14 +2091,8 @@ impl Engine {
     ) -> Result<EffectiveCapabilities, RegistryError> {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .effective_capabilities(&name)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().effective_capabilities(&name))
+            .await
     }
 
     /// Start a registered Agent Instance (AC1/AC2).
@@ -2149,8 +2107,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             supervisor.start(&registry, &name)
         })
         .await
@@ -2169,8 +2127,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             supervisor.start_detached(&registry, &name)
         })
         .await
@@ -2192,8 +2150,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             supervisor.stop(&registry, &name, window)
         })
         .await
@@ -2272,12 +2230,11 @@ impl Engine {
         window: Duration,
         notes: Option<&DiagnosticSink>,
     ) -> (HandoffShutdown, Option<std::net::TcpListener>) {
-        let proxy = self
-            .inner
-            .metering_proxy
-            .lock()
-            .expect("metering proxy mutex poisoned")
-            .take();
+        let proxy = crate::domain::bounded::cell_scope(
+            &self.inner.metering_proxy,
+            "metering proxy",
+            Option::take,
+        );
         let listener = match proxy {
             Some(mut proxy) => proxy.shutdown_keeping_listener(window).await,
             None => None,
@@ -2291,11 +2248,9 @@ impl Engine {
     /// owner and which agents it adopted — `None` unless the engine was
     /// opened with [`EngineOptions::host_posture`].
     pub fn host_recovery(&self) -> Option<HostRecovery> {
-        self.inner
-            .recovery
-            .lock()
-            .expect("recovery mutex poisoned")
-            .clone()
+        crate::domain::bounded::cell_scope(&self.inner.recovery, "recovery", |recovery| {
+            recovery.clone()
+        })
     }
 
     /// Story 24-3: commit and publish the one `recovery` event that sums up
@@ -2344,11 +2299,11 @@ impl Engine {
         };
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             let append = registry
                 .commit_event(EngineEvent::Recovery(event.clone()))
                 .map_err(EngineError::Store)?;
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.note_outbox_append(&append);
             supervisor.publish(append.seq, EngineEvent::Recovery(event.clone()));
             Ok(Some(event))
@@ -2370,8 +2325,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             supervisor.stop_after_crash(&registry, &name, window)
         })
         .await
@@ -2382,8 +2337,8 @@ impl Engine {
     pub(crate) async fn release_shim_held(&self) -> Vec<String> {
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             Ok::<_, std::convert::Infallible>(
                 supervisor
                     .release_shim_held(&registry)
@@ -2408,7 +2363,7 @@ impl Engine {
         use crate::domain::StopFault;
         let inner = Arc::clone(&self.inner);
         let name = InstanceName::new(name).expect("test instance name");
-        let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+        let mut supervisor = inner.supervisor.alone();
         if let Some(pid) = supervisor.held_pid(&name) {
             supervisor.arm_stop_fault(pid, StopFault::Fail);
         }
@@ -2426,8 +2381,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             supervisor.pause(&registry, &name)
         })
         .await
@@ -2441,8 +2396,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             supervisor.resume(&registry, &name)
         })
         .await
@@ -2467,8 +2422,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             supervisor
                 .drain(&registry, &name, timeout_override)
                 .map(|(instance, outcome)| DrainReport { instance, outcome })
@@ -2496,8 +2451,8 @@ impl Engine {
         let name = name.to_string();
         let text = text.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             supervisor.send_input(&registry, &name, &text)
         })
         .await
@@ -2519,7 +2474,7 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             let iname = InstanceName::new(&name).map_err(|reason| EngineError::InvalidName {
                 name: name.clone(),
                 reason,
@@ -2541,8 +2496,7 @@ impl Engine {
                 && record.as_ref().is_some_and(|record| {
                     inner
                         .supervisor
-                        .lock()
-                        .expect("supervisor mutex poisoned")
+                        .after(&registry)
                         .record_process_gone(record)
                 });
             if gone {
@@ -2597,7 +2551,7 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             let iname = InstanceName::new(&name).map_err(|reason| EngineError::InvalidName {
                 name: name.clone(),
                 reason,
@@ -2635,8 +2589,7 @@ impl Engine {
             })?;
             inner
                 .registry
-                .lock()
-                .expect("registry mutex poisoned")
+                .critical()
                 .effective_config(&iname, overrides)
         })
         .await
@@ -2662,11 +2615,7 @@ impl Engine {
                 name: name.clone(),
                 reason: reason.to_string(),
             })?;
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .reveal_secrets(&iname, overrides)
+            inner.registry.critical().reveal_secrets(&iname, overrides)
         })
         .await
     }
@@ -2674,13 +2623,7 @@ impl Engine {
     /// Empty the custody cache (cfg(test): the proxy's cache-miss tests).
     #[cfg(test)]
     pub(crate) fn clear_custody_cache_for_test(&self) {
-        if let Some(cache) = self
-            .inner
-            .supervisor
-            .lock()
-            .expect("supervisor mutex poisoned")
-            .custody_cache()
-        {
+        if let Some(cache) = self.inner.supervisor.alone().custody_cache() {
             cache.clear();
         }
     }
@@ -2704,7 +2647,7 @@ impl Engine {
                 name: name.clone(),
                 reason: reason.to_string(),
             })?;
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             let effective = registry.effective_config(&iname, ConfigLayer::empty())?;
             let Some(secret) = crate::domain::config::custodied_secret(&effective) else {
                 return Ok(None);
@@ -2722,7 +2665,7 @@ impl Engine {
                     name: name.clone(),
                     detail: format!("the reveal could not be recorded ({err})"),
                 })?;
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.note_outbox_append(&append);
             supervisor.publish(append.seq, EngineEvent::SecretRevealed(event.clone()));
             Ok(Some(event))
@@ -2766,15 +2709,14 @@ impl Engine {
                 name: name.clone(),
                 reason: reason.to_string(),
             })?;
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             let warnings = registry.set_config(&iname, &key, &value)?;
             // Story 21-2: a `labels.*` write re-binds the open Run's labels
             // (Registry → Supervisor, the fixed lock order).
             if key.starts_with(crate::domain::runs::labels::LABELS_PREFIX) {
                 inner
                     .supervisor
-                    .lock()
-                    .expect("supervisor mutex poisoned")
+                    .after(&registry)
                     .sync_run_labels(&registry, &iname);
             }
             // Story 21-3: an explicit `budget.breach_action` write clears
@@ -2790,8 +2732,7 @@ impl Engine {
             if key.starts_with("budget.") || key.starts_with("cost.rate.") {
                 inner
                     .supervisor
-                    .lock()
-                    .expect("supervisor mutex poisoned")
+                    .after(&registry)
                     .sync_run_policy(&registry, &iname);
             }
             Ok(warnings)
@@ -2811,8 +2752,8 @@ impl Engine {
     pub async fn open_child_run(&self, request: ChildRunRequest) -> Result<RunView, RunError> {
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.open_child_run(&registry, request)
         })
         .await
@@ -2825,8 +2766,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.close_run(&registry, &run_id)
         })
         .await
@@ -2837,14 +2778,8 @@ impl Engine {
     pub async fn run(&self, run_id: &str) -> Result<RunView, RunError> {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .run_view(&run_id)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().run_view(&run_id))
+            .await
     }
 
     /// Submit a Run's confirmed usage (story 19-5, PRD FR-45): totals for
@@ -2875,8 +2810,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             let (outcome, events) = registry.reconcile_run(&run_id, request, submitted_by)?;
             supervisor.publish_run_events(events);
             Ok(outcome)
@@ -2892,14 +2827,8 @@ impl Engine {
     ) -> Result<Vec<crate::domain::runs::reconcile::Reconciliation>, RunError> {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .run_reconciliations(&run_id)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().run_reconciliations(&run_id))
+            .await
     }
 
     /// A compacted Run's summary (story 24-4): what an ended Run keeps once
@@ -2913,14 +2842,8 @@ impl Engine {
     {
         let inner = Arc::clone(&self.inner);
         let run_id = run_id.to_string();
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .compacted_run(&run_id)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().compacted_run(&run_id))
+            .await
     }
 
     /// The retention windows and the compaction state (story 24-4). Reads
@@ -2929,14 +2852,8 @@ impl Engine {
         &self,
     ) -> Result<crate::domain::runs::retention::RetentionView, crate::ports::StoreError> {
         let inner = Arc::clone(&self.inner);
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .retention_view()
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().retention_view())
+            .await
     }
 
     /// Change the retention windows (story 24-4): the Run window moves the
@@ -2956,13 +2873,7 @@ impl Engine {
         self.refuse_if_read_only()?;
         let inner = Arc::clone(&self.inner);
         Ok(self
-            .run_blocking(move || {
-                inner
-                    .registry
-                    .lock()
-                    .expect("registry mutex poisoned")
-                    .set_retention(change)
-            })
+            .run_blocking(move || inner.registry.critical().set_retention(change))
             .await?)
     }
 
@@ -2972,14 +2883,8 @@ impl Engine {
     pub async fn instance_run(&self, instance: &str) -> Result<RunView, RunError> {
         let inner = Arc::clone(&self.inner);
         let instance = instance.to_string();
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .instance_run(&instance)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().instance_run(&instance))
+            .await
     }
 
     /// Bind and unbind labels on one Run as the Operator (story 21-9, PRD
@@ -3002,8 +2907,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.label_run(&registry, &run_id, change, dry_run)
         })
         .await
@@ -3016,14 +2921,8 @@ impl Engine {
     pub async fn select_runs(&self, selector: &Selector) -> Result<Vec<RunRecord>, RunError> {
         let inner = Arc::clone(&self.inner);
         let selector = selector.clone();
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .select_runs(&selector)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().select_runs(&selector))
+            .await
     }
 
     /// [`Engine::select_runs`] with each matched Run assembled as its
@@ -3036,14 +2935,8 @@ impl Engine {
     ) -> Result<Vec<RunSummary>, RunError> {
         let inner = Arc::clone(&self.inner);
         let selector = selector.clone();
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .select_run_summaries(&selector)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().select_run_summaries(&selector))
+            .await
     }
 
     /// Whether `verb` would act on Run `run_id` (story 21-6): the Run's
@@ -3059,7 +2952,7 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             let record = registry
                 .run_record(&run_id)?
                 .ok_or_else(|| RunError::NotFound {
@@ -3089,8 +2982,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             let record = registry
                 .run_record(&run_id)?
                 .ok_or_else(|| RunError::NotFound {
@@ -3190,8 +3083,8 @@ impl Engine {
         }
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             let ids: Vec<RunId> = run_ids.into_iter().map(RunId::from_wire).collect();
             supervisor.set_run_limits(&registry, &ids, &change, actor, dry_run)
         })
@@ -3249,11 +3142,9 @@ impl Engine {
     ) -> Result<crate::domain::PresentedState, RunError> {
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let reader = inner
-                .credential_reader
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            crate::domain::registry_keys::presented_state(&reader, &secret)
+            crate::domain::bounded::cell_scope_recovering(&inner.credential_reader, |reader| {
+                crate::domain::registry_keys::presented_state(reader, &secret)
+            })
         })
         .await
     }
@@ -3274,8 +3165,8 @@ impl Engine {
         self.refuse_if_read_only().map_err(RunError::Store)?;
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.open_child_run_as(&registry, actor, request)
         })
         .await
@@ -3296,11 +3187,11 @@ impl Engine {
         let hash = crate::domain::credential::hash_presented(&secret);
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let reader = inner
-                .credential_reader
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Ok(match reader.announce_credential(&hash)? {
+            let found = crate::domain::bounded::cell_scope_recovering(
+                &inner.credential_reader,
+                |reader| reader.announce_credential(&hash),
+            )?;
+            Ok(match found {
                 None => AnnounceCredentialState::Unknown,
                 Some((_, _, false)) => AnnounceCredentialState::Revoked,
                 Some((binding, token_id, true)) => {
@@ -3331,8 +3222,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let external = external_id.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.announce(&registry, credential, external, labels, inner.leases)
         })
         .await
@@ -3352,8 +3243,8 @@ impl Engine {
         self.refuse_if_read_only().map_err(RunError::Store)?;
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.ingest_telemetry(&registry, report, inner.leases)
         })
         .await
@@ -3376,8 +3267,8 @@ impl Engine {
         let run_id = RunId::from_wire(run_id);
         let set_by = set_by.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.set_disposition(&registry, &run_id, verb, &set_by)
         })
         .await
@@ -3396,8 +3287,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.heartbeat(&registry, actor, &run_id, inner.leases)
         })
         .await
@@ -3414,8 +3305,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.close_run_by(&registry, actor, &run_id)
         })
         .await
@@ -3432,8 +3323,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.close_run_as(&registry, actor, &run_id)
         })
         .await
@@ -3454,8 +3345,8 @@ impl Engine {
         }
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             let ids: Vec<RunId> = run_ids.into_iter().map(RunId::from_wire).collect();
             supervisor.set_run_limits_as(&registry, &ids, &change, actor, dry_run)
         })
@@ -3489,8 +3380,8 @@ impl Engine {
         let presented = SecretString::new(presented.expose_secret());
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.refresh_credentials(&registry, &presented)
         })
         .await
@@ -3510,8 +3401,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.revoke_run_keys(&registry, &run_id, cascade)
         })
         .await
@@ -3550,8 +3441,8 @@ impl Engine {
         let presented = resolved;
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             supervisor.revoke_exposed(&registry, &presented)
         })
         .await
@@ -3566,14 +3457,8 @@ impl Engine {
     ) -> Result<Vec<crate::domain::CredentialSummary>, RunError> {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .run_keys(&run_id)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().run_keys(&run_id))
+            .await
     }
 
     /// The budget read of one Run (story 21-6, `hekma budget show`): the
@@ -3583,14 +3468,8 @@ impl Engine {
     pub async fn run_limits_view(&self, run_id: &str) -> Result<RunLimitsView, RunError> {
         let inner = Arc::clone(&self.inner);
         let run_id = RunId::from_wire(run_id);
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .run_limits_view(&run_id)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().run_limits_view(&run_id))
+            .await
     }
 
     /// The Run listing (story 21-5, PRD FR-50): one exception-first (or
@@ -3605,14 +3484,8 @@ impl Engine {
     /// lock, read-only connection) — this is `hekma ps`'s read.
     pub async fn list_runs(&self, query: ListRunsQuery) -> Result<RunListing, RunError> {
         let inner = Arc::clone(&self.inner);
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .list_runs(&query)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().list_runs(&query))
+            .await
     }
 
     /// The per-call records listing (the calls store's read surface): one
@@ -3667,14 +3540,8 @@ impl Engine {
     ) -> Result<(), RunError> {
         let instance = instance.to_string();
         let inner = Arc::clone(&self.inner);
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .seed_perf_rows(&instance, &rows)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().seed_perf_rows(&instance, &rows))
+            .await
     }
 
     /// The subject Run of `event` and the labels it carries NOW (story
@@ -3704,7 +3571,7 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let event = event.clone();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             let Some(run_id) = registry.event_subject_run(&event) else {
                 return Ok(None);
             };
@@ -3722,8 +3589,7 @@ impl Engine {
         self.run_blocking(move || {
             inner
                 .registry
-                .lock()
-                .expect("registry mutex poisoned")
+                .critical()
                 .policies()
                 .map_err(RunError::Store)
         })
@@ -3738,8 +3604,7 @@ impl Engine {
         self.run_blocking(move || {
             inner
                 .registry
-                .lock()
-                .expect("registry mutex poisoned")
+                .critical()
                 .policy(&name)
                 .map_err(RunError::Store)?
                 .ok_or(RunError::PolicyNotFound { name })
@@ -3765,7 +3630,7 @@ impl Engine {
         }
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             if registry
                 .policy(&change.name)
                 .map_err(RunError::Store)?
@@ -3773,7 +3638,7 @@ impl Engine {
             {
                 return Err(RunError::PolicyExists { name: change.name });
             }
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let mut supervisor = inner.supervisor.after(&registry);
             supervisor.change_policy(&registry, change, dry_run)
         })
         .await
@@ -3796,7 +3661,7 @@ impl Engine {
         }
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             if registry
                 .policy(&change.name)
                 .map_err(RunError::Store)?
@@ -3804,7 +3669,7 @@ impl Engine {
             {
                 return Err(RunError::PolicyNotFound { name: change.name });
             }
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let mut supervisor = inner.supervisor.after(&registry);
             supervisor.change_policy(&registry, change, dry_run)
         })
         .await
@@ -3824,8 +3689,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let mut supervisor = inner.supervisor.after(&registry);
             supervisor.delete_policy(&registry, &name, dry_run)
         })
         .await
@@ -3855,14 +3720,8 @@ impl Engine {
         self.refuse_if_read_only().map_err(RegistryError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .attach_memory(&name, kind)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().attach_memory(&name, kind))
+            .await
     }
 
     /// Detach an Agent Instance's Memory Backing (story 5-1). METADATA ONLY:
@@ -3875,14 +3734,8 @@ impl Engine {
         self.refuse_if_read_only().map_err(RegistryError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .detach_memory(&name)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().detach_memory(&name))
+            .await
     }
 
     /// Read an instance's Memory Backing status through the public API (story
@@ -3899,14 +3752,8 @@ impl Engine {
     ) -> Result<Option<crate::ports::MemoryBackingStatus>, RegistryError> {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
-        self.run_blocking(move || {
-            inner
-                .registry
-                .lock()
-                .expect("registry mutex poisoned")
-                .memory_status(&name)
-        })
-        .await
+        self.run_blocking(move || inner.registry.critical().memory_status(&name))
+            .await
     }
 
     /// Read the recorded transition events for an instance from its log (AC1
@@ -3916,7 +3763,7 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             Supervisor::read_events(&registry, &name)
         })
         .await
@@ -3933,7 +3780,7 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             Supervisor::read_breach_events(&registry, &name)
         })
         .await
@@ -4002,7 +3849,7 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             let iname = InstanceName::new(&name).map_err(|reason| EngineError::InvalidName {
                 name: name.clone(),
                 reason,
@@ -4026,14 +3873,8 @@ impl Engine {
             return false;
         };
         let inner = Arc::clone(&self.inner);
-        self.run_blocking(move || {
-            inner
-                .supervisor
-                .lock()
-                .expect("supervisor mutex poisoned")
-                .has_live_capture(&name)
-        })
-        .await
+        self.run_blocking(move || inner.supervisor.alone().has_live_capture(&name))
+            .await
     }
 
     /// The engine's configured log-capture posture (story 17-4, review
@@ -4042,14 +3883,8 @@ impl Engine {
     /// holds and which capture surfaces serve, without a failed round-trip.
     pub async fn log_capture_mode(&self) -> LogCaptureMode {
         let inner = Arc::clone(&self.inner);
-        self.run_blocking(move || {
-            inner
-                .supervisor
-                .lock()
-                .expect("supervisor mutex poisoned")
-                .log_capture_mode()
-        })
-        .await
+        self.run_blocking(move || inner.supervisor.alone().log_capture_mode())
+            .await
     }
 
     /// Pull ONE bounded batch of committed events from the engine's global
@@ -4080,7 +3915,7 @@ impl Engine {
     ) -> Result<ExportBatch, EngineError> {
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             export_core(&registry, after, max)
         })
         .await
@@ -4102,13 +3937,13 @@ impl Engine {
         self.refuse_if_read_only().map_err(EngineError::Store)?;
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             // The SUPERVISOR lock is held across the ack: it serializes the
             // cursor advance against any append's compaction decision (a
             // compaction deciding what to keep against a MOVING ack cursor is
             // the one unsound interleaving). The guard binding is what holds
             // it.
-            let _supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let _supervisor = inner.supervisor.after(&registry);
             ack_core(&registry, seq)
         })
         .await
@@ -4131,16 +3966,12 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             // Story 17-4: the capture-mode guard is evaluated HERE (the
             // supervisor owns the engine-wide mode) — an Off engine never
             // captured anything, and a Metadata engine's `output.log` is
             // metadata-shaped, so neither can return attributable lines.
-            let mode = inner
-                .supervisor
-                .lock()
-                .expect("supervisor mutex poisoned")
-                .log_capture_mode();
+            let mode = inner.supervisor.after(&registry).log_capture_mode();
             let iname = InstanceName::new(&name).map_err(|reason| EngineError::InvalidName {
                 name: name.clone(),
                 reason,
@@ -4171,14 +4002,10 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let registry = inner.registry.critical();
             // Story 17-4: same capture-mode guard as `read_agent_log` (the
             // follow loop surfaces the refusal every poll).
-            let mode = inner
-                .supervisor
-                .lock()
-                .expect("supervisor mutex poisoned")
-                .log_capture_mode();
+            let mode = inner.supervisor.after(&registry).log_capture_mode();
             let iname = InstanceName::new(&name).map_err(|reason| EngineError::InvalidName {
                 name: name.clone(),
                 reason,
@@ -4207,8 +4034,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             // Story 17-4: OFF refuses honestly (nothing was ever captured —
             // an empty vector would LIE by implying a captured-then-exhausted
             // log). METADATA proceeds: the raw file exists while the instance
@@ -4243,8 +4070,8 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
-            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let registry = inner.registry.critical();
+            let supervisor = inner.supervisor.after(&registry);
             // Story 17-4: the same Off guard as `read_raw_output_since` (its
             // companion priming call — an Off engine refuses at the prime,
             // before the follow loop starts polling).
@@ -5236,7 +5063,7 @@ mod tests {
             "self-reported",
             "t",
         ));
-        let guard = engine.inner.registry.lock().unwrap();
+        let guard = engine.inner.registry.critical();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             let engine = &engine;
@@ -5386,8 +5213,8 @@ mod tests {
         use std::sync::atomic::Ordering;
         let tmp = tempfile::TempDir::new().unwrap();
         let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
-        let registry = engine.inner.registry.lock().unwrap();
-        let supervisor = engine.inner.supervisor.lock().unwrap();
+        let registry = engine.inner.registry.critical();
+        let supervisor = engine.inner.supervisor.after(&registry);
         // Let anything already in flight land before counting.
         std::thread::sleep(std::time::Duration::from_millis(200));
         let jobs = |registry: &Registry| registry.writer().stats().jobs.load(Ordering::Relaxed);
@@ -5627,7 +5454,7 @@ mod tests {
         ));
         let owner = RunId::mint();
         {
-            let registry = engine.inner.registry.lock().unwrap();
+            let registry = engine.inner.registry.critical();
             registry
                 .ensure_supervised_run(crate::domain::runs::ops::SupervisedRun {
                     instance: InstanceName::new("demo").unwrap(),
@@ -5679,7 +5506,7 @@ mod tests {
         facade.register("demo", "mock").unwrap();
         let owner = RunId::mint();
         {
-            let registry = engine.inner.registry.lock().unwrap();
+            let registry = engine.inner.registry.critical();
             registry
                 .ensure_supervised_run(crate::domain::runs::ops::SupervisedRun {
                     instance: InstanceName::new("demo").unwrap(),
@@ -5869,7 +5696,7 @@ mod tests {
         ));
         let owner = RunId::mint();
         {
-            let registry = engine.inner.registry.lock().unwrap();
+            let registry = engine.inner.registry.critical();
             registry
                 .ensure_supervised_run(crate::domain::runs::ops::SupervisedRun {
                     instance: InstanceName::new("demo").unwrap(),
@@ -5917,7 +5744,7 @@ mod tests {
             .collect();
         assert_eq!(committed.len(), 1);
         {
-            let registry = engine.inner.registry.lock().unwrap();
+            let registry = engine.inner.registry.critical();
             let snapshot = registry.run_snapshot();
             assert!(snapshot
                 .run(&owner)
@@ -6090,7 +5917,7 @@ mod tests {
         // start).
         let owner = RunId::mint();
         {
-            let registry = engine.inner.registry.lock().unwrap();
+            let registry = engine.inner.registry.critical();
             registry
                 .ensure_supervised_run(crate::domain::runs::ops::SupervisedRun {
                     instance: InstanceName::new("demo").unwrap(),
@@ -6114,7 +5941,7 @@ mod tests {
         // seeded here as the upgrade would leave it) clears in the same
         // write.
         {
-            let registry = engine.inner.registry.lock().unwrap();
+            let registry = engine.inner.registry.critical();
             registry
                 .writer
                 .call(|ctx| {
@@ -6305,7 +6132,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let inner = Arc::clone(&engine.inner);
         let holder = std::thread::spawn(move || {
-            let _guard = inner.registry.lock().unwrap();
+            let _guard = inner.registry.critical();
             locked_tx.send(()).unwrap();
             let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
         });
@@ -6319,7 +6146,7 @@ mod tests {
         let log = expected.join("logs").join("output.log");
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         std::fs::write(&log, "").unwrap();
-        let registry = engine.inner.registry.lock().unwrap();
+        let registry = engine.inner.registry.critical();
         let whole = Supervisor::read_agent_log(&registry, "demo").unwrap();
         let paths = Supervisor::agent_log_paths(&registry, "demo").unwrap();
         drop(registry);
@@ -6328,9 +6155,7 @@ mod tests {
             Supervisor::read_agent_log_since_at(&paths, 0).unwrap().1,
             whole.1
         );
-        assert!(
-            Supervisor::agent_log_paths(&engine.inner.registry.lock().unwrap(), "ghost").is_err()
-        );
+        assert!(Supervisor::agent_log_paths(&engine.inner.registry.critical(), "ghost").is_err());
     }
 
     #[test]

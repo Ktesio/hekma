@@ -9,6 +9,7 @@
 //! seed), and the [`Supervisor`] that drives start/stop through the process
 //! backend. Budgets and config resolution arrive with their stories.
 
+pub(crate) mod bounded;
 mod budget;
 mod bus;
 pub mod bypass;

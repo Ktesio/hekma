@@ -90,7 +90,14 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 python3 scripts/check_docs.py
+python3 scripts/check_ad17_debt.py
 ```
+
+`check_ad17_debt.py` is the lock-debt ratchet: `crates/hekma-engine/src/engine.rs`
+takes its locks only through the named scopes in `domain/bounded.rs`, and the
+few exceptions are listed by function in `.ad17-debt.txt`. A new exception
+fails it, and so does a paid-down one still listed: lower the file in the same
+change.
 
 Note: a bare `cargo` runs the repo's MSRV pin (`rust-toolchain.toml` → Rust
 1.96.1), while CI's latest-stable jobs run `cargo +stable`; version managers
