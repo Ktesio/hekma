@@ -239,4 +239,9 @@ The **O-items are Islam's rulings** (product and public-contract choices); the n
     - the Windows `taskkill /F` leg;
     - the flush-bound measurement;
     - the `Recovery` event.
+- 2026-11-14 — **phase 6 built** (stacked on phase 5, #430): parked calls across a `kill -9`. The drill now parks a call on the held Run, SIGKILLs the host, and checks O4's crash contract (the client gets no bytes; the connection just ends). It also checks R1: one record at the next start, `outcome: crash`, `disposition: hold`, `hold_end: crash`, `status_class: transport-error`.
+  - **Two real bugs, both fixed:**
+    - **(1)** The crash closure hard-coded `pass` with no `hold_end`, because `open_calls` never learned a call had parked. The calls store's schema 3 adds `open_calls.held_at` (one crash-atomic ALTER, stamped with it). The proxy marks a call held when it parks (`RecordPump::mark_held`, unacked and best effort like the call start), and the closure writes `hold` and `crash`.
+    - **(2)** The per-call record's `outcome`, `disposition` and `status_class` serialized as Rust variant names (`"Crash"`, `"Pass"`, `"TransportError"`) in `hekma calls list --json` and `/v0/calls`, against the documented `crash` / `pass` / `transport-error`. The enums now carry kebab-case (and `2xx`…`5xx`) serde names; `Other(raw)` stays raw.
+  - **Drift:** a held mark is not carried when an open call moves to the next day's file at rotation (rare: a call parked across UTC midnight); such a call closes as `pass`.
 

@@ -472,7 +472,42 @@ fn a_kill_9_loses_nothing_committed_before_it() {
     let before_parent = show(&parent);
     assert_eq!(before_child["run"]["status"], "held");
 
+    // A call on the held Run parks at the proxy (O4's crash contract: the
+    // dying host sends it nothing; the connection just ends).
+    let proxy = control_doc(state_dir)["metering_proxy_url"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("http://")
+        .to_string();
+    let path = format!("/_hekma/runs/{child}/v1/chat/completions");
+    let parked = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(&proxy).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
+        let body = r#"{"model":"m","messages":[]}"#;
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut answer = Vec::new();
+        let _ = stream.read_to_end(&mut answer);
+        answer
+    });
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    assert!(!parked.is_finished(), "the call is parked by the hold");
+
     helpers::kill_host(state_dir);
+    let answer = parked.join().unwrap();
+    assert!(
+        answer.is_empty(),
+        "a SIGKILLed host answers nothing: {}",
+        String::from_utf8_lossy(&answer)
+    );
     // The next write starts a host over the same state directory.
     assert!(hekma(&["agent", "register", "other", "--manifest", &manifest_arg]).success);
     let after_child = show(&child);
@@ -481,6 +516,17 @@ fn a_kill_9_loses_nothing_committed_before_it() {
         after_child, before_child,
         "the child Run is exactly as committed"
     );
+    // The parked call's record closes once, at the next start, as ended by
+    // the crash.
+    let listed = hekma(&["calls", "list", "--run", child.as_str(), "--json"]);
+    assert!(listed.success, "{}", both(&listed));
+    let doc: serde_json::Value = serde_json::from_str(&listed.stdout).unwrap();
+    let records = doc["items"].as_array().cloned().unwrap_or_default();
+    assert_eq!(records.len(), 1, "{doc}");
+    assert_eq!(records[0]["outcome"], "crash", "{doc}");
+    assert_eq!(records[0]["disposition"], "hold", "{doc}");
+    assert_eq!(records[0]["hold_end"], "crash", "{doc}");
+    assert_eq!(records[0]["status_class"], "transport-error", "{doc}");
     for field in [
         "run_id",
         "status",

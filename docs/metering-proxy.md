@@ -105,7 +105,7 @@ Responses are buffered whole before they are relayed, so through the proxy a str
 - Before anything is forwarded, the call reserves room for its records. When none frees up within one second, the call is refused with `503 hekma_ledger_unavailable`, so nothing is ever spent that cannot be recorded.
 - Records reach the store in batches. The proxy relays the response before its batch commits, and a call made in that window (about a quarter of a second) can pass a budget the previous call just crossed. That is the same bound the per-agent listener had.
 - Each call's record (its Run, the presenting key's token id, the model, the outcome and the token counts, never its content) lands in the **calls store**, `<state dir>/calls/`.
-- If the host is killed, calls in flight fail at the client as connection errors. At the next start, Hekma closes their records: `recovered` when the usage made it into the ledger, else `crash` with unknown tokens. A call relayed in the last batch window before a hard kill can go uncounted; it shows up as a `crash` record, never as a double count.
+- If the host is killed, calls in flight fail at the client as connection errors: a dying host cannot send a response, so the connection just ends, which SDKs retry by default. At the next start, Hekma closes their records once: `recovered` when the usage made it into the ledger, else `crash` with unknown tokens. A call that was parked at a hold closes as `hold`, with `hold_end` `crash`. A call relayed in the last batch window before a hard kill can go uncounted; it shows up as a `crash` record, never as a double count.
 - A client that disconnects cancels the upstream request, and the call is recorded as `client-disconnect` with unknown tokens. The provider may still bill a partial generation Hekma cannot see.
 
 ## Reading the records
@@ -122,7 +122,7 @@ A record carries:
 | `control_depth` | The Run's Control Depth at the call |
 | `binding` | The binding the call came through; `null` off a binding |
 | `disposition` | What the proxy did: `pass`, `block`, or `enforce` (refused under the `enforce` Scent-Check Mode); `hold`, `reroute` and `reject` are reserved |
-| `hold_end` | Always `null` until holds ship |
+| `hold_end` | How a held call ended: `released`, `rerouted`, `rejected`, `disconnect`, `shutdown` or `crash`; `null` for a call that was never held |
 | `outcome` | `completed`, `refused`, `upstream-error`, `client-disconnect`, `shutdown`, `crash` or `recovered` |
 | `status`, `status_class` | The status the client got (`null` when none) and its class: `2xx`, `3xx`, `4xx`, `5xx`, `refused` or `transport-error` |
 | `model` | The model the response or request named. A value that contains anything shaped like a Hekma credential (an `hk_run_`, `hk_ref_`, `hk_ann_` or `hk_pxy_` prefix in any case, followed by credential characters) reads back as `[redacted]` |
@@ -162,7 +162,7 @@ When reasons combine, the strongest wins: reject, then hold, then reroute. `hekm
 
 **Rerouting.** A route is one you stored with `hekma binding route add`. A rerouted call goes to the route's upstream with its own path after the binding prefix and its query, so set the route's base to fit the paths your client sends. A route with its own custodied key uses that key. Otherwise a Run whose provider key Hekma holds can be rerouted only to the origin its key is pinned to: a held key never leaves its origin. A reroute under a hold forwards the held calls to the route when the hold is released.
 
-**Seeing it.** A held Run that owns no process shows `held`, and `hekma ps` shows how many calls it holds and how long the oldest has waited. Run documents carry `dispositions`, `held_calls`, `oldest_held_at` and `last_hold_end` (how its most recent held call ended without a release: `disconnect` for a dropped connection, `shutdown` for a stop). Per-call records carry the disposition (`hold`, `reroute`, `reject`) and the `hold_end` (`released`, `rerouted`, `rejected`, `disconnect`, `shutdown`).
+**Seeing it.** A held Run that owns no process shows `held`, and `hekma ps` shows how many calls it holds and how long the oldest has waited. Run documents carry `dispositions`, `held_calls`, `oldest_held_at` and `last_hold_end` (how its most recent held call ended without a release: `disconnect` for a dropped connection, `shutdown` for a stop). Per-call records carry the disposition (`hold`, `reroute`, `reject`) and the `hold_end` (`released`, `rerouted`, `rejected`, `disconnect`, `shutdown`, or `crash` when the host was killed while the call was parked).
 
 ## Scent-Check
 
