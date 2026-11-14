@@ -925,3 +925,4 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-19-5-reconciliation-ingestion.md` (Authority)
   summary: The Control API cannot tell a Host from the Operator (one bearer class), so API submissions record `operator`.
   evidence: `crates/hekma-host/src/control/routes.rs` (`run_reconcile`). Trigger: a separate Host credential class (AD-20).
+

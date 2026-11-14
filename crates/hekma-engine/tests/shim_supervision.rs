@@ -260,7 +260,7 @@ fn a_shim_another_connection_holds_is_skipped_by_adoption_and_a_stop_still_ends_
     // Another engine's connection: the Shim's one control connection.
     let key = hekma_engine::shim::secret::host_key(state.path()).unwrap();
     let secret = hekma_engine::shim::secret::connection_secret(&key, &launch);
-    let (other, _) =
+    let (mut other, _) =
         hekma_engine::shim::connect(Path::new(&socket), &secret, Duration::from_secs(5)).unwrap();
     // This engine's adoption skips it (busy), and says so.
     let engine = open(state.path());
@@ -274,5 +274,82 @@ fn a_shim_another_connection_holds_is_skipped_by_adoption_and_a_stop_still_ends_
         assert!(Instant::now() < deadline, "the stop ended the child");
         std::thread::sleep(Duration::from_millis(50));
     }
+    // The holder takes the exit, so the Shim leaves at once (no linger).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while other.poll().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the Shim saw the exit");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    other.ack_exit().unwrap();
     drop(other);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Path::new(&socket).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the Shim left once its exit was taken"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_rotated_host_key_is_said_and_adoption_falls_back_to_the_fingerprint() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    manifest(dir.path(), "rotated", &["--linger-ms", "600000"]);
+    {
+        let engine = open(state.path());
+        let facade = engine.blocking();
+        facade
+            .register_with_adapter("rotated", &AdapterRef::Manifest(dir.path().to_path_buf()))
+            .unwrap();
+        facade.start("rotated").unwrap();
+    }
+    let (pid, _) = record(state.path());
+    // A new host key: every recorded secret now mismatches.
+    std::fs::remove_file(state.path().join("shim-host-key")).unwrap();
+    let engine = open(state.path());
+    let facade = engine.blocking();
+    let status = facade.instance_status("rotated").unwrap();
+    assert_eq!(status.instance.state, LifecycleState::Running, "{status:?}");
+    facade.stop("rotated", None).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive(pid) {
+        assert!(Instant::now() < deadline, "the stop ended the child");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_stop_reconnects_to_a_shim_that_was_busy_at_adoption() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    manifest(dir.path(), "freed", &["--linger-ms", "600000"]);
+    let first = open(state.path());
+    first
+        .blocking()
+        .register_with_adapter("freed", &AdapterRef::Manifest(dir.path().to_path_buf()))
+        .unwrap();
+    first.blocking().start("freed").unwrap();
+    let (pid, socket) = record(state.path());
+    // A second engine opens while the first holds the Shim: its adoption
+    // skips it. Then the first goes away, freeing the Shim.
+    let second = open(state.path());
+    drop(first);
+    let stopped = second.blocking().stop("freed", None).unwrap();
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive(pid) || Path::new(&socket).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the stop went through the Shim, which then left"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
