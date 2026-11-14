@@ -277,6 +277,9 @@ struct EngineInner {
     /// owning Service Host's supervisor holds), since its own supervisor is
     /// empty.
     read_only: bool,
+    /// Story 24-4 (AD-18 Step 0): the state directory's paths, held OUTSIDE
+    /// the registry mutex, so path arithmetic takes no lock.
+    paths: crate::paths::EnginePaths,
     registry: Mutex<Registry>,
     supervisor: Mutex<Supervisor>,
     /// The supervisor's event bus clone (story 7-2): held OUTSIDE the mutex so
@@ -617,12 +620,14 @@ impl Engine {
         let run_snapshot = Arc::clone(registry.run_publisher());
         let credential_reader = Mutex::new(registry.open_credential_reader(false)?);
         let calls_dir = registry.calls_dir();
+        let paths = registry.paths.clone();
         let leases = metering_proxy.leases;
         let identity_headers_flag = metering_proxy.identity_headers;
         let inner = Arc::new(EngineInner {
             metering_proxy: Mutex::new(proxy),
             metering_proxy_error: proxy_error,
             read_only: false,
+            paths,
             registry: Mutex::new(registry),
             supervisor: Mutex::new(supervisor),
             events,
@@ -688,10 +693,12 @@ impl Engine {
         let run_snapshot = Arc::clone(registry.run_publisher());
         let credential_reader = Mutex::new(registry.open_credential_reader(true)?);
         let calls_dir = registry.calls_dir();
+        let paths = registry.paths.clone();
         let inner = Arc::new(EngineInner {
             metering_proxy: Mutex::new(None),
             metering_proxy_error: None,
             read_only: true,
+            paths,
             registry: Mutex::new(registry),
             supervisor: Mutex::new(supervisor),
             events,
@@ -1382,13 +1389,11 @@ impl Engine {
 
     /// The engine-computed Agent Home path for `name` (display helper).
     ///
-    /// Pure path arithmetic — no I/O, no blocking pool needed.
+    /// Pure path arithmetic — no I/O, no blocking pool, and (story 24-4,
+    /// AD-18 Step 0) no lock: a stop holding the registry for seconds never
+    /// delays it.
     pub fn agent_home(&self, name: &InstanceName) -> PathBuf {
-        self.inner
-            .registry
-            .lock()
-            .expect("registry mutex poisoned")
-            .agent_home(name)
+        self.inner.paths.agent_home(name)
     }
 
     /// Register a new Agent Instance of a native `kind`.
@@ -3743,7 +3748,11 @@ impl Engine {
             if let Some(err) = capture_read_refusal(mode, &iname, true, &registry) {
                 return Err(err);
             }
-            Supervisor::read_agent_log(&registry, &name)
+            // Story 24-4 (AD-18 Step 0): the lookup and the paths under the
+            // guard; the whole-file read after it drops.
+            let paths = Supervisor::agent_log_paths(&registry, &name)?;
+            drop(registry);
+            Supervisor::read_agent_log_at(&paths)
         })
         .await
     }
@@ -3777,7 +3786,9 @@ impl Engine {
             if let Some(err) = capture_read_refusal(mode, &iname, true, &registry) {
                 return Err(err);
             }
-            Supervisor::read_agent_log_since(&registry, &name, cursor)
+            let paths = Supervisor::agent_log_paths(&registry, &name)?;
+            drop(registry);
+            Supervisor::read_agent_log_since_at(&paths, cursor)
         })
         .await
     }
@@ -5811,6 +5822,49 @@ mod tests {
             std::fs::read(&db).unwrap(),
             before,
             "the reads wrote nothing"
+        );
+    }
+
+    #[test]
+    fn agent_home_takes_no_lock_and_a_log_read_holds_the_registry_only_for_its_lookup() {
+        // Story 24-4 (AD-18 Step 0): with the registry mutex held by
+        // another thread, `agent_home` still answers at once (it used to
+        // block on the lock), and a log read's file work runs after the
+        // guard drops (the read returns the same lines either way).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        engine.blocking().register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        let expected = engine.inner.paths.agent_home(&name);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let inner = Arc::clone(&engine.inner);
+        let holder = std::thread::spawn(move || {
+            let _guard = inner.registry.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+        });
+        locked_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(engine.agent_home(&name), expected);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        // The split read answers what the one-piece read answered.
+        let log = expected.join("logs").join("output.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "").unwrap();
+        let registry = engine.inner.registry.lock().unwrap();
+        let whole = Supervisor::read_agent_log(&registry, "demo").unwrap();
+        let paths = Supervisor::agent_log_paths(&registry, "demo").unwrap();
+        drop(registry);
+        assert_eq!(Supervisor::read_agent_log_at(&paths).unwrap(), whole);
+        assert_eq!(
+            Supervisor::read_agent_log_since_at(&paths, 0).unwrap().1,
+            whole.1
+        );
+        assert!(
+            Supervisor::agent_log_paths(&engine.inner.registry.lock().unwrap(), "ghost").is_err()
         );
     }
 }
