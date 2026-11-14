@@ -40,12 +40,15 @@ struct Site {
     recent: VecDeque<Duration>,
 }
 
+/// One call site's key: the lock's name and where its guard was taken.
+type SiteKey = (&'static str, &'static Location<'static>);
+
 /// The shared switch and the per-site records of every [`TimedMutex`] an
-/// engine owns.
+/// engine owns (per engine, never a process global).
 #[derive(Debug, Default)]
 pub(crate) struct LockTiming {
     enabled: AtomicBool,
-    sites: Mutex<HashMap<(&'static str, &'static Location<'static>), Site>>,
+    sites: Mutex<HashMap<SiteKey, Site>>,
 }
 
 impl LockTiming {
