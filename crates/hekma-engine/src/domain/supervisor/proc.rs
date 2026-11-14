@@ -443,3 +443,242 @@ impl ProcessBackend for ProcBackend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::ports::LogCaptureMode;
+
+    fn spec(pipe_stdout: bool) -> SpawnSpec {
+        SpawnSpec {
+            exec: hekma_conformance::fake_agent_bin()
+                .to_string_lossy()
+                .into_owned(),
+            args: vec!["--linger-ms".to_string(), "600000".to_string()],
+            env: BTreeMap::new(),
+            working_dir: std::env::temp_dir(),
+            log_file: None,
+            attributed_log_path: None,
+            stderr_log_file: None,
+            instance_name: "proc-test".to_string(),
+            pipe_stdin: true,
+            pipe_stdout,
+            detach: false,
+            inherit_env: true,
+            capture_mode: LogCaptureMode::default(),
+        }
+    }
+
+    fn with_shim(exe: PathBuf, state: &Path) -> ProcBackend {
+        let mut backend = ProcBackend::new();
+        backend.set_shim(Some(ShimLauncher {
+            exe,
+            state_dir: state.to_path_buf(),
+        }));
+        backend
+    }
+
+    #[test]
+    fn direct_handles_debug_by_kind_and_report_no_shim() {
+        let backend = ProcBackend::new();
+        let mut handle = backend.spawn(&spec(false)).unwrap();
+        assert_eq!(format!("{handle:?}"), "ProcHandle::Direct");
+        assert!(backend.shim_endpoint(&handle).is_none());
+        assert!(backend.has_stdin(&handle));
+        assert!(!backend.stdin_timed_out(&handle));
+        let _ = backend.stop(&mut handle, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_missing_shim_program_fails_the_launch_and_acp_stays_direct() {
+        if !backends::shim_supported() {
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        let backend = with_shim(state.path().join("no-such-shim"), state.path());
+        let err = backend.spawn(&spec(false)).unwrap_err();
+        assert!(
+            err.to_string().contains("the Shim could not be started"),
+            "{err}"
+        );
+        // An ACP launch (piped stdout) never goes through the Shim.
+        let mut handle = backend.spawn(&spec(true)).unwrap();
+        assert!(matches!(handle, ProcHandle::Direct(_)));
+        let _ = backend.stop(&mut handle, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_shim_launch_debugs_its_socket_and_answers_every_verb() {
+        if !backends::shim_supported() {
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        let backend = with_shim(
+            hekma_conformance::test_support::shim_host_bin(),
+            state.path(),
+        );
+        let mut handle = backend.spawn(&spec(false)).unwrap();
+        let shown = format!("{handle:?}");
+        assert!(
+            shown.starts_with("ProcHandle::Shim") && shown.contains("socket"),
+            "{shown}"
+        );
+        let endpoint = backend.shim_endpoint(&handle).unwrap();
+        assert_eq!(endpoint.launch_id.len(), 32);
+        assert!(backend.pid(&handle) > 0);
+        assert_eq!(backend.fingerprint(&handle).pid, backend.pid(&handle));
+        assert!(backend.has_stdin(&handle));
+        assert!(!backend.stdin_timed_out(&handle));
+        assert!(backend.log_capture(&handle).is_none());
+        assert!(backend.take_stdin(&mut handle).is_none());
+        assert!(backend.take_stdout(&mut handle).is_none());
+        backend.write_stdin(&mut handle, b"hi\n").unwrap();
+        backend.pause(&mut handle).unwrap();
+        backend.resume(&mut handle).unwrap();
+        assert_eq!(backend.poll(&mut handle).unwrap(), ProcessStatus::Alive);
+        backend
+            .stop(&mut handle, Duration::from_millis(500))
+            .unwrap();
+        assert!(backend.poll(&mut handle).unwrap().is_exited());
+        // Stopped already: a second stop is a no-op, stdin is gone.
+        assert!(!backend.stop(&mut handle, Duration::ZERO).unwrap().forced);
+        assert!(!backend.has_stdin(&handle));
+        assert!(backend.self_fingerprint().is_some());
+        assert_eq!(
+            backend.probe_alive(&backend.fingerprint(&handle)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn reconnecting_finds_no_shim_a_foreign_secret_or_no_record() {
+        if !backends::shim_supported() {
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        let backend = ProcBackend::new();
+        let child = ProcessFingerprint::new(1, 1);
+        let mut record = crate::ports::SpawnRecord {
+            name: crate::domain::InstanceName::new("ghost").unwrap(),
+            fingerprint: child,
+            restart_policy: crate::domain::RestartPolicy::Never,
+            restart_count: 0,
+            last_known_cause: None,
+            detach: false,
+            acp_session_id: None,
+            run_id: None,
+            owner: None,
+            lease: None,
+            shim: None,
+        };
+        assert!(matches!(
+            backend.reacquire_shim(&record, state.path()).0,
+            ShimReacquire::None
+        ));
+        // A recorded socket nobody listens on.
+        record.shim = Some(crate::ports::ShimRecord {
+            socket: state.path().join("shims").join("s-gone.sock"),
+            launch_id: "aa".repeat(16),
+        });
+        let (found, note) = backend.reacquire_shim(&record, state.path());
+        assert!(matches!(found, ShimReacquire::None) && note.is_none());
+        // A Shim whose secret is not this launch's: refused, with a note.
+        let socket = state.path().join("shims").join("s-other.sock");
+        let listener = backends::shim_listen(&socket).unwrap();
+        let config = crate::shim::server::ShimConfig {
+            expected_secret_hash: [9u8; 32],
+            idle_linger: Duration::from_secs(2),
+            exit_linger: Duration::from_secs(2),
+        };
+        let server =
+            std::thread::spawn(move || crate::shim::server::serve(listener.as_ref(), config));
+        record.shim = Some(crate::ports::ShimRecord {
+            socket,
+            launch_id: "bb".repeat(16),
+        });
+        let (found, note) = backend.reacquire_shim(&record, state.path());
+        assert!(matches!(found, ShimReacquire::None));
+        assert!(
+            note.is_some_and(|note| note.contains("could not be reconnected")),
+            "a refused reconnect is said"
+        );
+        let _ = server.join();
+    }
+
+    #[test]
+    fn every_launch_and_reconnect_failure_is_a_typed_error() {
+        if !backends::shim_supported() {
+            return;
+        }
+        // A state directory that is a file: no host key can be made.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let backend = with_shim(hekma_conformance::test_support::shim_host_bin(), &file);
+        let err = backend.spawn(&spec(false)).unwrap_err().to_string();
+        assert!(err.contains("host key"), "{err}");
+        let endpoint = ShimEndpoint {
+            socket: file.join("s.sock"),
+            launch_id: "cc".repeat(16),
+        };
+        assert!(backend
+            .adopt_shim(&endpoint, &ProcessFingerprint::new(1, 1), &file)
+            .is_err());
+        // A `shims` path that is a file: the socket directory cannot be made.
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(state.path().join("shims"), b"x").unwrap();
+        let backend = with_shim(
+            hekma_conformance::test_support::shim_host_bin(),
+            state.path(),
+        );
+        let err = backend.spawn(&spec(false)).unwrap_err().to_string();
+        assert!(err.contains("Shim directory"), "{err}");
+        // A Shim that cannot launch the agent: the refusal names it.
+        let state = tempfile::tempdir().unwrap();
+        let backend = with_shim(
+            hekma_conformance::test_support::shim_host_bin(),
+            state.path(),
+        );
+        let mut missing = spec(false);
+        missing.exec = state
+            .path()
+            .join("no-such-agent")
+            .to_string_lossy()
+            .into_owned();
+        let err = backend.spawn(&missing).unwrap_err().to_string();
+        assert!(err.contains("could not launch it"), "{err}");
+        // A Shim that dies: its requests fail as control errors.
+        let mut handle = backend.spawn(&spec(false)).unwrap();
+        let socket = backend.shim_endpoint(&handle).unwrap().socket;
+        let shim = std::process::Command::new("pgrep")
+            .args(["-f", &socket.to_string_lossy()])
+            .output()
+            .unwrap();
+        let shim_pid = String::from_utf8_lossy(&shim.stdout)
+            .lines()
+            .next()
+            .unwrap()
+            .trim()
+            .to_string();
+        std::process::Command::new("kill")
+            .args(["-9", &shim_pid])
+            .status()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let err = backend.poll(&mut handle).unwrap_err().to_string();
+        assert!(err.contains("the agent's Shim"), "{err}");
+        // The child outlived its Shim; end it directly.
+        let child = backend.fingerprint(&handle);
+        if let Ok(Some(mut direct)) = backend.adopt(&child, false) {
+            let _ = backend.stop(&mut direct, Duration::from_millis(500));
+        }
+        // Direct handles hand their pipes over.
+        let plain = ProcBackend::new();
+        let mut direct = plain.spawn(&spec(false)).unwrap();
+        assert!(plain.take_stdin(&mut direct).is_some());
+        assert!(plain.take_stdout(&mut direct).is_none());
+        let _ = plain.stop(&mut direct, Duration::from_millis(500));
+    }
+}

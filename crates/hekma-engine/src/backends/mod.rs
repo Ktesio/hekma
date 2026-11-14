@@ -302,8 +302,17 @@ pub fn spawn_shim_process(
             command.env(key, value);
         }
     }
-    let child = spawn_detached_command(&mut command)?;
-    Ok(child.id())
+    let mut child = spawn_detached_command(&mut command)?;
+    let pid = child.id();
+    // The engine is the Shim's parent: reap it when it leaves, so a
+    // long-running host never collects zombies (the Shim outliving the
+    // engine is unaffected — the thread dies with the engine).
+    let _ = std::thread::Builder::new()
+        .name("hekma-shim-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    Ok(pid)
 }
 
 #[cfg(test)]
