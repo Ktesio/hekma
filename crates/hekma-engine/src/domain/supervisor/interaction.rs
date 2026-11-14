@@ -95,7 +95,7 @@ impl Supervisor {
         // below (no OS-conditional difference in delivering bytes to a
         // pipe). A missing handle, or one with no live stdin pipe (an
         // adopted instance), is a HARD error — never a silent success.
-        let Some(supervised) = self.running.get_mut(&name) else {
+        let Some(supervised) = self.instances.running.get_mut(&name) else {
             return Err(EngineError::InteractionUnavailable {
                 name: name.as_str().to_string(),
                 detail: "no live process handle is held in this engine session".to_string(),
@@ -209,7 +209,7 @@ impl Supervisor {
     /// token totals; a `None` simply means "no active Run" (current-run totals are
     /// zero). Held in memory alongside the process handle for this engine lifetime.
     pub fn current_run_id(&self, name: &InstanceName) -> Option<RunId> {
-        self.running.get(name).map(|s| s.run_id.clone())
+        self.instances.running.get(name).map(|s| s.run_id.clone())
     }
 
     /// Read the recorded [`TransitionEvent`]s for an instance from its log
@@ -405,7 +405,7 @@ impl Supervisor {
     /// CLI's read-only `logs --follow` asks the Service Host this to decide
     /// whether the raw fallback would double-report).
     pub(crate) fn has_live_capture(&self, name: &InstanceName) -> bool {
-        self.running.get(name).is_some_and(|supervised| {
+        self.instances.running.get(name).is_some_and(|supervised| {
             self.shared
                 .backend
                 .log_capture(&supervised.handle)

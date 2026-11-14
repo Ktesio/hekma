@@ -1401,8 +1401,8 @@ impl Supervisor {
         };
         // Story 4-2, Task 4: `handle` already exists (spawned above) and
         // carries a live `log_capture` (capture is unconditional, AC-E), but
-        // it is not YET in `self.running` (inserted below) — so the default
-        // `self.transition(...)`'s `self.running`-based lookup would miss
+        // it is not YET in `self.instances.running` (inserted below) — so the default
+        // `self.transition(...)`'s `self.instances.running`-based lookup would miss
         // it. Pass the capture explicitly so the `starting → running` line
         // lands in the attributed capture too.
         self.transition_with_log_capture(
@@ -1444,13 +1444,13 @@ impl Supervisor {
         // unconditionally would reset the pace every relaunch and strand
         // that contract (the growth machinery could never engage).
         if restart.is_none() {
-            self.requested_restart_streaks.remove(&name);
+            self.instances.requested_restart_streaks.remove(&name);
         }
         // Story 19-2: kept for the post-insert `block` evaluation (both move
         // into the `Supervised` below).
         let fence_run_id = run_id.clone();
         let fence_metering_source = metering_source.clone();
-        self.running.insert(
+        self.instances.running.insert(
             name.clone(),
             Supervised {
                 handle,

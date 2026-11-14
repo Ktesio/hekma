@@ -172,7 +172,7 @@ impl Supervisor {
         registry: &Registry,
         name: &InstanceName,
     ) -> crate::domain::registry_policy::InstanceContext {
-        match self.running.get(name) {
+        match self.instances.running.get(name) {
             Some(supervised) => crate::domain::registry_policy::InstanceContext {
                 metering_source: supervised.metering_source.clone(),
                 supervised: true,
@@ -285,6 +285,7 @@ impl Supervisor {
             String,
             crate::domain::registry_policy::InstanceContext,
         > = self
+            .instances
             .running
             .iter()
             .map(|(name, supervised)| {
@@ -521,7 +522,7 @@ impl Supervisor {
         // Then the process actions (only for instances this engine
         // supervises; D2: the caller applies them).
         for (name, breaches) in actions {
-            if !self.running.contains_key(&name) {
+            if !self.instances.running.contains_key(&name) {
                 // Not ours to act on (a foreign engine supervises the
                 // agent, or the process is gone): the breach stays
                 // recorded and published, and ONE diagnostic says so —
@@ -1029,6 +1030,7 @@ impl Supervisor {
     ) -> Result<Option<crate::domain::usage::UsageUpdateEvent>, crate::domain::error::RegistryError>
     {
         let metering_source = self
+            .instances
             .running
             .get(name)
             .map(|supervised| supervised.metering_source.clone())
