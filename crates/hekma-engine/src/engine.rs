@@ -2301,9 +2301,10 @@ impl Engine {
     /// Story 24-3: commit and publish the one `recovery` event that sums up
     /// this open's reconcile, once the Service Host has cleaned up after
     /// the previous owner (`runs_cleaned` agents stopped). `None` without a
-    /// recorded posture, and while the previous owner is still alive (an
-    /// in-place upgrade hands over; nothing was recovered). The host calls
-    /// it once per start.
+    /// recorded posture, while the previous owner is still alive (an
+    /// in-place upgrade hands over; nothing was recovered), and when the
+    /// open found nothing to reconcile (no agent left, no Shim lost, no
+    /// call left open). The host calls it once per start.
     pub async fn commit_recovery(
         &self,
         runs_cleaned: usize,
@@ -2321,6 +2322,15 @@ impl Engine {
             PreviousHost::Gone { handoff: true } => RecoveryPosture::On,
             PreviousHost::Gone { handoff: false } => RecoveryPosture::Off,
         };
+        // A start that found nothing to reconcile records nothing: the
+        // event marks work done, not every start.
+        if recovery.adopted.is_empty()
+            && recovery.shims_lost.is_empty()
+            && recovery.calls_closed_crash == 0
+            && recovery.calls_closed_recovered == 0
+        {
+            return Ok(None);
+        }
         let event = RecoveryEvent {
             schema_version: RECOVERY_SCHEMA_VERSION,
             change: RecoveryChange::Recovered,

@@ -258,5 +258,5 @@ The **O-items are Islam's rulings** (product and public-contract choices); the n
   - **Drift:**
     - an in-place upgrade (the previous owner `Live`) records none;
     - `runs_*` count agents, one process-owning Run each;
-    - a start after a clean stop records zero counts, which matches the I/O matrix's "second restart" row.
+    - a start that found nothing to reconcile (no agent left, no Shim lost, no call left open) records **no** event, unlike the I/O matrix's "second restart → `Recovery` with zero counts" row. A zero-count event on every start added an export row per restart and broke three pinned Control API export tests; the event marks work done. Recorded in the ledger for Islam.
   - **Still open:** the CLI `--json` derived fields.
