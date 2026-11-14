@@ -2543,6 +2543,17 @@ fn cause_suffix_and_engine_transition_line_text_cover_every_transition_cause() {
             TransitionCause::drain_stopped(false, 30_000),
             " (drain-stopped: timed out after 30000ms; stopped anyway)",
         ),
+        // Story 24-3: the crash-cleanup and the unconfirmed-adoption arms.
+        (
+            TransitionCause::EngineCrash,
+            " (cleanup after the previous host crashed)",
+        ),
+        (
+            TransitionCause::AdoptedUnconfirmed {
+                detail: "log line `ready`".to_string(),
+            },
+            " (adopted without the readiness answer: log line `ready`)",
+        ),
     ];
     for (cause, want_suffix) in cases {
         assert_eq!(cause_suffix(&cause), want_suffix, "{cause:?}");
@@ -11147,5 +11158,22 @@ fn this_engines_own_commits_never_reload_the_snapshot_and_a_foreign_commit_does(
         generation(&registry),
         after,
         "one foreign commit, one reload"
+    );
+}
+
+/// Story 24-3: a `starting` row that cannot be marked `running` at
+/// adoption says so (the transition-commit fault seam).
+#[test]
+fn a_starting_row_that_cannot_be_marked_running_at_adoption_is_noted() {
+    let (_state, _manifest, registry) = setup_fake("stg", &[]);
+    let mut sup = Supervisor::new();
+    let buffer = install_capture_sink(&mut sup);
+    let name = InstanceName::new("stg").unwrap();
+    sup.transition_fault_names.insert(name.clone());
+    sup.settle_adopted_starting(&registry, &name);
+    assert!(
+        sink_text(&buffer).contains("stg: adopted while starting, but could not be marked running"),
+        "{}",
+        sink_text(&buffer)
     );
 }

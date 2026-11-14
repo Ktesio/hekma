@@ -327,6 +327,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-18-1-readiness-probes.md` (review round 1, 2026-10-24)
   summary: The readiness tests' `free_port()` helper binds port 0, reads the port, and drops the listener — a TOCTOU window where another process can claim the port between the drop and the fake_agent's re-bind. A flake would look like a probe timeout or a bind failure in the wrong test. The std-only fix is a passed prebound `TcpListener` (the fake_agent inherits or re-uses it), which needs a fixture-side seam.
   evidence: `crates/hekma-engine/tests/readiness.rs` `free_port()` (bind 0 → local_addr → drop); `crates/hekma-conformance/src/bin/fake_agent.rs` `serve_http_ready` re-binds by number. Trigger: an observed CI flake on the http-get readiness tests — fix the seam, do not retry-loop the port grab.
+  **Resolved 2026-11-14 by the 24-3 phase 3 build:** a `starting` row with a live process is settled at adoption: `running` with `adopted-unconfirmed` naming the probe, or `adapter-ready` when none was declared. Re-running the probe at adoption is the stricter alternative, not built.
 
 ## Deferred from: review round 1 of spec-18-2 (2026-10-24)
 
@@ -973,7 +974,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 
 - source_spec: `spec-24-3-crash-recovery-and-registry-completeness.md` (T3: the completeness reconcile)
   summary: Not built yet:
-    - the mid-probe-wait `starting`-row arm;
+    - ~~the mid-probe-wait `starting`-row arm~~ (built in phase 3);
     - the `Recovery` summary event;
     - the estate-wide R1–R8 invariant check (open calls closed once, holds, Leases, latches and tokens intact, no claim naming a dead engine).
 

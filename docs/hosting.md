@@ -243,6 +243,12 @@ what the dead one recorded:
 Agents held directly die with the host only if the operating system takes
 their process group with it; those that survive are treated the same way.
 
+An agent the dead host was still starting is never left `starting`: if its
+process is alive, the next host marks it `running`. When its adapter
+declares a readiness probe, the probe's answer died with the host, so the
+transition says so (cause `adopted-unconfirmed`, naming the probe) instead
+of passing as an ordinary start.
+
 **In-place upgrades (a preview, Unix).** After installing a new `hekma`, run
 `hekma serve --upgrade` (or `POST /v0/host/upgrade`) to move the running host
 onto it without stopping agents or refusing a connection:

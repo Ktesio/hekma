@@ -2330,6 +2330,9 @@ fn cause_suffix(cause: &TransitionCause) -> String {
         TransitionCause::LaunchError { detail } => format!(" (launch error: {detail})"),
         TransitionCause::StopGraceful => String::new(),
         TransitionCause::EngineCrash => " (cleanup after the previous host crashed)".to_string(),
+        TransitionCause::AdoptedUnconfirmed { detail } => {
+            format!(" (adopted without the readiness answer: {detail})")
+        }
         TransitionCause::StopForced { detail } => format!(" (forced: {detail})"),
         TransitionCause::PauseBestEffort { detail } => format!(" (best-effort: {detail})"),
         TransitionCause::ResumeBestEffort { detail } => format!(" (best-effort: {detail})"),

@@ -667,3 +667,61 @@ fn a_dead_shim_degrades_to_direct_supervision_and_never_relaunches_its_live_agen
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// Story 24-3 (the 18-1 deferral): a row a dead host left `starting` is
+/// settled at adoption, never left `starting` — `running` with
+/// `adopted-unconfirmed` when a readiness probe was declared (its answer
+/// died with the host), plain `adapter-ready` when none was.
+#[test]
+fn a_row_left_starting_is_settled_at_adoption_and_names_an_unanswered_probe() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    use hekma_engine::TransitionCause;
+    let state = TempDir::new().unwrap();
+    let gated = TempDir::new().unwrap();
+    hekma_conformance::test_support::ManifestFixture::new(
+        "gated",
+        &[
+            "--ready-line",
+            "readiness-line-z9:50",
+            "--linger-ms",
+            "600000",
+        ],
+    )
+    .guaranteed_on_all_oses("interaction")
+    .readiness("kind = \"log-contains\"\ntimeout_ms = 8000\nline = \"readiness-line-z9\"")
+    .write(gated.path());
+    let plain = TempDir::new().unwrap();
+    manifest(plain.path(), "plain", &["--linger-ms", "600000"]);
+    {
+        let first = open(state.path());
+        let facade = first.blocking();
+        facade
+            .register_with_adapter("gated", &AdapterRef::Manifest(gated.path().to_path_buf()))
+            .unwrap();
+        facade
+            .register_with_adapter("plain", &AdapterRef::Manifest(plain.path().to_path_buf()))
+            .unwrap();
+        facade.start("gated").unwrap();
+        facade.start("plain").unwrap();
+    }
+    // The host "died mid-start": both rows read `starting`.
+    let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+    conn.execute("UPDATE agent_instances SET state = 'starting'", [])
+        .unwrap();
+    let second = open(state.path());
+    let facade = second.blocking();
+    for (name, expected) in [("gated", "adopted-unconfirmed"), ("plain", "adapter-ready")] {
+        let status = facade.instance_status(name).unwrap();
+        assert_eq!(status.instance.state, LifecycleState::Running, "{name}");
+        let last = facade.transition_events(name).unwrap().pop().unwrap();
+        assert_eq!(last.prior_state, LifecycleState::Starting, "{name}");
+        let kind = serde_json::to_value(&last.cause).unwrap()["kind"].clone();
+        assert_eq!(kind, expected, "{name}: {:?}", last.cause);
+        if let TransitionCause::AdoptedUnconfirmed { detail } = &last.cause {
+            assert!(detail.contains("readiness-line-z9"), "{detail}");
+        }
+        facade.stop(name, Some(Duration::from_secs(5))).unwrap();
+    }
+}
