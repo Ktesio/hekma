@@ -504,3 +504,12 @@ fn a_failed_commit_answers_every_job_in_the_batch_not_applied() {
     assert!(reader.get_instance(&name("doomed")).unwrap().is_none());
     create(&writer, "next").unwrap();
 }
+
+/// Story 24-3 (O1): the batch window is the only crash-loss window the docs
+/// state; it must stay inside the documented 5-second loss bound.
+#[test]
+fn the_unacked_batch_window_stays_inside_the_documented_loss_bound() {
+    assert_eq!(BATCH_WINDOW, Duration::from_millis(250));
+    assert_eq!(BATCH_MAX_EVENTS, 512);
+    assert!(BATCH_WINDOW < Duration::from_secs(5));
+}
