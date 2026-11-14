@@ -189,4 +189,20 @@ The **O-items are Islam's rulings** (product and public-contract choices); the n
     - T7, the flush-bound measurement.
 
     Each is in deferred-work.
+- 2026-11-14 — **phase 2 built** (stacked on 24-2 phase 4, #426): T4, the Shim-death matrix, on Unix.
+  - **What counts as lost.** Only a closed connection is a lost Shim: `UnexpectedEof`, `BrokenPipe`, `ConnectionReset`, `ConnectionAborted` or `NotConnected`. A timeout, a refusal or an unexpected frame stays a poll error on the existing streak path.
+  - **What the poll does.** On a loss it probes the child by fingerprint:
+    - alive → the handle is replaced by a direct handle re-held through the backend's adopt, so every later verb routes to the direct backend. Stdin is gone, and the teardown now ends the agent with the engine.
+    - gone, or no longer adoptable → `Exited { code: None }`, handed to the Restart Policy like any exit.
+  - **The note.** The reaper notes `<name>: its Shim is gone ...`. It was found because the old behaviour, an error streak after a Shim's death, would have crash-detected the live agent and relaunched it beside itself.
+  - **Drift:**
+    - no `supervised-degraded` Anomaly and no `shim lost` event (a note instead);
+    - the spawn record keeps naming the dead Shim (the next engine finds no socket and falls back to the fingerprint, as for a crash);
+    - a relaunch after a Shim-and-child death goes through a fresh Shim because every launch does, so nothing needed building there;
+    - Windows has no Shim yet.
+  - **Tests:**
+    - a real `kill -9` of a Shim under a live agent: noted, still `running`, no restart, and the direct stop ends it;
+    - a Shim and agent killed together: the instance leaves `running`;
+    - the classifier;
+    - the proc-level degrade, with `has_stdin` false and the stop working.
 

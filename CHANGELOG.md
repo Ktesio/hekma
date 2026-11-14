@@ -9,6 +9,7 @@ Release automation updates this file with a pull request after each `vMAJOR.MINO
 >
 > - **Each Service Host records its Handoff Mode in the state directory** before it adopts anything: on, off, or not chosen.
 > - **After a crash, the next host acts on that record.** With `--handoff` it reconnects to the dead host's agents. With `--no-handoff` it stops each one the ordinary way, and their Runs end with the new cause `engine-crash`, named in the started notice. With no mode chosen (the default), or no record, it adopts them as before. Detached starts are never stopped.
+> - **A Shim that dies no longer makes its live agent look crashed.** The host holds the agent directly from then on (no stdin; it no longer outlives the host), notes it, and never starts a second copy. An agent that died with its Shim is recorded as an exit whose code is unavailable.
 > - **Engine surface (breaking within the unreleased 0.12.0):** `TransitionCause` gains `EngineCrash` (`engine-crash`). Additive: `EngineOptions::host_posture` (`HandoffPosture`), `Engine::host_recovery` (`HostRecovery`, `PreviousHost`), and `Engine::clean_up_after_crash`. `state.db` migrates one way to schema 29.
 
 > **Unreleased — Handoff Mode and in-place upgrades, a preview (hekma-engine 0.12.0).**
