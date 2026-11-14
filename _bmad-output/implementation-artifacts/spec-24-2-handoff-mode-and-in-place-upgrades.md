@@ -228,3 +228,8 @@ The **O-items are Islam's rulings** (product and public-contract choices); the n
     - `control.json` does not carry the check (the route does).
 - 2026-11-14 — **phase 4 built** (stacked on phase 3, #425): T9's `self-update` trigger, on O4's recommended option (a). After a successful binary replacement, `hekma self-update` asks a host serving the default state root to hand over in place, through `serve --upgrade`'s own path, and waits for `control.json` to name the successor. With no host running it asks nothing and says so; if the upgrade fails, the note says to restart the host. The update itself never fails on it. `--no-restart` skips it. The host-present path is not unit-tested: it is `serve --upgrade`'s tested path. Only the no-host note is tested here, since `self-update` reaches the network.
 
+- 2026-11-14 — **phase 5 built** (stacked on 24-4 phase 4d, #436): T6's launchd half.
+  - **Detection:** a host whose `XPC_SERVICE_NAME` names a job (not unset, empty or `0`), and that systemd did not start, reads the job with `launchctl print system/<label>`, then `gui/<uid>/<label>`. It looks for `abandon process group` in the report's `properties` line.
+  - **The verdicts:** `verified` when the property is set. `unsafe` when it is not; the started notice names the plist key, not systemd's `KillMode`. `unverified` when the job cannot be read.
+  - **Tests:** unit-tested through the `launchd_check` seam, the properties parser, and the real query against an unknown label. The parser was checked by hand against real `launchctl print` output on macOS 27. No LaunchAgent is installed by any test.
+  - **Still unchecked:** Docker, supervisord and Windows job breakaway.
