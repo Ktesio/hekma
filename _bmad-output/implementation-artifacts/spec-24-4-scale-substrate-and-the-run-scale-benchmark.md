@@ -230,3 +230,10 @@ Each is a public-contract or product choice; the recommendation is the spec's cu
   - **Moved onto `EngineInner`:** the log-capture posture (fixed at open) and, for the test seam, the custody cache. `Engine::log_capture_mode` takes no lock; a test holds both engine locks on another thread and gets its answer in under a second.
   - **Now ordered:** `refresh_bypass_hosts`, `with_diagnostics`, `has_live_capture` and the stop-fault test seam take the registry first and the supervisor through `after`. None runs with the registry already held, and each already waited behind any start, which holds both locks.
   - **Removed:** `SupervisorCell::alone()`, so the supervisor is reachable only beside a registry guard. `.ad17-debt.txt` is empty, and the ratchet still fails CI on any bare `.lock()` or `alone()` that comes back.
+- 2026-11-14 — **phase 4f (built): the store gate, and Step 3 re-scoped** (stacked on phase 4e, #440).
+  - **The gate:** `RegistryCell::gate(|registry| …)` runs one registry call and releases the lock before returning; the guard never reaches the caller. All 19 single-call registry sites in `engine.rs` go through it. This replaces the spec's one-forwarding-method-per-Registry-method shape: the closure gives the same guarantee without 19 hand-written forwards.
+  - **Step 3 re-scoped:** the named single-file splits are **not taken**, per the plan's own abort rule ("stop and re-scope, record it here").
+    - `set_config`, `register_with_adapter`, `effective_config`, `resolve_secrets` and `write_effective_config_snapshot` each read, modify and write the Agent Home's `config.toml` or snapshot under the registry lock. That lock is what serializes two concurrent writers of the same file. Moving the file half off it would turn the lost-update window into a real race, unlike `remove`'s delete, which nothing else writes.
+    - These sites shrink only with a per-instance lock, which is Step 5, explicitly not taken.
+    - The histogram's falling max hold is shown for `remove` (phase 4d), which was the wedge the spec named.
+
