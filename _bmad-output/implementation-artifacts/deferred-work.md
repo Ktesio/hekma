@@ -989,7 +989,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-24-3-crash-recovery-and-registry-completeness.md` (T5, T6, T7)
   summary: Not built yet:
     - the full `kill -9` drill matrix (a parked hold, in-flight calls, Leases and `wire`/`announced` Runs, both modes, the Windows `taskkill /F` leg);
-    - SM-7's auditor and its seven scenarios;
+    - ~~SM-7's auditor~~ (built in phase 4, asserted in six scenarios; still missing: the socket-activated scenario and an SDK-shaped client harness);
     - the flush-bound measurement and its docs.
 
   Phase 1 tests the posture split with a real SIGKILL on Unix only.

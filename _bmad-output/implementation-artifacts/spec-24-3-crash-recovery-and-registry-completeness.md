@@ -212,4 +212,23 @@ The **O-items are Islam's rulings** (product and public-contract choices); the n
   - **Why not re-run the probe.** Of the spec's two honest arms, this builds "adopted with the gate's honesty note" rather than re-running the probe at adoption. A re-run needs the start path's probe-wait machinery (and its timeout teardown) inside adoption, which blocks the engine's open for the probe's whole budget. It is recorded as a possible follow-up.
   - **Drift:** `TransitionCause` gains a variant (breaking within the unreleased 0.12.0).
   - **Tests:** a real Shim-held gated and ungated pair whose rows are forced back to `starting`, then adopted by the next engine (the cause and the probe's name checked). The adoption, readiness and Shim suites, plus the engine library, all pass (1,478 tests).
+- 2026-11-14 — **phase 4 built** (stacked on phase 3, #428): T6, SM-7's auditor and its scenarios.
+  - **The auditor.** `hekma_conformance::sm7` reads the outbox in `state.db` and maps every initiating stop-, pause- or block-class action onto NFR-9's clauses. Unmapped actions are reported by sequence number and name:
+    - `→ stopping` and `running → paused`, by cause;
+    - a `starting → failed` readiness timeout;
+    - `hold` and `reject` dispositions;
+    - non-`warn` breaches.
+
+    Consequence edges are ignored.
+  - **The cause table** is pinned by unit tests. A verb and a Handoff-off shutdown share the `stop` command on the wire, so they are one clause.
+  - **Scenarios asserting it, with the exact actions taken:**
+    - SIGTERM with Handoff on (none) and off (the shutdown's stop);
+    - the in-place upgrade (none);
+    - `kill -9` with Handoff off (the cleanup), on (none) and unchosen (none);
+    - Shim death (none).
+  - **Drift:**
+    - No socket-activated restart scenario: Hekma has no socket activation yet.
+    - No SDK-shaped `wire`/`announced` client harness measuring retryable errors client-side. The upgrade's zero-refused-connections poller is the client-side measure that exists.
+    - The suite is the existing tests, not a separate `sm7_no_unrequested_stops.rs` file.
+    - It runs on every PR wherever those tests run (O3), but they run only on Unix, since the Shim is Unix-only.
 

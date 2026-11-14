@@ -641,6 +641,9 @@ fn a_dead_shim_degrades_to_direct_supervision_and_never_relaunches_its_live_agen
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(alive(pid), "the agent outlives its Shim");
+    // SM-7: a Shim's death stops, pauses and blocks nothing.
+    let actions = hekma_conformance::sm7::audit_state_dir(state.path());
+    assert!(actions.is_empty(), "{actions:?}");
     let status = facade.instance_status("lone").unwrap();
     assert_eq!(status.instance.state, LifecycleState::Running, "{status:?}");
     assert_eq!(status.restart_count, 0, "never relaunched beside itself");
