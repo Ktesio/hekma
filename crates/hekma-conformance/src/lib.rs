@@ -61,6 +61,7 @@ use hekma_adapter_api::{
 };
 
 pub mod gateway;
+pub mod sm7;
 pub mod tck;
 pub mod test_notes;
 pub mod test_support;
