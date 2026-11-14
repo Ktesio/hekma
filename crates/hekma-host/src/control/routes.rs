@@ -2319,6 +2319,14 @@ pub(crate) async fn binding_credentials(
 }
 
 /// `GET /v0/proxy` (Operator bearer only) — where the shared Metering
+/// `GET /v0/host` (story 24-2, Operator bearer only): this Service Host —
+/// its pid and version, its Handoff Mode, and whether the service manager
+/// keeps agents in their own Shim running when it stops
+/// (`handoff_check`: `verified`, `unsafe` or `unverified`, with the detail).
+pub(crate) async fn host_show(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    Json((*state.host).clone())
+}
+
 /// Story 24-2: the refusal where the OS has no hand-over.
 fn upgrade_available(supported: bool) -> ApiResult<()> {
     if supported {

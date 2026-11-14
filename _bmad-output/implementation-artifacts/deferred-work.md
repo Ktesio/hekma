@@ -953,6 +953,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 
 - source_spec: `spec-24-2-handoff-mode-and-in-place-upgrades.md` (T6: service-manager checks)
   summary: No `KillMode` (systemd) or job breakaway (Windows) check, and no `handoff_check` on `control.json` or a `GET /v0/host`. A manager that kills the whole cgroup takes the Shims down with the host.
+  **Partly resolved 2026-11-14 (phase 3):** the systemd `KillMode` check and `GET /v0/host` are built. Still open: Windows job breakaway, launchd, and `control.json` carrying the check.
   evidence: `crates/hekma-host/src/lib.rs`. Trigger: the next 24-2 phase, before the default flip.
 
 - source_spec: `spec-24-2-handoff-mode-and-in-place-upgrades.md` (T7: the hand-over report and events)

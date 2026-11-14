@@ -215,6 +215,20 @@ notice says so when Handoff Mode is on without Shims. After a plain stop,
 nothing serves the metering proxy or the Control API until the next host
 starts, and calls in that window are refused.
 
+**Your service manager must leave the Shims alone.** Handoff Mode and
+in-place upgrades keep agents running only if whatever stops the host stops
+the host's own process and nothing else. When agents run in their own Shim,
+the started notice says what Hekma could check, and `GET /v0/host` carries
+it as `handoff_check`:
+
+- **systemd** keeps them with `KillMode=process` or `none`. The default, `control-group`, and `mixed` stop them with the host. Hekma reports `verified` or `unsafe`, naming the unit and its setting.
+- **launchd** keeps them with `AbandonProcessGroup=true`; the default stops them. Hekma reports `unverified`, with how to check.
+- **A container** ends every process in it when it stops. Hekma reports `unverified`.
+- **Windows** is not checked yet: `unverified`.
+
+Hekma never refuses to start on `unsafe`: it warns, and stopping every agent
+with the host remains a working configuration.
+
 **After a crash.** A host that is killed (`kill -9`, out of memory, a power
 cut) cannot stop anything. Each host records in the state directory, before
 it adopts anything, which Handoff Mode it runs, and the next host acts on

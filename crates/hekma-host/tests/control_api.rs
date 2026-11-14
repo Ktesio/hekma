@@ -6980,3 +6980,26 @@ fn the_metering_listen_value_is_a_port_or_an_ip_literal_and_port() {
         assert!(message.contains("IP literal"), "{bad}: {message}");
     }
 }
+
+/// Story 24-2: `GET /v0/host` names this host, its Handoff Mode and the
+/// service-manager check, settled at start.
+#[test]
+fn the_host_route_names_the_mode_and_the_service_manager_check() {
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
+    let client = client();
+    let mut response = get_ok(&client, &server.addr, "/v0/host");
+    let host = json_body(&mut response);
+    assert_eq!(host["pid"], std::process::id());
+    assert_eq!(host["handoff"], false);
+    assert_eq!(host["handoff_chosen"], false);
+    assert_eq!(host["shim"], false);
+    assert!(
+        ["verified", "unsafe", "unverified"].contains(&host["handoff_check"].as_str().unwrap()),
+        "{host}"
+    );
+    assert!(host["handoff_check_detail"]
+        .as_str()
+        .is_some_and(|d| !d.is_empty()));
+}

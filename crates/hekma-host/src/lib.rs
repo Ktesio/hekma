@@ -38,6 +38,7 @@ mod drain;
 mod local;
 mod lock;
 mod otlp;
+mod service_manager;
 mod signals;
 pub mod wire;
 
@@ -1010,10 +1011,24 @@ where
         }
     }
 
-    // Story 24-2: say what a shutdown will do to the agents.
+    // Story 24-2: say what a shutdown will do to the agents, and whether
+    // the service manager would take them down with this host anyway.
     if let Some(note) = handoff_note(handoff, shim_launches) {
         notifier.note(note);
     }
+    let handoff_check = service_manager::check();
+    if shim_launches {
+        notifier.note(&handoff_check.note());
+    }
+    let host_doc = serde_json::json!({
+        "pid": std::process::id(),
+        "hekma_version": build_version.clone().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+        "handoff": handoff,
+        "handoff_chosen": handoff_chosen,
+        "shim": shim_launches,
+        "handoff_check": handoff_check.as_str(),
+        "handoff_check_detail": handoff_check.detail(),
+    });
 
     // (5.5) The Control API mounts here: AFTER the engine opens and the
     // started notice lands, BEFORE the signal wait. The LOCAL endpoint
@@ -1070,6 +1085,7 @@ where
         note_tap,
         notifier.sink.clone(),
         set_token_ttl_override,
+        host_doc,
     )) {
         Ok(api) => api,
         Err(message) => {

@@ -219,4 +219,11 @@ The **O-items are Islam's rulings** (product and public-contract choices); the n
     - T11, the default flip.
 
     Each is in deferred-work.
+- 2026-11-14 — **phase 3 built** (stacked on 24-3 phase 1, #424): the service-manager check (T6) and `GET /v0/host` (T9's read).
+  - **T6:** `crates/hekma-host/src/service_manager.rs`, read-only and run once at start. Under systemd (`INVOCATION_ID` set) the unit is named from `/proc/self/cgroup` (a user unit asks `systemctl --user`) and `systemctl show --value -p KillMode <unit>` is classified: `process`/`none` → `verified`, `control-group`/`mixed` → `unsafe`, with a warning naming the setting and the fix. An unknown value, an unreadable query, an unnamed unit, or no systemd at all → `unverified`, with how to check. When agents run in their own Shim, the started notice carries it. It never refuses to start (O5). The checker is runtime-checked, not cfg'd, and its classification is unit-tested with an injected query.
+  - **T9 (read half):** `GET /v0/host` (Operator) → `{pid, hekma_version, handoff, handoff_chosen, shim, handoff_check, handoff_check_detail}`.
+  - **Drift:**
+    - Windows job breakaway is not checked (`unverified`);
+    - launchd is `unverified` (no reliable read of `AbandonProcessGroup` from inside the job);
+    - `control.json` does not carry the check (the route does).
 
