@@ -619,7 +619,7 @@ impl Supervisor {
                     // poll alone stands.
                     let child_ended = match self.running.get_mut(&name) {
                         Some(supervised) => matches!(
-                            self.backend.poll(&mut supervised.handle),
+                            self.shared.backend.poll(&mut supervised.handle),
                             Ok(status) if status.is_exited()
                         ),
                         None => false,

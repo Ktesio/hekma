@@ -171,7 +171,7 @@ impl Supervisor {
                 let pid = self
                     .running
                     .get(&name)
-                    .map(|supervised| self.backend.pid(&supervised.handle));
+                    .map(|supervised| self.shared.backend.pid(&supervised.handle));
                 pid.and_then(|pid| self.injected_poll_fault(pid))
             };
             #[cfg(not(test))]
@@ -180,13 +180,13 @@ impl Supervisor {
                 Some(supervised) if supervised.stop_unconfirmed => {
                     let status = match injected {
                         Some(source) => Err(source),
-                        None => self.backend.poll(&mut supervised.handle),
+                        None => self.shared.backend.poll(&mut supervised.handle),
                     }
                     .map_err(|source| EngineError::Backend {
                         name: name.as_str().to_string(),
                         source,
                     })?;
-                    let log_capture = self.backend.log_capture(&supervised.handle);
+                    let log_capture = self.shared.backend.log_capture(&supervised.handle);
                     Some((status, log_capture))
                 }
                 _ => None,
@@ -260,14 +260,16 @@ impl Supervisor {
                 // otherwise by the child's fingerprint (an explicit stop
                 // acts even when another engine holds the Shim).
                 let adopted = match self
+                    .shared
                     .backend
                     .reacquire_shim(&record, registry.paths.state_base())
                     .0
                 {
                     proc::ShimReacquire::Held(handle) => Ok(Some(handle)),
-                    proc::ShimReacquire::Busy | proc::ShimReacquire::None => {
-                        self.backend.adopt(&record.fingerprint, record.detach)
-                    }
+                    proc::ShimReacquire::Busy | proc::ShimReacquire::None => self
+                        .shared
+                        .backend
+                        .adopt(&record.fingerprint, record.detach),
                 };
                 match adopted {
                     Ok(Some(handle)) => {
@@ -436,7 +438,7 @@ impl Supervisor {
                                 .to_string(),
                         });
                     }
-                    self.backend.resume(&mut supervised.handle)
+                    self.shared.backend.resume(&mut supervised.handle)
                 });
                 match resume_outcome {
                     Some(Ok(())) => {
@@ -505,7 +507,7 @@ impl Supervisor {
         // background tailer thread to stop) has run yet.
         let (outcome, log_capture) = match self.running.get_mut(&name) {
             Some(supervised) => {
-                let log_capture = self.backend.log_capture(&supervised.handle);
+                let log_capture = self.shared.backend.log_capture(&supervised.handle);
                 // Epic 20-1 coverage seam (cfg(test) only — the established
                 // fault-injection idiom, see the `stop_fault_pids` field
                 // docs): an armed fault ALSO fronts the LADDER's windowed
@@ -515,14 +517,14 @@ impl Supervisor {
                 // arms pin exactly that scenario; production is unchanged).
                 #[cfg(test)]
                 let raw_stop = {
-                    let pid = self.backend.pid(&supervised.handle);
+                    let pid = self.shared.backend.pid(&supervised.handle);
                     match Self::injected_zero_stop(&self.stop_fault_pids, pid) {
                         Some(faulted) => faulted,
-                        None => self.backend.stop(&mut supervised.handle, window),
+                        None => self.shared.backend.stop(&mut supervised.handle, window),
                     }
                 };
                 #[cfg(not(test))]
-                let raw_stop = self.backend.stop(&mut supervised.handle, window);
+                let raw_stop = self.shared.backend.stop(&mut supervised.handle, window);
                 let outcome = raw_stop.map_err(|source| match source {
                     // Fix pass (review of #80 follow-up — the CRITICAL
                     // finding): mark the handle so a RETRY `stop` (or the
@@ -1062,7 +1064,7 @@ impl Supervisor {
         let outcome = run_bounded_command(
             &registry.agent_home(name),
             &launch,
-            self.pause_command_cap,
+            self.shared.pause_command_cap,
             BOUNDED_COMMAND_POLL,
         );
         match outcome {
@@ -1089,7 +1091,7 @@ impl Supervisor {
                     detail: format!(
                         "the command outlived its {}s standalone bound and was killed; \
                          the lifecycle change was not applied",
-                        self.pause_command_cap.as_secs(),
+                        self.shared.pause_command_cap.as_secs(),
                     ),
                 });
             }
@@ -1220,8 +1222,8 @@ impl Supervisor {
             });
         }
         let result = match command {
-            LifecycleCommand::Pause => self.backend.pause(&mut supervised.handle),
-            _ => self.backend.resume(&mut supervised.handle),
+            LifecycleCommand::Pause => self.shared.backend.pause(&mut supervised.handle),
+            _ => self.shared.backend.resume(&mut supervised.handle),
         };
         result.map_err(|source| EngineError::Backend {
             name: name.as_str().to_string(),
@@ -1307,7 +1309,9 @@ impl Supervisor {
             // degrades to the resume attempt below (a single un-pollable
             // read is not crash evidence — that is poll_once's corroboration
             // discipline, AI-12 — and teardown must not invent a crash).
-            if let Ok(ProcessStatus::Exited { code }) = self.backend.poll(&mut supervised.handle) {
+            if let Ok(ProcessStatus::Exited { code }) =
+                self.shared.backend.poll(&mut supervised.handle)
+            {
                 self.reconcile_released_exit(registry, &name, code);
                 continue;
             }
@@ -1364,7 +1368,8 @@ impl Supervisor {
                     },
                 })
             } else {
-                self.backend
+                self.shared
+                    .backend
                     .resume(&mut supervised.handle)
                     .map_err(|source| EngineError::Backend {
                         name: name.as_str().to_string(),
@@ -1373,6 +1378,7 @@ impl Supervisor {
             };
             #[cfg(not(test))]
             let resume = self
+                .shared
                 .backend
                 .resume(&mut supervised.handle)
                 .map_err(|source| EngineError::Backend {

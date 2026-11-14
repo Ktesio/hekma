@@ -1136,6 +1136,7 @@ fn stop_on_a_stopping_instance_without_the_unconfirmed_flag_takes_the_ordinary_p
     // Teardown.
     let supervised = sup.running.get_mut(&name).unwrap();
     let _ = sup
+        .shared
         .backend
         .stop(&mut supervised.handle, Duration::from_secs(2));
 }
@@ -1184,6 +1185,7 @@ fn stop_retry_on_a_stuck_unconfirmed_instance_polls_cheaply_no_compounding() {
     // leak past this test.
     let supervised = sup.running.get_mut(&name).unwrap();
     let _ = sup
+        .shared
         .backend
         .stop(&mut supervised.handle, Duration::from_secs(2));
 }
@@ -1209,7 +1211,10 @@ fn stop_retry_on_a_stuck_unconfirmed_instance_maps_a_poll_failure_honestly() {
     sup.running.get_mut(&name).unwrap().stop_unconfirmed = true;
 
     // Arm the poll fault for THIS handle's pid, then retry the stop.
-    let pid = sup.backend.pid(&sup.running.get(&name).unwrap().handle);
+    let pid = sup
+        .shared
+        .backend
+        .pid(&sup.running.get(&name).unwrap().handle);
     sup.arm_poll_fault(pid);
 
     let start = Instant::now();
@@ -1239,6 +1244,7 @@ fn stop_retry_on_a_stuck_unconfirmed_instance_maps_a_poll_failure_honestly() {
     // live process, never the faulted poll.
     let supervised = sup.running.get_mut(&name).unwrap();
     let _ = sup
+        .shared
         .backend
         .stop(&mut supervised.handle, Duration::from_secs(2));
 }
@@ -1268,7 +1274,8 @@ fn stop_retry_self_heals_once_the_stuck_process_actually_exits() {
     // BOOKKEEPING pretends it was), so this succeeds quickly.
     {
         let supervised = sup.running.get_mut(&name).unwrap();
-        sup.backend
+        sup.shared
+            .backend
             .stop(&mut supervised.handle, Duration::from_secs(2))
             .expect("the process is not genuinely stuck in this test and must die promptly");
     }
@@ -1575,7 +1582,7 @@ fn adopt_orphans_takes_the_lease_when_adopting_a_dead_owners_record() {
         "the dead lease turns over"
     );
     assert!(sup2.running.contains_key(&name), "the handle is re-held");
-    let self_fp = sup2.backend.self_fingerprint().unwrap();
+    let self_fp = sup2.shared.backend.self_fingerprint().unwrap();
     let after = registry.spawn_record(&name).unwrap().unwrap();
     assert_eq!(
         after.lease,
@@ -1614,7 +1621,7 @@ fn adopt_orphans_re_adopts_without_a_new_cas_when_the_lease_already_names_this_p
         1,
         "the first adoption takes the lease"
     );
-    let self_fp = sup2.backend.self_fingerprint().unwrap();
+    let self_fp = sup2.shared.backend.self_fingerprint().unwrap();
     assert_eq!(
         registry.spawn_record(&name).unwrap().unwrap().lease,
         Some(self_fp)
@@ -3446,7 +3453,7 @@ fn send_input_past_the_stdin_pipe_buffer_times_out_and_poisons_the_handle_until_
     //
     //   1. `Err(BackendError::StdinTimedOut { .. })` =>
     //      `EngineError::InteractionTimedOut` — the mapping arm.
-    //   2. The `self.backend.stdin_timed_out(..)` PRE-FLIGHT early return —
+    //   2. The `self.shared.backend.stdin_timed_out(..)` PRE-FLIGHT early return —
     //      a handle whose prior write timed out is permanently poisoned for
     //      the rest of this engine session (`StdinState::TimedOut` is never
     //      recoverable; only a stop+start builds a fresh pipe), so a SECOND
@@ -3787,7 +3794,10 @@ fn poll_once_handle_specific_poll_failure_wiring_lands_failed_and_removes_the_ha
     sup.start(&registry, "wired").unwrap();
 
     // Arm the seam: every poll of THIS handle now errors.
-    let pid = sup.backend.pid(&sup.running.get(&name).unwrap().handle);
+    let pid = sup
+        .shared
+        .backend
+        .pid(&sup.running.get(&name).unwrap().handle);
     sup.arm_poll_fault(pid);
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -3842,13 +3852,13 @@ fn poll_once_multi_handle_same_tick_failure_is_environmental_and_keeps_handles_a
     sup.start(&registry, "envb").unwrap();
     let sink = install_capture_sink(&mut sup);
 
-    let pid_a = sup.backend.pid(
+    let pid_a = sup.shared.backend.pid(
         &sup.running
             .get(&InstanceName::new("enva").unwrap())
             .unwrap()
             .handle,
     );
-    let pid_b = sup.backend.pid(
+    let pid_b = sup.shared.backend.pid(
         &sup.running
             .get(&InstanceName::new("envb").unwrap())
             .unwrap()
@@ -4772,13 +4782,13 @@ fn the_environmental_tick_cap_escalates_once_then_resumes_crash_credit() {
     let buffer = install_capture_sink(&mut sup);
     sup.start(&registry, "envcap-a").unwrap();
     sup.start(&registry, "envcap-b").unwrap();
-    let pid_a = sup.backend.pid(
+    let pid_a = sup.shared.backend.pid(
         &sup.running
             .get(&InstanceName::new("envcap-a").unwrap())
             .unwrap()
             .handle,
     );
-    let pid_b = sup.backend.pid(
+    let pid_b = sup.shared.backend.pid(
         &sup.running
             .get(&InstanceName::new("envcap-b").unwrap())
             .unwrap()
@@ -5021,7 +5031,8 @@ fn crash_cause_for_a_signal_death_says_signal_without_inventing_a_code() {
     let name = InstanceName::new("sigdeath").unwrap();
     {
         let supervised = sup.running.get_mut(&name).unwrap();
-        sup.backend
+        sup.shared
+            .backend
             .stop(&mut supervised.handle, Duration::from_secs(5))
             .expect("the out-of-band kill must succeed promptly");
     }
@@ -5074,7 +5085,10 @@ fn persistent_poll_failure_with_a_live_sibling_handle_names_no_sole_handle() {
     sup.start(&registry, "lone").unwrap();
     sup.start(&registry, "sib").unwrap();
     let lone = InstanceName::new("lone").unwrap();
-    let pid = sup.backend.pid(&sup.running.get(&lone).unwrap().handle);
+    let pid = sup
+        .shared
+        .backend
+        .pid(&sup.running.get(&lone).unwrap().handle);
     sup.arm_poll_fault(pid);
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -5651,7 +5665,7 @@ fn the_release_pass_reconciles_an_already_dead_paused_child() {
     // by signal — the release-time discovery premise).
     let pid = {
         let supervised = sup.running.get(&name).unwrap();
-        sup.backend.pid(&supervised.handle)
+        sup.shared.backend.pid(&supervised.handle)
     };
     test_kill_pid(pid);
     // Bounded wait until the death is reaped (poll reaps the direct child).
@@ -5659,7 +5673,8 @@ fn the_release_pass_reconciles_an_already_dead_paused_child() {
     loop {
         let exited = {
             let supervised = sup.running.get_mut(&name).unwrap();
-            sup.backend
+            sup.shared
+                .backend
                 .poll(&mut supervised.handle)
                 .map(|status| status.is_exited())
                 .unwrap_or(true)
@@ -6305,7 +6320,8 @@ fn metadata_unlink_covers_the_crash_reap_path_too() {
     // path runs, so the reaper's crash reap is the only cleanup left.
     {
         let supervised = sup.running.get_mut(&name).unwrap();
-        sup.backend
+        sup.shared
+            .backend
             .stop(&mut supervised.handle, Duration::from_secs(2))
             .expect("the external kill lands promptly");
     }
@@ -6689,7 +6705,7 @@ fn a_zero_stable_run_window_override_is_ignored_with_a_diagnostic() {
     let buffer = install_capture_sink(&mut sup);
     sup.override_stable_run_window(Duration::ZERO);
     assert_eq!(
-        sup.stable_run_window, STABLE_RUN_WINDOW,
+        sup.shared.stable_run_window, STABLE_RUN_WINDOW,
         "a zero override must NOT land — the production window stays"
     );
     let text = sink_text(&buffer);
@@ -6700,7 +6716,7 @@ fn a_zero_stable_run_window_override_is_ignored_with_a_diagnostic() {
     // And the seam still works for a real (non-zero) override.
     sup.override_stable_run_window(Duration::from_millis(40));
     assert_eq!(
-        sup.stable_run_window,
+        sup.shared.stable_run_window,
         Duration::from_millis(40),
         "a valid override must still land"
     );
@@ -6733,7 +6749,7 @@ fn held_pid(sup: &Supervisor, name: &InstanceName) -> u32 {
         .get(name)
         .unwrap_or_else(|| panic!("{name} must be held"))
         .handle;
-    sup.backend.pid(handle)
+    sup.shared.backend.pid(handle)
 }
 
 #[test]
@@ -8970,7 +8986,7 @@ fn a_policy_change_publishes_on_the_bus_in_commit_order() {
         },
     )
     .unwrap();
-    let mut receiver = sup.events.subscribe();
+    let mut receiver = sup.shared.events.subscribe();
     sup.change_policy(
         &registry,
         crate::domain::PolicyChange {

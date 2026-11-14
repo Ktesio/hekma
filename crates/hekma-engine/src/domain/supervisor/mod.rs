@@ -779,6 +779,49 @@ pub(crate) enum ServeOptionsRefused {
     AlreadyApplied,
 }
 
+/// AD-18 Step 4: the supervisor's shared, `&self`-shaped state — the
+/// process backend, the restart schedule, the event bus, the usage source,
+/// the proxy's evaluation inbox and the fixed windows. None of it is
+/// per-instance, so a later step can hand it out without the supervisor
+/// lock.
+pub(crate) struct SupervisorShared {
+    pub(crate) backend: proc::ProcBackend,
+    pub(crate) usage_source: SelfReportedUsageSource,
+    pub(crate) backoff: BackoffSchedule,
+    /// The event bus (story 7-2, FR-33): publishes at the three commit points
+    /// (transition append, breach append, usage-ingestion commit) so a
+    /// subscriber observes exactly the committed truth in commit order. The
+    /// engine holds its own clone ([`Supervisor::event_bus`]) so
+    /// `subscribe()` never takes the supervisor lock.
+    pub(crate) events: EventBus,
+    /// Story 23-1 — the proxy's evaluation inbox: committed proxied closes
+    /// wait here for the reaper tick to publish them and act.
+    pub(crate) inbox: Arc<crate::domain::pipeline::EvaluationInbox>,
+    /// Story 18-3 — the stable-run window the counter reset reads: a run
+    /// that held `running` continuously for ≥ this resets the
+    /// consecutive-failure counter BEFORE the crash charges. PRODUCTION is
+    /// exactly [`STABLE_RUN_WINDOW`] (30 s, restart.rs — production-pinned
+    /// by unit test); tests scale it through this field the way
+    /// [`BackoffSchedule`] scales its base (the constant itself is never
+    /// weakened). Set at construction and via
+    /// [`Supervisor::override_stable_run_window`] — the open-time seam
+    /// `EngineOptions` threads for the integration tests; NOT an operator
+    /// config surface (that is deferred with a trigger, per the spec).
+    pub(crate) stable_run_window: Duration,
+    /// Story 18-4 — the STANDALONE pause-command cap: the wall-clock bound a
+    /// `[lifecycle.pause]` command gets when it runs OUTSIDE a drain (the
+    /// plain `pause` verb). PRODUCTION is exactly [`PAUSE_COMMAND_CAP`]
+    /// (30 s, pinned by unit test); tests scale it through this field the
+    /// way `stable_run_window` scales the window (the constant itself is
+    /// never weakened). INSIDE a drain the command shares the drain's own
+    /// bound instead (the three-tier bound, `drain.rs`), so this cap never
+    /// applies there. Set at construction and via
+    /// [`Supervisor::override_pause_command_cap`] — the open-time seam
+    /// `EngineOptions` threads for the integration tests; NOT an operator
+    /// config surface.
+    pub(crate) pause_command_cap: Duration,
+}
+
 /// The lifecycle supervisor: owns running process handles + drives transitions.
 ///
 /// Constructed empty by [`Engine::open`](crate::Engine::open). Holds ONE
@@ -788,7 +831,8 @@ pub(crate) enum ServeOptionsRefused {
 /// ingestion adapter, and the [`BackoffSchedule`] the restart executor uses
 /// (production 1s×2 cap 60s; tests inject a scaled one).
 pub struct Supervisor {
-    backend: proc::ProcBackend,
+    /// AD-18 Step 4: the shared, `&self`-shaped state.
+    shared: SupervisorShared,
     /// Story 22-4: the provider-host list (set when Shim launches are on).
     bypass_feed: Option<std::sync::Arc<crate::domain::bypass::BypassFeed>>,
     /// Story 24-3: the instances the latest adoption pass took over.
@@ -799,14 +843,6 @@ pub struct Supervisor {
     /// Story 24-3: the stop in progress cleans up after a crashed host.
     crash_cleanup: bool,
     running: HashMap<InstanceName, Supervised>,
-    usage_source: SelfReportedUsageSource,
-    backoff: BackoffSchedule,
-    /// The event bus (story 7-2, FR-33): publishes at the three commit points
-    /// (transition append, breach append, usage-ingestion commit) so a
-    /// subscriber observes exactly the committed truth in commit order. The
-    /// engine holds its own clone ([`Supervisor::event_bus`]) so
-    /// `subscribe()` never takes the supervisor lock.
-    events: EventBus,
     /// The host-provided diagnostic sink (story 10-2), when one is installed.
     /// `None` (every constructor's default) keeps the historical behavior: the
     /// two AD-12 diagnostics go to stderr. Both emission sites run while the
@@ -819,9 +855,6 @@ pub struct Supervisor {
     /// `<proxy url>/_hekma/runs/<run id>` as its base URL; with no proxy the
     /// start is refused naming the remediation.
     proxy_url: Option<String>,
-    /// Story 23-1 — the proxy's evaluation inbox: committed proxied closes
-    /// wait here for the reaper tick to publish them and act.
-    inbox: Arc<crate::domain::pipeline::EvaluationInbox>,
     /// Story 17-2 — the Host's `child_env_allowlist` (default `false`): when
     /// `true`, every spawn clears the inherited environment first and applies
     /// ONLY the manifest-declared mappings (via [`SpawnSpec::inherit_env`] —
@@ -868,29 +901,6 @@ pub struct Supervisor {
     /// handle's removal) clears the entry; a singleton error streak restarts
     /// from zero.
     poll_error_streaks: HashMap<InstanceName, u32>,
-    /// Story 18-3 — the stable-run window the counter reset reads: a run
-    /// that held `running` continuously for ≥ this resets the
-    /// consecutive-failure counter BEFORE the crash charges. PRODUCTION is
-    /// exactly [`STABLE_RUN_WINDOW`] (30 s, restart.rs — production-pinned
-    /// by unit test); tests scale it through this field the way
-    /// [`BackoffSchedule`] scales its base (the constant itself is never
-    /// weakened). Set at construction and via
-    /// [`Supervisor::override_stable_run_window`] — the open-time seam
-    /// `EngineOptions` threads for the integration tests; NOT an operator
-    /// config surface (that is deferred with a trigger, per the spec).
-    stable_run_window: Duration,
-    /// Story 18-4 — the STANDALONE pause-command cap: the wall-clock bound a
-    /// `[lifecycle.pause]` command gets when it runs OUTSIDE a drain (the
-    /// plain `pause` verb). PRODUCTION is exactly [`PAUSE_COMMAND_CAP`]
-    /// (30 s, pinned by unit test); tests scale it through this field the
-    /// way `stable_run_window` scales the window (the constant itself is
-    /// never weakened). INSIDE a drain the command shares the drain's own
-    /// bound instead (the three-tier bound, `drain.rs`), so this cap never
-    /// applies there. Set at construction and via
-    /// [`Supervisor::override_pause_command_cap`] — the open-time seam
-    /// `EngineOptions` threads for the integration tests; NOT an operator
-    /// config surface.
-    pause_command_cap: Duration,
     /// Story 18-3 — the per-instance RESTART-REQUESTED streak: how many
     /// restart-requested relaunches THIS supervisor has scheduled for the
     /// instance since its last fresh start / adoption / clean exit. It
@@ -1077,7 +1087,7 @@ impl Supervisor {
     /// Story 24-1: launch supervised processes through a Shim from now on
     /// (`None`: directly). Open-time, like the serve options.
     pub(crate) fn set_shim_launcher(&mut self, launcher: Option<proc::ShimLauncher>) {
-        self.backend.set_shim(launcher);
+        self.shared.backend.set_shim(launcher);
     }
 
     /// Story 22-4: the provider-host list Shim launches start with, and the
@@ -1087,7 +1097,7 @@ impl Supervisor {
         feed: Option<std::sync::Arc<crate::domain::bypass::BypassFeed>>,
     ) {
         self.bypass_feed = feed.clone();
-        self.backend.set_bypass_feed(feed);
+        self.shared.backend.set_bypass_feed(feed);
     }
 
     /// Story 24-3: what the recorded data-path owner was, as seen now —
@@ -1100,10 +1110,11 @@ impl Supervisor {
         };
         let owner = crate::ports::ProcessFingerprint::new(row.pid, row.start_time);
         let is_self = self
+            .shared
             .backend
             .self_fingerprint()
             .is_some_and(|me| me.matches(&owner));
-        if !is_self && self.backend.probe_alive(&owner) == Some(true) {
+        if !is_self && self.shared.backend.probe_alive(&owner) == Some(true) {
             return crate::PreviousHost::Live;
         }
         match row.handoff {
@@ -1116,7 +1127,7 @@ impl Supervisor {
     /// Story 24-3: record this engine as the data-path owner with `handoff`
     /// (`None`: the default, not chosen).
     pub(crate) fn record_host_posture(&self, registry: &Registry, handoff: Option<bool>) {
-        let Some(me) = self.backend.self_fingerprint() else {
+        let Some(me) = self.shared.backend.self_fingerprint() else {
             self.emit_diagnostic(
                 "this engine's own process could not be identified, so its Handoff Mode is not \
                  recorded; after a crash the next host adopts its agents",
@@ -1177,7 +1188,7 @@ impl Supervisor {
         let mut names: Vec<InstanceName> = self
             .running
             .iter()
-            .filter(|(_, supervised)| self.backend.is_shim(&supervised.handle))
+            .filter(|(_, supervised)| self.shared.backend.is_shim(&supervised.handle))
             .map(|(name, _)| name.clone())
             .collect();
         names.sort();
@@ -1201,6 +1212,7 @@ impl Supervisor {
     pub(crate) fn push_bypass_hosts(&mut self, config: &crate::shim::proto::BypassConfig) {
         for supervised in self.running.values_mut() {
             let _ = self
+                .shared
                 .backend
                 .push_bypass_hosts(&mut supervised.handle, config);
         }
@@ -1214,7 +1226,11 @@ impl Supervisor {
         };
         let mut reports = Vec::new();
         for supervised in self.running.values_mut() {
-            if let Some(report) = self.backend.take_bypass_report(&mut supervised.handle) {
+            if let Some(report) = self
+                .shared
+                .backend
+                .take_bypass_report(&mut supervised.handle)
+            {
                 reports.push((supervised.run_id.clone(), report));
             }
         }
@@ -1257,18 +1273,22 @@ impl Supervisor {
     /// exercise self-reported / lifecycle paths.
     pub fn new() -> Self {
         Self {
-            backend: proc::ProcBackend::new(),
+            shared: SupervisorShared {
+                backend: proc::ProcBackend::new(),
+                usage_source: SelfReportedUsageSource::new(),
+                backoff: BackoffSchedule::production(),
+                events: EventBus::new(),
+                inbox: Arc::default(),
+                stable_run_window: STABLE_RUN_WINDOW,
+                pause_command_cap: PAUSE_COMMAND_CAP,
+            },
             bypass_feed: None,
             adopted_names: Vec::new(),
             shims_lost: Vec::new(),
             crash_cleanup: false,
             running: HashMap::new(),
-            usage_source: SelfReportedUsageSource::new(),
-            backoff: BackoffSchedule::production(),
-            events: EventBus::new(),
             diagnostics: None,
             proxy_url: None,
-            inbox: Arc::default(),
             child_env_allowlist: false,
             custody_cache: None,
             serve_options_applied: false,
@@ -1279,8 +1299,6 @@ impl Supervisor {
             policies_degraded_noted: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
-            stable_run_window: STABLE_RUN_WINDOW,
-            pause_command_cap: PAUSE_COMMAND_CAP,
             requested_restart_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
@@ -1320,18 +1338,22 @@ impl Supervisor {
     /// unchanged.
     pub fn with_runtime(_runtime: tokio::runtime::Handle) -> Self {
         Self {
-            backend: proc::ProcBackend::new(),
+            shared: SupervisorShared {
+                backend: proc::ProcBackend::new(),
+                usage_source: SelfReportedUsageSource::new(),
+                backoff: BackoffSchedule::production(),
+                events: EventBus::new(),
+                inbox: Arc::default(),
+                stable_run_window: STABLE_RUN_WINDOW,
+                pause_command_cap: PAUSE_COMMAND_CAP,
+            },
             bypass_feed: None,
             adopted_names: Vec::new(),
             shims_lost: Vec::new(),
             crash_cleanup: false,
             running: HashMap::new(),
-            usage_source: SelfReportedUsageSource::new(),
-            backoff: BackoffSchedule::production(),
-            events: EventBus::new(),
             diagnostics: None,
             proxy_url: None,
-            inbox: Arc::default(),
             child_env_allowlist: false,
             custody_cache: None,
             serve_options_applied: false,
@@ -1342,8 +1364,6 @@ impl Supervisor {
             policies_degraded_noted: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
-            stable_run_window: STABLE_RUN_WINDOW,
-            pause_command_cap: PAUSE_COMMAND_CAP,
             requested_restart_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
@@ -1382,18 +1402,22 @@ impl Supervisor {
     #[cfg(test)]
     pub(crate) fn with_backoff(backoff: BackoffSchedule) -> Self {
         Self {
-            backend: proc::ProcBackend::new(),
+            shared: SupervisorShared {
+                backend: proc::ProcBackend::new(),
+                usage_source: SelfReportedUsageSource::new(),
+                backoff,
+                events: EventBus::new(),
+                inbox: Arc::default(),
+                stable_run_window: STABLE_RUN_WINDOW,
+                pause_command_cap: PAUSE_COMMAND_CAP,
+            },
             bypass_feed: None,
             adopted_names: Vec::new(),
             shims_lost: Vec::new(),
             crash_cleanup: false,
             running: HashMap::new(),
-            usage_source: SelfReportedUsageSource::new(),
-            backoff,
-            events: EventBus::new(),
             diagnostics: None,
             proxy_url: None,
-            inbox: Arc::default(),
             child_env_allowlist: false,
             custody_cache: None,
             serve_options_applied: false,
@@ -1404,8 +1428,6 @@ impl Supervisor {
             policies_degraded_noted: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
-            stable_run_window: STABLE_RUN_WINDOW,
-            pause_command_cap: PAUSE_COMMAND_CAP,
             requested_restart_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
@@ -1443,7 +1465,7 @@ impl Supervisor {
     /// the same channel, so publishes through either clone reach every
     /// receiver.
     pub(crate) fn event_bus(&self) -> EventBus {
-        self.events.clone()
+        self.shared.events.clone()
     }
 
     /// Publish one committed event — with its outbox `seq` — onto the bus
@@ -1459,7 +1481,7 @@ impl Supervisor {
     /// supervision: a send with no receivers (or any send error) is
     /// swallowed by the bus.
     pub(crate) fn publish(&self, seq: u64, event: EngineEvent) {
-        self.events.publish(seq, event);
+        self.shared.events.publish(seq, event);
     }
 
     /// Install the engine's custody cache (story 22-2, open-time only,
@@ -1520,7 +1542,7 @@ impl Supervisor {
     /// strand already-started listeners, so serve options are open-time only).
     /// The proxy's evaluation inbox (story 23-1).
     pub(crate) fn proxy_inbox(&self) -> Arc<crate::domain::pipeline::EvaluationInbox> {
-        Arc::clone(&self.inbox)
+        Arc::clone(&self.shared.inbox)
     }
 
     /// A thread-safe diagnostic emitter for the proxy (story 23-1): the
@@ -1588,7 +1610,7 @@ impl Supervisor {
             );
             return;
         }
-        self.stable_run_window = window;
+        self.shared.stable_run_window = window;
     }
 
     /// Override the STANDALONE pause-command cap (story 18-4's TEST SCALING
@@ -1617,7 +1639,7 @@ impl Supervisor {
             );
             return;
         }
-        self.pause_command_cap = cap;
+        self.shared.pause_command_cap = cap;
     }
 
     /// The engine's log-capture posture (story 17-4). `Copy` — a snapshot,
@@ -2082,7 +2104,7 @@ impl Supervisor {
     fn log_capture_for(&self, name: &InstanceName) -> Option<LogCapture> {
         self.running
             .get(name)
-            .and_then(|s| self.backend.log_capture(&s.handle))
+            .and_then(|s| self.shared.backend.log_capture(&s.handle))
     }
 
     /// Land a spawn failure in `failed` with the backend diagnostic preserved

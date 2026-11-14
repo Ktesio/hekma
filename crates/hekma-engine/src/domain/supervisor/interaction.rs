@@ -142,13 +142,13 @@ impl Supervisor {
         // different fact from "no pipe was ever recoverable", and the CLI's
         // remediation differs (restart to get a fresh channel either way, but
         // the cause is not the same).
-        if self.backend.stdin_timed_out(&supervised.handle) {
+        if self.shared.backend.stdin_timed_out(&supervised.handle) {
             return Err(EngineError::InteractionTimedOut {
                 name: name.as_str().to_string(),
                 timeout_secs: crate::ports::STDIN_WRITE_TIMEOUT.as_secs(),
             });
         }
-        if !self.backend.has_stdin(&supervised.handle) {
+        if !self.shared.backend.has_stdin(&supervised.handle) {
             return Err(EngineError::InteractionUnavailable {
                 name: name.as_str().to_string(),
                 detail: "no live stdin pipe is held for this instance in this engine session \
@@ -173,7 +173,11 @@ impl Supervisor {
         // like `stop`'s existing bounded graceful-window wait; a deliberate,
         // ACCEPTED, BOUNDED tradeoff, not the unbounded-freeze problem this
         // fix closes.
-        match self.backend.write_stdin(&mut supervised.handle, &bytes) {
+        match self
+            .shared
+            .backend
+            .write_stdin(&mut supervised.handle, &bytes)
+        {
             Ok(()) => Ok(()),
             Err(BackendError::StdinTimedOut { timeout_secs }) => {
                 Err(EngineError::InteractionTimedOut {
@@ -195,7 +199,8 @@ impl Supervisor {
     /// (never claims a death it cannot prove). The read-only engine uses it
     /// to show what adoption would record.
     pub(crate) fn record_process_gone(&self, record: &crate::ports::SpawnRecord) -> bool {
-        record.fingerprint.pid != 0 && self.backend.probe_alive(&record.fingerprint) == Some(false)
+        record.fingerprint.pid != 0
+            && self.shared.backend.probe_alive(&record.fingerprint) == Some(false)
     }
 
     /// The current [`RunId`] for a supervised instance (story 3-1), or `None` if
@@ -400,9 +405,12 @@ impl Supervisor {
     /// CLI's read-only `logs --follow` asks the Service Host this to decide
     /// whether the raw fallback would double-report).
     pub(crate) fn has_live_capture(&self, name: &InstanceName) -> bool {
-        self.running
-            .get(name)
-            .is_some_and(|supervised| self.backend.log_capture(&supervised.handle).is_some())
+        self.running.get(name).is_some_and(|supervised| {
+            self.shared
+                .backend
+                .log_capture(&supervised.handle)
+                .is_some()
+        })
     }
 
     /// The RAW `agent.log` FALLBACK read (story 15-2, Fibery 207) — honest

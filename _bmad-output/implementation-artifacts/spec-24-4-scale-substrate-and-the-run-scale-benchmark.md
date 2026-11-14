@@ -237,3 +237,10 @@ Each is a public-contract or product choice; the recommendation is the spec's cu
     - These sites shrink only with a per-instance lock, which is Step 5, explicitly not taken.
     - The histogram's falling max hold is shown for `remove` (phase 4d), which was the wedge the spec named.
 
+- 2026-11-14 — **phase 4g (built): AD-18 Step 4a, `SupervisorShared`** (stacked on phase 4f, #441).
+  - **The move:** the supervisor's shared, `&self`-shaped state moves into `SupervisorShared`, held as `Supervisor.shared`. That is the process backend, the restart schedule, the event bus, the usage source, the proxy's evaluation inbox, and the stable-run and pause-command windows. 103 accesses across the supervisor files now read `self.shared.…`.
+  - **Behaviour:** no change, and the supervisor mutex is unchanged.
+  - **Not built (Step 4b):**
+    - the per-instance `InstanceState`;
+    - receivers taking `(&SupervisorShared, &StoreGate, &mut InstanceState)`, so shared state can be handed out without the supervisor lock.
+    - The mutable configuration fields (diagnostics, proxy URL, env allowlist, log capture) stay on `Supervisor`, since they are set after construction.
