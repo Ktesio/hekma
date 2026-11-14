@@ -58,6 +58,11 @@ pub struct MeteringProxyOptions {
     /// [`ProxyInfo::public_url`] (display only; without it the bind address
     /// is shown).
     pub public_host: Option<String>,
+    /// Story 22-5's TEST SEAM: treat every peer as a remote one (as if it
+    /// connected from another machine), so the beyond-loopback rules can be
+    /// proven over `127.0.0.1` on any host. Never an operator surface.
+    #[doc(hidden)]
+    pub peers_as_remote: bool,
     /// Record the bound port for the state directory and reuse it (the
     /// host sets this; embedders default to an unrecorded ephemeral port).
     pub sticky: bool,
@@ -110,6 +115,7 @@ impl Default for MeteringProxyOptions {
             bind: None,
             tls: None,
             public_host: None,
+            peers_as_remote: false,
             sticky: false,
             identity_headers: None,
             max_concurrent_calls: 512,
@@ -302,6 +308,7 @@ impl MeteringProxy {
             Arc::clone(&shared),
             stop_rx,
             acceptor,
+            options.peers_as_remote,
         ));
         let sweeper = spawn_sweeper(
             handle,
@@ -511,6 +518,7 @@ async fn accept_loop(
     shared: Arc<forward::ProxyShared>,
     mut stop: tokio::sync::watch::Receiver<Option<Duration>>,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
+    peers_as_remote: bool,
 ) {
     let mut connections = tokio::task::JoinSet::new();
     let grace = loop {
@@ -523,7 +531,7 @@ async fn accept_loop(
                 let Ok((stream, peer)) = accepted else { continue };
                 let _ = stream.set_nodelay(true);
                 // Story 22-5: each connection's peer scope, stamped once.
-                let peer_loopback = peer_is_loopback(peer.ip());
+                let peer_loopback = peer_is_loopback(peer.ip()) && !peers_as_remote;
                 connections.spawn(accept_connection(
                     stream,
                     peer_loopback,

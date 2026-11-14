@@ -2652,6 +2652,9 @@ fn self_signed(dir: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
     let key = dir.join("key.pem");
     std::fs::write(&cert, certified.cert.pem()).unwrap();
     std::fs::write(&key, certified.signing_key.serialize_pem()).unwrap();
+    // Story 22-5: TLS files must be owner-only.
+    hekma_engine::restrict_to_owner(&cert).unwrap();
+    hekma_engine::restrict_to_owner(&key).unwrap();
     (cert, key, certified.cert.der().to_vec())
 }
 
@@ -6506,4 +6509,231 @@ fn the_hold_family_routes_act_on_wire_runs_and_refuse_everything_else() {
         "{}",
         json_body(&mut response)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Story 22-5: the metering proxy beyond loopback — the start-time refusals
+// (before anything is created or opened), the owner-only TLS files, and a
+// wide bind's notices, GET /v0/proxy and control.json.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_proxy_beyond_loopback_needs_its_tls_pair_and_every_refusal_comes_before_anything_opens() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().join("state");
+    let pems = tempfile::tempdir().unwrap();
+    let (cert, key, _) = self_signed(pems.path());
+    let wide: std::net::IpAddr = "0.0.0.0".parse().unwrap();
+    let refuse = |options: hekma_host::ServeOptions| {
+        hekma_host::serve_with_signal(options, |_sink| async { Ok("SIGTEST") })
+            .expect_err("refused")
+            .to_string()
+    };
+    let cases: Vec<(hekma_host::ServeOptions, &str)> = vec![
+        (
+            hekma_host::ServeOptions {
+                state_base: Some(base.clone()),
+                metering_listen_addr: Some(wide),
+                ..Default::default()
+            },
+            "without transport encryption",
+        ),
+        (
+            hekma_host::ServeOptions {
+                state_base: Some(base.clone()),
+                metering_listen_addr: Some(wide),
+                proxy_tls_cert: Some(cert.clone()),
+                ..Default::default()
+            },
+            "--proxy-tls-cert and --proxy-tls-key go together",
+        ),
+        (
+            hekma_host::ServeOptions {
+                state_base: Some(base.clone()),
+                proxy_tls_cert: Some(cert.clone()),
+                proxy_tls_key: Some(key.clone()),
+                ..Default::default()
+            },
+            "require a --metering-listen address beyond loopback",
+        ),
+        (
+            hekma_host::ServeOptions {
+                state_base: Some(base.clone()),
+                proxy_public_host: Some("proxy.example".into()),
+                ..Default::default()
+            },
+            "--proxy-public-host requires",
+        ),
+        (
+            hekma_host::ServeOptions {
+                state_base: Some(base.clone()),
+                metering_listen_addr: Some(wide),
+                proxy_tls_cert: Some(cert.clone()),
+                proxy_tls_key: Some(key.clone()),
+                autostart: true,
+                ..Default::default()
+            },
+            "--autostart",
+        ),
+        (
+            hekma_host::ServeOptions {
+                state_base: Some(base.clone()),
+                metering_listen_addr: Some(wide),
+                proxy_tls_cert: Some(pems.path().join("missing.pem")),
+                proxy_tls_key: Some(key.clone()),
+                ..Default::default()
+            },
+            "missing.pem",
+        ),
+    ];
+    for (options, expected) in cases {
+        let message = refuse(options);
+        assert!(message.contains(expected), "{expected}: {message}");
+        assert!(!base.exists(), "nothing was created or opened ({expected})");
+    }
+    // A key other users can read is refused on Unix, naming the path, for
+    // the proxy's pair and the Control API's alike; Windows relies on the
+    // profile's access control (documented), so the start proceeds there.
+    let loose = pems.path().join("loose-key.pem");
+    std::fs::write(&loose, std::fs::read(&key).unwrap()).unwrap();
+    if hekma_engine::OsId::current() != hekma_engine::OsId::Windows {
+        let message = refuse(hekma_host::ServeOptions {
+            state_base: Some(base.clone()),
+            metering_listen_addr: Some(wide),
+            proxy_tls_cert: Some(cert.clone()),
+            proxy_tls_key: Some(loose.clone()),
+            ..Default::default()
+        });
+        assert!(
+            message.contains("loose-key.pem") && message.contains("chmod 600"),
+            "{message}"
+        );
+        let message = refuse(hekma_host::ServeOptions {
+            state_base: Some(base.clone()),
+            control_listen: Some("0.0.0.0:0".parse().unwrap()),
+            bearer_secret: Some(BEARER_NAME.to_string()),
+            tls_cert: Some(cert.clone()),
+            tls_key: Some(loose.clone()),
+            ..Default::default()
+        });
+        assert!(message.contains("loose-key.pem"), "{message}");
+        assert!(!base.exists());
+    }
+}
+
+#[test]
+fn a_proxy_bound_beyond_loopback_says_where_and_what_it_needs() {
+    let state = tempfile::tempdir().unwrap();
+    let pems = tempfile::tempdir().unwrap();
+    let (cert, key, _) = self_signed(pems.path());
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    write_secrets_file(state.path());
+    let mut server = spawn_serve(hekma_host::ServeOptions {
+        state_base: Some(state.path().to_path_buf()),
+        control_listen: Some("127.0.0.1:0".parse().unwrap()),
+        bearer_secret: Some(BEARER_NAME.to_string()),
+        stop_window: Some(1),
+        diagnostics: Some(diagnostic_sink_of(&sink_handle)),
+        metering_listen_addr: Some("0.0.0.0".parse().unwrap()),
+        proxy_tls_cert: Some(cert),
+        proxy_tls_key: Some(key),
+        proxy_public_host: Some("proxy.example".into()),
+        ..Default::default()
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = sink_handle.text();
+        if let Some(addr) = text
+            .lines()
+            .find_map(|line| line.split("control api listening on ").nth(1))
+            .map(|rest| rest.split(" (").next().unwrap().to_string())
+        {
+            server.addr = addr;
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{text}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let text = sink_handle.text();
+    assert!(
+        text.contains("the metering proxy is listening on https://proxy.example:")
+            && text.contains("Every call to it from another machine must carry a credential."),
+        "{text}"
+    );
+    assert!(
+        text.contains("no proxy-access credential is active yet"),
+        "{text}"
+    );
+    assert!(
+        text.contains("other user accounts")
+            || text.contains("no other user accounts")
+            || text.contains("cannot tell whether this machine has other interactive users"),
+        "the port-squatting line:\n{text}"
+    );
+    let client = client();
+    let mut response = get_ok(&client, &server.addr, "/v0/proxy");
+    let proxy = json_body(&mut response);
+    let port = proxy["port"].as_u64().unwrap();
+    assert_eq!(proxy["tls"], true, "{proxy}");
+    assert_eq!(proxy["bind"], "0.0.0.0");
+    assert_eq!(proxy["public_url"], format!("https://proxy.example:{port}"));
+    assert_eq!(proxy["url"], format!("http://127.0.0.1:{port}"));
+    let discovery = hekma_host::read_discovery(state.path()).unwrap();
+    assert_eq!(
+        discovery.metering_proxy_public_url.as_deref(),
+        Some(format!("https://proxy.example:{port}").as_str())
+    );
+    // The credential's note now says what accepts it.
+    let response = call(
+        &client,
+        "POST",
+        &format!("http://{}/v0/bindings", server.addr),
+        Some(serde_json::json!({
+            "name": "openai", "prefix": "/openai", "upstream": "https://api.example.com/v1",
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("http://{}/v0/bindings/openai/credentials", server.addr),
+        Some(serde_json::json!({"class": "proxy-access"})),
+    );
+    let issued = json_body(&mut response);
+    assert!(
+        issued["note"]
+            .as_str()
+            .unwrap()
+            .contains("metering proxy bound beyond loopback"),
+        "{issued}"
+    );
+    server.stop().unwrap();
+}
+
+#[test]
+fn the_metering_listen_value_is_a_port_or_an_ip_literal_and_port() {
+    use hekma_host::parse_metering_listen;
+    assert_eq!(parse_metering_listen("8400").unwrap(), (None, 8400));
+    assert_eq!(
+        parse_metering_listen("0.0.0.0:8400").unwrap(),
+        (Some("0.0.0.0".parse().unwrap()), 8400)
+    );
+    assert_eq!(
+        parse_metering_listen("[::]:8400").unwrap(),
+        (Some("::".parse().unwrap()), 8400)
+    );
+    assert_eq!(
+        parse_metering_listen("127.0.0.1:0").unwrap(),
+        (Some("127.0.0.1".parse().unwrap()), 0)
+    );
+    for bad in [
+        "proxy.example:8400",
+        "localhost:8400",
+        "70000",
+        "0.0.0.0",
+        "",
+    ] {
+        let message = parse_metering_listen(bad).unwrap_err();
+        assert!(message.contains("IP literal"), "{bad}: {message}");
+    }
 }

@@ -116,6 +116,10 @@ pub use adapter::{AdapterRef, ResolvedAdapter};
 pub use backends::spawn_detached_process;
 // Story 22-5: the host's port-squatting warning and its TLS key check.
 pub use backends::interactive_users_hint;
+/// Make a file readable only by its owner (mode `0600` on Unix; the
+/// per-user access control on Windows) — the rule [`check_owner_only_file`]
+/// checks, for an embedder or a test writing TLS material.
+pub use backends::restrict_to_owner;
 
 /// Story 22-5: refuse a file that other users can read (the secrets-file
 /// rule: owner-only, mode `0600` on Unix; a documented no-op on Windows,
