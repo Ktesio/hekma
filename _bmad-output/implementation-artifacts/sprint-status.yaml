@@ -236,7 +236,7 @@ development_status:
   24-2-handoff-mode-and-in-place-upgrades: backlog  # flips Handoff Mode to default on acceptance
   24-3-crash-recovery-and-registry-completeness: backlog
   24-4-scale-substrate-and-the-run-scale-benchmark: backlog
-  24-5-otlp-metrics-v2: backlog  # AI-55 two-pass review
+  24-5-otlp-metrics-v2: in-progress  # AI-55 two-pass review; built before 24-1 (only its bypass counter needs 22-4)
   epic-24-retrospective: optional
   epic-25: backlog  # Nodes and Hub (FR-58; AD-24 reserved) — placeholder; stories after Epic 24 closes
   epic-25-retrospective: optional

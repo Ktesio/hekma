@@ -3252,3 +3252,49 @@ fn a_serve_flag_overrides_the_stored_identity_header_setting_for_its_run_only() 
     assert_eq!(post(port, "/openai/chat", &[]).status, 200);
     assert!(upstream.served()[1].header("x-hekma-run-id").is_none());
 }
+
+#[test]
+fn a_proxied_calls_usage_event_carries_its_runs_depth_and_labels() {
+    // Story 24-5: the usage event is stamped with its Run's context in the
+    // job that commits it (the exporter reads it from the event).
+    let state = TempDir::new().unwrap();
+    let upstream = Upstream::start();
+    let (engine, port) = open(&state, true);
+    bind(
+        &engine,
+        "openai",
+        "/openai",
+        &upstream.base(),
+        &[("team", "core")],
+    );
+    let mut events = engine.subscribe();
+    assert_eq!(post(port, "/openai/chat", &[]).status, 200);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let update = loop {
+        match events.try_recv() {
+            Ok(hekma_engine::EngineEvent::UsageUpdate(update)) => break update,
+            Ok(_) => {}
+            Err(_) => {
+                assert!(Instant::now() < deadline, "no usage event");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    assert_eq!(update.control_depth, Some(hekma_engine::ControlDepth::Wire));
+    assert_eq!(
+        update.labels,
+        vec![("team".to_string(), "core".to_string())]
+    );
+    assert!(
+        update.policies.contains(&"default".to_string()),
+        "{:?}",
+        update.policies
+    );
+    // The fields are additive: an older event without them still decodes.
+    let mut wire = serde_json::to_value(&update).unwrap();
+    for key in ["control_depth", "policies", "labels"] {
+        wire.as_object_mut().unwrap().remove(key);
+    }
+    let older: hekma_engine::UsageUpdateEvent = serde_json::from_value(wire).unwrap();
+    assert!(older.control_depth.is_none() && older.labels.is_empty());
+}

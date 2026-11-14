@@ -22,6 +22,7 @@ use hekma_engine::EngineEvent;
 
 use super::{push, ExporterConfig, OtlpExporter, FINAL_FLUSH_BOUND, QUEUE_CAPACITY};
 use crate::otlp::payload::MetricState;
+use crate::otlp::v2::ExporterState;
 use crate::Notifier;
 
 /// A sink that records every notice (the serve.rs suite's shape).
@@ -89,7 +90,7 @@ fn usage(instance: &str, run: &str, seq: u64) -> EngineEvent {
 fn the_queue_holds_capacity_events_before_dropping_anything() {
     let (sink, notifier) = SharedSink::notifier();
     let mut queue = VecDeque::new();
-    let mut state = MetricState::new(0, "test".to_string());
+    let mut state = ExporterState::V1(MetricState::new(0, "test".to_string()));
     let mut noted = false;
     for seq in 0..QUEUE_CAPACITY as u64 {
         push(
@@ -113,7 +114,7 @@ fn the_queue_holds_capacity_events_before_dropping_anything() {
 fn overflow_drops_the_oldest_with_a_surfaced_note_and_a_counter() {
     let (sink, notifier) = SharedSink::notifier();
     let mut queue = VecDeque::new();
-    let mut state = MetricState::new(0, "test".to_string());
+    let mut state = ExporterState::V1(MetricState::new(0, "test".to_string()));
     let mut noted = false;
     for seq in 0..(QUEUE_CAPACITY + 3) as u64 {
         push(
@@ -148,7 +149,7 @@ fn the_overflow_note_is_rate_limited_to_once_per_flush_cycle() {
     // the FIRST overflow of a cycle notes; the rest only grow the counter.
     let (sink, notifier) = SharedSink::notifier();
     let mut queue = VecDeque::new();
-    let mut state = MetricState::new(0, "test".to_string());
+    let mut state = ExporterState::V1(MetricState::new(0, "test".to_string()));
     let mut noted = false;
     for seq in 0..(QUEUE_CAPACITY + 50) as u64 {
         push(
@@ -200,6 +201,12 @@ fn loop_config(endpoint: String) -> ExporterConfig {
         headers: Vec::new(),
         flush_interval: Duration::from_secs(300),
         service_instance_id: "task-loop-test".to_string(),
+        // These loop tests pin the v1 payload (story 24-5 keeps it).
+        exposition: crate::otlp::Exposition::V1,
+        label_keys: Vec::new(),
+        label_cardinality: crate::otlp::DEFAULT_LABEL_CARDINALITY,
+        ca_file: None,
+        counters: None,
     }
 }
 
@@ -327,18 +334,12 @@ async fn settle() {
 }
 
 /// The defensive client-construction arm: an endpoint the parse-time
-/// validation would refuse (https:// is the v1 deferral) still surfaces a
+/// validation would refuse (a scheme other than http:// or https://) still surfaces a
 /// DOWN note instead of a silent export stop (AI-18).
 #[tokio::test]
 async fn an_endpoint_the_client_rejects_surfaces_export_down_and_returns_zero() {
     let (sink_handle, sink) = SharedSink::sink();
-    let exporter = exporter_over(
-        Vec::new(),
-        16,
-        "https://collector.example".to_string(),
-        sink,
-    )
-    .await;
+    let exporter = exporter_over(Vec::new(), 16, "ftp://collector.example".to_string(), sink).await;
     settle().await;
     let lost = exporter.shutdown(Duration::from_secs(5)).await;
     assert_eq!(

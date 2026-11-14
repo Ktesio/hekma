@@ -824,3 +824,331 @@ fn a_refused_collector_surfaces_diagnostics_grows_the_counter_and_never_blocks()
         "the dropped counter's honesty rides the stop notes:\n{text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Story 24-5 — `otlp-metrics v2`: the default exposition end to end, the v1
+// switch, and an https collector behind a self-signed certificate.
+// ---------------------------------------------------------------------------
+
+/// A collector serving HTTPS with a self-signed certificate for 127.0.0.1;
+/// its PEM root is written to `dir` for `--otlp-ca-file`.
+fn tls_collector(dir: &Path) -> (Collector, PathBuf) {
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".into(), "localhost".into()]).unwrap();
+    let ca = dir.join("collector-ca.pem");
+    std::fs::write(&ca, certified.cert.pem()).unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certified.cert.der().clone()],
+                rustls_pki_types::PrivateKeyDer::Pkcs8(
+                    certified.signing_key.serialize_der().into(),
+                ),
+            )
+            .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let config = Arc::clone(&config);
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let Ok(conn) = rustls::ServerConnection::new(config) else {
+                    return;
+                };
+                let mut tls = rustls::StreamOwned::new(conn, stream);
+                let mut reader = BufReader::new(&mut tls);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
+                    return;
+                }
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; length];
+                if reader.read_exact(&mut body).is_ok() {
+                    log.lock().unwrap().push(RecordedRequest {
+                        method,
+                        path,
+                        content_type: Some("application/json".into()),
+                        body: String::from_utf8_lossy(&body).to_string(),
+                        answered: 200,
+                    });
+                }
+                drop(reader);
+                let _ = tls.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = tls.flush();
+            });
+        }
+    });
+    (Collector { addr, requests }, ca)
+}
+
+/// Start the budgeted agent under `otlp` and return the first payload that
+/// carries token usage, with the host's diagnostics.
+fn exported_payload(otlp: hekma_host::OtlpOptions, collector: &Collector) -> (Value, String) {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let _manifest = registered_budgeted_agent(&base, "worker");
+    let (sink_handle, sink) = SharedSink::new();
+    let options = options_with(base, sink, otlp);
+    let server = spawn_serve(options, &sink_handle, true);
+    let http = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let start_url = format!("http://{}/v0/instances/worker/start", server.addr);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(response) = http
+            .post(&start_url)
+            .header("Authorization", &auth)
+            .send("")
+        {
+            if response.status() == StatusCode::OK {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "{}", sink_handle.text());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    collector.wait_for(
+        |requests| {
+            requests.iter().any(|r| {
+                r.body.contains("gen_ai.client.token_usage")
+                    && r.body.contains("hekma.budget.breaches")
+            })
+        },
+        Duration::from_secs(30),
+    );
+    let body = collector
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|r| r.body.contains("hekma.budget.breaches"))
+        .unwrap()
+        .body
+        .clone();
+    server.stop().expect("the serve thread joins").unwrap();
+    (serde_json::from_str(&body).unwrap(), sink_handle.text())
+}
+
+fn family<'a>(payload: &'a Value, name: &str) -> Option<&'a Value> {
+    payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == name)
+}
+
+fn points(metric: &Value) -> Vec<Value> {
+    ["sum", "histogram", "gauge"]
+        .iter()
+        .find_map(|kind| metric[kind]["dataPoints"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+fn attr_keys(point: &Value) -> Vec<String> {
+    point["attributes"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(|kv| kv["key"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn attr_value<'a>(point: &'a Value, key: &str) -> Option<&'a str> {
+    point["attributes"]
+        .as_array()?
+        .iter()
+        .find(|kv| kv["key"] == key)?["value"]["stringValue"]
+        .as_str()
+}
+
+#[test]
+fn the_default_v2_exposition_groups_by_depth_and_policy_with_run_ids_only_in_exemplars() {
+    let collector = Collector::start(200);
+    let otlp = hekma_host::OtlpOptions::from_flags(Some(collector.endpoint()), None, Some(1))
+        .unwrap()
+        .with_exposition_flags(None, Some("team"), Some(5), None)
+        .unwrap();
+    let (payload, text) = exported_payload(otlp, &collector);
+    assert_eq!(
+        payload["resourceMetrics"][0]["scopeMetrics"][0]["scope"]["version"],
+        "v2"
+    );
+    assert!(text.contains("otlp-metrics v2"), "{text}");
+    let vocabulary = [
+        "gen_ai.token.type",
+        "hekma.instance",
+        "hekma.control_depth",
+        "hekma.policy",
+        "hekma.estimate_state",
+        "hekma.budget.dimension",
+        "hekma.budget.scope",
+        "hekma.budget.action",
+        "hekma.state",
+        "hekma.anomaly",
+        "outcome",
+    ];
+    for metric in payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        .as_array()
+        .unwrap()
+    {
+        for point in points(metric) {
+            for key in attr_keys(&point) {
+                assert!(
+                    vocabulary.contains(&key.as_str()) || key.starts_with("hekma.label."),
+                    "{key} is outside the v2 vocabulary: {point}"
+                );
+            }
+        }
+    }
+    let usage = points(family(&payload, "gen_ai.client.token_usage").unwrap());
+    assert!(usage
+        .iter()
+        .all(|p| attr_value(p, "hekma.control_depth") == Some("supervised")));
+    assert!(usage
+        .iter()
+        .all(|p| attr_value(p, "hekma.policy").is_none()));
+    let exemplar = &usage[0]["exemplars"][0];
+    assert_eq!(exemplar["filteredAttributes"][0]["key"], "hekma.run_id");
+    assert!(exemplar.get("traceId").is_none());
+    let breaches = points(family(&payload, "hekma.budget.breaches").unwrap());
+    assert!(
+        breaches
+            .iter()
+            .all(|p| attr_value(p, "hekma.policy").is_some()),
+        "{breaches:?}"
+    );
+    for name in [
+        "hekma.calls.unscented",
+        "hekma.telemetry.received",
+        "hekma.otlp.folded",
+        "hekma.otlp.dropped",
+    ] {
+        assert!(family(&payload, name).is_some(), "{name}");
+    }
+}
+
+#[test]
+fn the_v1_switch_keeps_the_run_keyed_exposition() {
+    let collector = Collector::start(200);
+    let otlp = hekma_host::OtlpOptions::from_flags(Some(collector.endpoint()), None, Some(1))
+        .unwrap()
+        .with_exposition_flags(Some("v1"), None, None, None)
+        .unwrap();
+    let (payload, _) = exported_payload(otlp, &collector);
+    assert_eq!(
+        payload["resourceMetrics"][0]["scopeMetrics"][0]["scope"]["version"],
+        "v1"
+    );
+    let usage = points(family(&payload, "gen_ai.client.token_usage").unwrap());
+    assert!(usage
+        .iter()
+        .all(|p| attr_value(p, "hekma.run_id").is_some()));
+    assert!(payload.to_string().find("exemplars").is_none());
+    assert!(family(&payload, "hekma.calls.unscented").is_none());
+}
+
+#[test]
+fn an_https_collector_is_reached_with_its_ca_root_and_refused_without_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (collector, ca) = tls_collector(dir.path());
+    let endpoint = format!("https://{}", collector.addr);
+    let otlp = hekma_host::OtlpOptions::from_flags(Some(endpoint.clone()), None, Some(1))
+        .unwrap()
+        .with_exposition_flags(None, None, None, Some(ca))
+        .unwrap();
+    let (payload, _) = exported_payload(otlp, &collector);
+    assert!(family(&payload, "gen_ai.client.token_usage").is_some());
+    // Without the root, the handshake fails: nothing lands, and it is said.
+    let (bare, _) = tls_collector(dir.path());
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, sink) = SharedSink::new();
+    let otlp =
+        hekma_host::OtlpOptions::from_flags(Some(format!("https://{}", bare.addr)), None, Some(1))
+            .unwrap();
+    let server = spawn_serve(
+        options_with(state.path().to_path_buf(), sink, otlp),
+        &sink_handle,
+        true,
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !sink_handle.text().contains("NOT delivered") {
+        assert!(Instant::now() < deadline, "{}", sink_handle.text());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(bare.requests.lock().unwrap().is_empty());
+    server.stop().expect("the serve thread joins").unwrap();
+    // An unreadable CA file is refused at parse, naming it.
+    let err = hekma_host::OtlpOptions::from_flags(Some(endpoint), None, None)
+        .unwrap()
+        .with_exposition_flags(None, None, None, Some(dir.path().join("missing.pem")))
+        .unwrap_err();
+    assert!(err.contains("missing.pem"), "{err}");
+}
+
+#[test]
+fn the_exposition_flags_are_refused_when_they_cannot_apply() {
+    let base = || {
+        hekma_host::OtlpOptions::from_flags(Some("http://127.0.0.1:4318".into()), None, None)
+            .unwrap()
+    };
+    for (exposition, keys, cap, expected) in [
+        (Some("v3"), None, None, "v1 or v2"),
+        (
+            Some("v1"),
+            Some("team"),
+            None,
+            "v1 carries no label attributes",
+        ),
+        (None, Some("Team"), None, "not a label key"),
+        (None, Some("team,team"), None, "twice"),
+        (None, Some("a,b,c,d,e,f,g,h,i"), None, "at most 8"),
+        (None, None, Some(1), "2 to 10000"),
+        (None, None, Some(10_001), "2 to 10000"),
+    ] {
+        let err = base()
+            .with_exposition_flags(exposition, keys, cap, None)
+            .unwrap_err();
+        assert!(err.contains(expected), "{expected}: {err}");
+    }
+    let err = hekma_host::OtlpOptions::from_flags(None, None, None)
+        .unwrap()
+        .with_exposition_flags(None, Some("team"), None, None)
+        .unwrap_err();
+    assert!(err.contains("requires --otlp-endpoint"), "{err}");
+    let options = base()
+        .with_exposition_flags(Some("v2"), Some("team, env"), Some(50), None)
+        .unwrap();
+    assert_eq!(
+        options.label_keys,
+        vec!["team".to_string(), "env".to_string()]
+    );
+    assert_eq!(options.effective_label_cardinality(), 50);
+    assert_eq!(options.effective_exposition(), hekma_host::Exposition::V2);
+}

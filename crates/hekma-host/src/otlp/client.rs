@@ -17,6 +17,47 @@ use hyper::body::Bytes;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::CertificateDer;
+
+/// Story 24-5: the connector both schemes share (`http://` passes through,
+/// `https://` dials TLS over the in-tree rustls + ring pair).
+type Connector = hyper_rustls::HttpsConnector<HttpConnector>;
+
+/// Story 24-5 (`--otlp-ca-file`): read a PEM file's certificates, to trust
+/// beside the vendored public roots. A file that cannot be read or holds no
+/// certificate is a refusal naming it.
+pub fn load_ca_file(path: &std::path::Path) -> Result<Vec<CertificateDer<'static>>, String> {
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
+        .map_err(|err| format!("--otlp-ca-file {} could not be read: {err}", path.display()))?
+        .collect::<Result<_, _>>()
+        .map_err(|err| format!("--otlp-ca-file {} is not valid PEM: {err}", path.display()))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "--otlp-ca-file {} holds no PEM certificate",
+            path.display()
+        ));
+    }
+    Ok(certs)
+}
+
+/// The client TLS configuration: the vendored public roots (webpki-roots —
+/// no system trust store) plus `extra` roots.
+fn tls_config(extra: Vec<CertificateDer<'static>>) -> Result<rustls::ClientConfig, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for cert in extra {
+        roots
+            .add(cert)
+            .map_err(|err| format!("the --otlp-ca-file certificate is not usable: {err}"))?;
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|err| format!("could not configure TLS: {err}"))?
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
 
 /// The bounded per-attempt POST timeout: a collector that accepts and stalls
 /// is classified RETRYABLE when it trips this, never an unbounded hang.
@@ -66,18 +107,35 @@ pub struct OtlpClient {
     /// is manually redacted below).
     headers: Vec<(String, String)>,
     /// The shared legacy client (connection pooling on the host runtime).
-    client: Client<HttpConnector, Full<Bytes>>,
+    client: Client<Connector, Full<Bytes>>,
 }
 
 impl OtlpClient {
     /// Build a client for `endpoint` (validated by [`validate_endpoint`])
     /// with startup-resolved `headers`.
-    pub fn new(endpoint: &str, headers: Vec<(String, String)>) -> Result<Self, String> {
+    /// Trusting `ca_file`'s roots beside the vendored public
+    /// roots for an `https://` collector (story 24-5).
+    pub fn with_ca(
+        endpoint: &str,
+        headers: Vec<(String, String)>,
+        ca_file: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
         let post_url = build_post_url(endpoint)?;
+        let extra = match ca_file {
+            Some(path) => load_ca_file(path)?,
+            None => Vec::new(),
+        };
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config(extra)?)
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(http);
         Ok(OtlpClient {
             post_url,
             headers,
-            client: Client::builder(TokioExecutor::new()).build(HttpConnector::new()),
+            client: Client::builder(TokioExecutor::new()).build(connector),
         })
     }
 
@@ -226,6 +284,7 @@ pub fn validate_endpoint(endpoint: &str) -> Result<(), String> {
     }
     let authority = endpoint
         .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
         .unwrap_or(endpoint)
         .split('/')
         .next()
@@ -262,29 +321,27 @@ fn port_is_numeric(authority: &str) -> bool {
     }
 }
 
-/// Validate an `--otlp-endpoint` value and derive the POST URL. v1 is
-/// http-ONLY: `https://` is the documented deferral (TLS handshakes are not
-/// provable network-free; the deferral names its trigger), and anything that
-/// is not an `http://host[:port][/base]` URL is a typed refusal. The strict
+/// Validate an `--otlp-endpoint` value and derive the POST URL: an
+/// `http://` or (story 24-5) `https://` `host[:port][/base]` URL; anything
+/// else is a typed refusal. The strict
 /// flag-time refusals live in [`validate_endpoint`]; this builder only
 /// APPENDS the `/v1/metrics` path when the base does not already end in it
 /// (P3c — a library caller reaching here directly cannot mint a doubled
 /// path).
 pub fn build_post_url(endpoint: &str) -> Result<String, String> {
-    let rest = match endpoint.strip_prefix("http://") {
-        Some(rest) if !rest.is_empty() => rest,
-        _ if endpoint.starts_with("https://") => {
-            return Err(
-                "the OTLP endpoint must be http:// in v1 — https:// is deferred (a \
-                 named deferral in docs/telemetry.md; it reopens when an operator \
-                 names an https collector as a real need)"
-                    .to_string(),
-            );
-        }
+    let (scheme, rest) = match endpoint
+        .strip_prefix("http://")
+        .map(|rest| ("http://", rest))
+        .or_else(|| {
+            endpoint
+                .strip_prefix("https://")
+                .map(|rest| ("https://", rest))
+        }) {
+        Some((scheme, rest)) if !rest.is_empty() => (scheme, rest),
         _ => {
             return Err(format!(
-                "the OTLP endpoint must be an http:// URL like http://127.0.0.1:4318 \
-                 (got {endpoint:?})"
+                "the OTLP endpoint must be an http:// or https:// URL like \
+                 http://127.0.0.1:4318 (got {endpoint:?})"
             ));
         }
     };
@@ -309,9 +366,9 @@ pub fn build_post_url(endpoint: &str) -> Result<String, String> {
     };
     // Append the OTLP path ONLY when the base does not already carry it.
     if base == "/v1/metrics" {
-        return Ok(format!("http://{authority}{base}"));
+        return Ok(format!("{scheme}{authority}{base}"));
     }
-    Ok(format!("http://{authority}{base}/v1/metrics"))
+    Ok(format!("{scheme}{authority}{base}/v1/metrics"))
 }
 
 #[cfg(test)]
@@ -335,10 +392,26 @@ mod tests {
     }
 
     #[test]
-    fn https_is_a_typed_refusal_naming_the_deferral() {
-        let err = build_post_url("https://collector.example.com").unwrap_err();
-        assert!(err.contains("deferred"), "{err}");
-        assert!(err.contains("http://"), "{err}");
+    fn https_is_accepted_and_keeps_its_scheme() {
+        // Story 24-5: https:// collectors are supported.
+        assert_eq!(
+            build_post_url("https://collector.example.com").unwrap(),
+            "https://collector.example.com/v1/metrics"
+        );
+        assert_eq!(
+            build_post_url("https://collector.example.com:4318/base/").unwrap(),
+            "https://collector.example.com:4318/base/v1/metrics"
+        );
+        assert!(validate_endpoint("https://collector.example.com:x").is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, "").unwrap();
+        assert!(load_ca_file(&empty)
+            .unwrap_err()
+            .contains("no PEM certificate"));
+        assert!(load_ca_file(&dir.path().join("missing.pem"))
+            .unwrap_err()
+            .contains("could not be read"));
     }
 
     #[test]
