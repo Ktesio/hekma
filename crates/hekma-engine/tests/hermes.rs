@@ -488,27 +488,9 @@ impl Drop for EnvGuard {
 /// `<shim_dir>/hermes`), NOT the engine's cwd. Without this copy the shim
 /// panics (exit 101) and every launch reports LaunchFailed.
 fn install_shim(shim_dir: &TempDir) -> PathBuf {
-    let exe = std::env::current_exe().expect("locate the running test executable");
-    let mut dir = exe;
-    dir.pop(); // drop the test-bin file name
-    if dir.ends_with("deps") {
-        dir.pop(); // drop `deps`
-    }
-    let candidate = dir.join(format!("hermes_shim{}", std::env::consts::EXE_SUFFIX));
-    let source = if candidate.exists() {
-        candidate
-    } else {
-        // Not built by this harness — build it on demand (tarpaulin parity with
-        // fake_agent_bin's fallback).
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-        let status = Command::new(cargo)
-            .args(["build", "-p", "hekma-conformance", "--bin", "hermes_shim"])
-            .env_remove("RUSTC_WRAPPER") // a shimmed PATH must not break the build
-            .status()
-            .expect("run cargo for hermes_shim");
-        assert!(status.success(), "on-demand hermes_shim build failed");
-        candidate
-    };
+    // The shared locator: resolves the profile dir from every layout Cargo
+    // runs tests from, and builds the helper on demand when absent.
+    let source = hekma_conformance::workspace_bin("hermes_shim");
     let shim = shim_dir
         .path()
         .join(format!("hermes{}", std::env::consts::EXE_SUFFIX));
