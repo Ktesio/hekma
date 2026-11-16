@@ -1719,11 +1719,16 @@ mod custody_tests {
         let one = super::super::ProxyTls(Arc::new(config));
         assert_eq!(one, one.clone());
         assert_eq!(format!("{one:?}"), "ProxyTls(..)");
-        // An unreadable file is named, never read.
-        let missing = std::path::Path::new("/nonexistent/hekma/key.pem");
-        assert!(crate::check_owner_only_file(missing)
-            .unwrap_err()
-            .contains("key.pem"));
+        // An unreadable file is named, never read. Unix only: on Windows the
+        // owner-only check is a documented no-op (a profile's default access
+        // control applies), so it answers Ok for any path.
+        #[cfg(unix)]
+        {
+            let missing = std::path::Path::new("/nonexistent/hekma/key.pem");
+            assert!(crate::check_owner_only_file(missing)
+                .unwrap_err()
+                .contains("key.pem"));
+        }
     }
 
     const KEY: &str = "sk-live-0123456789abcdef";
