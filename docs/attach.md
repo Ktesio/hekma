@@ -43,7 +43,7 @@ Wire control acts on calls, not on processes. Each verb takes a **Selector**, a 
 | Verb | Effect |
 |---|---|
 | hold | New calls wait at the proxy with the agent's state intact. Hekma sets no time limit; only the client's own timeout ends a hold. |
-| release | Held calls go through unchanged, in arrival order. |
+| release | Held calls go through unchanged. They leave the hold in arrival order; the provider can receive them in a different order. |
 | reroute | Calls go to another route configured on the binding. |
 | reject | Calls get the typed, non-retryable response a `block` **Breach Action** returns. |
 
