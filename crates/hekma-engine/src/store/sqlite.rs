@@ -5258,4 +5258,45 @@ mod tests {
         .expect("an already-migrated database is not migrated twice");
         assert!(notes.is_empty());
     }
+
+    #[test]
+    fn per_instance_reads_and_idempotent_clears_on_an_unregistered_name_are_empty_successes() {
+        // A name with no instance row: every read answers the honest empty
+        // value and every idempotent clear succeeds (the desired end state
+        // already holds) — none of them is an error, and none writes a row.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let ghost = name("ghost");
+        assert!(store.usage_events(&ghost).unwrap().is_empty());
+        assert!(store.get_spawn_record(&ghost).unwrap().is_none());
+        assert!(store.get_memory_backing(&ghost).unwrap().is_none());
+        store.clear_spawn_record(&ghost).unwrap();
+        store.clear_memory_backing(&ghost).unwrap();
+        // A vanished record adopts nothing: the lease answers "skip".
+        assert!(!store
+            .try_acquire_adoption_lease(&ghost, None, ProcessFingerprint::new(1, 1))
+            .unwrap());
+        assert!(store.list_instances().unwrap().is_empty());
+        assert!(store.list_spawn_records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn identity_writes_against_an_unregistered_name_are_not_found_naming_it() {
+        // The resume id and the durable Run id must never vanish silently:
+        // writing either for a name with no instance row is NotFound naming
+        // that name (the caller surfaces it), never a quiet no-op.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let ghost = name("ghost");
+        match store.set_acp_session_id(&ghost, Some("sess-1")) {
+            Err(StoreError::NotFound { name }) => assert_eq!(name, "ghost"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        match store.set_spawn_run_id(
+            &ghost,
+            &RunId::from_wire("run-1"),
+            &ProcessFingerprint::new(42, 7),
+        ) {
+            Err(StoreError::NotFound { name }) => assert_eq!(name, "ghost"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
 }
