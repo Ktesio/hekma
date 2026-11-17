@@ -635,7 +635,7 @@ In Handoff Mode, Runs survive the Service Host crashing, restarting or upgrading
 The Operator can hold a Run's calls at the Metering Proxy, pausing the Run with its in-process state intact, and later release, reroute or reject them.
 **Consequences (testable):**
 - While a Run is held, every new call it makes waits at the Metering Proxy, up to a per-Run held-call cap beyond which new calls get a typed retryable hold-full response and an Anomaly; calls already forwarded complete, and the hold is qualified accordingly. `hekma ps` shows the Run as `held` with the held-call count and the oldest held call's age.
-- Release forwards every held call unchanged, in arrival order; reroute forwards them to another configured model; reject returns the typed non-retryable response of the `block` Breach Action (FR-43).
+- Release forwards every held call unchanged; held calls leave the queue in arrival order and are forwarded without waiting for each other, so the provider may receive them in a different order; reroute forwards them to another configured model; reject returns the typed non-retryable response of the `block` Breach Action (FR-43).
 - When a held call ends without a release — the client's own timeout, the connection dropping or the process exiting — Hekma records which and shows it on the Run; it never reports the Run as cleanly paused.
 - Hold, release, reroute and reject accept Selectors (FR-50) and appear in per-call records.
 
