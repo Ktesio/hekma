@@ -1719,11 +1719,11 @@ mod custody_tests {
         let one = super::super::ProxyTls(Arc::new(config));
         assert_eq!(one, one.clone());
         assert_eq!(format!("{one:?}"), "ProxyTls(..)");
-        // An unreadable file is named, never read. Unix only: on Windows the
+        // An unreadable file is named, never read. Not on Windows: there the
         // owner-only check is a documented no-op (a profile's default access
-        // control applies), so it answers Ok for any path.
-        #[cfg(unix)]
-        {
+        // control applies), so it answers Ok for any path. Data-driven, not
+        // a cfg, per the boundary gate.
+        if hekma_adapter_api::OsId::current() != hekma_adapter_api::OsId::Windows {
             let missing = std::path::Path::new("/nonexistent/hekma/key.pem");
             assert!(crate::check_owner_only_file(missing)
                 .unwrap_err()
