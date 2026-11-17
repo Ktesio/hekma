@@ -9637,6 +9637,19 @@ fn a_raw_log_over_its_cap_with_an_unconsumed_partial_line_is_not_truncated() {
     sup.agent_log_cap_override = Some(64);
     sup.start(&registry, "truncpart").unwrap();
     let log = registry.agent_output_log_path(&name);
+    // Wait for the agent's own ready line first, so nothing the agent
+    // writes later completes the partial line or moves the length.
+    let ready_by = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("fake_agent ready")
+    {
+        assert!(
+            Instant::now() < ready_by,
+            "the agent never wrote its ready line"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let partial = "a partial agent line that has not reached its newline yet, well past the cap";
     std::fs::OpenOptions::new()
         .append(true)

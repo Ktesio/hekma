@@ -1310,13 +1310,11 @@ mod tests {
         // already set, so it reads nothing) fails every still-registered
         // waiter at once — a bounded handshake never waits out its whole
         // timeout after the stream is gone — and clears the in-flight turn.
-        let mut child = std::process::Command::new(
-            std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()),
-        )
-        .arg("--version")
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn a piped process for the stdout half");
+        let mut child = std::process::Command::new(hekma_conformance::fake_agent_bin())
+            .args(["--exit-fast", "0"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn a piped process for the stdout half");
         let stdout = child.stdout.take().expect("stdout pipe");
         let conn = routing_connection();
         let waiter = conn.register_waiter(conn.next_request_id());

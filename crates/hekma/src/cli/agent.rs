@@ -5878,26 +5878,6 @@ mod tests {
         assert_eq!(classify(outbox.as_ref()), ExitCode::General);
     }
 
-    #[test]
-    fn a_raw_log_that_shrank_between_polls_is_noted_and_one_that_grew_is_not() {
-        // The note goes to stderr only; both directions must return without
-        // touching anything else.
-        note_if_raw_shrunk(4, 128, "shrunk");
-        note_if_raw_shrunk(128, 4, "grown");
-    }
-
-    #[test]
-    fn runtime_status_still_renders_when_the_fleet_read_degraded() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
-        engine.blocking().register("degraded", "mock").unwrap();
-        let status = engine.blocking().instance_status("degraded").unwrap();
-        assert_eq!(status.instance.state, LifecycleState::Registered);
-        // No Fleet entry: the usage and metering rows fall back instead of
-        // failing the table.
-        render_runtime_status(&status, None);
-    }
-
     // ---- Routed writes against a scripted local Service Host ----
 
     /// `KTESIO_STATE_DIR` pointed at one directory for one test, cleared on

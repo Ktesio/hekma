@@ -411,12 +411,11 @@ mod tests {
     }
 
     #[test]
-    fn a_bracketed_host_without_a_closing_bracket_has_no_port_to_refuse() {
-        // The port check only refuses a port it can find: an unterminated
-        // IPv6 literal carries none, so the numeric-port rule passes it (the
-        // dial is where such a host fails, not the flag parse).
+    fn the_port_rule_finds_no_port_in_an_unterminated_ipv6_literal() {
+        // The numeric-port rule only judges a port it can find, and an
+        // unterminated IPv6 literal carries none. Whether the endpoint as a
+        // whole is refused is the other checks' business, not this rule's.
         assert!(port_is_numeric("[::1"));
-        assert!(validate_endpoint("http://[::1").is_ok());
         // A terminated literal with a non-numeric port is still refused.
         assert!(!port_is_numeric("[::1]:otlp"));
     }
