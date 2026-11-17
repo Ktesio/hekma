@@ -4,8 +4,10 @@
 //! ticket in its Run's queue and waits. A parked call re-reads the
 //! published snapshot on a short tick — the snapshot is the truth; there
 //! is no separate wake path to miss — and leaves only when the Run is no
-//! longer held AND its ticket is at the front, so released calls start in
-//! arrival order. Each queue holds at most `cap` calls; past that, the
+//! longer held AND its ticket is at the front, so released calls leave the
+//! queue in arrival order. They are then forwarded concurrently, so the
+//! upstream may receive them in any order: Hekma promises queue order,
+//! not upstream order. Each queue holds at most `cap` calls; past that, the
 //! caller answers the retryable hold-full refusal. A ticket leaves its
 //! queue when dropped (a released call, or a dropped connection).
 
@@ -164,5 +166,44 @@ mod tests {
         let _b = queues.enter(&other, "t").unwrap();
         assert_eq!(queues.stats(&run), (0, None));
         assert_eq!(HoldQueues::new(0).cap, 1);
+    }
+
+    /// Hekma promises queue order on release, not upstream order: parked
+    /// calls woken together still leave one at a time, front first. The
+    /// loop is the proxy's parking loop (`forward.rs`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn released_calls_leave_the_queue_in_arrival_order_even_when_woken_together() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let queues = Arc::new(HoldQueues::new(8));
+        let run = RunId::from_wire("run_A");
+        let held = Arc::new(AtomicBool::new(true));
+        let left = Arc::new(Mutex::new(Vec::new()));
+        let parked: Vec<_> = (0..6)
+            .map(|n| {
+                let ticket = queues.enter(&run, &format!("t{n}")).unwrap();
+                let queues = Arc::clone(&queues);
+                let held = Arc::clone(&held);
+                let left = Arc::clone(&left);
+                tokio::spawn(async move {
+                    loop {
+                        if !held.load(Ordering::Acquire) && ticket.is_front() {
+                            break;
+                        }
+                        queues.wait().await;
+                    }
+                    left.lock().unwrap().push(n);
+                    drop(ticket);
+                })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        assert!(left.lock().unwrap().is_empty(), "nothing leaves while held");
+        held.store(false, Ordering::Release);
+        queues.changed.notify_waiters();
+        for task in parked {
+            task.await.unwrap();
+        }
+        assert_eq!(*left.lock().unwrap(), (0..6).collect::<Vec<_>>());
+        assert_eq!(queues.stats(&run), (0, None));
     }
 }
