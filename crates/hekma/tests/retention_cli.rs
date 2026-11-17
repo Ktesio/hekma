@@ -80,7 +80,18 @@ fn the_read_starts_nothing_and_an_invalid_window_is_a_usage_error() {
         "{}",
         run.stdout
     );
-    assert!(run.stdout.contains("no pass yet"), "{}", run.stdout);
+    // The engine runs the retention pass once when its timer starts, and
+    // whether that pass committed before the setup engine above closed is
+    // a race (a loaded CI runner usually loses it). Either fresh state is
+    // right: no pass yet, or a pass that compacted nothing.
+    assert!(
+        run.stdout.contains("no pass yet")
+            || run
+                .stdout
+                .contains("0 Run(s) compacted and 0 file(s) deleted"),
+        "{}",
+        run.stdout
+    );
     let shown = json(&hekma(&["run", "retention", "--json"]));
     assert_eq!(shown["settings"]["run_retention_days"], 7, "{shown}");
     assert_eq!(shown["settings"]["calls_retention_days"], 7, "{shown}");
