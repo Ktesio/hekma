@@ -203,12 +203,14 @@ mod tests {
             "-----BEGIN CERTIFICATE-----\n!!!! not base64 !!!!\n-----END CERTIFICATE-----\n",
         )
         .unwrap();
+        // Static assertion messages: a refusal about TLS material is never
+        // echoed into the test log.
         let err = load_server_config(&corrupt, &key).unwrap_err();
-        assert!(err.contains("is not valid PEM"), "{err}");
         assert!(
-            err.contains("corrupt.pem"),
-            "the refusal names the file: {err}"
+            err.contains("is not valid PEM"),
+            "a corrupt block is not PEM"
         );
+        assert!(err.contains("corrupt.pem"), "the refusal names the file");
     }
 
     #[test]
@@ -219,17 +221,14 @@ mod tests {
         let err = load_server_config(&cert, &missing).unwrap_err();
         assert!(
             err.contains("could not read a PEM private key from"),
-            "{err}"
+            "a missing key file has no key to read"
         );
-        assert!(
-            err.contains("absent-key.pem"),
-            "the refusal names the key: {err}"
-        );
+        assert!(err.contains("absent-key.pem"), "the refusal names the key");
         // A key slot that holds only a certificate has no key to read either.
         let err = load_server_config(&cert, &cert).unwrap_err();
         assert!(
             err.contains("could not read a PEM private key from"),
-            "{err}"
+            "a certificate in the key slot has no key to read"
         );
     }
 

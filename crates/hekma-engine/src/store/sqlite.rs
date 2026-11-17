@@ -5286,17 +5286,20 @@ mod tests {
         // that name (the caller surfaces it), never a quiet no-op.
         let store = SqliteStore::open_in_memory().unwrap();
         let ghost = name("ghost");
-        match store.set_acp_session_id(&ghost, Some("sess-1")) {
-            Err(StoreError::NotFound { name }) => assert_eq!(name, "ghost"),
-            other => panic!("expected NotFound, got {other:?}"),
-        }
-        match store.set_spawn_run_id(
+        // The assertion messages stay static: a resume id is never printed.
+        let session = store.set_acp_session_id(&ghost, Some("sess-1"));
+        assert!(
+            matches!(&session, Err(StoreError::NotFound { name }) if name == "ghost"),
+            "a resume id written for an unregistered name is NotFound naming it"
+        );
+        let run = store.set_spawn_run_id(
             &ghost,
             &RunId::from_wire("run-1"),
             &ProcessFingerprint::new(42, 7),
-        ) {
-            Err(StoreError::NotFound { name }) => assert_eq!(name, "ghost"),
-            other => panic!("expected NotFound, got {other:?}"),
-        }
+        );
+        assert!(
+            matches!(&run, Err(StoreError::NotFound { name }) if name == "ghost"),
+            "a Run id written for an unregistered name is NotFound naming it"
+        );
     }
 }
