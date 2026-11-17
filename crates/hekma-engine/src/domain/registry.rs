@@ -920,7 +920,11 @@ impl Registry {
     /// ≤ 1 s pickup for a foreign revocation, a foreign binding change or a
     /// foreign Run end). The O(changed-entries) refinement is deferred (24-4).
     /// A failed reload keeps the last good snapshot serving; the caller
-    /// surfaces it.
+    /// surfaces it. A reload that only met a busy store (another connection
+    /// holding the write transaction) is not a failure: the seen version
+    /// stays behind so the next tick retries, and nothing is reported —
+    /// otherwise a foreign change committed just before a busy tick would
+    /// wait for some later, unrelated commit.
     pub(crate) fn poll_foreign_commits(&self) -> Result<(), StoreError> {
         let Ok(version) = self.store.data_version() else {
             return Ok(());
@@ -929,10 +933,11 @@ impl Registry {
         if *seen == version {
             return Ok(());
         }
+        let previous = *seen;
         *seen = version;
         drop(seen);
         let publisher = std::sync::Arc::clone(&self.run_snapshot);
-        self.writer.call(move |ctx| {
+        let reloaded = self.writer.call(move |ctx| {
             let entries = crate::domain::runs::ops::open_entries(ctx.store())?;
             let keys = crate::domain::runs::keys::open_keys(ctx.store())?;
             let bindings = crate::domain::runs::bindings::published_table(ctx.store())?;
@@ -941,7 +946,12 @@ impl Registry {
                 publisher.publish_bindings(bindings);
             });
             Ok(())
-        })
+        });
+        if let Err(StoreError::Busy { .. }) = reloaded {
+            *self.data_version.lock().expect("data version mutex") = previous;
+            return Ok(());
+        }
+        reloaded
     }
 
     /// The read-only store, for the Run-scale reads ([`RunStore`]).
@@ -5263,6 +5273,36 @@ source = "self-reported"
         assert_eq!(reg.transition_events(&name).unwrap().len(), 2);
         assert_eq!(reg.breach_events(&name).unwrap().len(), 2);
         assert!(reg.take_open_notes().is_empty());
+    }
+
+    #[test]
+    fn a_busy_foreign_reload_notes_nothing_and_retries_on_the_next_tick() {
+        // Story 23-1: a reload that only met a busy store is retried, not
+        // reported and not forgotten.
+        let tmp = TempDir::new().unwrap();
+        let reg = Registry::open(Some(tmp.path().to_path_buf())).unwrap();
+        let paths = EnginePaths::new(Some(tmp.path().to_path_buf())).unwrap();
+        let foreign = rusqlite::Connection::open(paths.state_db()).unwrap();
+        foreign
+            .execute_batch("CREATE TABLE foreign_probe (x INTEGER)")
+            .unwrap();
+        let before = *reg.data_version.lock().unwrap();
+        // The foreign connection now holds the write transaction.
+        foreign.execute_batch("BEGIN IMMEDIATE").unwrap();
+        reg.poll_foreign_commits()
+            .expect("a busy store is retried, not reported");
+        assert_eq!(
+            *reg.data_version.lock().unwrap(),
+            before,
+            "the foreign commit stays unseen, so the next tick retries it"
+        );
+        foreign.execute_batch("ROLLBACK").unwrap();
+        reg.poll_foreign_commits().expect("the retry reloads");
+        assert_eq!(
+            *reg.data_version.lock().unwrap(),
+            reg.store.data_version().unwrap(),
+            "the retry records the version it reloaded"
+        );
     }
 
     #[test]
