@@ -2731,7 +2731,7 @@ fn call_dispositions(
 }
 
 #[test]
-fn a_held_run_parks_its_calls_and_release_forwards_them_in_arrival_order() {
+fn a_held_run_parks_its_calls_and_release_forwards_them_all() {
     use hekma_engine::DispositionVerb;
     let state = TempDir::new().unwrap();
     let upstream = Upstream::start();
@@ -2787,18 +2787,22 @@ fn a_held_run_parks_its_calls_and_release_forwards_them_in_arrival_order() {
     for call in calls {
         assert_eq!(call.join().unwrap().status, 200);
     }
-    let order: Vec<String> = upstream
+    // Released calls leave the queue in arrival order (pinned in
+    // `hold.rs`), then are forwarded concurrently: the upstream may
+    // receive them in any order, so only the set is checked here.
+    let mut forwarded: Vec<String> = upstream
         .served()
         .iter()
         .skip(served + 1)
         .map(|seen| seen.request_line.clone())
         .collect();
+    forwarded.sort();
     assert_eq!(
-        order,
+        forwarded,
         (0..3)
             .map(|n| format!("POST /v1/chat/{n} HTTP/1.1"))
             .collect::<Vec<_>>(),
-        "released in arrival order"
+        "every held call is forwarded once on release"
     );
     assert_eq!(
         run_with(&engine, ("binding", "openai"))
