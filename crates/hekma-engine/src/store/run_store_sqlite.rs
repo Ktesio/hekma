@@ -1424,8 +1424,9 @@ mod tests {
     #[test]
     fn an_instance_less_usage_row_advances_the_fold_without_touching_any_rollup() {
         // A usage row with no instance has no per-instance rollup to fold
-        // into: the fold passes over it (the watermark still moves past it,
-        // so it is never re-read) and every instance's rollup stays zero.
+        // into: the fold passes over it for the instances (the watermark
+        // still moves past it, so it is never re-read) and every instance's
+        // rollup stays zero.
         let store = store_with("known");
         store
             .conn()
@@ -1451,12 +1452,29 @@ mod tests {
             store.instance_rollup(&name("known")).unwrap(),
             Rollup::zero()
         );
+        // Since story 23-1 (schema v18) the Run rollup is keyed by the run id
+        // alone, so an instance-less Run (a wire Run of the shared proxy)
+        // folds into its own Run rollup, with no instance on it.
+        let run_rollup: (Option<i64>, i64, i64, i64) = store
+            .conn()
+            .query_row(
+                "SELECT instance_id, events, input_tokens, output_tokens \
+                 FROM usage_rollup_run WHERE run_id = 'run-free'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            run_rollup,
+            (None, 1, 7, 3),
+            "the instance-less Run has its own rollup, owned by no instance"
+        );
         let rollup_rows: i64 = store
             .conn()
             .query_row("SELECT COUNT(*) FROM usage_rollup_run", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(rollup_rows, 0, "no Run rollup is invented for it");
+        assert_eq!(rollup_rows, 1, "no other Run rollup is invented");
     }
 }

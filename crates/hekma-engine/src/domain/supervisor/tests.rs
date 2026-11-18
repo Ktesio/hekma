@@ -10944,10 +10944,13 @@ fn an_adopted_raw_log_truncate_failure_latches_one_notice_until_a_truncate_succe
 }
 
 #[test]
-fn an_adoption_surfaces_unreadable_breach_records_and_a_stuck_launch_generation() {
-    // Adoption never fails on bookkeeping: a resumed Run whose breach records
-    // cannot be read re-raises no fence and says so, and a launch generation
-    // that cannot be advanced falls back to the stored one and says so.
+fn an_adoption_survives_unreadable_breach_records_and_a_stuck_launch_generation() {
+    // Adoption never fails on bookkeeping. Since story 23-1 an adopted agent
+    // is metered through the shared proxy: there is no per-instance listener
+    // to re-fence and no sequence restart to re-generation, so the adoption
+    // neither reads the resumed Run's breach records nor advances the launch
+    // generation — faults on either surface leave it untouched, on the stored
+    // generation, with nothing to surface.
     let (state, _manifest, registry) = setup_fake("adoptfault", &["--linger-ms", "600000"]);
     let name = InstanceName::new("adoptfault").unwrap();
     let mut sup1 = Supervisor::with_backoff(fast_backoff());
@@ -10972,19 +10975,14 @@ fn an_adoption_surfaces_unreadable_breach_records_and_a_stuck_launch_generation(
     );
     let text = sink_text(&buffer);
     assert!(
-        text.contains("adoptfault: the resumed Run's breach records could not be read")
-            && text.contains("a `block` fence it carried is not re-raised"),
-        "the unreadable breach records are named:\n{text}"
-    );
-    assert!(
-        text.contains("adoptfault: the adopted instance's launch generation could not be advanced")
-            && text.contains("injected launch-generation fault"),
-        "the stuck generation is named with its cause:\n{text}"
+        !text.contains("breach records could not be read")
+            && !text.contains("launch generation could not be advanced"),
+        "nothing on those surfaces is read or written at adoption:\n{text}"
     );
     assert_eq!(
         sup2.running.get(&name).unwrap().launch_generation,
         stored_generation,
-        "the fallback is the stored generation"
+        "the adopted instance stays on the stored generation"
     );
 
     state_db_exec(
