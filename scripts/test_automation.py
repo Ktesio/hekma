@@ -673,7 +673,18 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertNotIn("--profile parallel-heavy", ci)
         # The unbounded group + shadow profile exist.
         self.assertIn("[test-groups.unbounded]", nextest)
-        self.assertIn("max-threads = 2147483647", nextest)
+        self.assertIn("max-threads = 512", nextest)
+        # No group may ask for a huge max-threads: nextest reserves every
+        # defined group's slot heap at run start (8 bytes a slot), and the
+        # old i32::MAX value was a 16 GiB request that aborted ubuntu runs
+        # when Linux refused it (2026-11-13 to 11-16).
+        caps = [
+            int(line.split("=", 1)[1].strip())
+            for line in nextest.splitlines()
+            if line.strip().startswith("max-threads") and line.split("=", 1)[1].strip().isdigit()
+        ]
+        self.assertTrue(caps, "the test groups declare numeric max-threads")
+        self.assertTrue(all(cap <= 4096 for cap in caps), caps)
         self.assertIn("[profile.parallel-heavy]", nextest)
         # Shadow-pair equality: each serialized filter appears EXACTLY
         # twice — once under `default`'s overrides (serialized group) and

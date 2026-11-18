@@ -92,7 +92,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = "1"
 # Engine state store (AD-6): bundled SQLite, no system dependency.
-rusqlite = { version = "0.41.1", features = ["bundled"] }
+rusqlite = { version = "0.42.0", features = ["bundled"] }
 # Cross-platform data-dir resolution; keeps engine path code cfg-free (OS-cfg gate).
 directories = "6"
 console = "0.16"
@@ -106,7 +106,7 @@ toml = "1"
 thiserror = "2"
 # Run ids (story 21-2, AD-25): the ULID's 80 random bits. Already in the
 # tree through `ring` (rustls); a direct edge adds no crate (NFR-8).
-getrandom = "0.2"
+getrandom = "0.4"
 ureq = { version = "3", features = ["json"] }
 semver = "1"
 flate2 = "1"

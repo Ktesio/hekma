@@ -794,3 +794,54 @@ fn a_successor_without_its_token_or_its_predecessor_is_refused() {
     let lock = hekma_host::HostLock::acquire(&base.join(hekma_engine::paths::HOST_LOCK_FILE));
     assert!(lock.is_ok());
 }
+
+#[test]
+fn a_discovery_file_that_cannot_be_written_aborts_the_start_after_a_drain() {
+    // `control.json` occupied by a directory can never be replaced by the
+    // discovery write's rename. The engine has already opened by then, so
+    // the host runs its bounded drain and refuses with the typed Startup
+    // naming the file — through the error AND the caller sink — instead of
+    // serving an API no CLI could ever find.
+    let state = tempfile::tempdir().unwrap();
+    let occupied = hekma_host::control_file(state.path());
+    std::fs::create_dir(&occupied).unwrap();
+    std::fs::write(occupied.join("keep"), b"a directory, not a discovery file").unwrap();
+    let (sink_handle, sink) = SharedSink::new();
+    let options = ServeOptions {
+        state_base: Some(state.path().to_path_buf()),
+        diagnostics: Some(sink),
+        ..ServeOptions::default()
+    };
+    let err = serve_with_signal(options, immediate_signal())
+        .expect_err("an unwritable discovery file refuses the start");
+    match &err {
+        ServeError::Startup { message } => {
+            assert!(
+                message.contains("could not write the discovery file"),
+                "the refusal says what failed: {message}"
+            );
+            assert!(
+                message.contains(hekma_host::CONTROL_FILE),
+                "the refusal names the file: {message}"
+            );
+        }
+        other => panic!("expected Startup, got {other:?}"),
+    }
+    let notes = sink_handle.text();
+    assert!(
+        notes.contains("could not write the discovery file"),
+        "the refusal is ALSO noted through the caller sink:\n{notes}"
+    );
+    assert!(
+        !notes.contains("local control endpoint on"),
+        "the API never announced an endpoint it could not record:\n{notes}"
+    );
+    assert!(
+        state.path().join("state.db").exists(),
+        "the refusal came after the engine opened (hence the drain)"
+    );
+    assert!(
+        occupied.join("keep").exists(),
+        "the occupying directory is left as it was"
+    );
+}
