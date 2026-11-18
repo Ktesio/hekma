@@ -612,6 +612,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: `hk_ann_` announce credentials have their format, class, store CHECK value, key-index slot and authority-matrix row (Heartbeat, OtlpIntake — no route yet), but nothing issues one: there is no endpoint binding to scope one to, and no announce endpoint or heartbeat route.
   evidence: `domain/credential.rs` (`TokenClass::Announce`), `crates/hekma-host/src/control/auth.rs` (the matrix). Trigger: story 23.1 (`hekma binding`, announce-credential issuance) and story 23.2 (the announce endpoint, heartbeats and Leases).
   resolved: story 23-2 (`POST /v0/runs/announce`, `POST /v0/runs/{id}/heartbeat` and close by the creating credential; the matrix opens `Announce → Announce | Heartbeat | OtlpIntake | RunClose`) 2026-11-13
+  resolved-too: story 23-3 (the OtlpIntake cell has its route, `POST /v1/metrics`) 2026-11-13
 
 - source_spec: `spec-22-1-run-keys.md` (Design Notes: the snapshot index)
   summary: Cross-engine revocation propagation: a second engine on the same state dir (an embedder beside `hekma serve`) publishes its own snapshot, so a revocation it commits reaches the host's snapshot only on the host's next open. Harmless for the Control API — every Run Key action is a write that re-validates the key's row inside its job, and a snapshot miss falls back to one store read (`Engine::credential_state`) — but a proxy that reads only the snapshot would honour a key another engine revoked.
@@ -773,3 +774,25 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: A header announce whose pair cannot be minted (the OS random source failed) still claims the identity and creates the Run, with no credentials; the call is served, and the client has no key to present.
   evidence: `metering/proxy/forward.rs` (`claim_announce`). Trigger: a report of an RNG failure on a host.
 
+
+## From spec-23-3 (inbound OTLP and observed Runs) — build, 2026-11-13
+
+- source_spec: `spec-23-3-inbound-otlp-and-observed-runs.md` (Design Notes: what 23-3 does not do)
+  summary: The receiver reads OTLP/HTTP+JSON only; protobuf and gRPC answer `415` naming the Collector translation (docs/telemetry.md carries the recipe).
+  evidence: `crates/hekma-host/src/otlp/intake.rs` (`is_json`). Trigger: a named client or SDK that cannot post OTLP/HTTP+JSON through a Collector.
+
+- source_spec: `spec-23-3-inbound-otlp-and-observed-runs.md` (Design Notes: deferrals)
+  summary: No per-binding switch for the intake; the announce credential is the switch (no credential, no intake).
+  evidence: `crates/hekma-host/src/control/auth.rs` (the OtlpIntake cell). Trigger: an Operator asks for one.
+
+- source_spec: `spec-23-3-inbound-otlp-and-observed-runs.md` (Design Notes: deferrals)
+  summary: Each identity in a batch is its own writer job; multiple posts are not batched into one job.
+  evidence: `crates/hekma-host/src/otlp/intake.rs` (`metrics_intake`), `domain/runs/telemetry.rs` (`ingest`). Trigger: a measured writer-load report at Run scale.
+
+- source_spec: `spec-23-3-inbound-otlp-and-observed-runs.md` (Design Notes: no new exported counter)
+  summary: The intake's skips, bound-key labels and re-bases are host diagnostics and `partialSuccess` only; no exported OTLP counter yet.
+  evidence: `crates/hekma-host/src/control/auth.rs` (`AuthDiagnostics::intake`). Trigger: `otlp-metrics v2` (24-5).
+
+- source_spec: `spec-23-3-inbound-otlp-and-observed-runs.md` (Design Notes: one job, and the diff is the idempotence)
+  summary: The counter is per (Run, token type), summed over the batch's points; a client that reports several series per token type (one per model, say) must send all of them in every batch, as cumulative exporters do, or the sum goes down and re-bases. A batch with points for several models prices unpriced unless the Run's Policy sets a flat Rate.
+  evidence: `domain/runs/telemetry.rs` (`ingest`). Trigger: a client that sends partial series, or a request for per-model pricing of telemetry.

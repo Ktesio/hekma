@@ -32,7 +32,10 @@ against its implementation and assert byte-exact agreement.
   Caller layer (a Run's own limits, applied only where tighter), then four
   `policy-wire-*` cases: `block` executes at every depth with a wire path,
   while `pause` and `stop` there act as `warn` with the `depth-fallback`
-  Anomaly.
+  Anomaly, then three Scent-Check Mode cases, then three `policy-observed-*`
+  cases: at `observed` depth (no wire path, no process) a Policy's `warn`
+  executes, while `block` and `pause` act as `warn` with the
+  `depth-fallback` Anomaly.
 
 ## Getting the artifact
 
@@ -56,7 +59,7 @@ without running the CLI.
 
 ## The document, schema version 1
 
-An excerpt (the full artifact carries 76 cases; the shape is identical
+An excerpt (the full artifact carries 79 cases; the shape is identical
 throughout):
 
 ```json

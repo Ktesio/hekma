@@ -20,9 +20,9 @@
 //! unaffected), so graceful usually completes inside the bounded grace and
 //! the abort backstop never fires; only then does the host's drain run.
 
-mod auth;
+pub(crate) mod auth;
 mod dto;
-mod error;
+pub(crate) mod error;
 pub(crate) mod notes;
 mod routes;
 pub(crate) mod sets;
@@ -56,7 +56,7 @@ pub(crate) struct ApiState {
     /// The engine — the ONLY internal edge (AD-2): handlers call its PUBLIC
     /// async methods directly (they run ON the host's runtime; the blocking
     /// facade's `block_on` would panic there).
-    engine: Arc<hekma_engine::Engine>,
+    pub(crate) engine: Arc<hekma_engine::Engine>,
     /// The host's credential resolver (hashes + classes, never a value).
     resolver: CredentialResolver,
     /// Serializes CONFIG WRITES per host (review item 8): a `PUT .../config`
@@ -87,7 +87,7 @@ pub(crate) struct ApiState {
     loopback: bool,
     /// Story 22-1: the rate-limited count of unresolved presentations,
     /// shared by every listener.
-    auth_diagnostics: auth::AuthDiagnostics,
+    pub(crate) auth_diagnostics: auth::AuthDiagnostics,
 }
 
 /// The API's request activity (story 21-4): how many authenticated requests
@@ -239,6 +239,8 @@ fn router(state: ApiState) -> Router {
         // a Run's key metadata.
         .route("/v0/runs/refresh", post(routes::run_refresh))
         .route("/v0/runs/announce", post(routes::run_announce))
+        // Story 23-3: inbound OTLP/HTTP+JSON under an announce credential.
+        .route("/v1/metrics", post(crate::otlp::intake::metrics_intake))
         .route("/v0/runs/{id}/heartbeat", post(routes::run_heartbeat))
         .route("/v0/runs/{id}/revoke-keys", post(routes::run_revoke_keys))
         .route("/v0/runs/{id}/keys", get(routes::run_keys))

@@ -5,7 +5,7 @@ description: "A client Hekma did not start tells Hekma who it is: an announce he
 
 # Announce and Leases
 
-> **On main, not yet released.** Announce and Leases ship with the next release. The OpenTelemetry announce channel and the CrewAI and LangGraph helpers are still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **On main, not yet released.** Announce and Leases ship with the next release, and so does the OpenTelemetry channel. The CrewAI and LangGraph helpers are still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 > This page mirrors [hekma.ktesio.dev/docs/announce/](https://hekma.ktesio.dev/docs/announce/), where it is kept current.
 
@@ -13,14 +13,15 @@ A framework or plain client that Hekma did not start can still be a [Run](runs.m
 
 **Announcing tells Hekma who is calling. It is not authentication: on this machine any process can announce.** Announcing gives a client an identity to budget, list and fence. It does not decide who may reach a model provider. Possession of a Run Key is what binds later calls to the Run.
 
-## Two channels, one identity
+## Three channels, one identity
 
 | Channel | How | What comes back |
 |---|---|---|
 | The announce header | `x-hekma-announce: <id>` on a call through the [metering proxy](metering-proxy.md) | On the first claim, the Run Key and refresh credential in the `x-hekma-run-key` and `x-hekma-refresh` response headers |
 | The announce endpoint | `POST /v0/runs/announce` on the [Control API](control-api.md#announce-and-heartbeat), under a binding's announce credential | `201` with the Run and its Run Key and refresh credential, or `200` with the renewed Run |
+| OpenTelemetry | `POST /v1/metrics` with the resource attribute `hekma.run.external_id`, under a binding's announce credential ([inbound telemetry](telemetry.md#inbound-telemetry-v1metrics)) | Nothing: it creates or renews an `observed` Run and its Lease, and never issues a Run Key |
 
-Both channels claim the same identity, so a client discovered on the wire and announced later stays **one Run**:
+All three channels claim the same identity, so a client discovered on the wire and announced later stays **one Run**:
 
 - **Beneath a binding,** an announce claims `<id>` in that binding's namespace, the same one an `x-hekma-run` split uses. The Run carries the binding's labels as bound labels, so Policies select it, and the announce's `x-hekma-labels` (or the endpoint's `labels`) as Caller labels.
 - **Beneath a Run Key or a Run route,** an announce on the header channel names a **child** Run of that Run. Its usage rolls up to the parent, every ancestor's ceilings apply, and the parent's `block` fences it.

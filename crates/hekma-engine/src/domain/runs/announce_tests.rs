@@ -52,6 +52,7 @@ fn endpoint(credential: &AnnounceCredential, external: &str) -> AnnounceClaim {
         created_by: Some(credential.hash),
         issuer: credential.token_id.clone(),
         wire: false,
+        telemetry: false,
     }
 }
 
@@ -64,6 +65,7 @@ fn header(scope: AnnounceScope, external: &str) -> AnnounceClaim {
         created_by: None,
         issuer: "announce".into(),
         wire: true,
+        telemetry: false,
     }
 }
 

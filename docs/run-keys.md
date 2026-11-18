@@ -19,7 +19,7 @@ With [key custody](#key-custody-preview--not-yet-supported) (a preview), a Run K
 |---|---|
 | A key per launch | Every supervised start, and every Restart Policy relaunch, issues a fresh Run Key and hands it to the agent in `HEKMA_RUN_KEY`. |
 | A pair per child Run | `POST /v0/runs` (and `hekma run open --print-key`) returns the child's Run Key and a refresh credential, once. |
-| A pair per announced Run | An [announce](announce.md) that creates its Run returns the Run's Run Key and refresh credential once: in the `201` of `POST /v0/runs/announce`, or in the `x-hekma-run-key` and `x-hekma-refresh` response headers of the announcing call. Announcing an open identity again issues nothing. |
+| A pair per announced Run | An [announce](announce.md) that creates its Run returns the Run's Run Key and refresh credential once: in the `201` of `POST /v0/runs/announce`, or in the `x-hekma-run-key` and `x-hekma-refresh` response headers of the announcing call. Announcing an open identity again issues nothing. A Run that [inbound telemetry](telemetry.md#inbound-telemetry-v1metrics) created holds no Run Key, ever. |
 | Hash-only storage | Hekma stores the SHA-256 of each credential, never the value. A short **token id** (12 hex characters) labels it in records and reports. |
 | Revocation | A key is revoked when its process exits, when its Run ends, after a refresh, when it shows up in a URL, and on demand with `hekma run revoke-keys`. The next request presenting it is refused. |
 | Refresh with reuse detection | A refresh credential trades itself once for a new pair. Presenting a used one again — or seeing one in a URL — revokes the Run's current pair and raises the `credential-reuse` Anomaly. |

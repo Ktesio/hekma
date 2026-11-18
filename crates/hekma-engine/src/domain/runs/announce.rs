@@ -53,6 +53,10 @@ pub(crate) struct AnnounceClaim {
     pub issuer: String,
     /// The header channel: the announcing call is the Run's wire path.
     pub wire: bool,
+    /// The telemetry channel (story 23-3): the claim never moves the Run's
+    /// depth (only its own wire traffic or a minting announce does) and,
+    /// with no pair passed, never mints.
+    pub telemetry: bool,
 }
 
 impl AnnounceClaim {
@@ -239,12 +243,14 @@ fn renew(
     let run_id = record.run_id.clone();
     let current = store.run_labels(&run_id)?;
     labels::check_caller_labels(&run_id, &current, caller)?;
-    let wire_path = record.wire_path || claim.wire;
-    let depth = match record.control_depth {
-        ControlDepth::Observed | ControlDepth::Wire if wire_path => ControlDepth::Announced,
-        other => other,
-    };
-    changes.extend(ops::sync_depth(store, record, depth, wire_path, &at)?);
+    if !claim.telemetry {
+        let wire_path = record.wire_path || claim.wire;
+        let depth = match record.control_depth {
+            ControlDepth::Observed | ControlDepth::Wire if wire_path => ControlDepth::Announced,
+            other => other,
+        };
+        changes.extend(ops::sync_depth(store, record, depth, wire_path, &at)?);
+    }
     let mut prior: Vec<Label> = current
         .iter()
         .filter(|label| label.source == LabelSource::Caller)

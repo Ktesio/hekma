@@ -82,7 +82,7 @@ impl CredentialClass {
 /// columns, story 22-1). `Proxy` and `OtlpIntake` have no Control API
 /// route; their cells are pinned for the stories that add them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // `Proxy`, `OtlpIntake`: pinned, no route here.
+#[allow(dead_code)] // `Proxy`: pinned, no route here.
 pub(crate) enum RouteFamily {
     /// Every route that is not one of the Caller families: the fleet,
     /// instances, config, labels, Policies, the listing, a Run's read,
@@ -130,6 +130,7 @@ impl RouteFamily {
             (&Method::POST, ["", "v0", "runs", "refresh"]) => RouteFamily::RunRefresh,
             (&Method::POST, ["", "v0", "runs", "announce"]) => RouteFamily::Announce,
             (&Method::POST, ["", "v0", "runs", _, "heartbeat"]) => RouteFamily::Heartbeat,
+            (&Method::POST, ["", "v1", "metrics"]) => RouteFamily::OtlpIntake,
             (&Method::POST, ["", "v0", "runs", _, "close"]) => RouteFamily::RunClose,
             (&Method::PATCH, ["", "v0", "runs", _, "limits"]) => RouteFamily::RunLimits,
             _ => RouteFamily::Operator,
@@ -223,6 +224,13 @@ struct DiagnosticsInner {
     /// that was last reported.
     check_failures: u64,
     last_check_failure: Option<Instant>,
+    /// Story 23-3: the OTLP intake's skipped points, Caller labels skipped
+    /// on bound keys, and counter re-bases, and when they were last
+    /// reported.
+    intake_skipped: u64,
+    intake_labels: u64,
+    intake_rebased: u64,
+    last_intake: Option<Instant>,
     /// Tokens the URL scan left past its cap (refused with the request, not
     /// revoked), and when that was last reported.
     url_overflow: u64,
@@ -243,6 +251,10 @@ impl AuthDiagnostics {
                 last_check_failure: None,
                 url_overflow: 0,
                 last_url_overflow: None,
+                intake_skipped: 0,
+                intake_labels: 0,
+                intake_rebased: 0,
+                last_intake: None,
             })),
             notifier: notifier.map(Arc::new),
             interval,
@@ -311,6 +323,39 @@ impl AuthDiagnostics {
         );
         inner.check_failures = 0;
         inner.last_check_failure = Some(Instant::now());
+        drop(inner);
+        if let Some(notifier) = &self.notifier {
+            notifier.note(&line);
+        }
+        Some(line)
+    }
+
+    /// Count the OTLP intake's skipped points, skipped Caller labels and
+    /// counter re-bases (story 23-3); emit one line when the interval has
+    /// passed and anything was counted. Never a value. Returns the line
+    /// emitted, if any (for tests).
+    pub(crate) fn intake(&self, skipped: u64, labels: u64, rebased: u64) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.intake_skipped += skipped;
+        inner.intake_labels += labels;
+        inner.intake_rebased += rebased;
+        let total = inner.intake_skipped + inner.intake_labels + inner.intake_rebased;
+        let due = inner
+            .last_intake
+            .is_none_or(|last| last.elapsed() >= self.interval);
+        if total == 0 || !due {
+            return None;
+        }
+        let line = format!(
+            "the OTLP intake skipped {} data point(s) and {} Caller label(s) on keys their \
+             binding sets, and re-based {} restarted counter(s), since the last report; no \
+             value is recorded",
+            inner.intake_skipped, inner.intake_labels, inner.intake_rebased
+        );
+        inner.intake_skipped = 0;
+        inner.intake_labels = 0;
+        inner.intake_rebased = 0;
+        inner.last_intake = Some(Instant::now());
         drop(inner);
         if let Some(notifier) = &self.notifier {
             notifier.note(&line);
@@ -843,6 +888,8 @@ mod tests {
             (Method::GET, "/v0/runs", F::Operator),
             (Method::POST, "/v0/runs/refresh", F::RunRefresh),
             (Method::POST, "/v0/runs/announce", F::Announce),
+            (Method::POST, "/v1/metrics", F::OtlpIntake),
+            (Method::GET, "/v1/metrics", F::Operator),
             (Method::GET, "/v0/runs/announce", F::Operator),
             (Method::POST, "/v0/runs/run_1/heartbeat", F::Heartbeat),
             (Method::GET, "/v0/runs/run_1/heartbeat", F::Operator),

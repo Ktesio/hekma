@@ -528,6 +528,7 @@ fn an_announce_claims_the_hint_namespaces_and_wins_over_a_hint() {
             created_by: None,
             issuer: "announce".into(),
             wire: true,
+            telemetry: false,
         };
     // Beneath a labelled binding, with Caller labels: `binding:openai`,
     // falling back to the binding's own Run.

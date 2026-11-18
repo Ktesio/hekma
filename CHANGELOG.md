@@ -4,6 +4,19 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — inbound OTLP: `observed` Runs from their own telemetry (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **`POST /v1/metrics` on the Control API listener**, OTLP/HTTP+JSON only, under a binding's announce credential (every other class `403`; none, unknown or revoked `401`). Always on; inert until an announce credential is issued.
+> - **Exactly three inputs are read:** the resource attribute `hekma.run.external_id`, `hekma.label.*` Caller labels (a key the binding sets is skipped), and cumulative `gen_ai.client.token_usage` sums by `gen_ai.token.type` (`input`, `output`, `cached`; the point's `gen_ai.request.model` prices it and is never stored). Nothing else is stored.
+> - **The third announce channel.** The identity is claimed beneath the credential's binding (one identity, one Run across the header, the endpoint and telemetry), created at depth `observed` or renewed, with a Lease and **no Run Key, ever**. Telemetry never moves a Run's depth.
+> - **Counted once.** The last cumulative value per Run and token type is stored; only the increase becomes a usage row (`metering_source: "telemetry-reported"`, always estimated), in the same transaction, so a retried batch records nothing twice. A lower value re-bases.
+> - **Budgets at `observed`:** telemetry usage counts; `warn` executes; a Policy's `block`, `pause` or `stop` acts as `warn` with the `depth-fallback` Anomaly. A Run whose calls pass through the metering proxy keeps per-call metering: its telemetry is skipped and reported in `partialSuccess`, never summed.
+> - **Answers:** `200` (with `partialSuccess` and fixed messages for skipped points), `400`, `409 too-many-children`, `413` over 4 MiB, `415` for protobuf or gRPC (a Collector translates), `503` with `x-should-retry: true`. Bounds: 8 resources and 64 token-usage points per batch, 16 labels.
+> - **Governance vectors stay 1.4.0** and gain three `policy-observed-*` cases appended after every earlier case (79 in all; new checksum).
+> - **One-way upgrade.** The first open migrates `state.db` to schema 21 (`telemetry_counters`).
+> - **Engine surface within the unreleased `hekma-engine` 0.12.0** (no version bump): `Engine::ingest_telemetry` and its `Blocking` twin; `TelemetryReport`, `TelemetryPoint`, `TelemetryTokenType`, `TelemetryOutcome`.
+
 > **Unreleased — announce and Leases: Runs for clients Hekma did not start (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >

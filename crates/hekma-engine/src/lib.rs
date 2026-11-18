@@ -198,6 +198,8 @@ pub use domain::{
     CREDENTIAL_EVENT_SCHEMA_VERSION, MAX_CALLER_OPEN_CHILDREN, MAX_ROOT_OPEN_DESCENDANTS,
     REFRESH_PREFIX, RUN_KEY_PREFIX, TOKEN_BODY_LEN, TOKEN_ID_LEN,
 };
+// Story 23-3: inbound telemetry (the Control API's `/v1/metrics`).
+pub use domain::{TelemetryOutcome, TelemetryPoint, TelemetryReport, TelemetryTokenType};
 // Story 23-1: the shared Metering Proxy's endpoint bindings.
 pub use domain::{
     Binding, BindingChange, BindingCredential, BindingCredentialClass, BindingError, BindingEvent,

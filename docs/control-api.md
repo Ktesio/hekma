@@ -158,6 +158,7 @@ masked, exactly as the CLI displays it).
 | `POST` | `/v0/runs/refresh` | Trade a refresh credential (the bearer) once for a new Run Key and refresh credential (below) | 200 + the new pair |
 | `POST` | `/v0/runs/announce` | Announce a Run beneath the bearer announce credential's binding: `{"external_id", "labels"?}` (below) | 201 + `Location` + the Run and its pair once, or 200 + the renewed Run |
 | `POST` | `/v0/runs/{id}/heartbeat` | Renew a Run's Lease (below); `409 run-ended` on an ended Run | 204 |
+| `POST` | `/v1/metrics` | Inbound OTLP/HTTP+JSON metrics under an announce credential (below) | 200, or 200 + `partialSuccess` |
 | `POST` | `/v0/runs/{id}/revoke-keys` | Revoke a Run's keys, and by default every key issued under them: `{"cascade": bool}` (Operator only, below) | 200 |
 | `GET` | `/v0/runs/{id}/keys` | A Run's credentials by token id, class, state and launch generation, never a value (Operator only, below) | 200 |
 | `GET` | `/v0/runs/{id}/labels` | One Run's labels, bound and caller, each with its `source` and (bound) `origin` | 200 |
@@ -440,6 +441,23 @@ run-out-of-scope`, and an ended Run is `409 run-ended`, naming the announce
 path. The announce credential closes only the Runs it created (`403
 run-out-of-scope` otherwise); the Run ends with cause `closed` and its keys
 are revoked.
+
+### Inbound telemetry
+
+`POST /v1/metrics` takes an OTLP/HTTP+JSON metrics export request under a
+binding's announce credential, the only class allowed there (`403
+forbidden` for every other; `401` with none, or an unknown or revoked one).
+It reads `hekma.run.external_id`, `hekma.label.*` and cumulative
+`gen_ai.client.token_usage` sums, claims the identity beneath the
+credential's binding as an `observed` Run (never issuing a Run Key), and
+records the increase in each count as `telemetry-reported` usage. It
+answers `200`, with OTLP's `partialSuccess` (`rejectedDataPoints` and a
+fixed message) when points were skipped; `400` for a body that is not an
+OTLP JSON request, `409 too-many-children` past the binding's cap, `413`
+over 4 MiB, `415` for protobuf or gRPC (send them through a Collector), and
+`503` with `x-should-retry: true` past the store's one-second bound. The
+[telemetry docs](telemetry.md#inbound-telemetry-v1metrics) have the full
+contract and a Collector recipe.
 
 ### Never in a URL
 
