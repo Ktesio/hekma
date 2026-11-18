@@ -499,6 +499,7 @@ mod tests {
             token_per_run: Some(500),
             dollar_per_run_micros: Some(hekma_engine::Micros(1_500_000)),
             breach_action: Some(BreachAction::Warn),
+            ..Default::default()
         };
         let text = render_text(&view, "opened");
         assert!(
@@ -517,6 +518,7 @@ mod tests {
                 token_per_run: None,
                 dollar_per_run_micros: Some(cap),
                 breach_action: None,
+                ..Default::default()
             }),
             format!("{} per run (warn)", hekma_engine::render_dollars_bare(cap))
         );

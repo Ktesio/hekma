@@ -302,6 +302,9 @@ fn invalid(message: String) -> Box<dyn std::error::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::agent::RoutedError;
+    use crate::cli::fanout::reclassed;
+    use crate::cli::host_client::CallError;
     use crate::error::{RunInvalidState, RunNotFound};
     use hekma_engine::RunError;
 
