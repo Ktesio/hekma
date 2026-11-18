@@ -78,7 +78,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 [target.'cfg(unix)'.dependencies]
 # Story 24-1: `socket` + `user` for the Shim's peer-uid check (getpeereid
 # on macOS/BSD, SO_PEERCRED on Linux) and the owner's uid.
-nix = { version = "0.31", features = ["signal", "process", "socket", "user"] }
+nix = { version = "0.31", features = ["signal", "process", "socket", "user", "uio"] }
 
 # Windows ProcessBackend (AD-4): one Job Object per Agent Instance
 # (CreateJobObjectW / AssignProcessToJobObject / SetInformationJobObject

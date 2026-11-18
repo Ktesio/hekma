@@ -187,7 +187,46 @@ pub(crate) async fn drain_and_stop(
     window: Duration,
     notes: &Notes,
 ) -> Vec<DrainOutcome> {
-    let mut attempted: HashSet<String> = HashSet::new();
+    drain_except(engine, window, notes, HashSet::new()).await
+}
+
+/// What a Handoff-Mode shutdown did (story 24-2): the agents released to
+/// their Shims (still running, for the next engine) and the outcome of each
+/// directly held agent's drain.
+#[derive(Clone, Debug, Default)]
+pub struct HandoffShutdown {
+    /// Released to their Shims, sorted: running, not stopped.
+    pub released: Vec<String>,
+    /// The drain of every agent held directly.
+    pub outcomes: Vec<DrainOutcome>,
+}
+
+/// Story 24-2: release every Shim-held agent, then drain the rest.
+pub(crate) async fn release_and_drain(
+    engine: &Engine,
+    window: Duration,
+    notes: &Notes,
+) -> HandoffShutdown {
+    let released = engine.release_shim_held().await;
+    for name in &released {
+        notes.note(&format!(
+            "{name} released to its Shim; it keeps running for the next host"
+        ));
+    }
+    let skip: HashSet<String> = released.iter().cloned().collect();
+    let outcomes = drain_except(engine, window, notes, skip).await;
+    HandoffShutdown { released, outcomes }
+}
+
+/// The drain, skipping `skip` (released agents: alive by design).
+async fn drain_except(
+    engine: &Engine,
+    window: Duration,
+    notes: &Notes,
+    skip: HashSet<String>,
+) -> Vec<DrainOutcome> {
+    let released = !skip.is_empty();
+    let mut attempted: HashSet<String> = skip.clone();
     let mut outcomes = Vec::new();
 
     // Pass 1 — the snapshot plan.
@@ -202,7 +241,11 @@ pub(crate) async fn drain_and_stop(
     let newcomer_found = stop_pass(engine, window, notes, &mut attempted, &mut outcomes).await;
 
     if !found_any && !newcomer_found {
-        notes.note("no running or paused agents; nothing to stop");
+        if released {
+            notes.note("no agent is held directly; nothing to stop");
+        } else {
+            notes.note("no running or paused agents; nothing to stop");
+        }
     }
 
     // Finding 5's honesty cap: anything STILL alive (running OR paused)
@@ -211,7 +254,10 @@ pub(crate) async fn drain_and_stop(
     // the operator reads exactly that here, never a silent exit.
     match engine.fleet().await {
         Ok(fleet) => {
-            let still_alive = drain_plan(&fleet);
+            let still_alive: Vec<String> = drain_plan(&fleet)
+                .into_iter()
+                .filter(|name| !skip.contains(name))
+                .collect();
             if !still_alive.is_empty() {
                 notes.note(&format!(
                     "still running or paused after the shutdown drain: {} — the engine's exit \

@@ -201,9 +201,62 @@ own small supervisor, a Shim, which this binary runs as the hidden internal
 command `hekma shim`. The Shim owns the agent's process, so the agent keeps
 running when the host exits or crashes, and the next host reconnects to it.
 Unix only, and ACP agents stay held directly. It is off by default: without
-the variable, nothing changes. What happens to Shim-held agents when the
-host stops (keep them for the next host, or stop them) is still to be
-decided; today a draining host stops them as before.
+the variable, nothing changes.
+
+**Handoff Mode (a preview).** By default a stopping host stops every agent,
+Shim-held or not. Start the host with `--handoff` (or `HEKMA_HANDOFF=on`) and
+a stopping host — on SIGTERM, SIGINT or an auto-started host's idle exit —
+instead releases each agent held through a Shim: it closes the connection
+without sending a stop, so the agent keeps running in its Shim, and notes
+`<name> released to its Shim`. The next host, started by you or by the next
+`hekma` write, reconnects to each one. Agents held directly (ACP agents, or
+any agent while `HEKMA_SHIM` is off) are still stopped, and the started
+notice says so when Handoff Mode is on without Shims. After a plain stop,
+nothing serves the metering proxy or the Control API until the next host
+starts, and calls in that window are refused.
+
+**Your service manager must leave the Shims alone.** Handoff Mode and
+in-place upgrades keep agents running only if whatever stops the host stops
+the host's own process and nothing else. When agents run in their own Shim,
+the started notice says what Hekma could check, and `GET /v0/host` carries
+it as `handoff_check`:
+
+- **systemd** keeps them with `KillMode=process` or `none`. The default, `control-group`, and `mixed` stop them with the host. Hekma reports `verified` or `unsafe`, naming the unit and its setting.
+- **launchd** keeps them with `AbandonProcessGroup=true`; the default stops them. Hekma finds its job from `XPC_SERVICE_NAME` and reads the job with `launchctl print`: `verified` when the property is set, `unsafe` (with the plist key to set) when it is not, and `unverified` when the job cannot be read.
+- **A container** ends every process in it when it stops, and ends when its first process exits. When the host is that first process (PID 1), Hekma reports `unsafe`: its exit ends the container. Otherwise it reports `unverified`, since agents outlive the host only while the container's first process keeps running. Hekma recognizes a container from `/.dockerenv`, `/run/.containerenv`, or a Docker, containerd, Kubernetes or Podman cgroup.
+- **Windows** is not checked yet: `unverified`.
+
+Hekma never refuses to start on `unsafe`: it warns, and stopping every agent
+with the host remains a working configuration.
+
+**In-place upgrades (a preview, Unix).** After installing a new `hekma`, run
+`hekma serve --upgrade` (or `POST /v0/host/upgrade`) to move the running host
+onto it without stopping agents or refusing a connection:
+
+1. The host launches the new binary with its own arguments, and the two
+   connect over a socket only your user can open, inside the state
+   directory. A one-time token, passed in the environment and never written
+   anywhere, proves the new process is the one this host launched.
+2. Until the new host answers, nothing has stopped: if it fails to start or
+   connect within 30 seconds, the old host notes why and keeps serving.
+3. The old host then stops its Control API, releases the agents held through
+   their Shims (whatever `--handoff` says), stops the agents held directly,
+   and closes its store. It hands over the metering proxy's listening
+   socket, which never closes, so a connection that arrives meanwhile waits
+   rather than being refused, and its host lock, so no third host can take
+   the state directory in between.
+4. The new host opens the state directory, reconnects to every Shim, serves
+   on the same socket, writes `control.json`, and tells the old host, which
+   exits.
+
+`hekma serve --upgrade` waits until `control.json` names the new host and
+prints both pids. With no host serving the state directory it does nothing:
+the next `hekma` command starts a host on the new binary anyway. If the new
+host fails after the hand-over, the old one exits with an error saying so;
+the agents keep running in their Shims and the next `hekma` command starts a
+host that reconnects to them. Calls that were in flight or held at the
+proxy when the old host stopped get the same retryable answer as at any
+shutdown.
 
 Each Shim also watches its agent's process tree for direct connections to
 known provider hosts, every 5 seconds, and the host records what it finds on

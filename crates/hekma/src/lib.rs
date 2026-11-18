@@ -21,6 +21,9 @@ Details:
   Updates the hekma binary using the current install channel. Homebrew installs run
   brew upgrade, Cargo installs run cargo install --force, and manual binary
   installs download and verify the latest GitHub Release archive.
+  After an update, a host serving the state directory is asked to move onto
+  the new binary in place (on Unix: agents in their own Shim keep running);
+  --no-restart skips that.
 
 Example:
   hekma self-update";
@@ -270,7 +273,12 @@ enum Commands {
         about = "Update the hekma binary",
         after_help = SELF_UPDATE_AFTER_HELP
     )]
-    SelfUpdate,
+    SelfUpdate {
+        /// Replace the binaries only: do not ask a running host to move
+        /// onto the new binary in place
+        #[arg(long)]
+        no_restart: bool,
+    },
     /// Manage Agent Instances in the Fleet
     #[command(
         about = "Manage Agent Instances in the Fleet",
@@ -482,6 +490,23 @@ enum Commands {
         /// identity-headers` stored (identity headers are on by default)
         #[arg(long, conflicts_with = "identity_headers")]
         no_identity_headers: bool,
+        /// Handoff Mode: on shutdown, agents running in their own Shim are
+        /// released, not stopped, and the next host reconnects to them
+        /// (overrides HEKMA_HANDOFF; off by default)
+        #[arg(long, conflicts_with = "no_handoff")]
+        handoff: bool,
+        /// Stop every agent on shutdown, whatever HEKMA_HANDOFF says
+        #[arg(long)]
+        no_handoff: bool,
+        /// Hand the running host for this state directory over to a fresh
+        /// copy of this binary, in place: agents in their own Shim keep
+        /// running and the metering proxy refuses no connection (Unix)
+        #[arg(long)]
+        upgrade: bool,
+        /// Internal: take over from the host that launched this one (an
+        /// in-place upgrade), over its handoff channel
+        #[arg(long, hide = true, value_name = "CHANNEL")]
+        handoff_from: Option<std::path::PathBuf>,
         /// Send x-hekma-run-id and x-hekma-labels to the model provider for
         /// this run only, whatever `hekma proxy set identity-headers` stored
         #[arg(long)]
@@ -1447,7 +1472,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match cli.command {
-        Some(Commands::SelfUpdate) => cli::self_update::run(),
+        Some(Commands::SelfUpdate { no_restart }) => cli::self_update::run(no_restart),
         // Story 24-1: the Shim (internal). It touches no state.db; a bad
         // argument is a usage refusal.
         Some(Commands::Shim {
@@ -1470,6 +1495,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             proxy_tls_key,
             proxy_public_host,
             no_identity_headers,
+            handoff,
+            no_handoff,
+            upgrade,
+            handoff_from,
             identity_headers,
             proxy_allowed_hosts,
             proxy_allowed_origins,
@@ -1495,6 +1524,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             proxy_tls_key,
             proxy_public_host,
             no_identity_headers,
+            handoff: match (handoff, no_handoff) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
+            handoff_from,
+            upgrade,
             identity_headers,
             proxy_allowed_hosts,
             proxy_allowed_origins,
@@ -1994,7 +2030,7 @@ fn lifecycle_args(
 }
 
 fn should_check_for_updates(command: &Option<Commands>) -> bool {
-    matches!(command, Some(command) if !matches!(command, Commands::SelfUpdate | Commands::Serve { .. } | Commands::Shim { .. }))
+    matches!(command, Some(command) if !matches!(command, Commands::SelfUpdate { .. } | Commands::Serve { .. } | Commands::Shim { .. }))
 }
 
 /// Classify a returned diagnostic into the documented, stable numeric exit
