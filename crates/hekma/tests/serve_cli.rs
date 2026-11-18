@@ -1357,3 +1357,42 @@ fn a_serve_flag_overrides_the_stored_identity_header_setting_and_says_so() {
             .stored_identity_headers
     );
 }
+
+#[test]
+fn the_otlp_exposition_flags_are_usage_refusals_when_they_cannot_apply() {
+    // Story 24-5: the real binary exits 2 naming the flag, before anything
+    // opens.
+    let ctx = TestContext::new();
+    let state_dir = ctx.project_dir.join("state");
+    let endpoint = ["--otlp-endpoint", "http://127.0.0.1:4318"];
+    let missing_ca = ctx.project_dir.join("missing-ca.pem");
+    let missing_ca = missing_ca.to_str().unwrap();
+    for (extra, expected) in [
+        (vec!["--otlp-exposition", "x"], "v1 or v2"),
+        (
+            vec!["--otlp-exposition", "v1", "--otlp-label-keys", "team"],
+            "v1 carries no label",
+        ),
+        (vec!["--otlp-label-cardinality", "1"], "2 to 10000"),
+        (vec!["--otlp-label-cardinality", "10001"], "2 to 10000"),
+        (vec!["--otlp-ca-file", missing_ca], "missing-ca.pem"),
+    ] {
+        let args: Vec<&str> = ["serve"]
+            .into_iter()
+            .chain(endpoint)
+            .chain(extra.iter().copied())
+            .collect();
+        let run = run_hekma_agent(&args, &ctx.project_dir, &state_dir);
+        assert_eq!(run.code, Some(2), "{args:?}: {}", run.stderr);
+        assert!(run.stderr.contains(expected), "{args:?}: {}", run.stderr);
+    }
+    // Without an endpoint, every exposition flag is a usage refusal.
+    let run = run_hekma_agent(
+        &["serve", "--otlp-label-keys", "team"],
+        &ctx.project_dir,
+        &state_dir,
+    );
+    assert_eq!(run.code, Some(2), "{}", run.stderr);
+    assert!(run.stderr.contains("--otlp-endpoint"), "{}", run.stderr);
+    assert!(!state_dir.exists(), "a refused serve created nothing");
+}

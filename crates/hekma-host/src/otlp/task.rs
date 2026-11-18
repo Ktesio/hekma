@@ -22,9 +22,9 @@ use tokio::sync::{broadcast, watch};
 use hekma_engine::{DiagnosticSink, EngineEvent};
 
 use super::client::{self, OtlpClient, PostOutcome};
-use super::payload::{
-    unix_nanos_now, MetricState, EXPOSITION_NAME, EXPOSITION_VERSION, MAX_RUNS_PER_INSTANCE,
-};
+use super::payload::{unix_nanos_now, EXPOSITION_NAME};
+use super::v2::ExporterState;
+use super::Exposition;
 use crate::Notifier;
 
 /// The bounded queue capacity: the engine bus's own
@@ -57,6 +57,15 @@ pub struct ExporterConfig {
     pub flush_interval: Duration,
     /// The resource's `service.instance.id` (the state-dir lock identity).
     pub service_instance_id: String,
+    /// Story 24-5: the exposition (v2 by default).
+    pub exposition: Exposition,
+    /// Story 24-5: the allow-listed label keys and their per-key cap.
+    pub label_keys: Vec<String>,
+    pub label_cardinality: u32,
+    /// Story 24-5: a PEM root to trust for an `https://` collector.
+    pub ca_file: Option<std::path::PathBuf>,
+    /// Story 24-5: the engine's counters, sampled at each flush (v2).
+    pub counters: Option<std::sync::Arc<dyn Fn() -> hekma_engine::ExportCounters + Send + Sync>>,
 }
 
 impl OtlpExporter {
@@ -102,27 +111,36 @@ async fn run(
     mut shutdown: watch::Receiver<bool>,
     notifier: Notifier,
 ) -> u64 {
-    let client = match OtlpClient::new(&config.endpoint, config.headers) {
-        Ok(client) => client,
-        Err(message) => {
-            // Unreachable in practice (the endpoint is validated at option
-            // parse time) — but a surfaced diagnostic beats a silent export
-            // stop (AI-18), and the task ends without touching supervision.
-            notifier.note(&format!(
-                "otlp export DOWN before it started ({message}) — supervision continues"
-            ));
-            return 0;
-        }
-    };
-    let mut state = MetricState::new(unix_nanos_now(), config.service_instance_id);
+    let client =
+        match OtlpClient::with_ca(&config.endpoint, config.headers, config.ca_file.as_deref()) {
+            Ok(client) => client,
+            Err(message) => {
+                // Unreachable in practice (the endpoint is validated at option
+                // parse time) — but a surfaced diagnostic beats a silent export
+                // stop (AI-18), and the task ends without touching supervision.
+                notifier.note(&format!(
+                    "otlp export DOWN before it started ({message}) — supervision continues"
+                ));
+                return 0;
+            }
+        };
+    let mut state = ExporterState::new(
+        config.exposition,
+        unix_nanos_now(),
+        config.service_instance_id,
+        config.label_keys,
+        config.label_cardinality,
+    );
+    let counters = config.counters;
     let mut interval = tokio::time::interval(config.flush_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Consume the interval's immediate first tick: the exporter must not
     // flush an (empty) batch the moment it starts.
     interval.tick().await;
     notifier.note(&format!(
-        "otlp export enabled ({EXPOSITION_NAME} {EXPOSITION_VERSION}): POSTing metrics \
+        "otlp export enabled ({EXPOSITION_NAME} {}): POSTing metrics \
          to {} every {}s (metrics-only — no agent content, no secrets)",
+        state.version(),
         client.post_url(),
         config.flush_interval.as_secs()
     ));
@@ -161,6 +179,9 @@ async fn run(
             },
             _ = interval.tick() => {
                 drain_bus(&mut rx, &mut queue, &mut state, &notifier, &mut overflow_noted);
+                if let Some(sample) = &counters {
+                    state.sample(sample());
+                }
                 flush(&client, &mut queue, &mut state, &notifier).await;
                 // A new flush cycle opens: the next overflow may note again.
                 overflow_noted = false;
@@ -185,6 +206,9 @@ async fn run(
     // undercount exactly the events the final flush was supposed to carry.
     for event in queue.drain(..) {
         state.observe(&event);
+    }
+    if let Some(sample) = &counters {
+        state.sample(sample());
     }
     let in_flight_at_stop = state.in_flight();
     let flush = tokio::time::timeout(
@@ -227,7 +251,7 @@ async fn run(
 fn push(
     queue: &mut VecDeque<EngineEvent>,
     event: EngineEvent,
-    state: &mut MetricState,
+    state: &mut ExporterState,
     notifier: &Notifier,
     noted_this_cycle: &mut bool,
 ) {
@@ -252,7 +276,7 @@ fn push(
 fn drain_bus(
     rx: &mut broadcast::Receiver<EngineEvent>,
     queue: &mut VecDeque<EngineEvent>,
-    state: &mut MetricState,
+    state: &mut ExporterState,
     notifier: &Notifier,
     noted_this_cycle: &mut bool,
 ) {
@@ -282,7 +306,7 @@ fn drain_bus(
 async fn flush(
     client: &OtlpClient,
     queue: &mut VecDeque<EngineEvent>,
-    state: &mut MetricState,
+    state: &mut ExporterState,
     notifier: &Notifier,
 ) {
     for event in queue.drain(..) {
@@ -291,13 +315,8 @@ async fn flush(
     // The run-window eviction note (P5): ONE surfaced note per flush cycle
     // naming each instance's evicted-run count — the window is bounded by
     // design, and the eviction is visible, not silent.
-    for (instance, count) in state.take_evicted_run_series() {
-        notifier.note(&format!(
-            "otlp export: the token-usage run window for {instance} is full — \
-             {count} run series beyond the {MAX_RUNS_PER_INSTANCE}-run bound were \
-             evicted from the live payload (the durable ledger keeps every run; \
-             this is a bounded window, not a drop)"
-        ));
+    for note in state.take_notes() {
+        notifier.note(&note);
     }
     let payload = serde_json::to_string(&state.snapshot(unix_nanos_now()))
         // Unreachable for the plain derive structs; an honest empty-batch
@@ -322,7 +341,7 @@ async fn flush(
                 "otlp export: the collector accepted the batch but REJECTED \
                  {rejected_points} point(s) (partialSuccess: {error_message}) — the \
                  hekma.otlp.dropped counter grew; check the collector's acceptance \
-                 policy for the otlp-metrics v1 families"
+                 policy for the otlp-metrics families"
             ));
         }
         PostOutcome::Retryable(reason) | PostOutcome::Terminal(reason) => {

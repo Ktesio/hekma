@@ -104,17 +104,17 @@ impl TokenType {
 /// One histogram accumulator: the cumulative count/sum/min/max and the
 /// bucket counts for one (instance, run, token type) series.
 #[derive(Clone, Debug, Default)]
-struct HistogramAccumulator {
-    count: u64,
-    sum: f64,
-    min: f64,
-    max: f64,
-    buckets: [u64; TOKEN_HISTOGRAM_BOUNDS.len() + 1],
+pub(crate) struct HistogramAccumulator {
+    pub(crate) count: u64,
+    pub(crate) sum: f64,
+    pub(crate) min: f64,
+    pub(crate) max: f64,
+    pub(crate) buckets: [u64; TOKEN_HISTOGRAM_BOUNDS.len() + 1],
 }
 
 impl HistogramAccumulator {
     /// Record one observation, bucketing it against [`TOKEN_HISTOGRAM_BOUNDS`].
-    fn observe(&mut self, value: f64) {
+    pub(crate) fn observe(&mut self, value: f64) {
         if self.count == 0 {
             self.min = value;
             self.max = value;
@@ -435,6 +435,7 @@ impl MetricState {
                     explicit_bounds: TOKEN_HISTOGRAM_BOUNDS.to_vec(),
                     min: Some(accum.min),
                     max: Some(accum.max),
+                    exemplars: Vec::new(),
                 })
                 .collect();
             metrics.push(Metric {
@@ -472,6 +473,7 @@ impl MetricState {
                     time_unix_nano: now.clone(),
                     as_int: Some(count.to_string()),
                     as_double: None,
+                    exemplars: Vec::new(),
                 })
                 .collect();
             metrics.push(Metric {
@@ -505,6 +507,7 @@ impl MetricState {
                     time_unix_nano: now.clone(),
                     as_int: None,
                     as_double: Some(*usd),
+                    exemplars: Vec::new(),
                 })
                 .collect();
             metrics.push(Metric {
@@ -536,6 +539,7 @@ impl MetricState {
                     time_unix_nano: now.clone(),
                     as_int: Some(value.to_string()),
                     as_double: None,
+                    exemplars: Vec::new(),
                 })
                 .collect();
             metrics.push(Metric {
@@ -567,6 +571,7 @@ impl MetricState {
                     time_unix_nano: now.clone(),
                     as_int: Some(self.dropped.to_string()),
                     as_double: None,
+                    exemplars: Vec::new(),
                 }],
                 aggregation_temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
                 is_monotonic: true,
@@ -744,6 +749,28 @@ pub struct NumberDataPoint {
     /// The double value (JSON number).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub as_double: Option<f64>,
+    /// Story 24-5: `otlp-metrics v2` exemplars (omitted when empty — v1
+    /// never sets them, so v1's bytes are unchanged).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exemplars: Vec<Exemplar>,
+}
+
+/// One exemplar (story 24-5): ONLY `hekma.run_id` in `filteredAttributes`,
+/// the observation moment and its value — never a trace id (traces are not
+/// exported), never a label value, a token id or content.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Exemplar {
+    /// `[{key: "hekma.run_id", value: {stringValue}}]`.
+    pub filtered_attributes: VecKeyValue,
+    /// Decimal-string nanos.
+    pub time_unix_nano: String,
+    /// The integer value (decimal string).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub as_int: Option<String>,
+    /// The double value (JSON number).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub as_double: Option<f64>,
 }
 
 /// `histogramDataPoint` — `count` and `bucketCounts` are decimal STRINGS
@@ -771,6 +798,9 @@ pub struct HistogramDataPoint {
     /// The largest observation (JSON number).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
+    /// Story 24-5: `otlp-metrics v2` exemplars (omitted when empty).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exemplars: Vec<Exemplar>,
 }
 
 /// The `repeated KeyValue` attribute list (a type alias keeps every struct's
@@ -797,7 +827,7 @@ pub struct AttrValue {
 }
 
 /// Shorthand for a string attribute.
-fn attr(key: &str, value: &str) -> KeyValue {
+pub(crate) fn attr(key: &str, value: &str) -> KeyValue {
     KeyValue {
         key: key.to_string(),
         value: AttrValue {

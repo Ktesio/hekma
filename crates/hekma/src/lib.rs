@@ -510,6 +510,24 @@ enum Commands {
             requires = "otlp_endpoint"
         )]
         otlp_flush_interval: Option<u64>,
+        /// The OTLP exposition: v2 (the default) or v1 (deprecated; the
+        /// Run-keyed series). Requires --otlp-endpoint
+        #[arg(long, value_name = "v1|v2", requires = "otlp_endpoint")]
+        otlp_exposition: Option<String>,
+        /// Label keys exported as hekma.label.<key> attributes in v2
+        /// (comma-separated, at most 8; none by default). Requires
+        /// --otlp-endpoint
+        #[arg(long, value_name = "KEY,...", requires = "otlp_endpoint")]
+        otlp_label_keys: Option<String>,
+        /// Each label key's distinct-value cap, 2..=10000 (default 200);
+        /// further values fold into one overflow value. Requires
+        /// --otlp-endpoint
+        #[arg(long, value_name = "N", requires = "otlp_endpoint")]
+        otlp_label_cardinality: Option<u64>,
+        /// A PEM root certificate to trust for an https:// collector, beside
+        /// the built-in public roots. Requires --otlp-endpoint
+        #[arg(long, value_name = "PEM", requires = "otlp_endpoint")]
+        otlp_ca_file: Option<String>,
         /// Serve --listen over HTTPS with this PEM certificate chain (with
         /// --tls-key). Required for a non-loopback --listen.
         #[arg(long, value_name = "PEM", requires_all = ["tls_key", "listen"])]
@@ -1368,6 +1386,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             otlp_endpoint,
             otlp_headers,
             otlp_flush_interval,
+            otlp_exposition,
+            otlp_label_keys,
+            otlp_label_cardinality,
+            otlp_ca_file,
             tls_cert,
             tls_key,
             autostart,
@@ -1392,6 +1414,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             otlp_endpoint,
             otlp_headers,
             otlp_flush_interval,
+            otlp_exposition,
+            otlp_label_keys,
+            otlp_label_cardinality,
+            otlp_ca_file,
             tls_cert,
             tls_key,
             autostart,

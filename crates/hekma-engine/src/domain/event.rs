@@ -806,9 +806,31 @@ pub struct BudgetBreachEvent {
     pub metering_source: String,
     /// RFC 3339 UTC timestamp the engine stamped when it recorded the breach.
     pub at: String,
+    /// Story 24-5 (additive): the breaching Run's Control Depth. Absent on
+    /// events from before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_depth: Option<super::runs::ControlDepth>,
+    /// Story 24-5 (additive): what supplied the breached limit — the
+    /// Policy's name, `default` for the default Policy, or `explicit` for a
+    /// limit set on the Run or its Agent Instance. Absent on older events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// Story 24-5 (additive): the breaching Run's labels, bound and Caller,
+    /// as `(key, value)` sorted by key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<(String, String)>,
 }
 
 impl BudgetBreachEvent {
+    /// The same event carrying its Run's context (story 24-5): the depth,
+    /// the labels, and what supplied the breached limit.
+    pub(crate) fn with_context(mut self, context: &super::runs::RunContext) -> Self {
+        self.control_depth = context.control_depth;
+        self.labels = context.labels.clone();
+        self.policy = Some(context.supplier(self.dimension, self.scope));
+        self
+    }
+
     /// Build a TOKEN breach event (story 3-2), stamping the current
     /// [`BUDGET_SCHEMA_VERSION`]. `dimension` is `tokens`, the dollar fields absent.
     /// `at` is an RFC 3339 UTC timestamp (a parameter so the struct stays pure and
@@ -838,6 +860,9 @@ impl BudgetBreachEvent {
             action,
             metering_source: metering_source.into(),
             at: at.into(),
+            control_depth: None,
+            policy: None,
+            labels: Vec::new(),
         }
     }
 
@@ -874,6 +899,9 @@ impl BudgetBreachEvent {
             action,
             metering_source: metering_source.into(),
             at: at.into(),
+            control_depth: None,
+            policy: None,
+            labels: Vec::new(),
         }
     }
 

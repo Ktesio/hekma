@@ -400,6 +400,12 @@ pub(crate) async fn metrics_intake(
     let mut rebased = 0u64;
     let mut skipped_labels = 0u64;
     let identities = std::mem::take(&mut batch.identities);
+    // Story 24-5: the points this batch kept (a skipped wire Run's points
+    // move to the skipped tally below).
+    let mut accepted: u64 = identities
+        .iter()
+        .map(|identity| identity.points.len() as u64)
+        .sum();
     for identity in identities {
         let report = TelemetryReport {
             credential: credential.clone(),
@@ -422,6 +428,7 @@ pub(crate) async fn metrics_intake(
             }) => skipped_labels += labels as u64,
             Ok(TelemetryOutcome::SkippedWireRun { points, .. }) => {
                 batch.skip(SkipReason::WireRun, points);
+                accepted = accepted.saturating_sub(points as u64);
             }
             Err(RunError::Store(hekma_engine::ports::StoreError::Busy { .. })) => {
                 let mut response = ApiError::new(
@@ -438,9 +445,11 @@ pub(crate) async fn metrics_intake(
             Err(err) => return ApiError::for_authority(&authority, err).into_response(),
         }
     }
+    let skipped: u64 = batch.skipped.values().sum();
+    state.engine.note_telemetry_points(accepted, skipped);
     state
         .auth_diagnostics
-        .intake(batch.skipped.values().sum(), skipped_labels, rebased);
+        .intake(skipped, skipped_labels, rebased);
     partial_success(&batch.skipped)
 }
 

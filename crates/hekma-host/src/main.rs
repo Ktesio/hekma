@@ -51,6 +51,10 @@ fn main() {
     let mut otlp_endpoint: Option<String> = None;
     let mut otlp_headers: Option<String> = None;
     let mut otlp_flush_interval: Option<u64> = None;
+    let mut otlp_exposition: Option<String> = None;
+    let mut otlp_label_keys: Option<String> = None;
+    let mut otlp_label_cardinality: Option<u64> = None;
+    let mut otlp_ca_file: Option<std::path::PathBuf> = None;
     let mut tls_cert: Option<std::path::PathBuf> = None;
     let mut tls_key: Option<std::path::PathBuf> = None;
     let mut i = 0;
@@ -198,6 +202,25 @@ fn main() {
                     None => usage_error("--otlp-flush-interval needs a whole number of seconds"),
                 }
             }
+            "--otlp-exposition" | "--otlp-label-keys" | "--otlp-ca-file" => {
+                let flag = args[i].clone();
+                i += 1;
+                match args.get(i) {
+                    Some(value) if !value.starts_with('-') => match flag.as_str() {
+                        "--otlp-exposition" => otlp_exposition = Some(value.clone()),
+                        "--otlp-label-keys" => otlp_label_keys = Some(value.clone()),
+                        _ => otlp_ca_file = Some(std::path::PathBuf::from(value)),
+                    },
+                    _ => usage_error(&format!("{flag} needs a value")),
+                }
+            }
+            "--otlp-label-cardinality" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                    Some(n) => otlp_label_cardinality = Some(n),
+                    None => usage_error("--otlp-label-cardinality needs a whole number"),
+                }
+            }
             "--tls-cert" => {
                 i += 1;
                 match args.get(i) {
@@ -227,7 +250,15 @@ fn main() {
         otlp_endpoint,
         otlp_headers.as_deref(),
         otlp_flush_interval,
-    ) {
+    )
+    .and_then(|options| {
+        options.with_exposition_flags(
+            otlp_exposition.as_deref(),
+            otlp_label_keys.as_deref(),
+            otlp_label_cardinality,
+            otlp_ca_file,
+        )
+    }) {
         Ok(options) => options,
         Err(message) => usage_error(&message),
     };
@@ -315,9 +346,8 @@ fn usage_text() -> String {
                                   (nothing captured). Same flag and values\n    \
                                   as `hekma serve`\n    \
          --otlp-endpoint <url>    OPT-IN OTLP metrics export to this\n    \
-                                  collector (http:// in v1; https is\n    \
-                                  deferred). Default: off - no export\n    \
-                                  task, no dial\n    \
+                                  collector (http:// or https://).\n    \
+                                  Default: off - no export task, no dial\n    \
          --otlp-headers <k=v,...> Headers for every OTLP POST; a value may\n    \
                                   be a `secret:NAME` reference (resolved\n    \
                                   at startup, never logged). Requires\n    \
@@ -325,6 +355,16 @@ fn usage_text() -> String {
          --otlp-flush-interval <secs>\n    \
                                   The export flush interval, whole seconds\n    \
                                   1..=3600 (default: 10)\n    \
+         --otlp-exposition <v1|v2>\n    \
+                                  The exposition (default: v2; v1 is\n    \
+                                  deprecated)\n    \
+         --otlp-label-keys <k,...>\n    \
+                                  Label keys exported as attributes in v2\n    \
+                                  (at most 8; default: none)\n    \
+         --otlp-label-cardinality <n>\n    \
+                                  Each key's distinct-value cap, 2..=10000\n    \
+                                  (default: 200)\n    \
+         --otlp-ca-file <pem>     A root to trust for an https collector\n    \
          -h, --help               Print this help\n    \
          -V, --version            Print the version\n\
      \n\

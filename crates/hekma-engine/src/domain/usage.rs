@@ -299,6 +299,18 @@ pub struct UsageUpdateEvent {
     pub schema_version: u32,
     /// The committed usage measurement (the AD-7 minimum shape + dedup ordinal).
     pub event: UsageEvent,
+    /// Story 24-5 (additive): the Run's Control Depth when the usage
+    /// committed. Absent on events from before it, and decoded as absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_depth: Option<super::runs::ControlDepth>,
+    /// Story 24-5 (additive): the names of the Policies that supplied the
+    /// Run's limits (its stored resolution; `default` counts).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<String>,
+    /// Story 24-5 (additive): the Run's labels, bound and Caller, as
+    /// `(key, value)` sorted by key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<(String, String)>,
 }
 
 impl UsageUpdateEvent {
@@ -307,7 +319,18 @@ impl UsageUpdateEvent {
         Self {
             schema_version: USAGE_SCHEMA_VERSION,
             event,
+            control_depth: None,
+            policies: Vec::new(),
+            labels: Vec::new(),
         }
+    }
+
+    /// The same event carrying its Run's context (story 24-5).
+    pub(crate) fn with_context(mut self, context: &super::runs::RunContext) -> Self {
+        self.control_depth = context.control_depth;
+        self.policies = context.policies.clone();
+        self.labels = context.labels.clone();
+        self
     }
 }
 

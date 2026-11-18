@@ -78,6 +78,11 @@ bytes = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
+# Story 24-5: the OTLP exporter's https:// collectors — the SAME
+# hyper-rustls + webpki-roots the engine's metering proxy already dials with
+# (no new package in the tree; the one-rustls gate holds).
+hyper-rustls = { workspace = true }
+webpki-roots = { workspace = true }
 ring = { version = "0.17", default-features = false }
 
 [dev-dependencies]

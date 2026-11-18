@@ -138,7 +138,9 @@ pub(crate) fn commit_usage(
             evaluation: Evaluation::default(),
         });
     }
-    let update = UsageUpdateEvent::new(job.event);
+    // Story 24-5: the Run's context rides the event (read in this job).
+    let context = runs::RunContext::read(ctx.store(), &job.event.run_id)?;
+    let update = UsageUpdateEvent::new(job.event).with_context(&context);
     let append = ctx
         .store()
         .append_outbox(&EngineEvent::UsageUpdate(update.clone()), OUTBOX_MAX_BYTES)?;
@@ -207,7 +209,8 @@ pub(crate) fn evaluate(
     let mut run_changes = RunChanges::default();
     for (level, outcome) in levels.iter().zip(outcomes) {
         for decision in outcome.decisions {
-            let event = breach_event(input, &level.run_id, &decision);
+            let event = breach_event(input, &level.run_id, &decision)
+                .with_context(&runs::RunContext::read(ctx.store(), &level.run_id)?);
             let key = LatchKey::new(decision.dimension, decision.scope);
             store.append_breach(&event)?;
             store.latch(&level.run_id, key, decision.action, &event.at)?;
@@ -878,7 +881,8 @@ pub(crate) fn commit_run_usage(
     if store.insert_usage(&event, rate, generation)? == RecordOutcome::DuplicateReplay {
         return Ok(());
     }
-    let update = UsageUpdateEvent::new(event);
+    let context = runs::RunContext::read(store, &event.run_id)?;
+    let update = UsageUpdateEvent::new(event).with_context(&context);
     let append =
         store.append_outbox(&EngineEvent::UsageUpdate(update.clone()), OUTBOX_MAX_BYTES)?;
     // The process level's arms: the process-owning ancestor's stored

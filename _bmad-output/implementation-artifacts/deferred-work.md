@@ -385,7 +385,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 
 - source_spec: `spec-20-1-otlp-telemetry-export.md` (pre-decided gate: https deferred)
   summary: The OTLP exporter accepts http:// endpoints ONLY in v1; an `https://` value is a typed startup refusal naming the deferral. Reopens when a user names an https collector as a real need — the work is a TLS connector on the host's POST client (the engine's metering listener already proves the hyper-rustls shape, vendored roots) plus a self-signed-root test seam, all inside `crates/hekma-host/src/otlp/client.rs`.
-  evidence: `crates/hekma-host/src/otlp/client.rs` `build_post_url` (the https arm returns the named-deferral refusal); `docs/telemetry.md` "The https deferral" section documents the local-collector bridge as the supported posture. Trigger: a user names an https collector as a real need.
+  evidence: `crates/hekma-host/src/otlp/client.rs` `build_post_url` (the https arm returns the named-deferral refusal); `docs/telemetry.md` "The https deferral" section documents the local-collector bridge as the supported posture. Trigger: a user names an https collector as a real need. **RESOLVED 2026-11-14 by 24-5 (`otlp-metrics v2`).**
 - source_spec: `spec-20-1-otlp-telemetry-export.md` (epic context: ledger-sourced re-derivation)
   summary: Ledger-sourced lossless re-derivation of the exported counters (closing the at-most-once crash/lag window) stays deferred — already recorded by the 2026-10-23 entry for the bus contract; the exporter inherits it unchanged and its restart-reset is documented in `docs/telemetry.md`.
   evidence: the 2026-10-23 deferred entry for the event bus's at-most-once window; `docs/telemetry.md` "Restart-reset semantics".
@@ -741,7 +741,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 
 - source_spec: `spec-22-3-scent-check-modes.md` (Ask First O7)
   summary: No OTLP counter for unscented calls yet; the count surfaces through the `unscented` Anomaly, the proxy's counters and its once-a-minute note.
-  evidence: `metering/proxy/forward.rs` `unscented_served` / `unscented_refused`. Trigger: `otlp-metrics v2` (24-5).
+  evidence: `metering/proxy/forward.rs` `unscented_served` / `unscented_refused`. Trigger: `otlp-metrics v2` (24-5). **RESOLVED 2026-11-14 by 24-5 (`otlp-metrics v2`).**
 
 - source_spec: `spec-22-3-scent-check-modes.md` (Design Notes: what 22-3 does not do)
   summary: Per-call records do not carry a `scented` field, and the Host read surface cannot filter unscented calls (only `disposition=enforce` refusals).
@@ -791,7 +791,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 
 - source_spec: `spec-23-3-inbound-otlp-and-observed-runs.md` (Design Notes: no new exported counter)
   summary: The intake's skips, bound-key labels and re-bases are host diagnostics and `partialSuccess` only; no exported OTLP counter yet.
-  evidence: `crates/hekma-host/src/control/auth.rs` (`AuthDiagnostics::intake`). Trigger: `otlp-metrics v2` (24-5).
+  evidence: `crates/hekma-host/src/control/auth.rs` (`AuthDiagnostics::intake`). Trigger: `otlp-metrics v2` (24-5). **RESOLVED 2026-11-14 by 24-5 (`otlp-metrics v2`).**
 
 - source_spec: `spec-23-3-inbound-otlp-and-observed-runs.md` (Design Notes: one job, and the diff is the idempotence)
   summary: The counter is per (Run, token type), summed over the batch's points; a client that reports several series per token type (one per model, say) must send all of them in every batch, as cumulative exporters do, or the sum goes down and re-bases. A batch with points for several models prices unpriced unless the Run's Policy sets a flat Rate.
@@ -855,3 +855,22 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-22-5-authenticated-proxy-beyond-loopback.md` (Tasks 5: the body bound, and the no-leak sweep)
   summary: An unauthenticated remote call is answered without reading its body and its connection closes (`connection: close`); the spec's sentinel no-leak sweep across a `kill -9` and restart is covered by the reopen leg (revoked across a reopen) and the strip assertion, not by a byte scan of the state directory.
   evidence: `metering/proxy/forward.rs`, the end-to-end test. Trigger: the independent security review.
+
+## From spec-24-5 (`otlp-metrics v2`) — build, 2026-11-14
+
+- source_spec: `spec-24-5-otlp-metrics-v2.md` (Tasks: the bypass feed)
+  summary: `hekma.bypass.detected` is not emitted: bypass detection (22-4) is not built yet (24-5 was built before 24-1 and 22-4). The family, its `hekma.provider.host` attribute and its exemplars join when 22-4 lands.
+  evidence: `crates/hekma-host/src/otlp/v2.rs` (module docs). Trigger: 22-4's build.
+
+- source_spec: `spec-24-5-otlp-metrics-v2.md` (Records: 23-4's counters)
+  summary: Held calls and wire dispositions have no OTLP counter; 23-4 excluded them without promising a shape here.
+  evidence: `crates/hekma-host/src/otlp/v2.rs`. Trigger: an Operator asking for held-call telemetry.
+
+- source_spec: `spec-24-5-otlp-metrics-v2.md` (Records: the v1 removal)
+  summary: `otlp-metrics v1` stays selectable (`--otlp-exposition v1`), deprecated; removal waits for a major release.
+  evidence: `docs/telemetry.md` (The deprecated exposition). Trigger: the major release that removes it.
+
+- source_spec: `spec-24-5-otlp-metrics-v2.md` (Design: run-keyed Anomaly tracking)
+  summary: `hekma.run.anomalies` counts a flag once when a Run gains it; the exporter keeps each open Run's current flags (only Runs with a flag) and forgets a Run when it ends, so memory grows with the number of open Runs carrying an Anomaly.
+  evidence: `crates/hekma-host/src/otlp/v2.rs` (`run_anomalies`). Trigger: the Run-scale benchmark (24-4) measuring exporter memory.
+

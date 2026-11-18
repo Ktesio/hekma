@@ -202,7 +202,9 @@ pub use domain::{
     PolicyEventKind, PolicyLimits, PolicyOutcome, PolicyRecord, PolicyResolution, RunPolicy,
     ScentCheckMode, UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
 };
-pub use engine::{Blocking, DrainReport, Engine, EngineOptions, EventSubscription, InstanceStatus};
+pub use engine::{
+    Blocking, DrainReport, Engine, EngineOptions, EventSubscription, ExportCounters, InstanceStatus,
+};
 // Story 22-1: Run Keys — the credential classes, the one-time issued pair,
 // the snapshot's match, the metadata listing and revocation report, the
 // credential event, and the actor a Caller acts as.

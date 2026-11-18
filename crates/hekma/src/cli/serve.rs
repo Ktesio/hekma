@@ -67,6 +67,12 @@ pub struct ServeFlags {
     pub otlp_headers: Option<String>,
     /// `--otlp-flush-interval <secs>`.
     pub otlp_flush_interval: Option<u64>,
+    /// Story 24-5: `--otlp-exposition`, `--otlp-label-keys`,
+    /// `--otlp-label-cardinality`, `--otlp-ca-file`.
+    pub otlp_exposition: Option<String>,
+    pub otlp_label_keys: Option<String>,
+    pub otlp_label_cardinality: Option<u64>,
+    pub otlp_ca_file: Option<String>,
     /// `--tls-cert <pem>` (story 21-4).
     pub tls_cert: Option<String>,
     /// `--tls-key <pem>` (story 21-4).
@@ -102,6 +108,14 @@ pub fn run(flags: ServeFlags) -> Result<(), Box<dyn std::error::Error>> {
         flags.otlp_headers.as_deref(),
         flags.otlp_flush_interval,
     )
+    .and_then(|options| {
+        options.with_exposition_flags(
+            flags.otlp_exposition.as_deref(),
+            flags.otlp_label_keys.as_deref(),
+            flags.otlp_label_cardinality,
+            flags.otlp_ca_file.map(PathBuf::from),
+        )
+    })
     .map_err(|message| ServeOptionsInvalid { message })?;
     let options = hekma_host::ServeOptions {
         state_base: flags.state_dir.map(PathBuf::from),
