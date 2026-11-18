@@ -229,6 +229,47 @@ it as `handoff_check`:
 Hekma never refuses to start on `unsafe`: it warns, and stopping every agent
 with the host remains a working configuration.
 
+**After a crash.** A host that is killed (`kill -9`, out of memory, a power
+cut) cannot stop anything. Each host records in the state directory, before
+it adopts anything, which Handoff Mode it runs, and the next host acts on
+what the dead one recorded:
+
+| The crashed host ran | Its agents in their Shims (or detached) |
+|---|---|
+| `--handoff` (or `HEKMA_HANDOFF=on`) | Kept: the next host reconnects to each and says how many. |
+| `--no-handoff` (or `HEKMA_HANDOFF=off`) | Cleaned up: the next host stops each one the ordinary way (the graceful signal, then the forced kill after the stop window), its Run ends with cause `engine-crash`, and the started notice names them. A detached start is never cleaned up: it was asked to outlive any host. |
+| No mode chosen (the default), or a state directory from before this record | Kept: an unknown wish never stops anything, and the notice says so. |
+
+Agents held directly die with the host only if the operating system takes
+their process group with it; those that survive are treated the same way.
+
+A host start that had anything to reconcile then records one `recovery`
+event that sums it up: the dead host's mode (`posture`: `on`, `off` or `unknown`), the
+agents it kept (`runs_adopted`) and stopped (`runs_cleaned`), the agents
+whose Shim was gone (`shims_lost`), and the proxied calls it closed as
+`crash` or `recovered`. A start that found nothing (no agent left running,
+no call left open) records none, and so does an in-place upgrade. `GET /v0/host`
+carries the event this start recorded as `recovery` (or `null`). It is on `GET /v0/events` and in
+the export like any other event.
+
+**What a crash can lose.** Everything a command or the Control API changes
+(a Run, a label, a limit, a Policy, a hold, a Lease, a revocation) is
+committed before the command answers, so a crash loses none of it. The only
+window is the per-call stream the metering proxy writes in the background:
+call records and their usage are written in batches of at most 250 ms or 512
+records. A call relayed in the last batch before a hard kill can go
+uncounted; its record closes at the next start as `crash` with unknown
+tokens, an under-count, never a double count. Held calls are connections, not
+records: their bytes die with the host, and their records close as `crash`.
+The 5-second loss bound promised for usage is the outer limit; the batch
+window is what the build guarantees.
+
+An agent the dead host was still starting is never left `starting`: if its
+process is alive, the next host marks it `running`. When its adapter
+declares a readiness probe, the probe's answer died with the host, so the
+transition says so (cause `adopted-unconfirmed`, naming the probe) instead
+of passing as an ordinary start.
+
 **In-place upgrades (a preview, Unix).** After installing a new `hekma`, run
 `hekma serve --upgrade` (or `POST /v0/host/upgrade`) to move the running host
 onto it without stopping agents or refusing a connection:
@@ -257,6 +298,13 @@ the agents keep running in their Shims and the next `hekma` command starts a
 host that reconnects to them. Calls that were in flight or held at the
 proxy when the old host stopped get the same retryable answer as at any
 shutdown.
+
+If a Shim dies while its agent keeps running, the host does not treat the
+agent as crashed and never starts a second copy: it holds the agent directly
+from then on, notes `<name>: its Shim is gone`, and its stop still ends it.
+Held that way, the agent takes no input over stdin and no longer outlives
+the host. If the agent died with its Shim, the host records an exit whose
+code is unavailable and the Restart Policy applies as for any exit.
 
 Each Shim also watches its agent's process tree for direct connections to
 known provider hosts, every 5 seconds, and the host records what it finds on

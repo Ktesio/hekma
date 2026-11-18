@@ -154,6 +154,10 @@ pub enum EngineEvent {
     /// root outbound identity-header switch. Committed with its outbox row
     /// in the job that made the change; names the setting and its value.
     ProxySetting(super::runs::bindings::ProxySettingEvent),
+    /// One open-time reconcile, summed up (story 24-3): what the previous
+    /// Service Host left and what this one did with it. Committed once per
+    /// host start, after any cleanup; counts only.
+    Recovery(super::recovery::RecoveryEvent),
 }
 
 /// The in-supervisor handle to the event bus: a cloneable pair of

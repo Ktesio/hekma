@@ -38,6 +38,7 @@ pub(crate) mod probe_kinds;
 /// manifest's declared `[readiness]` gate. Private to the crate — the
 /// supervisor's start path is the only caller.
 pub(crate) mod readiness;
+pub(crate) mod recovery;
 mod registry;
 pub(crate) mod registry_keys;
 pub(crate) mod registry_limits;

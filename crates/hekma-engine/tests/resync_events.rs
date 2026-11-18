@@ -141,6 +141,9 @@ fn assert_payload_validates(event: &EngineEvent) {
                 hekma_engine::SECRET_REVEALED_SCHEMA_VERSION
             )
         }
+        EngineEvent::Recovery(e) => {
+            assert_eq!(e.schema_version, hekma_engine::RECOVERY_SCHEMA_VERSION)
+        }
     }
 }
 

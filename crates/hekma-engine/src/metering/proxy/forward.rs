@@ -1110,6 +1110,8 @@ async fn serve_resolved(
             return WireError::HoldFull.response();
         };
         guard.get().hold_end = Some("disconnect");
+        // Story 24-3: durable, so a crash closes it as a held call.
+        shared.pump.mark_held(guard.get().call_id.clone());
         loop {
             if shared.stopping.load(Ordering::Acquire) {
                 drop(ticket);

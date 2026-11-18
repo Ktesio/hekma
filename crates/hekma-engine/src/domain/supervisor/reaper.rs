@@ -7,6 +7,49 @@ use crate::domain::liveness::{self, LivenessSignal, WindowDecision};
 use crate::domain::runs::ops::RunFate;
 use crate::ports::StoreError;
 
+impl Supervisor {
+    /// Story 24-3 (the 18-1 deferral): an adopted live process whose row
+    /// says `starting` — its host died during the start. Without a declared
+    /// readiness probe it is `running` (it outlived the start's survival
+    /// window, the same fact `adapter-ready` records). With one, the probe's
+    /// answer died with the host: it is adopted as `running` with that said
+    /// (`adopted-unconfirmed`), never as if no gate had been declared.
+    pub(super) fn settle_adopted_starting(&mut self, registry: &Registry, name: &InstanceName) {
+        let gate = registry
+            .adapter_launch_facts(name)
+            .ok()
+            .and_then(|(kind, manifest, _)| {
+                crate::adapter::resolve_readiness_probe(&kind, manifest.as_deref())
+                    .ok()
+                    .flatten()
+            });
+        let cause = match &gate {
+            Some(gate) => TransitionCause::AdoptedUnconfirmed {
+                detail: crate::domain::readiness::describe(&gate.probe),
+            },
+            None => TransitionCause::AdapterReady,
+        };
+        match self.transition(
+            registry,
+            name,
+            LifecycleState::Starting,
+            LifecycleState::Running,
+            cause,
+        ) {
+            Ok(_) if gate.is_some() => self.emit_diagnostic(&format!(
+                "{}: its previous host stopped while waiting for the readiness probe; the \
+                 live process is adopted as running, but the probe never answered",
+                name.as_str()
+            )),
+            Ok(_) => {}
+            Err(err) => self.emit_diagnostic(&format!(
+                "{}: adopted while starting, but could not be marked running ({err})",
+                name.as_str()
+            )),
+        }
+    }
+}
+
 /// The portable classification domain (story 18-3): only a code in
 /// `0..=255` can match a declared class — the `[exit_codes]` lists are
 /// validated to exactly that domain (the portable exit-code domain: unix
@@ -248,6 +291,7 @@ impl Supervisor {
         // un-pollable HANDLE amid readable peers is exactly the crash signal
         // AI-12 exists to surface.
         let mut outcomes: Vec<(InstanceName, PollOutcome)> = Vec::with_capacity(names.len());
+        let mut shims_lost: Vec<InstanceName> = Vec::new();
         for name in &names {
             // AI-12 wiring seam (cfg(test)): the armed pid's poll fails with an
             // injected error — the fault-injection front for the backend's poll
@@ -268,12 +312,25 @@ impl Supervisor {
             let Some(supervised) = self.running.get_mut(name) else {
                 continue;
             };
+            let held_by_shim = self.backend.is_shim(&supervised.handle);
             let outcome = match self.backend.poll(&mut supervised.handle) {
                 Ok(ProcessStatus::Alive) => PollOutcome::Alive,
                 Ok(ProcessStatus::Exited { code }) => PollOutcome::Exited(code),
                 Err(err) => PollOutcome::Errored(err),
             };
+            // Story 24-3 (T4): the Shim died and its agent lives on, now held
+            // directly.
+            if held_by_shim && !self.backend.is_shim(&supervised.handle) {
+                shims_lost.push(name.clone());
+            }
             outcomes.push((name.clone(), outcome));
+        }
+        for name in shims_lost {
+            self.emit_diagnostic(&format!(
+                "{}: its Shim is gone, but the agent is still running; it is supervised directly \
+                 from now on (no input over stdin, and it no longer outlives this host)",
+                name.as_str()
+            ));
         }
 
         // PHASE 2 — same-tick corroboration (AI-12 amendment a). Count how many
@@ -1567,7 +1624,14 @@ impl Supervisor {
                     ));
                     continue;
                 }
-                proc::ShimReacquire::None => self.backend.adopt(&record.fingerprint, record.detach),
+                proc::ShimReacquire::None => {
+                    // Story 24-3: a recorded Shim that no longer answers is
+                    // lost, whatever became of its agent.
+                    if record.shim.is_some() {
+                        self.shims_lost.push(name.clone());
+                    }
+                    self.backend.adopt(&record.fingerprint, record.detach)
+                }
             };
             match held {
                 Ok(Some(handle)) => {
@@ -1913,6 +1977,20 @@ impl Supervisor {
                         },
                     );
                     adopted += 1;
+                    // Story 24-3: a detached start was asked to outlive any
+                    // host, so it is never an orphan to clean up.
+                    if !record.detach {
+                        self.adopted_names.push(name.clone());
+                    }
+                    // Story 24-3: a row left `starting` by a host that died
+                    // mid-start (its readiness wait among them) is settled
+                    // here, never left `starting`.
+                    if registry
+                        .lookup(&name)
+                        .is_ok_and(|instance| instance.state == LifecycleState::Starting)
+                    {
+                        self.settle_adopted_starting(registry, &name);
+                    }
                     // Story 21-2: the adoption KEEPS the Run (created here if
                     // the record predates Runs) and re-syncs its wire path
                     // and bound labels from this engine's view.

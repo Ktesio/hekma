@@ -99,6 +99,18 @@ impl RecordPump {
         }
     }
 
+    /// Story 24-3: record that a call parked at a hold (unacked, best
+    /// effort: a lost mark only makes a crash close it as a plain call).
+    pub(crate) fn mark_held(&self, call_id: String) {
+        if let Some(handle) = self.handle() {
+            let at = crate::time::now_rfc3339();
+            let _ = handle.submit_then(
+                move |ctx| ctx.store().mark_open_call_held(&call_id, &at),
+                |_| {},
+            );
+        }
+    }
+
     /// Submit the close record with its usage; `permit` is released once
     /// it commits or is skipped.
     pub(crate) fn close_call(

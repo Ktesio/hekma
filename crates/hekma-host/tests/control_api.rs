@@ -7481,6 +7481,7 @@ fn the_host_route_names_the_mode_and_the_service_manager_check() {
     let host = json_body(&mut response);
     assert_eq!(host["pid"], std::process::id());
     assert_eq!(host["handoff"], false);
+    assert_eq!(host["handoff_chosen"], false);
     assert_eq!(host["shim"], false);
     assert!(
         ["verified", "unsafe", "unverified"].contains(&host["handoff_check"].as_str().unwrap()),
@@ -7489,4 +7490,8 @@ fn the_host_route_names_the_mode_and_the_service_manager_check() {
     assert!(host["handoff_check_detail"]
         .as_str()
         .is_some_and(|d| !d.is_empty()));
+    assert!(
+        host["recovery"].is_null(),
+        "a fresh start reconciles nothing: {host}"
+    );
 }

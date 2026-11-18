@@ -1437,7 +1437,7 @@ mod tests {
         {
             let conn = Connection::open(dir.join("2026-11-13.db")).unwrap();
             conn.execute_batch(
-                "CREATE TABLE calls (call_id TEXT PRIMARY KEY); PRAGMA user_version = 3;",
+                "CREATE TABLE calls (call_id TEXT PRIMARY KEY); PRAGMA user_version = 4;",
             )
             .unwrap();
         }

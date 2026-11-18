@@ -317,6 +317,8 @@ impl MetricState {
             EngineEvent::SecretRevealed(_) => {}
             // Story 21-8: a proxy setting has no metric — ignored.
             EngineEvent::ProxySetting(_) => {}
+            // Story 24-3: a reconcile summary has no v1 metric — ignored.
+            EngineEvent::Recovery(_) => {}
         }
     }
 

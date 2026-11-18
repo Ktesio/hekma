@@ -139,6 +139,9 @@ pub fn check_owner_only_file(path: &std::path::Path) -> Result<(), String> {
     })
 }
 pub use domain::custody::{SecretRevealedEvent, SECRET_REVEALED_SCHEMA_VERSION};
+pub use domain::recovery::{
+    RecoveryChange, RecoveryEvent, RecoveryPosture, RECOVERY_SCHEMA_VERSION,
+};
 
 /// Story 22-2 (P10): harden the calling process's memory — on Linux it
 /// becomes non-dumpable (no core dump, no same-user `ptrace` or
@@ -222,7 +225,8 @@ pub use domain::{
     ScentCheckMode, UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
 };
 pub use engine::{
-    Blocking, DrainReport, Engine, EngineOptions, EventSubscription, ExportCounters, InstanceStatus,
+    Blocking, DrainReport, Engine, EngineOptions, EventSubscription, ExportCounters,
+    HandoffPosture, HostRecovery, InstanceStatus, PreviousHost,
 };
 // Story 22-1: Run Keys — the credential classes, the one-time issued pair,
 // the snapshot's match, the metadata listing and revocation report, the

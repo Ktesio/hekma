@@ -700,7 +700,8 @@ pub(crate) fn subject_labels(
         | EngineEvent::BreachDefaultUpgraded(_)
         | EngineEvent::Binding(_)
         | EngineEvent::SecretRevealed(_)
-        | EngineEvent::ProxySetting(_) => return SubjectLabels::NoSubject,
+        | EngineEvent::ProxySetting(_)
+        | EngineEvent::Recovery(_) => return SubjectLabels::NoSubject,
     };
     match entry {
         Some(entry) => SubjectLabels::Found(entry.labels.clone()),

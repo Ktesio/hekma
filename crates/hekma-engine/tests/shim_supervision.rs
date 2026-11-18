@@ -511,3 +511,306 @@ fn an_upgrade_shutdown_hands_back_the_proxy_socket_and_the_next_engine_serves_on
     second.blocking().stop("kept", None).unwrap();
     drop(first);
 }
+
+fn open_as_host(state: &Path, posture: hekma_engine::HandoffPosture) -> Engine {
+    Engine::open_with_options(
+        Some(state.to_path_buf()),
+        EngineOptions {
+            shim_exe: Some(hekma_conformance::test_support::shim_host_bin()),
+            host_posture: Some(posture),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+/// Story 24-3: the open reads the previous owner's record before adopting:
+/// none → `Unknown`; an owner that chose off and is gone → its orphans are
+/// listed, and `clean_up_after_crash` stops each the ordinary way, ending
+/// its Run `engine-crash`.
+#[test]
+fn the_next_owner_reads_the_previous_posture_and_cleans_up_after_an_off_crash() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    use hekma_engine::{HandoffPosture, PreviousHost};
+    let state = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    manifest(dir.path(), "orph", &["--linger-ms", "600000"]);
+    {
+        let first = open_as_host(state.path(), HandoffPosture::Off);
+        let recovery = first.host_recovery().expect("a host records and reads");
+        assert_eq!(
+            recovery.previous,
+            PreviousHost::Unknown,
+            "nothing recorded yet"
+        );
+        assert!(recovery.adopted.is_empty());
+        let facade = first.blocking();
+        facade
+            .register_with_adapter("orph", &AdapterRef::Manifest(dir.path().to_path_buf()))
+            .unwrap();
+        facade.start("orph").unwrap();
+        // Dropped without a shutdown: the Shim keeps the agent (a crash).
+    }
+    let second = open_as_host(state.path(), HandoffPosture::Unset);
+    let recovery = second.host_recovery().unwrap();
+    assert_eq!(recovery.previous, PreviousHost::Gone { handoff: false });
+    assert_eq!(recovery.adopted, vec!["orph".to_string()]);
+    let run_id = second
+        .blocking()
+        .instance_run("orph")
+        .unwrap()
+        .record
+        .run_id;
+    let stopped = second
+        .blocking()
+        .clean_up_after_crash("orph", Some(Duration::from_secs(5)))
+        .unwrap();
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+    let run = second.blocking().run(run_id.as_str()).unwrap();
+    assert_eq!(run.record.end_cause.as_deref(), Some("engine-crash"));
+    // The one summary: off, one cleaned, none kept.
+    let summary = second.blocking().commit_recovery(1).unwrap().unwrap();
+    assert_eq!(summary.posture, hekma_engine::RecoveryPosture::Off);
+    assert_eq!((summary.runs_cleaned, summary.runs_adopted), (1, 0));
+    drop(second);
+    // The second owner recorded `unset`: a third sees an unknown wish.
+    let third = open_as_host(state.path(), HandoffPosture::On);
+    assert_eq!(
+        third.host_recovery().unwrap().previous,
+        PreviousHost::Unknown
+    );
+    // An engine that owns no data path records and reads nothing.
+    assert!(
+        third.blocking().commit_recovery(0).unwrap().is_none(),
+        "nothing to reconcile"
+    );
+    let plain = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    assert!(plain.host_recovery().is_none());
+    assert!(plain.blocking().commit_recovery(0).unwrap().is_none());
+}
+
+/// Story 24-3: a host start that reconciled something commits one
+/// `recovery` event summing it up — the previous mode, the agents kept, and
+/// the Shims found gone — on the bus and in the outbox; a start that found
+/// nothing records none.
+#[test]
+fn a_host_start_that_reconciles_commits_one_recovery_event_summing_it_up() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    use hekma_engine::{EngineEvent, HandoffPosture, RecoveryPosture};
+    let state = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    manifest(dir.path(), "kept", &["--linger-ms", "600000"]);
+    {
+        let first = open_as_host(state.path(), HandoffPosture::On);
+        let facade = first.blocking();
+        facade
+            .register_with_adapter("kept", &AdapterRef::Manifest(dir.path().to_path_buf()))
+            .unwrap();
+        facade.start("kept").unwrap();
+        // Dropped without a shutdown: a crash.
+    }
+    // The Shim dies while no host holds it; the agent lives on.
+    let (pid, socket) = record(state.path());
+    kill9(shim_pid(&socket).expect("the Shim runs"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while shim_pid(&socket).is_some() {
+        assert!(Instant::now() < deadline, "the Shim never died");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(alive(pid));
+    let second = open_as_host(state.path(), HandoffPosture::Unset);
+    assert_eq!(
+        second.host_recovery().unwrap().shims_lost,
+        vec!["kept".to_string()]
+    );
+    let mut events = second.subscribe();
+    let summary = second.blocking().commit_recovery(0).unwrap().unwrap();
+    assert_eq!(summary.posture, RecoveryPosture::On);
+    assert_eq!(
+        (
+            summary.runs_adopted,
+            summary.runs_cleaned,
+            summary.shims_lost,
+            summary.calls_closed_crash,
+            summary.calls_closed_recovered,
+        ),
+        (1, 0, 1, 0, 0)
+    );
+    let published = loop {
+        match events.try_recv() {
+            Ok(EngineEvent::Recovery(event)) => break event,
+            Ok(_) => continue,
+            Err(err) => panic!("no recovery event on the bus: {err:?}"),
+        }
+    };
+    assert_eq!(published, summary);
+    second
+        .blocking()
+        .stop("kept", Some(Duration::from_secs(5)))
+        .unwrap();
+    drop(second);
+    // The outbox kept it.
+    let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+    let kept: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM outbox WHERE event LIKE '%\"kind\":\"recovery\"%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, 1);
+    // Nothing left behind: nothing to sum up, so no event.
+    let third = open_as_host(state.path(), HandoffPosture::Unset);
+    assert!(third.blocking().commit_recovery(0).unwrap().is_none());
+}
+
+/// A diagnostic sink capturing into a shared buffer.
+struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn kill9(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status();
+}
+
+/// Story 24-3 (T4): a Shim that dies under a live agent does not make the
+/// agent look crashed (no relaunch beside it): the engine re-holds it
+/// directly, says so, and its stop still ends it. A Shim that dies with
+/// its agent is an exit whose code is unavailable.
+#[test]
+fn a_dead_shim_degrades_to_direct_supervision_and_never_relaunches_its_live_agent() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    manifest(dir.path(), "lone", &["--linger-ms", "600000"]);
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let sink: hekma_engine::DiagnosticSink = std::sync::Arc::new(std::sync::Mutex::new(Box::new(
+        Capture(std::sync::Arc::clone(&captured)),
+    )
+        as Box<dyn std::io::Write + Send>));
+    let lines = || String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+    let engine = Engine::open_with_options(
+        Some(state.path().to_path_buf()),
+        EngineOptions {
+            shim_exe: Some(hekma_conformance::test_support::shim_host_bin()),
+            diagnostics: Some(sink),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter("lone", &AdapterRef::Manifest(dir.path().to_path_buf()))
+        .unwrap();
+    facade.start("lone").unwrap();
+    let (pid, socket) = record(state.path());
+    kill9(shim_pid(&socket).expect("the Shim runs"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !lines().contains("its Shim is gone") {
+        assert!(Instant::now() < deadline, "never noticed: {}", lines());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(alive(pid), "the agent outlives its Shim");
+    // SM-7: a Shim's death stops, pauses and blocks nothing.
+    let actions = hekma_conformance::sm7::audit_state_dir(state.path());
+    assert!(actions.is_empty(), "{actions:?}");
+    let status = facade.instance_status("lone").unwrap();
+    assert_eq!(status.instance.state, LifecycleState::Running, "{status:?}");
+    assert_eq!(status.restart_count, 0, "never relaunched beside itself");
+    facade.stop("lone", Some(Duration::from_secs(5))).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive(pid) {
+        assert!(Instant::now() < deadline, "the direct stop ended it");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Both gone: an exit, its code unavailable.
+    facade.start("lone").unwrap();
+    let (pid, socket) = record(state.path());
+    let shim = shim_pid(&socket).expect("the Shim runs");
+    kill9(pid);
+    kill9(shim);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = facade.instance_status("lone").unwrap().instance.state;
+        if state != LifecycleState::Running {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the exit was never seen");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Story 24-3 (the 18-1 deferral): a row a dead host left `starting` is
+/// settled at adoption, never left `starting` — `running` with
+/// `adopted-unconfirmed` when a readiness probe was declared (its answer
+/// died with the host), plain `adapter-ready` when none was.
+#[test]
+fn a_row_left_starting_is_settled_at_adoption_and_names_an_unanswered_probe() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+    use hekma_engine::TransitionCause;
+    let state = TempDir::new().unwrap();
+    let gated = TempDir::new().unwrap();
+    hekma_conformance::test_support::ManifestFixture::new(
+        "gated",
+        &[
+            "--ready-line",
+            "readiness-line-z9:50",
+            "--linger-ms",
+            "600000",
+        ],
+    )
+    .guaranteed_on_all_oses("interaction")
+    .readiness("kind = \"log-contains\"\ntimeout_ms = 8000\nline = \"readiness-line-z9\"")
+    .write(gated.path());
+    let plain = TempDir::new().unwrap();
+    manifest(plain.path(), "plain", &["--linger-ms", "600000"]);
+    {
+        let first = open(state.path());
+        let facade = first.blocking();
+        facade
+            .register_with_adapter("gated", &AdapterRef::Manifest(gated.path().to_path_buf()))
+            .unwrap();
+        facade
+            .register_with_adapter("plain", &AdapterRef::Manifest(plain.path().to_path_buf()))
+            .unwrap();
+        facade.start("gated").unwrap();
+        facade.start("plain").unwrap();
+    }
+    // The host "died mid-start": both rows read `starting`.
+    let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+    conn.execute("UPDATE agent_instances SET state = 'starting'", [])
+        .unwrap();
+    let second = open(state.path());
+    let facade = second.blocking();
+    for (name, expected) in [("gated", "adopted-unconfirmed"), ("plain", "adapter-ready")] {
+        let status = facade.instance_status(name).unwrap();
+        assert_eq!(status.instance.state, LifecycleState::Running, "{name}");
+        let last = facade.transition_events(name).unwrap().pop().unwrap();
+        assert_eq!(last.prior_state, LifecycleState::Starting, "{name}");
+        let kind = serde_json::to_value(&last.cause).unwrap()["kind"].clone();
+        assert_eq!(kind, expected, "{name}: {:?}", last.cause);
+        if let TransitionCause::AdoptedUnconfirmed { detail } = &last.cause {
+            assert!(detail.contains("readiness-line-z9"), "{detail}");
+        }
+        facade.stop(name, Some(Duration::from_secs(5))).unwrap();
+    }
+}

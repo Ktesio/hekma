@@ -327,6 +327,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-18-1-readiness-probes.md` (review round 1, 2026-10-24)
   summary: The readiness tests' `free_port()` helper binds port 0, reads the port, and drops the listener — a TOCTOU window where another process can claim the port between the drop and the fake_agent's re-bind. A flake would look like a probe timeout or a bind failure in the wrong test. The std-only fix is a passed prebound `TcpListener` (the fake_agent inherits or re-uses it), which needs a fixture-side seam.
   evidence: `crates/hekma-engine/tests/readiness.rs` `free_port()` (bind 0 → local_addr → drop); `crates/hekma-conformance/src/bin/fake_agent.rs` `serve_http_ready` re-binds by number. Trigger: an observed CI flake on the http-get readiness tests — fix the seam, do not retry-loop the port grab.
+  **Resolved 2026-11-14 by the 24-3 phase 3 build:** a `starting` row with a live process is settled at adoption: `running` with `adopted-unconfirmed` naming the probe, or `adapter-ready` when none was declared. Re-running the probe at adoption is the stricter alternative, not built.
 
 ## Deferred from: review round 1 of spec-18-2 (2026-10-24)
 
@@ -969,3 +970,33 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
     - the default flip.
   evidence: the spec's phase logs. Trigger: the next 24-2 phases, in that order.
 
+## From spec-24-3 (crash recovery and registry completeness) — build, 2026-11-14
+
+- source_spec: `spec-24-3-crash-recovery-and-registry-completeness.md` (T3: the completeness reconcile)
+  summary: Not built yet:
+    - ~~the mid-probe-wait `starting`-row arm~~ (built in phase 3);
+    - the `Recovery` summary event;
+    - the estate-wide R1–R8 invariant check (open calls closed once, holds, Leases, latches and tokens intact, no claim naming a dead engine).
+
+  The existing open-time reconciles still run.
+  evidence: `crates/hekma-engine/src/domain/supervisor/reaper.rs`. Trigger: 24-3 phase 2.
+
+- source_spec: `spec-24-3-crash-recovery-and-registry-completeness.md` (T4: Shim death)
+  summary: A lost Shim's child is not probed and supervised directly (`supervised-degraded`), and no new Shim is started for its relaunch.
+  **Partly resolved 2026-11-14 (phase 2):** the child is probed and re-held directly, never relaunched beside itself, and the degradation is noted. Still open: the `supervised-degraded` Anomaly and a `shim lost` event, and updating the spawn record.
+  evidence: `crates/hekma-engine/src/domain/supervisor/proc.rs`. Trigger: 24-3 phase 2.
+
+- source_spec: `spec-24-3-crash-recovery-and-registry-completeness.md` (T5, T6, T7)
+  summary: Not built yet:
+    - the full `kill -9` drill matrix (a parked hold, in-flight calls, Leases and `wire`/`announced` Runs, both modes, the Windows `taskkill /F` leg);
+    - ~~SM-7's auditor~~ (built in phase 4, asserted in six scenarios; still missing: the socket-activated scenario and an SDK-shaped client harness);
+    - ~~the flush-bound measurement and its docs~~ (stated in phase 8: the writer's 250 ms / 512-record batch, pinned by a unit test; a measured kill-during-batch drill is still open).
+
+  Phases 5, 7 and 9 add the drills for committed governance, Leases (held and lapsed while no host runs) and the `recovery` event. Still open: the Windows leg, and CLI `--json` fields derived from the event.
+
+  Phase 1 tests the posture split with a real SIGKILL on Unix only.
+  evidence: `crates/hekma/tests/shim_cli.rs`. Trigger: 24-3 phase 2 and 3.
+
+- source_spec: `spec-24-3-crash-recovery-and-registry-completeness.md` (found while building phase 9)
+  summary: Some test runs leave `fake_agent` processes behind, SIGSTOPped (state `T`), so they never reach their `--linger-ms` exit. 19 were found on the build machine, up to three days old, all with `--emit-usage 1 --linger-ms 600000`. A paused agent whose test ends without a stop keeps running stopped forever.
+  evidence: `ps -eo pid,etime,stat,command | grep debug/fake_agent`. Trigger: the next test-harness pass; a `TestContext` drop that SIGCONTs and kills its agents, or `fake_agent` exiting when its parent dies.

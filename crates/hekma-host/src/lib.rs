@@ -189,6 +189,10 @@ pub struct ServeOptions {
     /// instead of stopped. Off by default; agents held directly are always
     /// stopped.
     pub handoff: bool,
+    /// Story 24-3: whether the Operator chose the mode (a flag or the
+    /// environment) rather than taking the default. Only a chosen "off"
+    /// asks for a crashed host's agents to be cleaned up.
+    pub handoff_chosen: bool,
     /// Story 24-2: this host is the successor of an in-place upgrade — the
     /// previous host's handoff channel, which hands over the metering
     /// proxy's socket and the host lock (instead of acquiring it).
@@ -461,6 +465,7 @@ where
         set_token_ttl_override,
         shim_exe,
         handoff,
+        handoff_chosen,
         handoff_from,
         handoff_token,
     } = options;
@@ -919,6 +924,13 @@ where
                 pause_command_cap_override: None,
                 // Story 24-1: the Shim program, when the host was given one.
                 shim_exe,
+                // Story 24-3: this host owns the data path; its Handoff Mode
+                // is recorded before anything is adopted.
+                host_posture: Some(match (handoff, handoff_chosen) {
+                    (true, _) => hekma_engine::HandoffPosture::On,
+                    (false, true) => hekma_engine::HandoffPosture::Off,
+                    (false, false) => hekma_engine::HandoffPosture::Unset,
+                }),
                 // Route the ENGINE's own diagnostics (adoption notes, the
                 // re-bind notes, enforcement breadcrumbs) through the SAME
                 // sink the host notices use — one interleaved, honest stream.
@@ -975,6 +987,37 @@ where
         notifier.note(&note);
     }
 
+    // Story 24-3: what the previous owner left behind. A crashed host
+    // with Handoff Mode off asked for its agents to be cleaned up: each is
+    // stopped the ordinary way and its Run ends `engine-crash`. On, or not
+    // recorded: they were adopted and keep running.
+    let mut recovered: Option<hekma_engine::RecoveryEvent> = None;
+    if let Some(recovery) = engine.host_recovery() {
+        let (cleaned, failed) = match recovery.previous {
+            hekma_engine::PreviousHost::Gone { handoff: false } => {
+                let mut cleaned = Vec::new();
+                let mut failed = Vec::new();
+                for name in &recovery.adopted {
+                    match engine.blocking().clean_up_after_crash(name, Some(window)) {
+                        Ok(_) => cleaned.push(name.clone()),
+                        Err(err) => failed.push(format!("{name} ({err})")),
+                    }
+                }
+                (cleaned, failed)
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+        if let Some(note) = recovery_note(&recovery, &cleaned, &failed) {
+            notifier.note(&note);
+        }
+        // The one durable summary of this reconcile.
+        let (event, note) = recovery_committed(engine.blocking().commit_recovery(cleaned.len()));
+        recovered = event;
+        if let Some(note) = note {
+            notifier.note(&note);
+        }
+    }
+
     // Story 24-2: say what a shutdown will do to the agents, and whether
     // the service manager would take them down with this host anyway.
     if let Some(note) = handoff_note(handoff, shim_launches) {
@@ -988,9 +1031,13 @@ where
         "pid": std::process::id(),
         "hekma_version": build_version.clone().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
         "handoff": handoff,
+        "handoff_chosen": handoff_chosen,
         "shim": shim_launches,
         "handoff_check": handoff_check.as_str(),
         "handoff_check_detail": handoff_check.detail(),
+        // Story 24-3: what this start reconciled (the `recovery` event it
+        // committed), or null.
+        "recovery": recovered,
     });
 
     // (5.5) The Control API mounts here: AFTER the engine opens and the
@@ -1443,6 +1490,61 @@ fn hand_over(
         .map_err(|err| err.to_string())
 }
 
+/// Story 24-3: what a commit of the `recovery` summary leaves for
+/// `GET /v0/host`, and the note when it could not be recorded.
+fn recovery_committed(
+    result: Result<Option<hekma_engine::RecoveryEvent>, hekma_engine::EngineError>,
+) -> (Option<hekma_engine::RecoveryEvent>, Option<String>) {
+    match result {
+        Ok(event) => (event, None),
+        Err(err) => (
+            None,
+            Some(format!(
+                "the recovery summary could not be recorded ({err}); the agents and calls \
+                 above are settled all the same"
+            )),
+        ),
+    }
+}
+
+/// Story 24-3: the started notice's line about the previous owner's agents.
+fn recovery_note(
+    recovery: &hekma_engine::HostRecovery,
+    cleaned: &[String],
+    failed: &[String],
+) -> Option<String> {
+    use hekma_engine::PreviousHost;
+    let adopted = recovery.adopted.join(", ");
+    match recovery.previous {
+        PreviousHost::Gone { handoff: false } if !recovery.adopted.is_empty() => {
+            let mut note = format!(
+                "the previous host stopped without Handoff Mode and left {} agent(s) running; \
+                 stopped {} of them ({}); their Runs end with cause engine-crash",
+                recovery.adopted.len(),
+                cleaned.len(),
+                cleaned.join(", ")
+            );
+            if !failed.is_empty() {
+                note.push_str(&format!(
+                    "; could not stop: {} — they stay supervised here",
+                    failed.join(", ")
+                ));
+            }
+            Some(note)
+        }
+        PreviousHost::Gone { handoff: true } if !recovery.adopted.is_empty() => Some(format!(
+            "the previous host ran in Handoff Mode; reconnected to its {} agent(s): {adopted}",
+            recovery.adopted.len()
+        )),
+        PreviousHost::Unknown if !recovery.adopted.is_empty() => Some(format!(
+            "no record of the previous host's Handoff Mode, so its {} agent(s) were adopted, not \
+             stopped: {adopted}",
+            recovery.adopted.len()
+        )),
+        _ => None,
+    }
+}
+
 /// Story 24-2: the started notice's Handoff Mode line, when there is one.
 fn handoff_note(handoff: bool, shim_launches: bool) -> Option<&'static str> {
     match (handoff, shim_launches) {
@@ -1685,5 +1787,49 @@ mod identity_headers_note_tests {
         assert!(started.elapsed() >= std::time::Duration::from_millis(100));
         // Alone, it closes at once.
         super::close_engine(straggler, std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_recovery_summary_that_cannot_be_recorded_is_noted_and_left_null() {
+        let (event, note) = super::recovery_committed(Err(hekma_engine::EngineError::NotFound {
+            name: "ghost".into(),
+        }));
+        assert!(event.is_none());
+        assert!(note.unwrap().contains("could not be recorded"));
+        assert_eq!(super::recovery_committed(Ok(None)), (None, None));
+    }
+
+    #[test]
+    fn the_recovery_note_says_what_happened_to_the_previous_hosts_agents() {
+        use hekma_engine::{HostRecovery, PreviousHost};
+        let recovery = |previous, adopted: &[&str]| HostRecovery {
+            previous,
+            adopted: adopted.iter().map(|name| name.to_string()).collect(),
+            shims_lost: Vec::new(),
+            calls_closed_crash: 0,
+            calls_closed_recovered: 0,
+        };
+        let off = recovery(PreviousHost::Gone { handoff: false }, &["a", "b"]);
+        let note = super::recovery_note(&off, &["a".into()], &["b (busy)".into()]).unwrap();
+        assert!(
+            note.contains("left 2 agent(s) running; stopped 1 of them (a)"),
+            "{note}"
+        );
+        assert!(note.contains("engine-crash") && note.contains("could not stop: b (busy)"));
+        let on = recovery(PreviousHost::Gone { handoff: true }, &["a"]);
+        assert!(super::recovery_note(&on, &[], &[])
+            .unwrap()
+            .contains("reconnected to its 1"));
+        let unknown = recovery(PreviousHost::Unknown, &["a"]);
+        assert!(super::recovery_note(&unknown, &[], &[])
+            .unwrap()
+            .contains("adopted, not stopped"));
+        assert!(super::recovery_note(&recovery(PreviousHost::Live, &["a"]), &[], &[]).is_none());
+        assert!(super::recovery_note(
+            &recovery(PreviousHost::Gone { handoff: false }, &[]),
+            &[],
+            &[]
+        )
+        .is_none());
     }
 }
