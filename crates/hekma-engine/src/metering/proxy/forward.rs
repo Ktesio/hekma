@@ -52,6 +52,8 @@ pub(crate) struct RefusalCounters {
     pub out_of_scope: AtomicU64,
     pub no_route: AtomicU64,
     pub bad_target: AtomicU64,
+    pub bad_host: AtomicU64,
+    pub path_not_allowed: AtomicU64,
     pub busy: AtomicU64,
     pub ignored_hints: AtomicU64,
     pub capped_hints: AtomicU64,
@@ -101,6 +103,16 @@ pub(crate) struct ProxyShared {
     pub diagnostics: Arc<dyn Fn(String) + Send + Sync>,
     /// The minute of the last pre-identification refusal note.
     pub last_note_minute: AtomicU64,
+    /// Story 22-2: the custody cache — the swap's value source (in-memory
+    /// only; a missing entry means the key was never seeded or its refresh
+    /// never succeeded, and the call is refused, never forwarded bare).
+    pub custody: Arc<crate::domain::custody::CustodyCache>,
+    /// Story 22-2: the Host header values beyond the loopback literals the
+    /// guard accepts (`--proxy-allowed-hosts`).
+    pub allowed_hosts: Arc<[String]>,
+    /// Story 22-2: the `Origin` values the guard accepts
+    /// (`--proxy-allowed-origins`); an `Origin` NOT on the list is refused.
+    pub allowed_origins: Arc<[String]>,
     /// cfg(test) seam: slow each Run creation down inside the writer, so a
     /// creation queued behind it is not taken within the ack bound.
     #[cfg(test)]
@@ -131,7 +143,7 @@ impl ProxyShared {
         (self.diagnostics)(format!(
             "metering proxy refusals so far: {} credential in URL, {} unknown credential, {} \
              revoked credential, {} Run Key in the API-key slot, {} out of scope, {} no route, \
-             {} bad target, {} busy",
+             {} bad target, {} bad host, {} path outside the held key's list, {} busy",
             c.credential_in_url.load(Ordering::Relaxed),
             c.unknown_credential.load(Ordering::Relaxed),
             c.credential_revoked.load(Ordering::Relaxed),
@@ -139,6 +151,8 @@ impl ProxyShared {
             c.out_of_scope.load(Ordering::Relaxed),
             c.no_route.load(Ordering::Relaxed),
             c.bad_target.load(Ordering::Relaxed),
+            c.bad_host.load(Ordering::Relaxed),
+            c.path_not_allowed.load(Ordering::Relaxed),
             c.busy.load(Ordering::Relaxed),
         ));
     }
@@ -188,6 +202,123 @@ fn refusal_error(refusal: Refusal) -> WireError {
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// A `Host` header value without its port (`[::1]:80` → `::1`,
+/// `name:8478` → `name`, `name` → `name`).
+fn host_name_part(host: &str) -> &str {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split_once(']').map_or(rest, |(inside, _)| inside);
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if !name.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => {
+            name
+        }
+        _ => host,
+    }
+}
+
+/// Whether a `Host` header value names a loopback literal (`127.0.0.0/8`,
+/// `::1`, `localhost` — the port stripped, brackets kept honest) — the DNS
+/// rebinding half of the boundary: only the proxy's own loopback addresses
+/// are ever acceptable by default.
+fn host_is_loopback_literal(host: &str) -> bool {
+    let hostname = host_name_part(host);
+    if hostname.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = hostname.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    false
+}
+
+/// The Host/Origin guard (story 22-2): `Host` must be a loopback literal or
+/// on the Operator's `--proxy-allowed-hosts` list; `Origin`, when present,
+/// must be on `--proxy-allowed-origins` (browser pages send `Origin` on
+/// cross-site requests; SDKs send none). The refusal precedes
+/// identification and any dial, and no `Access-Control-*` header is ever
+/// added — a page's read of a response body fails in the browser regardless.
+fn host_origin_ok(
+    headers: &HeaderMap,
+    allowed_hosts: &[String],
+    allowed_origins: &[String],
+) -> bool {
+    let listed = |value: &str, list: &[String]| {
+        list.iter()
+            .any(|allowed| allowed.trim().eq_ignore_ascii_case(value.trim()))
+    };
+    let host_ok = match header(headers, hyper::header::HOST.as_str()) {
+        Some(host) => {
+            host_is_loopback_literal(host)
+                || listed(host, allowed_hosts)
+                || listed(host_name_part(host), allowed_hosts)
+        }
+        None => false,
+    };
+    if !host_ok {
+        return false;
+    }
+    match header(headers, "origin") {
+        Some(origin) => listed(origin, allowed_origins),
+        None => true,
+    }
+}
+
+/// Replace every exact occurrence of `needle` in `haystack`, or `None`
+/// when there is none (byte-wise: a body need not be UTF-8).
+fn replace_bytes(haystack: &[u8], needle: &[u8], mask: &[u8]) -> Option<Vec<u8>> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut index = 0;
+    let mut found = false;
+    while index < haystack.len() {
+        if haystack[index..].starts_with(needle) {
+            out.extend_from_slice(mask);
+            index += needle.len();
+            found = true;
+        } else {
+            out.push(haystack[index]);
+            index += 1;
+        }
+    }
+    found.then_some(out)
+}
+
+/// Response redaction (story 22-2): every exact occurrence of the custodied
+/// key in the relayed headers and the buffered body becomes the fixed mask.
+/// A header whose value cannot hold the masked text is dropped rather than
+/// relayed with the key; a changed body gets its `content-length` rewritten.
+fn redact_response(headers: &mut HeaderMap, body: Bytes, needle: &[u8]) -> Bytes {
+    let mask = wire::REDACTION_MASK.as_bytes();
+    let mut drop: Vec<HeaderName> = Vec::new();
+    for (name, value) in headers.iter_mut() {
+        if let Some(replaced) = replace_bytes(value.as_bytes(), needle, mask) {
+            match HeaderValue::from_bytes(&replaced) {
+                Ok(mut masked) => {
+                    masked.set_sensitive(value.is_sensitive());
+                    *value = masked;
+                }
+                Err(_) => drop.push(name.clone()),
+            }
+        }
+    }
+    for name in drop {
+        headers.remove(name);
+    }
+    match replace_bytes(&body, needle, mask) {
+        Some(masked) => {
+            headers.insert(
+                hyper::header::CONTENT_LENGTH,
+                HeaderValue::from(masked.len()),
+            );
+            Bytes::from(masked)
+        }
+        None => body,
+    }
 }
 
 /// The canonical (scheme, host, port) of a URI: lowercased host, no
@@ -437,6 +568,20 @@ pub(crate) async fn serve(
     shared: Arc<ProxyShared>,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
+    // Story 22-2: the Host/Origin guard runs FIRST — before the target
+    // check, before identification, before any dial — so a rebinding-shaped
+    // request never reaches the key. `OPTIONS` preflights meet the same
+    // guard (never a permissive answer, never a CORS header).
+    if !host_origin_ok(
+        req.headers(),
+        &shared.allowed_hosts,
+        &shared.allowed_origins,
+    ) {
+        shared.counters.bad_host.fetch_add(1, Ordering::Relaxed);
+        drain_request_body(req.into_body()).await;
+        shared.note_refusals();
+        return WireError::BadHost.response();
+    }
     if !target_ok(req.method(), req.uri(), &shared.authority) {
         shared.counters.bad_target.fetch_add(1, Ordering::Relaxed);
         drain_request_body(req.into_body()).await;
@@ -468,7 +613,12 @@ async fn serve_admitted(
                 query: query.as_deref(),
                 run_key: header(headers, wire::RUN_KEY_HEADER),
                 authorization: header(headers, hyper::header::AUTHORIZATION.as_str()),
-                api_key: header(headers, "x-api-key"),
+                // Story 22-2: every provider's API-key header is a slot
+                // (Anthropic's, Google's, Azure's), so a Run Key placed in
+                // any of them is read — never forwarded as if it were a key.
+                api_key: header(headers, "x-api-key")
+                    .or_else(|| header(headers, "x-goog-api-key"))
+                    .or_else(|| header(headers, "api-key")),
                 hint: header(headers, wire::RUN_HINT_HEADER),
                 hint_labels: header(headers, wire::LABELS_HEADER),
             },
@@ -603,6 +753,81 @@ async fn serve_admitted(
         return WireError::BadTarget.response();
     };
 
+    // Story 22-2 — the custody swap's gates, before the body is buffered
+    // and before any dial: the outbound scheme is `https` with certificate
+    // verification on (the client is built with the webpki store and no
+    // bypass exists), the outbound ORIGIN equals the origin frozen on the
+    // Run (canonical equality: scheme, lowercased host, effective port),
+    // and the outbound PATH is on the key's allow-list. A failure refuses
+    // with nothing forwarded and the upstream seeing nothing.
+    let mut custody = None;
+    if let Some(info) = target.custody.clone() {
+        let name = crate::domain::config::secret_name(&info.key_ref)
+            .unwrap_or_default()
+            .to_string();
+        let entry = match shared.custody.get(&name) {
+            Some(entry) => Some(entry),
+            // A miss (a binding's key, a custodied Run adopted after a
+            // restart): resolve once, off the async threads.
+            None => {
+                let cache = Arc::clone(&shared.custody);
+                let lookup = name.clone();
+                tokio::task::spawn_blocking(move || cache.resolve_now(&lookup))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        };
+        let Some(entry) = entry else {
+            drain_request_body(req.into_body()).await;
+            guard.close(
+                CallDisposition::Pass,
+                CallOutcome::Refused,
+                None,
+                StatusClass::Refused,
+                None,
+                None,
+            );
+            shared.count(Refusal::CustodyUnavailable);
+            return WireError::CustodyUnavailable.response();
+        };
+        let scheme_https = uri.scheme_str() == Some("https");
+        let origin_pinned =
+            scheme_https && crate::domain::custody::origins_equal(&uri.to_string(), &info.origin);
+        if !origin_pinned {
+            drain_request_body(req.into_body()).await;
+            guard.close(
+                CallDisposition::Pass,
+                CallOutcome::Refused,
+                None,
+                StatusClass::Refused,
+                None,
+                None,
+            );
+            shared.counters.bad_target.fetch_add(1, Ordering::Relaxed);
+            return WireError::BadTarget.response();
+        }
+        let paths = crate::domain::custody::allowed_paths(entry.declared.as_ref(), &info.origin);
+        if !crate::domain::custody::path_allowed(&paths, uri.path()) {
+            drain_request_body(req.into_body()).await;
+            guard.close(
+                CallDisposition::Pass,
+                CallOutcome::Refused,
+                None,
+                StatusClass::Refused,
+                None,
+                None,
+            );
+            shared
+                .counters
+                .path_not_allowed
+                .fetch_add(1, Ordering::Relaxed);
+            shared.note_refusals();
+            return WireError::PathNotAllowed.response();
+        }
+        custody = Some((info, entry));
+    }
+
     // The request body (capped), and the byte budget.
     let declared = req
         .headers()
@@ -671,8 +896,8 @@ async fn serve_admitted(
         &mut req_bytes,
     );
 
-    // The outbound headers: hop-by-hop, Host and every `x-hekma-*` stripped;
-    // credential values marked sensitive; identity headers added.
+    // The outbound headers: hop-by-hop, Host and every `x-hekma-*` header
+    // stripped; credential values marked sensitive; identity headers added.
     strip_hop_by_hop(&mut parts.headers);
     wire::strip_hekma_headers(&mut parts.headers);
     parts.headers.remove(hyper::header::HOST);
@@ -680,9 +905,53 @@ async fn serve_admitted(
         hyper::header::AUTHORIZATION,
         hyper::header::PROXY_AUTHORIZATION,
         HeaderName::from_static("x-api-key"),
+        HeaderName::from_static("x-goog-api-key"),
+        HeaderName::from_static("api-key"),
     ] {
         if let Some(value) = parts.headers.get_mut(&name) {
             value.set_sensitive(true);
+        }
+    }
+    // Story 22-2 — the swap: under custody the presented credential
+    // headers LEAVE (the Run Key itself, or a client's own key — a
+    // custodied Run spends only its custodied key, which is what makes
+    // attribution total) and the custodied key is inserted ONCE, in the
+    // provider's scheme for the frozen origin, its `HeaderValue` marked
+    // sensitive so no `Debug` path ever prints it.
+    if let Some((info, entry)) = &custody {
+        for name in [
+            hyper::header::AUTHORIZATION,
+            hyper::header::PROXY_AUTHORIZATION,
+            HeaderName::from_static("x-api-key"),
+            HeaderName::from_static("x-goog-api-key"),
+            HeaderName::from_static("api-key"),
+        ] {
+            parts.headers.remove(&name);
+        }
+        // The response must be readable to be redacted: ask for it
+        // uncompressed (a key echoed inside a gzip body would pass the
+        // byte scan unseen).
+        parts.headers.insert(
+            hyper::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+        let scheme = crate::domain::custody::scheme_for(&info.origin);
+        match scheme.header_value(&entry.value) {
+            Some((name, value)) => {
+                parts.headers.insert(name, value);
+            }
+            None => {
+                guard.close(
+                    CallDisposition::Pass,
+                    CallOutcome::Refused,
+                    None,
+                    StatusClass::Refused,
+                    None,
+                    None,
+                );
+                shared.counters.bad_target.fetch_add(1, Ordering::Relaxed);
+                return WireError::BadTarget.response();
+            }
         }
     }
     if shared.identity_headers {
@@ -786,13 +1055,27 @@ async fn serve_admitted(
     // Relay the buffered response, with the breach header when the Run or
     // an ancestor holds a latched breach of any action.
     strip_hop_by_hop(&mut res_parts.headers);
+    // Story 22-2 — response redaction: exact occurrences of the custodied
+    // key in the relayed headers and body are replaced with the fixed mask
+    // (a provider can echo a presented key in an error body; the response
+    // the agent reads must not carry the real key back into everything the
+    // agent prints or writes). Responses are buffered whole today; when
+    // incremental relay lands the redaction moves to a sliding window.
+    let relay_bytes = match &custody {
+        Some((_, entry)) => redact_response(
+            &mut res_parts.headers,
+            res_bytes,
+            entry.value.expose_secret().as_bytes(),
+        ),
+        None => res_bytes,
+    };
     let latched = shared.snapshot.current().disposition_over(&run_id);
     if let Some(value) = wire::breach_header_value(&Disposition::reasons(latched.breach_latched)) {
         res_parts
             .headers
             .insert(HeaderName::from_static(wire::BREACH_HEADER), value);
     }
-    let mut response = Response::new(Full::new(res_bytes));
+    let mut response = Response::new(Full::new(relay_bytes));
     *response.status_mut() = res_parts.status;
     *response.headers_mut() = res_parts.headers;
     response
@@ -891,5 +1174,155 @@ impl super::identify::Target {
         } else {
             self.rest.clone()
         }
+    }
+}
+
+/// Story 22-2: the pure pieces of the custody swap — response redaction and
+/// the Host/Origin guard.
+#[cfg(test)]
+mod custody_tests {
+    use super::*;
+
+    const KEY: &str = "sk-live-0123456789abcdef";
+
+    #[test]
+    fn redaction_masks_every_occurrence_byte_wise_and_fixes_the_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-echo",
+            HeaderValue::from_static("key=sk-live-0123456789abcdef!"),
+        );
+        headers.insert("content-length", HeaderValue::from_static("999"));
+        headers.insert("x-other", HeaderValue::from_static("untouched"));
+        // A non-UTF-8 body: the bytes around the key survive exactly.
+        let mut body = vec![0xff, 0xfe];
+        body.extend_from_slice(KEY.as_bytes());
+        body.extend_from_slice(b" and again ");
+        body.extend_from_slice(KEY.as_bytes());
+        body.push(0x80);
+        let out = redact_response(&mut headers, Bytes::from(body), KEY.as_bytes());
+        let mut expected = vec![0xff, 0xfe];
+        expected.extend_from_slice(wire::REDACTION_MASK.as_bytes());
+        expected.extend_from_slice(b" and again ");
+        expected.extend_from_slice(wire::REDACTION_MASK.as_bytes());
+        expected.push(0x80);
+        assert_eq!(out.as_ref(), expected.as_slice());
+        assert_eq!(
+            headers["content-length"],
+            HeaderValue::from(expected.len()),
+            "a changed body carries its new length"
+        );
+        assert_eq!(headers["x-echo"], "key=hekma_redacted_key!");
+        assert_eq!(headers["x-other"], "untouched");
+    }
+
+    #[test]
+    fn a_body_without_the_key_is_relayed_untouched() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", HeaderValue::from_static("5"));
+        let out = redact_response(&mut headers, Bytes::from_static(b"hello"), KEY.as_bytes());
+        assert_eq!(out.as_ref(), b"hello");
+        assert_eq!(headers["content-length"], "5");
+        assert_eq!(replace_bytes(b"", KEY.as_bytes(), b"x"), None);
+        assert_eq!(replace_bytes(b"abc", b"", b"x"), None);
+    }
+
+    #[test]
+    fn a_header_that_cannot_hold_the_mask_is_dropped_never_relayed_with_the_key() {
+        let mut headers = HeaderMap::new();
+        // An obs-text header value: valid on the wire, and the mask still
+        // fits; a value whose replacement would be invalid is dropped.
+        let raw = [b"\x80".as_slice(), KEY.as_bytes()].concat();
+        headers.insert("x-raw", HeaderValue::from_bytes(&raw).unwrap());
+        redact_response(&mut headers, Bytes::new(), KEY.as_bytes());
+        let kept = headers.get("x-raw").map(|v| v.as_bytes().to_vec());
+        assert!(
+            kept.as_deref()
+                .is_none_or(|v| !v.windows(KEY.len()).any(|w| w == KEY.as_bytes())),
+            "the key never survives in a header"
+        );
+    }
+
+    #[test]
+    fn the_host_name_part_strips_ports_and_brackets() {
+        assert_eq!(host_name_part("127.0.0.1:8478"), "127.0.0.1");
+        assert_eq!(host_name_part("[::1]:80"), "::1");
+        assert_eq!(host_name_part("[::1]"), "::1");
+        assert_eq!(host_name_part("localhost"), "localhost");
+        assert_eq!(host_name_part("proxy.internal:8478"), "proxy.internal");
+        // A bare IPv6 literal (no brackets) is not split on its colons.
+        assert_eq!(host_name_part("::1"), "::1");
+    }
+
+    fn guard(host: Option<&str>, origin: Option<&str>, hosts: &[&str], origins: &[&str]) -> bool {
+        let mut headers = HeaderMap::new();
+        if let Some(host) = host {
+            headers.insert(hyper::header::HOST, HeaderValue::from_str(host).unwrap());
+        }
+        if let Some(origin) = origin {
+            headers.insert("origin", HeaderValue::from_str(origin).unwrap());
+        }
+        let hosts: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
+        let origins: Vec<String> = origins.iter().map(|o| o.to_string()).collect();
+        host_origin_ok(&headers, &hosts, &origins)
+    }
+
+    #[test]
+    fn the_guard_admits_loopback_literals_and_listed_names_only() {
+        for host in [
+            "127.0.0.1",
+            "127.0.0.1:8478",
+            "127.9.9.9:1",
+            "[::1]:8478",
+            "localhost:1",
+        ] {
+            assert!(guard(Some(host), None, &[], &[]), "{host}");
+        }
+        // Rebinding-shaped names, a missing Host, a routable address.
+        for host in [
+            "evil.example",
+            "localhost.evil.example",
+            "127.0.0.1.nip.io",
+            "10.0.0.5:8478",
+        ] {
+            assert!(!guard(Some(host), None, &[], &[]), "{host}");
+        }
+        assert!(!guard(None, None, &[], &[]), "no Host");
+        // An Operator-listed name, with or without its port.
+        assert!(guard(
+            Some("proxy.internal"),
+            None,
+            &["proxy.internal"],
+            &[]
+        ));
+        assert!(guard(
+            Some("proxy.internal:8478"),
+            None,
+            &["proxy.internal"],
+            &[]
+        ));
+        assert!(guard(
+            Some("PROXY.internal:8478"),
+            None,
+            &["proxy.internal"],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn any_origin_is_refused_unless_listed() {
+        assert!(!guard(
+            Some("127.0.0.1"),
+            Some("https://evil.example"),
+            &[],
+            &[]
+        ));
+        assert!(!guard(Some("127.0.0.1"), Some("null"), &[], &[]));
+        assert!(guard(
+            Some("127.0.0.1"),
+            Some("https://app.example"),
+            &[],
+            &["https://app.example"]
+        ));
     }
 }

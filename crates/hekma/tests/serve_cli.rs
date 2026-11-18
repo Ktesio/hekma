@@ -532,6 +532,19 @@ fn serve_helper_subprocess() {
             "http://127.0.0.1:9/",
         )
         .expect("helper config");
+    // Story 22-2: an engine-observed agent starts only when Hekma holds its
+    // provider key (FR-19); this metering test holds one with custody off.
+    std::env::set_var("HEKMA_TEST_PROVIDER_KEY", "sk-test-held-provider-key");
+    facade
+        .set_config(
+            "observed",
+            "provider.api_key",
+            "secret:HEKMA_TEST_PROVIDER_KEY",
+        )
+        .expect("helper config");
+    facade
+        .set_config("observed", "provider.custody", "off")
+        .expect("helper config");
     facade.start("observed").expect("helper start");
     // The crashed host: no drop, no drain, no kill-on-drop — the child
     // survives.

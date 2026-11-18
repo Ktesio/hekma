@@ -2167,6 +2167,21 @@ pub fn config_set(name: &str, key: &str, value: &str) -> Result<(), Box<dyn std:
     Ok(())
 }
 
+/// Whether an effective configuration holds its provider key under key
+/// custody (story 22-2): `provider.api_key` names a `secret:` reference and
+/// `provider.custody` is not `off`.
+fn custodies_a_key(effective: &hekma_engine::EffectiveConfig) -> bool {
+    let held = effective
+        .value("provider.api_key")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.starts_with("secret:"));
+    let opted_out = effective
+        .value("provider.custody")
+        .and_then(|value| value.as_str())
+        == Some("off");
+    held && !opted_out
+}
+
 /// `hekma agent config get <name> [<key>] [--json]` — read the EFFECTIVE (resolved)
 /// config WITH per-value provenance (story 2-1 read + story 2-3 provenance,
 /// AC10/AC-A/AC3/AC4, AD-12/AD-9).
@@ -2214,9 +2229,40 @@ pub fn config_get(
     // as a stderr diagnostic (never a crash). Without --reveal, an empty overlay
     // leaves every secret masked via the engine's display().
     let revealed = if reveal {
-        blocking
+        let revealed = blocking
             .reveal_secrets(name, ConfigLayer::empty())
-            .map_err(map_config_error)?
+            .map_err(map_config_error)?;
+        // Story 22-2 (P10): a custodied provider key is revealed only after
+        // the Service Host has committed a `secret_revealed` event naming
+        // it — when that cannot be recorded, nothing is printed.
+        if custodies_a_key(&effective) {
+            let routed = route(
+                "POST",
+                &format!("/v0/instances/{}/config/revealed", segment(name)),
+                None,
+            )
+            .map_err(RoutedError::into_diagnostic)?;
+            let secrets = routed
+                .value
+                .as_ref()
+                .and_then(|body| body.get("secrets"))
+                .and_then(Value::as_array)
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            if !secrets.is_empty() {
+                ui::note(format!(
+                    "revealing the custodied provider key {secrets}: a secret_revealed event \
+                     was recorded"
+                ));
+            }
+        }
+        revealed
     } else {
         std::collections::BTreeMap::new()
     };
@@ -3367,6 +3413,13 @@ pub(crate) fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
         // detached start would strand the agent's model traffic on a dead port.
         // The engine refused BEFORE any side effect (the instance keeps its prior
         // state); the detail carries the why + the remediation.
+        EngineError::Custody { name, detail } => AgentConfig {
+            message: format!(
+                "Agent Instance '{name}' cannot start under key custody: {detail}. Nothing was \
+                 changed."
+            ),
+        }
+        .into(),
         EngineError::DetachRefused { name, detail } => AgentDetachRefused {
             message: format!(
                 "Agent Instance '{name}' cannot be started with --detach: {detail}. Nothing \

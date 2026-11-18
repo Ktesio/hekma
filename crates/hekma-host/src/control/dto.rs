@@ -181,6 +181,16 @@ pub(crate) struct ConfigLeaf {
     pub unvalidated: bool,
 }
 
+/// `POST /v0/instances/{name}/config/revealed` (story 22-2): the
+/// custodied secret names whose reveal was just committed as a
+/// `secret_revealed` event (empty when the instance custodies nothing, and
+/// no event was written). Names only, never a value.
+#[derive(Serialize)]
+pub(crate) struct RevealedDocument {
+    pub schema_version: u32,
+    pub secrets: Vec<String>,
+}
+
 /// `GET /v0/instances/{name}/config` — the effective config, the SAME
 /// document `config get --json` renders ([`CONFIG_GET_SCHEMA_VERSION`]).
 #[derive(Serialize)]

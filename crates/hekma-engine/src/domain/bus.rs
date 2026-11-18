@@ -146,6 +146,10 @@ pub enum EngineEvent {
     /// Carries a token id on a credential change, never a token or a hash.
     /// Boxed for the same ring-size reason as `Policy`.
     Binding(Box<super::runs::bindings::BindingEvent>),
+    /// A custodied secret was revealed (story 22-2): `config get --reveal`
+    /// printed an instance's held provider key. Names the secret, never a
+    /// value; committed before the value prints.
+    SecretRevealed(super::custody::SecretRevealedEvent),
 }
 
 /// The in-supervisor handle to the event bus: a cloneable pair of

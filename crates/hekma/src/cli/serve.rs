@@ -40,6 +40,10 @@ pub struct ServeFlags {
     /// `--no-identity-headers` (story 23-1): send neither
     /// `x-hekma-run-id` nor `x-hekma-labels` to the model provider.
     pub no_identity_headers: bool,
+    /// `--proxy-allowed-hosts <name,...>` (story 22-2).
+    pub proxy_allowed_hosts: Vec<String>,
+    /// `--proxy-allowed-origins <origin,...>` (story 22-2).
+    pub proxy_allowed_origins: Vec<String>,
     /// `--state-dir <dir>`.
     pub state_dir: Option<String>,
     /// `--listen <addr>`.
@@ -95,6 +99,10 @@ pub fn run(flags: ServeFlags) -> Result<(), Box<dyn std::error::Error>> {
         stop_window: flags.stop_window,
         metering_listen_port: flags.metering_listen,
         identity_headers: !flags.no_identity_headers,
+        proxy_allowed_hosts: proxy_allowed_hosts(flags.proxy_allowed_hosts)
+            .map_err(|message| ServeOptionsInvalid { message })?,
+        proxy_allowed_origins: proxy_allowed_origins(flags.proxy_allowed_origins)
+            .map_err(|message| ServeOptionsInvalid { message })?,
         control_listen: flags.listen,
         bearer_secret: flags.bearer_secret,
         // Story 17-4: the capture posture — `None` (no flag) means the
@@ -136,8 +144,83 @@ pub fn run(flags: ServeFlags) -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
+/// `--proxy-allowed-hosts` (story 22-2): each a bare host name or address,
+/// with an optional `:port` — what a `Host` header carries. Trimmed;
+/// empty entries dropped; anything with a scheme, path or space refused.
+fn proxy_allowed_hosts(values: Vec<String>) -> Result<Vec<String>, String> {
+    let mut hosts = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if value.contains("://")
+            || value.contains('/')
+            || value.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(format!(
+                "--proxy-allowed-hosts takes host names as a Host header carries them (for \
+                 example proxy.internal or proxy.internal:8478), not '{value}'"
+            ));
+        }
+        hosts.push(value.to_ascii_lowercase());
+    }
+    Ok(hosts)
+}
+
+/// `--proxy-allowed-origins` (story 22-2): each an origin as a browser
+/// sends it, `scheme://host[:port]` with no path. Trimmed; empty entries
+/// dropped.
+fn proxy_allowed_origins(values: Vec<String>) -> Result<Vec<String>, String> {
+    let mut origins = Vec::new();
+    for value in values {
+        let value = value.trim().trim_end_matches('/');
+        if value.is_empty() {
+            continue;
+        }
+        let valid = value.split_once("://").is_some_and(|(scheme, rest)| {
+            matches!(scheme, "http" | "https")
+                && !rest.is_empty()
+                && !rest.contains('/')
+                && !rest.chars().any(|c| c.is_whitespace() || c.is_control())
+        });
+        if !valid {
+            return Err(format!(
+                "--proxy-allowed-origins takes origins as a browser sends them (for example \
+                 https://app.example or http://localhost:3000), not '{value}'"
+            ));
+        }
+        origins.push(value.to_ascii_lowercase());
+    }
+    Ok(origins)
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_guard_flags_take_host_names_and_bare_origins_only() {
+        assert_eq!(
+            proxy_allowed_hosts(vec![" Proxy.Internal ".into(), "".into(), "h:8478".into()]),
+            Ok(vec!["proxy.internal".to_string(), "h:8478".to_string()])
+        );
+        for bad in ["http://h", "h/x", "a b"] {
+            assert!(proxy_allowed_hosts(vec![bad.into()]).is_err(), "{bad}");
+        }
+        assert_eq!(
+            proxy_allowed_origins(vec!["https://App.Example/".into(), " ".into()]),
+            Ok(vec!["https://app.example".to_string()])
+        );
+        for bad in [
+            "app.example",
+            "ftp://x",
+            "https://x/path",
+            "https://",
+            "null",
+        ] {
+            assert!(proxy_allowed_origins(vec![bad.into()]).is_err(), "{bad}");
+        }
+    }
     use super::*;
 
     #[test]

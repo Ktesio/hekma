@@ -60,6 +60,34 @@ pub use unix::check_secrets_file_permissions;
 #[cfg(windows)]
 pub use windows::check_secrets_file_permissions;
 
+// ---- Story 22-2: home isolation's per-OS variable list ----
+
+/// The home-pointing environment variables an isolated Agent Home rewrites
+/// (story 22-2, `provider.isolate_home = "on"`): Unix keeps `HOME` plus the
+/// XDG base directories; Windows rewrites the profile variables (tools also
+/// reach the known-folder APIs, which the docs name as the residual limit).
+/// Overriding any of these in the spawn environment replaces the inherited
+/// value — the OS floor re-applies `HOME`/`USERPROFILE` first, then the
+/// mapped environment wins.
+#[cfg(unix)]
+pub use unix::isolated_home_env_vars;
+#[cfg(windows)]
+pub use windows::isolated_home_env_vars;
+
+/// Story 22-2 (P10): the Service Host's memory hardening — non-dumpable
+/// and `RLIMIT_CORE` 0 on Linux, nothing elsewhere.
+#[cfg(unix)]
+pub use unix::harden_host_memory;
+#[cfg(windows)]
+pub use windows::harden_host_memory;
+
+/// Owner-only file permissions (`0600` on Unix; a fresh profile file
+/// already is on Windows) — the secrets-file posture.
+#[cfg(all(test, unix))]
+pub use unix::restrict_to_owner;
+#[cfg(all(test, windows))]
+pub use windows::restrict_to_owner;
+
 // ---- Story 11-2 review-1: atomic-write filesystem glue (the cfg home) ----
 // The per-OS bits of `paths::write_atomically` (permission preservation and
 // the rename with the Windows sharing-retry), cfg-selected exactly like the

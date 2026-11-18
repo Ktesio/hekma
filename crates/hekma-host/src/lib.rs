@@ -97,6 +97,15 @@ pub struct ServeOptions {
     /// (the run id and labels sent to the model provider — on by default);
     /// `true` sends neither.
     pub identity_headers: bool,
+    /// Story 22-2 (`--proxy-allowed-hosts`): `Host` header values the
+    /// metering proxy accepts beyond the loopback literals (`127.0.0.0/8`,
+    /// `::1`, `localhost`). Empty (the default) = the loopback literals
+    /// alone; anything else is refused `403 hekma_bad_host` before any dial.
+    pub proxy_allowed_hosts: Vec<String>,
+    /// Story 22-2 (`--proxy-allowed-origins`): the `Origin` values the
+    /// metering proxy accepts. Empty (the default) = a request carrying any
+    /// `Origin` is refused (SDKs send none; a browser page does).
+    pub proxy_allowed_origins: Vec<String>,
     /// The address the v0 Control API binds (`None` = API off — the default;
     /// serve is byte-identical to 17-2). Requires [`ServeOptions::bearer_secret`]
     /// (a missing partner is [`ServeError::InvalidOptions`] — the API never
@@ -393,6 +402,8 @@ where
         stop_window,
         metering_listen_port,
         identity_headers,
+        proxy_allowed_hosts,
+        proxy_allowed_origins,
         control_listen,
         bearer_secret,
         log_capture,
@@ -715,6 +726,15 @@ where
     // diagnostics go through the note tap (story 21-4): every line still
     // reaches the host's stream, and a write request's lines also ride back
     // to its client.
+    // Story 22-2 (P10): the engine's custody cache will hold provider keys
+    // in this process's memory — keep it out of core dumps (and, on Linux,
+    // out of same-user ptrace) before the engine opens. A failure is
+    // surfaced and serving goes on.
+    if let Err(detail) = hekma_engine::harden_host_memory() {
+        notifier.note(&format!(
+            "the Service Host could not harden its memory against core dumps: {detail}"
+        ));
+    }
     let note_tap = if autostart {
         control::NoteTap::keeping_startup_notes()
     } else {
@@ -735,6 +755,9 @@ where
                     port: metering_listen_port,
                     sticky: true,
                     identity_headers,
+                    // Story 22-2: the Host/Origin guard's Operator lists.
+                    allowed_hosts: proxy_allowed_hosts,
+                    allowed_origins: proxy_allowed_origins,
                     ..hekma_engine::MeteringProxyOptions::default()
                 },
                 child_env_allowlist: !autostart,

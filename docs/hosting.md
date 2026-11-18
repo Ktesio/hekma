@@ -167,6 +167,18 @@ raw files stay on the volume. If agent output is sensitive, treat the volume as
 sensitive, or run `--log-capture off` and accept the degraded sentinel
 metering it announces.
 
+## Provider keys in the host's memory
+
+Under [key custody](run-keys.md#key-custody-preview--not-yet-supported) (a preview), `hekma serve` holds your provider keys in its own memory, never in the agents' environments. At start the host hardens that memory where the OS allows:
+
+| OS | What the host does | What you should do |
+|---|---|---|
+| Linux | Marks itself non-dumpable and sets its core-dump limit to 0, so other processes running as the same user cannot read its memory or environment, and a crash writes no core file. If that fails, the host says so and keeps serving. | Nothing more. |
+| macOS | Nothing. | Leave full crash reports off for `hekma`. |
+| Windows | Nothing. | Leave full crash dumps off for `hekma`. |
+
+The secrets file lives in the state directory, so backups, snapshots and sync tools copy it with the volume. Exclude it, or give `hekma serve` its keys through its own environment instead, which the resolver reads first.
+
 ## The meter is cooperative — the container is not a fence
 
 Engine-observed metering works inside the container as it does on a machine.

@@ -141,6 +141,9 @@ fn engine_parts(err: &EngineError) -> (&'static str, Value) {
             "ObservedMetering",
             json!({ "name": name, "detail": detail }),
         ),
+        EngineError::Custody { name, detail } => {
+            ("Custody", json!({ "name": name, "detail": detail }))
+        }
         EngineError::DetachRefused { name, detail } => {
             ("DetachRefused", json!({ "name": name, "detail": detail }))
         }
@@ -574,6 +577,10 @@ fn decode_engine(variant: &str, f: &Fields) -> Option<EngineError> {
             detail: text(f, "detail")?,
         },
         "ObservedMetering" => EngineError::ObservedMetering {
+            name: text(f, "name")?,
+            detail: text(f, "detail")?,
+        },
+        "Custody" => EngineError::Custody {
             name: text(f, "name")?,
             detail: text(f, "detail")?,
         },

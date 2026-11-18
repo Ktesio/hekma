@@ -33,6 +33,7 @@ fn supervised(run_id: &RunId, wire_path: bool, fresh: bool) -> SupervisedRun {
         fresh,
         inputs: None,
         upstream: None,
+        custody: None,
     }
 }
 

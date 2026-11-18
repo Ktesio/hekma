@@ -462,7 +462,7 @@ hekma agent config get demo --reveal
 
 - `<key>` — optional; omitted prints the whole effective config. With a key, prints just that value. A key with no effective value is rejected on stderr with a non-zero exit. When that key has no value of its own but **is a table prefix** of effective keys (e.g. `budget` while `budget.tokens.cumulative` is set), the diagnostic names the effective child leaves (the first eight, then an ellipsis) and suggests the `get` for one of them; a key that is neither a value nor a prefix gets the plain not-found diagnostic. The same diagnostic applies in `--json` mode (stderr carries it; stdout stays clean of a partial document).
 - `--json` — emit a versioned document whose per-leaf objects carry `{ key, value, source, unvalidated }`.
-- `--reveal` — the sole explicit un-mask for `secret:` values. It re-resolves secrets **live** (environment, then the secrets file) at read time, so a revealed value may differ from what a running instance resolved at its start. It never un-masks the persisted snapshot, logs, or events.
+- `--reveal` — the sole explicit un-mask for `secret:` values. It re-resolves secrets **live** (environment, then the secrets file) at read time, so a revealed value may differ from what a running instance resolved at its start. It never un-masks the persisted snapshot, logs, or events. When the instance holds its provider key under [key custody](run-keys.md#key-custody-preview--not-yet-supported) (a preview), the reveal first asks the Service Host to record a `secret_revealed` event naming the secret, never its value, and notes that on stderr; if the event cannot be recorded, nothing is printed.
 
 Values resolve across four layers — engine defaults &lt; agent-kind defaults &lt; instance config &lt; invocation overrides — and each value names its winning source layer (a **Source** column, or a `source` field with `--json`).
 
@@ -511,7 +511,9 @@ hekma run close run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
 | `--json` | Print the Run as `{"schema_version": 1, "run": {…}}` |
 
 `show` prints the Run's CONTROL depth (`supervised (no wire)` when its calls
-skip the metering proxy), status, Anomalies, parent, instance, labels with
+skip the metering proxy), its CUSTODY when it owns a process (`on`, or `off`
+with the reason: `no-held-key`, `opted-out` or `pre-custody`; see
+[key custody](run-keys.md#key-custody-preview--not-yet-supported)), status, Anomalies, parent, instance, labels with
 their source (`bound, config`, `bound, label-verb` or `caller`), limits, subtree usage and open children. A child's usage counts
 on every ancestor, and every ancestor's ceilings apply to it. `close` ends a
 child Run (closing an ended one changes nothing); a Run that owns an agent's
@@ -577,7 +579,9 @@ not listed, and `--all` adds every Run inside the window. Rows are ordered
 by run id, newest first, and the cursor pages without duplicates. The
 columns: **RUN** (the agent's name on process-owning rows, the run id on
 child Runs), **CONTROL** (the depth; `supervised (no wire)` for an agent
-whose model calls skip the metering proxy), **STATUS**, **ANOMALIES**
+whose model calls skip the metering proxy; on a process-owning row it adds
+the Run's [key custody](run-keys.md#key-custody-preview--not-yet-supported),
+`· custody on` or `· custody off (<reason>)`), **STATUS**, **ANOMALIES**
 (the `breach` Anomaly with each latched Breach Action — `breach[block]`),
 **LABELS** (a caller label is suffixed `(caller)`), **Usage** (the Run's
 subtree tokens and derived dollars — an estimate; a dollar figure appears
@@ -752,7 +756,7 @@ hekma binding credential list openai [--json]
 
 There are at most 256 bindings. A refusal names the field or the clash: a bad prefix, upstream or reference, a duplicate name or prefix, or a `/` binding while an upgraded agent holds the legacy route. A refusal exits `2`, and a missing binding or route exits `3`. The same operations are on the Control API under [`/v0/bindings`](control-api.md), for the Operator bearer only.
 
-## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--no-identity-headers] [--listen <addr> --bearer-secret <name> [--tls-cert <pem> --tls-key <pem>]] [--state-dir <dir>] [--log-capture <mode>] [--otlp-endpoint <url> [--otlp-headers <k=v,...>] [--otlp-flush-interval <secs>]]`
+## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--no-identity-headers] [--proxy-allowed-hosts <name,...>] [--proxy-allowed-origins <origin,...>] [--listen <addr> --bearer-secret <name> [--tls-cert <pem> --tls-key <pem>]] [--state-dir <dir>] [--log-capture <mode>] [--otlp-endpoint <url> [--otlp-headers <k=v,...>] [--otlp-flush-interval <secs>]]`
 
 Run the long-running **Service Host**: one process that owns a state directory for its whole lifetime — it adopts every live agent at open, holds the single-writer host lock, and waits. On SIGTERM (or Ctrl+C / SIGINT) it stops every RUNNING agent through the bounded graceful ladder, surfaces each per-instance outcome, and only then exits. While it runs, stdout stays silent — the command's "result" is the long-running process itself, and everything of operator consequence is a `[hekma] `-prefixed diagnostic line on **stderr** (host startup naming the state root, the signal receipt, each per-instance stop outcome, shutdown complete), interleaved with the engine's own diagnostics on the same stream.
 
@@ -772,6 +776,8 @@ Every serve — explicit or auto-started by a `hekma agent` write — binds a **
 - `--stop-window <secs>` — the graceful stop window, in whole seconds, each running agent gets to exit on before the stop ladder escalates to a forced kill (default `30`, the same default as `hekma agent stop`; bounded `1..=86400` — `0` and out-of-range values are refused as a usage error, on this flag and on every other serve surface).
 - `--metering-listen <port>` — the loopback port of the host's **metering proxy**, the one listener every metered model call goes through (see [The metering proxy](metering-proxy.md)). Without it the host uses the port recorded for this state directory, or lets the OS pick one the first time and records it, so a restart binds the same port and adopted agents keep a live base URL. A port that is already in use never makes the host move to another: the host keeps serving the Control API, names the port and why in a diagnostic (and in `GET /v0/proxy`), and refuses `engine-observed` starts until you free the port or pass another.
 - `--no-identity-headers` — stop adding the outbound identity headers. By default every call the metering proxy forwards carries `x-hekma-run-id` and `x-hekma-labels` (the Run's id and labels) to the model provider; with this flag neither is sent.
+- `--proxy-allowed-hosts <name,...>` — `Host` header values the metering proxy accepts besides loopback addresses and `localhost` (comma-separated; a listed name matches with or without a port). Any other `Host` is refused with `403 hekma_bad_host`, which stops DNS-rebinding pages.
+- `--proxy-allowed-origins <origin,...>` — `Origin` values the metering proxy accepts, as a browser sends them (`https://app.example`). By default a request carrying any `Origin` is refused; SDKs send none.
 - `--listen <addr>` / `--bearer-secret <name>` — expose the **Control API** (v0, unstable) on an operator address too: an HTTP/JSON surface over the hosted fleet — registration, lifecycle, config, budgets and usage, input, memory, live SSE events — guarded by the resolved bearer token. Both flags or neither (a half-configured API is a usage error); the secret NAME resolves like every Hekma secret (env var, then the state root's `secrets.toml`), and an unresolvable name — or a secret that resolved to an EMPTY value — refuses the startup before anything binds. Operator tooling for a trusted operator — not a multi-tenant service. See [the Control API reference](control-api.md).
 - `--tls-cert <pem>` / `--tls-key <pem>` — serve `--listen` over HTTPS with this PEM certificate chain and private key (both or neither; they need `--listen`). **Required for a non-loopback `--listen`**: `--listen 0.0.0.0:8477` without them is refused with exit code `2` before anything binds or opens, and so is an unreadable PEM file or a key that does not match the certificate (the error names the path). The local endpoint never uses TLS.
 - `--state-dir <dir>` — serve this state directory instead of the resolved default (`HEKMA_STATE_DIR`/`KTESIO_STATE_DIR`, else the platform data dir; same resolution order as every other command).
@@ -827,6 +833,9 @@ Set these with `hekma agent config set <name> <key> <value>`.
 | `model` | string | Model name or identifier passed to the agent through its declared config mapping (if any; the builtin `mock` maps it to the `MODEL` env var, `hermes` does not map it) |
 | `budget.tokens.per_run` | integer | Per-run token ceiling |
 | `budget.tokens.cumulative` | integer | Cumulative token ceiling |
+| `provider.api_key` | `secret:NAME` only | The agent's provider key, held by Hekma. With it set, [key custody](run-keys.md#key-custody-preview--not-yet-supported) (a preview) is on by default: the agent receives its Run Key in this key's mapped variable, never the real key. An adapter may map it only to an `env` target. An `engine-observed` agent without it is refused at start |
+| `provider.custody` | `on` \| `off` | `off` delivers the real key to the agent instead (default `on` when `provider.api_key` is set) |
+| `provider.isolate_home` | `off` \| `on` | `on` points the agent's home-directory variables (`HOME` and the XDG variables; `USERPROFILE`, `APPDATA` and `LOCALAPPDATA` on Windows) at a directory inside its Agent Home (default `off`) |
 | `budget.breach_action` | `pause` \| `stop` \| `warn` \| `block` | Action on any budget/cap breach (default `pause`). `warn` records the breach event only — it performs no lifecycle transition. `block` keeps the agent running but the metering proxy refuses its further model calls (any Run whose calls go through the proxy — see below) |
 | `cost.rate.input` | dollar string (e.g. `3.00`) | Input price per 1M tokens |
 | `cost.rate.output` | dollar string | Output price per 1M tokens |

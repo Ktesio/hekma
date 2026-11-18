@@ -166,7 +166,7 @@ windows = "best-effort"
 A viable Metering Source. `source` is one of:
 
 - `"self-reported"` — the agent emits its own usage accounting (`KTESIO_USAGE {json}` sentinel lines on stdout).
-- `"engine-observed"` — the engine meters the agent's model traffic through the host's shared loopback [metering proxy](metering-proxy.md). The engine injects `metering.base_url`, which the config mapping below points at the agent's OpenAI-compatible base URL (for example `OPENAI_BASE_URL`), and the operator sets `metering.upstream_base_url` to the real provider endpoint. The injected value carries a path, `<proxy url>/_hekma/runs/<run id>`: an agent that appends its request paths to its base URL works unchanged, and one that keeps only the base URL's host gets `404 hekma_no_route`.
+- `"engine-observed"` — the engine meters the agent's model traffic through the host's shared loopback [metering proxy](metering-proxy.md). The engine injects `metering.base_url`, which the config mapping below points at the agent's OpenAI-compatible base URL (for example `OPENAI_BASE_URL`), and the operator sets `metering.upstream_base_url` to the real provider endpoint. The injected value carries a path, `<proxy url>/_hekma/runs/<run id>`: an agent that appends its request paths to its base URL works unchanged, and one that keeps only the base URL's host gets `404 hekma_no_route`. Hekma must hold the agent's provider key (`provider.api_key`, below), or the start is refused.
 
 ```toml
 [metering]
@@ -243,6 +243,17 @@ env = "MY_AGENT_HEKMA_KEY"
 [config."run.refresh_key"]
 env = "MY_AGENT_HEKMA_REFRESH"
 ```
+
+#### The provider key
+
+`provider.api_key` is the key an adapter maps to the agent's API-key variable. The operator sets it to a `secret:NAME` reference. Under [key custody](run-keys.md#key-custody-preview--not-yet-supported) (a preview, on by default when it is set) the agent receives its launch's Run Key there, and the real key stays with Hekma; with `provider.custody = "off"` it receives the real key. Map it to an `env` target only: a `flag` or `file` target is refused at registration, because it would put the key on the command line or in the Agent Home.
+
+```toml
+[config."provider.api_key"]
+env = "OPENAI_API_KEY"
+```
+
+An `engine-observed` agent whose operator has not set `provider.api_key` is refused at start.
 
 - Every agent receives its Run Key in `HEKMA_RUN_KEY`, whatever the manifest maps.
 - Only an `env` target is accepted for either key. A `flag` or `file` target is refused at registration, naming the key: an argv is readable by other local users, and a file would put the credential in the Agent Home.

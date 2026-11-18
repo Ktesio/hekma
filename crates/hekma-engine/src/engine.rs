@@ -542,13 +542,31 @@ impl Engine {
         if let Some(sink) = diagnostics {
             supervisor.install_diagnostics(sink);
         }
+        // Story 22-2: the custody cache — the one in-memory home for
+        // custodied provider values — is created BEFORE the supervisor and
+        // the proxy (both hold it), with its refresher on this runtime (a
+        // rotated secrets entry is picked up within the documented bound).
+        let custody_cache = Arc::new(crate::domain::custody::CustodyCache::new(
+            registry.secrets_file(),
+        ));
+        custody_cache.install_diagnostics(supervisor.diagnostic_fn());
+        supervisor.install_custody_cache(Arc::clone(&custody_cache));
+        let _custody_refresher = custody_cache.start_refresher(
+            rt.handle(),
+            std::time::Duration::from_secs(crate::domain::custody::CUSTODY_REFRESH_SECS),
+        );
         // Story 23-1: the shared Metering Proxy starts BEFORE adoption and the
         // reaper, so an adopted engine-observed agent's base URL is live on
         // this very open and the first snapshot it reads already carries
         // every durable `block` reason. A bind failure is surfaced, never a
         // port hop.
-        let (proxy, proxy_error) =
-            Self::start_metering_proxy(&rt, &registry, &supervisor, &metering_proxy);
+        let (proxy, proxy_error) = Self::start_metering_proxy(
+            &rt,
+            &registry,
+            &supervisor,
+            &metering_proxy,
+            &custody_cache,
+        );
         let proxy_url = proxy.as_ref().map(|proxy| proxy.info().url.clone());
         if let Some(error) = &proxy_error {
             supervisor.emit_open_note(error);
@@ -703,6 +721,7 @@ impl Engine {
         registry: &Registry,
         supervisor: &Supervisor,
         options: &crate::metering::proxy::MeteringProxyOptions,
+        custody: &Arc<crate::domain::custody::CustodyCache>,
     ) -> (
         Option<crate::metering::proxy::MeteringProxy>,
         Option<String>,
@@ -728,6 +747,7 @@ impl Engine {
             writer,
             inbox: supervisor.proxy_inbox(),
             diagnostics,
+            custody: Arc::clone(custody),
         };
         match crate::metering::proxy::MeteringProxy::start(rt.handle(), &chosen, deps) {
             Ok(proxy) => {
@@ -855,11 +875,58 @@ impl Engine {
             })
     }
 
+    /// Story 22-2 (P7): a binding naming a custodied key must send it only
+    /// where the key is pinned — its upstream over `https`, and on the
+    /// key's declared origins or the built-in provider table. Checked on
+    /// the Operator's create and change, before the write.
+    fn check_binding_pin(
+        inner: &Arc<EngineInner>,
+        key_ref: Option<&str>,
+        upstream: &str,
+    ) -> Result<(), BindingError> {
+        let Some(key_ref) = key_ref else {
+            return Ok(());
+        };
+        let Some(name) = crate::domain::config::secret_name(key_ref) else {
+            // The reference's own shape is refused by the spec validation.
+            return Ok(());
+        };
+        let invalid = |reason: String| BindingError::Invalid {
+            field: "custodied_key".to_string(),
+            reason,
+        };
+        if crate::domain::custody::canonical_origin(upstream)
+            .is_none_or(|(scheme, _, _)| scheme != "https")
+        {
+            return Err(invalid(
+                "a custodied key is sent only over https: give the binding an https upstream, \
+                 or clear its custodied key"
+                    .to_string(),
+            ));
+        }
+        let declared = inner
+            .registry
+            .lock()
+            .expect("registry mutex poisoned")
+            .custody_pin(name)
+            .map_err(|err| invalid(err.to_string()))?;
+        crate::domain::custody::resolve_origin(
+            name,
+            key_ref,
+            declared.as_ref(),
+            Some(upstream),
+            None,
+        )
+        .map(|_| ())
+        .map_err(|err| invalid(err.to_string()))
+    }
+
     /// Create an endpoint binding (story 23-1, D3): the Operator surface the
     /// shared Metering Proxy routes on. One `binding` event.
     pub async fn create_binding(&self, spec: BindingSpec) -> Result<Binding, BindingError> {
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
+            Self::check_binding_pin(&inner, spec.custodied_key.as_deref(), &spec.upstream)?;
             Self::binding_write(&inner, move |job, legacy| {
                 let at = crate::time::now_rfc3339();
                 crate::domain::runs::bindings::create(
@@ -884,6 +951,25 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
+            // The binding as it will be after the patch, when the patch
+            // touches its key or its upstream.
+            if patch.custodied_key.is_some() || patch.upstream.is_some() {
+                let current = {
+                    let registry = inner.registry.lock().expect("registry mutex poisoned");
+                    registry.reader().binding(&name)?
+                };
+                if let Some(current) = current {
+                    let key = match &patch.custodied_key {
+                        Some(next) => next.clone(),
+                        None => current.custodied_key.clone(),
+                    };
+                    let upstream = patch
+                        .upstream
+                        .clone()
+                        .unwrap_or_else(|| current.upstream.clone());
+                    Self::check_binding_pin(&inner, key.as_deref(), &upstream)?;
+                }
+            }
             Self::binding_write(&inner, move |job, legacy| {
                 let at = crate::time::now_rfc3339();
                 crate::domain::runs::bindings::update(
@@ -2118,6 +2204,65 @@ impl Engine {
                 .lock()
                 .expect("registry mutex poisoned")
                 .reveal_secrets(&iname, overrides)
+        })
+        .await
+    }
+
+    /// Empty the custody cache (cfg(test): the proxy's cache-miss tests).
+    #[cfg(test)]
+    pub(crate) fn clear_custody_cache_for_test(&self) {
+        if let Some(cache) = self
+            .inner
+            .supervisor
+            .lock()
+            .expect("supervisor mutex poisoned")
+            .custody_cache()
+        {
+            cache.clear();
+        }
+    }
+
+    /// Record that an instance's custodied provider key is about to be
+    /// revealed (story 22-2, P10): when the instance holds its provider key
+    /// under custody (`provider.api_key` set, `provider.custody` not `off`),
+    /// one `secret_revealed` event naming the secret — never a value — is
+    /// committed with its outbox row and published, and returned. `None`
+    /// when the instance custodies nothing (no event). A `config get
+    /// --reveal` that shows a custodied key calls this first and prints
+    /// nothing when it fails.
+    pub async fn note_secret_revealed(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::domain::custody::SecretRevealedEvent>, ConfigError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let iname = InstanceName::new(&name).map_err(|reason| ConfigError::InvalidName {
+                name: name.clone(),
+                reason: reason.to_string(),
+            })?;
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let effective = registry.effective_config(&iname, ConfigLayer::empty())?;
+            let Some(secret) = crate::domain::config::custodied_secret(&effective) else {
+                return Ok(None);
+            };
+            let event = crate::domain::custody::SecretRevealedEvent {
+                schema_version: crate::domain::custody::SECRET_REVEALED_SCHEMA_VERSION,
+                instance: name.clone(),
+                secrets: vec![secret],
+                at: crate::time::now_rfc3339(),
+            };
+            let committed = EngineEvent::SecretRevealed(event.clone());
+            let append = registry
+                .commit_event(committed)
+                .map_err(|err| ConfigError::Store {
+                    name: name.clone(),
+                    detail: format!("the reveal could not be recorded ({err})"),
+                })?;
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.note_outbox_append(&append);
+            supervisor.publish(append.seq, EngineEvent::SecretRevealed(event.clone()));
+            Ok(Some(event))
         })
         .await
     }
@@ -3977,6 +4122,16 @@ impl Blocking<'_> {
             .block_on(self.engine.delete_policy(name, dry_run))
     }
 
+    /// Blocking [`Engine::note_secret_revealed`] (story 22-2).
+    pub fn note_secret_revealed(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::domain::custody::SecretRevealedEvent>, ConfigError> {
+        self.engine
+            .rt
+            .block_on(self.engine.note_secret_revealed(name))
+    }
+
     /// Blocking [`Engine::reveal_secrets`] (story 2-4, AC-C/AC11). The
     /// `config get --reveal` un-mask uses this to fetch the resolved cleartext of
     /// the secret leaves.
@@ -4578,6 +4733,7 @@ mod tests {
                     fresh: true,
                     inputs: None,
                     upstream: None,
+                    custody: None,
                 })
                 .unwrap();
         }
@@ -4629,6 +4785,7 @@ mod tests {
                     fresh: true,
                     inputs: None,
                     upstream: None,
+                    custody: None,
                 })
                 .unwrap();
         }
@@ -4818,6 +4975,7 @@ mod tests {
                     fresh: true,
                     inputs: None,
                     upstream: None,
+                    custody: None,
                 })
                 .unwrap();
         }
@@ -5038,6 +5196,7 @@ mod tests {
                     fresh: true,
                     inputs: None,
                     upstream: None,
+                    custody: None,
                 })
                 .unwrap();
         }

@@ -42,6 +42,21 @@ pub(crate) fn default_root_store() -> rustls::RootCertStore {
     roots
 }
 
+/// The default client config plus one extra trusted root (DER): the custody
+/// tests' TLS fake upstream.
+#[cfg(test)]
+pub(crate) fn tls_config_with_root(der: &[u8]) -> Arc<rustls::ClientConfig> {
+    let mut roots = default_root_store();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der.to_vec()))
+        .expect("a valid test root");
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
 pub(crate) fn default_tls_config() -> Arc<rustls::ClientConfig> {
     Arc::new(
         rustls::ClientConfig::builder()

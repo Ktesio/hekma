@@ -449,6 +449,7 @@ pub(crate) fn table_of(rows: &[BindingRow]) -> BindingTable {
                 prefix: row.prefix.clone(),
                 upstream: std::sync::Arc::from(row.upstream.as_str()),
                 labels: row.labels.clone(),
+                custodied_key: row.custodied_key.clone(),
             })
             .collect(),
     )

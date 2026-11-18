@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::domain::custody::CustodyPin;
 use crate::domain::SecretString;
 
 /// The secret-resolution port (spine AD-10). Given a `NAME` (the lookup key after
@@ -54,6 +55,14 @@ use crate::domain::SecretString;
 pub trait SecretResolver {
     /// Resolve `NAME` (the key after `secret:`), per the contract above.
     fn resolve(&self, name: &str) -> Result<Option<SecretString>, SecretError>;
+
+    /// The pinning declared beside `NAME` in the secrets file
+    /// (`[custody.NAME]`), when this resolver declares one. Only the FILE
+    /// resolver does (the environment cannot carry a table); the default is
+    /// "no pin declared" so every other resolver is unchanged.
+    fn custody_pin(&self, _name: &str) -> Result<Option<CustodyPin>, SecretError> {
+        Ok(None)
+    }
 }
 
 /// Why a `secret:NAME` reference could not be resolved (story 2-4). `thiserror`
@@ -193,6 +202,61 @@ impl SecretResolver for FileSecretResolver {
             _ => Ok(None),
         }
     }
+
+    fn custody_pin(&self, name: &str) -> Result<Option<CustodyPin>, SecretError> {
+        let Some(table) = self.load_table()? else {
+            return Ok(None);
+        };
+        // The optional additive `[custody.NAME]` table beside the plain
+        // `NAME = "value"` entries: `{ origins = ["https://…"], paths =
+        // ["/v1/…"] }` pins where a custodied key may be sent. A missing
+        // table is "no pin declared" (the built-in provider table supplies
+        // defaults); a PRESENT but malformed table is a hard parse error —
+        // a pin an operator tried to declare must never silently vanish.
+        let Some(toml::Value::Table(custody)) = table.get("custody") else {
+            return Ok(None);
+        };
+        let Some(entry) = custody.get(name) else {
+            return Ok(None);
+        };
+        let toml::Value::Table(entry) = entry else {
+            return Err(SecretError::FileUnreadable {
+                path: self.path.to_string_lossy().into_owned(),
+                detail: format!("[custody.{name}] must be a table of origins and paths"),
+            });
+        };
+        let parse_list = |key: &str| -> Result<Option<Vec<String>>, SecretError> {
+            match entry.get(key) {
+                None => Ok(None),
+                Some(toml::Value::Array(items)) => {
+                    let mut values = Vec::with_capacity(items.len());
+                    for item in items {
+                        let toml::Value::String(value) = item else {
+                            return Err(SecretError::FileUnreadable {
+                                path: self.path.to_string_lossy().into_owned(),
+                                detail: format!("[custody.{name}].{key} must be a list of strings"),
+                            });
+                        };
+                        values.push(value.clone());
+                    }
+                    Ok(Some(values))
+                }
+                Some(_) => Err(SecretError::FileUnreadable {
+                    path: self.path.to_string_lossy().into_owned(),
+                    detail: format!("[custody.{name}].{key} must be a list of strings"),
+                }),
+            }
+        };
+        let origins = parse_list("origins")?;
+        let paths = parse_list("paths")?;
+        if origins.as_deref().is_some_and(<[String]>::is_empty) {
+            return Err(SecretError::FileUnreadable {
+                path: self.path.to_string_lossy().into_owned(),
+                detail: format!("[custody.{name}].origins is empty; remove it or list at least one https origin"),
+            });
+        }
+        Ok(Some(CustodyPin { origins, paths }))
+    }
 }
 
 /// The COMPOSITE resolver (AD-10): tries an ordered list of resolvers and returns
@@ -253,6 +317,17 @@ impl SecretResolver for CompositeSecretResolver {
             // A hard error short-circuits (not "absent"). A None tries the next.
             if let Some(secret) = resolver.resolve(name)? {
                 return Ok(Some(secret));
+            }
+        }
+        Ok(None)
+    }
+
+    fn custody_pin(&self, name: &str) -> Result<Option<CustodyPin>, SecretError> {
+        // The first resolver that declares a pin wins (in the recorded
+        // composition only the file resolver ever does).
+        for (_, resolver) in &self.resolvers {
+            if let Some(pin) = resolver.custody_pin(name)? {
+                return Ok(Some(pin));
             }
         }
         Ok(None)
@@ -486,6 +561,65 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("/x/secrets.toml"), "{msg}");
         assert!(msg.contains("chmod 600"), "{msg}");
+    }
+
+    #[test]
+    fn file_resolver_reads_a_custody_pin_beside_the_secret() {
+        // The optional additive `[custody.NAME]` table declares where a
+        // custodied key may be sent. A well-formed table parses; an absent
+        // one is "no pin declared" (`None`); a malformed one is a hard
+        // error (a declared pin never silently vanishes).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.toml");
+        std::fs::write(
+            &path,
+            "PROVIDER = \"sentinel\"\n[custody.PROVIDER]\norigins = [\"https://api.example-vendor.com\"]\n\
+             paths = [\"/v1/chat/completions\", \"/v1/embeddings\"]\n",
+        )
+        .unwrap();
+        set_owner_only(&path);
+        let resolver = FileSecretResolver::new(&path);
+        let pin = resolver.custody_pin("PROVIDER").unwrap().unwrap();
+        assert_eq!(
+            pin.origins,
+            Some(vec!["https://api.example-vendor.com".to_string()])
+        );
+        assert_eq!(
+            pin.paths,
+            Some(vec![
+                "/v1/chat/completions".to_string(),
+                "/v1/embeddings".to_string()
+            ])
+        );
+        // Another name with no table beside it: no pin declared.
+        assert!(resolver.custody_pin("OTHER").unwrap().is_none());
+        // Origins alone is a valid pin (paths fall back to built-ins).
+        std::fs::write(
+            &path,
+            "PROVIDER = \"sentinel\"\n[custody.PROVIDER]\norigins = [\"https://api.example-vendor.com\"]\n",
+        )
+        .unwrap();
+        set_owner_only(&path);
+        let pin = resolver.custody_pin("PROVIDER").unwrap().unwrap();
+        assert_eq!(pin.paths, None);
+
+        // Malformed shapes are hard errors, never silent misses.
+        for malformed in [
+            "P = \"v\"\n[custody.P]\norigins = 3\n",
+            "P = \"v\"\n[custody.P]\norigins = [1, 2]\n",
+            "P = \"v\"\n[custody.P]\npaths = [\"/v1\"]\norigins = []\n",
+            "P = \"v\"\n[custody.P]\norigins = \"https://x\"\n",
+        ] {
+            std::fs::write(&path, malformed).unwrap();
+            set_owner_only(&path);
+            assert!(
+                resolver.custody_pin("P").is_err(),
+                "malformed pin must be refused: {malformed}"
+            );
+        }
+        // A missing secrets file declares no pin.
+        let absent = FileSecretResolver::new(dir.path().join("absent.toml"));
+        assert!(absent.custody_pin("P").unwrap().is_none());
     }
 
     /// Set a temp secrets file to owner-only (0600) on Unix so the permission check

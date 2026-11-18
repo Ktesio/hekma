@@ -97,7 +97,13 @@ use crate::ports::{
 /// see [`super::runs_sqlite`].
 /// v17 (story 22-1): `tokens`, the credential hashes and their metadata —
 /// see [`super::tokens_sqlite`].
-pub(crate) const SCHEMA_VERSION: i64 = 18;
+/// v18 (story 23-1): the shared proxy's tables — see
+/// [`super::proxy_sqlite`].
+/// v19 (story 22-2): the Run custody columns —
+/// `runs.custody_state`/`custody_reason`/`custody_origin`/`custody_key_ref`
+/// (additive, no backfill: a Run live at upgrade honestly reads
+/// `pre-custody`) — see [`super::runs_sqlite`].
+pub(crate) const SCHEMA_VERSION: i64 = 19;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -746,6 +752,12 @@ fn migrate(
     // Run rollup by run id (one crash-atomic step, one-way).
     if version < 18 {
         super::proxy_sqlite::migrate_v18(conn)?;
+    }
+    // Story 22-2: v19 adds the Run custody columns (one crash-atomic step,
+    // additive ALTER TABLEs only, no backfill — `pre-custody` is the honest
+    // default for existing rows).
+    if version < 19 {
+        super::runs_sqlite::migrate_v19(conn)?;
     }
     Ok(notes)
 }
