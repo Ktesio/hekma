@@ -43,6 +43,7 @@ pub(crate) mod limits;
 pub(crate) mod listing;
 pub(crate) mod ops;
 pub(crate) mod policy;
+pub mod reconcile;
 pub mod retention;
 pub mod selector;
 pub(crate) mod snapshot;
@@ -589,6 +590,10 @@ pub struct RunView {
     pub policy: Option<PolicyResolution>,
     /// Its subtree usage.
     pub usage: RunUsage,
+    /// Story 19-5: its newest confirmed (reconciled) figure beside the
+    /// estimated `usage`, with the drift; absent when none was submitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciled: Option<reconcile::ReconciledView>,
     /// How many of its children have not ended.
     pub open_children: u64,
     /// Story 22-2: its custody, when it owns a supervised process (the
@@ -696,6 +701,9 @@ pub enum RunEventKind {
     /// reasons (story 23-4): `hold`, `reject` or `reroute`; the cause names
     /// which.
     DispositionChanged,
+    /// A Host or the Operator submitted confirmed usage for it (story
+    /// 19-5); the cause names the source and the reference.
+    Reconciled,
 }
 
 impl RunEventKind {
@@ -710,6 +718,7 @@ impl RunEventKind {
             RunEventKind::LimitsChanged => "limits-changed",
             RunEventKind::Ended => "ended",
             RunEventKind::DispositionChanged => "disposition-changed",
+            RunEventKind::Reconciled => "reconciled",
         }
     }
 }
@@ -1024,6 +1033,18 @@ pub enum RunError {
         /// The cap.
         max: u64,
     },
+    /// Story 19-5: a submission reused a reference the Run already holds,
+    /// with different figures.
+    #[error(
+        "Run `{run_id}` already has a reconciliation with the reference `{reference}` and \
+         different figures — use a new reference for new figures"
+    )]
+    ReconciliationConflict {
+        /// The Run.
+        run_id: String,
+        /// The reused reference.
+        reference: String,
+    },
     /// The store refused or failed.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -1070,6 +1091,7 @@ impl RunError {
             RunError::TooManyChildren { .. } | RunError::TooManyCallerRuns { .. } => {
                 "too-many-children"
             }
+            RunError::ReconciliationConflict { .. } => "reconciliation-conflict",
             RunError::Store(_) => "store",
         }
     }

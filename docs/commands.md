@@ -529,6 +529,38 @@ timestamps (`--json`: `{"schema_version": 1, "compacted_run": {…}}`). `close` 
 [lifecycle verbs](#selectors-on-the-lifecycle-verbs); a Run that owns an
 agent's process is that Run's refusal.
 
+## `hekma run reconcile <run-id> --input <tokens> --output <tokens> [...]`
+
+Submit a Run's confirmed usage, as the provider's invoice or your own gateway
+states it, so it sits beside Hekma's estimated figures (see
+[Runs](runs.md#reconciliation)). A write: it goes through the local Service
+Host.
+
+```bash
+hekma run reconcile run_01JZ6Q9G3S8V2X7K4M1N5P0R2T --input 120000 --output 18000 --dollars 2.41 --source provider --ref inv-2026-11
+```
+
+| Flag | Meaning |
+|---|---|
+| `--input <tokens>`, `--output <tokens>` | The confirmed totals for the Run and its descendants (required) |
+| `--cached <tokens>` | The confirmed cached input, when known |
+| `--dollars <dollars>` | The confirmed cost, when known; no cost means no dollar drift |
+| `--source provider\|host` | Who confirmed the figures (default `host`) |
+| `--ref <id>` | A reference that makes a retry safe, such as an invoice id; without it the reference is built from the figures |
+| `--note <text>` | A note kept with the submission (at most 512 characters) |
+| `--json` | Print `{"schema_version": 1, "reconciliation": {…}, "replayed": false}` |
+
+The newest submission is the Run's reconciled figure; `hekma run show` prints
+it as RECONCILED, labelled `(reconciled)`, with the drift against the
+`(estimated)` USAGE. Resubmitting the same reference with the same figures
+changes nothing. Exit codes:
+
+- `4`: the same reference with different figures;
+- `3`: no Run has the id;
+- `2`: a bad flag, source or dollar figure.
+
+Budgets keep acting on the estimated figures.
+
 ## `hekma run retention [--runs <days>] [--calls <days>] [--json]`
 
 How long ended Runs and per-call records are kept. With no option it reads
