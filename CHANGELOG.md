@@ -17,6 +17,11 @@ Release automation updates this file with a pull request after each `vMAJOR.MINO
 > - **One-way upgrade.** The first open migrates `state.db` to schema 15. An older engine refuses the migrated state dir.
 > - **Breaking engine surface within the unreleased `hekma-engine` 0.12.0:** `EngineEvent` gains `Policy` and `BreachDefaultUpgraded`, `Anomaly` gains `UnpricedModel` and `RunError` gains `PolicyNotFound` and `PolicyExists` (exhaustive public enums). Additive: `Engine::policies`, `policy`, `create_policy`, `change_policy`, `delete_policy` (async and blocking), `PolicyChange`, `PolicyOutcome`, `PolicyRecord`, `PolicyLimits`, `PolicyEvent`, `ScentCheckMode` and the resolution types.
 
+> **Unreleased — honest release diagnostics for a signal-killed paused agent (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **A signal-killed paused detached agent is no longer recorded as an adopted process when the engine releases it.** At shutdown the engine reconciles a paused detached agent that had already exited to `failed`; when that agent was spawned by this engine and died by a signal, the recorded cause now says "terminated by signal". Only an agent adopted from a previous engine — whose exit code this engine structurally cannot read — keeps the "exit code unavailable — adopted process is not this engine's child" wording. The `paused → failed` transition, the record settlement, and the coded-exit wording are unchanged.
+
 > **Unreleased — Control API body shapes.**
 > Announced ahead of the release that ships it:
 >
