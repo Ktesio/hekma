@@ -1290,3 +1290,199 @@ fn the_identity_header_switch_resolves_binding_then_flag_then_the_stored_root() 
         "x-hekma-labels"
     );
 }
+
+#[test]
+fn beyond_loopback_every_remote_call_authenticates_and_a_proxy_access_credential_keeps_to_its_binding(
+) {
+    // Story 22-5: the posture table — bind × peer × credential × prefix.
+    let mut w = world();
+    let (pxy, pxy_hash) = token(TokenClass::ProxyAccess);
+    let (revoked_pxy, revoked_pxy_hash) = token(TokenClass::ProxyAccess);
+    let (unknown_pxy, _) = token(TokenClass::ProxyAccess);
+    let (supervised_key, supervised_hash) = token(TokenClass::RunKey);
+    w.snapshot.keys.insert(
+        supervised_hash,
+        Arc::new(KeyEntry {
+            process_owner: true,
+            ..(*key_entry("run_O", TokenClass::RunKey)).clone()
+        }),
+    );
+    let mut vault = openai();
+    vault.custodied_key = Some("secret:VAULT".into());
+    w.snapshot.bindings = Arc::new(
+        BindingTable::new(vec![
+            vault,
+            BindingEntry {
+                name: "plain".into(),
+                prefix: "/plain".into(),
+                upstream: Arc::from(BINDING_UPSTREAM),
+                labels: Vec::new(),
+                custodied_key: None,
+                identity_headers: None,
+            },
+        ])
+        .with_proxy_access(
+            vec![(pxy_hash, "openai".into(), "tid-pxy".into())],
+            vec![revoked_pxy_hash],
+        ),
+    );
+    let bearer = |value: &str| format!("Bearer {value}");
+    let posture = |path, beyond_loopback, peer_loopback| CallFacts {
+        beyond_loopback,
+        peer_loopback,
+        ..facts(path)
+    };
+
+    // A remote peer with no credential: refused before the route.
+    let remote = posture("/openai/v1", true, false);
+    assert_eq!(
+        refused(&identify(&w.snapshot, &remote)),
+        Some(Refusal::AuthenticationRequired)
+    );
+    let remote_unrouted = posture("/nowhere", true, false);
+    assert_eq!(
+        refused(&identify(&w.snapshot, &remote_unrouted)),
+        Some(Refusal::AuthenticationRequired)
+    );
+    // A loopback peer on the same listener keeps today's rules.
+    let (target, attribution, _) = call(identify(&w.snapshot, &posture("/openai/v1", true, true)));
+    assert_eq!(attribution, run("run_B"));
+    assert!(target.proxy_access.is_none() && target.custody.is_none());
+    // A loopback bind never asks (the default facts are loopback-bound).
+    assert!(refused(&identify(&w.snapshot, &facts("/openai/v1"))).is_none());
+
+    // The proxy-access credential: its binding, its token id, the binding's
+    // custodied key — and never a scented call.
+    for slot in ["authorization", "x-api-key"] {
+        let auth = bearer(&pxy);
+        let mut f = posture("/openai/v1", true, false);
+        if slot == "authorization" {
+            f.authorization = Some(&auth);
+        } else {
+            f.api_key = Some(&pxy);
+        }
+        let (target, attribution, _) = call(identify(&w.snapshot, &f));
+        assert_eq!(attribution, run("run_B"), "{slot}");
+        assert_eq!(target.proxy_access.as_deref(), Some("tid-pxy"));
+        assert!(
+            target.token_id.is_none(),
+            "a proxy-access call is unscented"
+        );
+        assert_eq!(
+            target.custody.as_ref().map(|c| &*c.key_ref),
+            Some("secret:VAULT")
+        );
+    }
+    // Out of scope: another binding, a Run route.
+    let auth = bearer(&pxy);
+    for path in ["/plain/v1", "/_hekma/runs/run_P/v1"] {
+        let f = CallFacts {
+            authorization: Some(&auth),
+            ..posture(path, true, false)
+        };
+        assert_eq!(
+            refused(&identify(&w.snapshot, &f)),
+            Some(Refusal::CredentialOutOfScope),
+            "{path}"
+        );
+    }
+    // Revoked and unknown.
+    for (presented, expected) in [
+        (&revoked_pxy, Refusal::CredentialRevoked),
+        (&unknown_pxy, Refusal::UnknownCredential),
+    ] {
+        let auth = bearer(presented);
+        let f = CallFacts {
+            authorization: Some(&auth),
+            ..posture("/openai/v1", true, false)
+        };
+        assert_eq!(refused(&identify(&w.snapshot, &f)), Some(expected));
+    }
+    // On a loopback bind, or in x-hekma-run-key, a proxy-access credential
+    // is not one: unknown (even when revoked).
+    for presented in [&pxy, &revoked_pxy] {
+        let auth = bearer(presented);
+        let loopback = CallFacts {
+            authorization: Some(&auth),
+            ..facts("/openai/v1")
+        };
+        assert_eq!(
+            refused(&identify(&w.snapshot, &loopback)),
+            Some(Refusal::UnknownCredential)
+        );
+        let in_run_key = CallFacts {
+            run_key: Some(presented),
+            ..posture("/openai/v1", true, false)
+        };
+        assert_eq!(
+            refused(&identify(&w.snapshot, &in_run_key)),
+            Some(Refusal::UnknownCredential)
+        );
+    }
+
+    // A Run Key: a non-supervised Run's from anywhere; a supervised Run's
+    // from loopback peers only.
+    let f = CallFacts {
+        run_key: Some(&w.child_key),
+        ..posture("/openai/v1", true, false)
+    };
+    let (target, attribution, _) = call(identify(&w.snapshot, &f));
+    assert_eq!(attribution, run("run_C"));
+    assert!(target.token_id.is_some());
+    let remote_supervised = CallFacts {
+        run_key: Some(&supervised_key),
+        ..posture("/openai/v1", true, false)
+    };
+    assert_eq!(
+        refused(&identify(&w.snapshot, &remote_supervised)),
+        Some(Refusal::UnknownCredential)
+    );
+    let local_supervised = CallFacts {
+        run_key: Some(&supervised_key),
+        ..posture("/openai/v1", true, true)
+    };
+    assert_eq!(
+        call(identify(&w.snapshot, &local_supervised)).1,
+        run("run_O")
+    );
+    // A Run Key and a proxy-access credential together: the key identifies
+    // (scented); the credential must still be in scope.
+    let auth = bearer(&pxy);
+    let both = CallFacts {
+        run_key: Some(&w.child_key),
+        authorization: Some(&auth),
+        ..posture("/openai/v1", true, false)
+    };
+    let (target, attribution, _) = call(identify(&w.snapshot, &both));
+    assert_eq!(attribution, run("run_C"));
+    assert!(target.token_id.is_some() && target.proxy_access.is_some());
+    let both_elsewhere = CallFacts {
+        run_key: Some(&w.child_key),
+        authorization: Some(&auth),
+        ..posture("/plain/v1", true, false)
+    };
+    assert_eq!(
+        refused(&identify(&w.snapshot, &both_elsewhere)),
+        Some(Refusal::CredentialOutOfScope)
+    );
+    assert!(w.snapshot.bindings.has_proxy_access());
+    assert!(!BindingTable::default().has_proxy_access());
+}
+
+#[test]
+fn a_peer_is_loopback_only_on_127_8_and_the_ipv6_loopback() {
+    use std::net::IpAddr;
+    for (ip, loopback) in [
+        ("127.0.0.1", true),
+        ("127.9.9.9", true),
+        ("::1", true),
+        ("::ffff:127.0.0.1", true),
+        ("0.0.0.0", false),
+        ("::", false),
+        ("10.0.0.5", false),
+        ("::ffff:10.0.0.5", false),
+    ] {
+        let ip: IpAddr = ip.parse().unwrap();
+        assert_eq!(super::peer_is_loopback(ip), loopback, "{ip}");
+    }
+}

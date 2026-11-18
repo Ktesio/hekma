@@ -263,6 +263,13 @@ pub(crate) struct BindingTable {
     entries: Vec<Arc<BindingEntry>>,
     /// The stored root setting: on unless the Operator turned it off.
     identity_headers: bool,
+    /// Story 22-5: the active proxy-access credentials, by hash: the
+    /// binding each belongs to and its token id. Published with the
+    /// bindings, so a rotate or revoke binds on the next call.
+    proxy_access: Arc<HashMap<TokenHash, (String, String)>>,
+    /// Story 22-5: proxy-access credentials revoked in the last 24 hours
+    /// (at most [`RECENTLY_REVOKED_MAX`]): their holders are told revoked.
+    revoked_proxy_access: Arc<std::collections::HashSet<TokenHash>>,
 }
 
 impl Default for BindingTable {
@@ -283,7 +290,41 @@ impl BindingTable {
         Self {
             entries: entries.into_iter().map(Arc::new).collect(),
             identity_headers: true,
+            proxy_access: Arc::default(),
+            revoked_proxy_access: Arc::default(),
         }
+    }
+
+    /// The same table with the proxy-access credentials (story 22-5).
+    pub(crate) fn with_proxy_access(
+        mut self,
+        active: Vec<(TokenHash, String, String)>,
+        revoked: Vec<TokenHash>,
+    ) -> Self {
+        self.proxy_access = Arc::new(
+            active
+                .into_iter()
+                .map(|(hash, binding, token_id)| (hash, (binding, token_id)))
+                .collect(),
+        );
+        self.revoked_proxy_access = Arc::new(revoked.into_iter().collect());
+        self
+    }
+
+    /// A presented proxy-access credential's verdict (story 22-5): its
+    /// binding and token id when active, else whether it was recently
+    /// revoked.
+    pub(crate) fn proxy_access(&self, hash: &TokenHash) -> Result<(&str, &str), bool> {
+        match self.proxy_access.get(hash) {
+            Some((binding, token_id)) => Ok((binding.as_str(), token_id.as_str())),
+            None => Err(self.revoked_proxy_access.contains(hash)),
+        }
+    }
+
+    /// Whether any proxy-access credential is active (the started notice's
+    /// "none yet" note).
+    pub(crate) fn has_proxy_access(&self) -> bool {
+        !self.proxy_access.is_empty()
     }
 
     /// The same table with the stored root identity-header setting.

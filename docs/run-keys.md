@@ -5,7 +5,7 @@ description: "Each Run's own credential: issued per launch, shown once, stored a
 
 # Run Keys and key custody
 
-> **On main, not yet released.** Run Keys ship with the next release. Key custody is on main as a preview, not yet supported. Scent-Check Modes are on main too. Bypass detection and the authenticated proxy beyond loopback are still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **On main, not yet released.** Run Keys ship with the next release. Key custody is on main as a preview, not yet supported. Scent-Check Modes are on main too. The authenticated proxy beyond loopback is on main too. Bypass detection is still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 > This page mirrors [hekma.ktesio.dev/docs/run-keys/](https://hekma.ktesio.dev/docs/run-keys/), where it is kept current.
 
@@ -245,7 +245,7 @@ The small supervisor that will own each supervised process (the Shim) will watch
 
 ### An authenticated proxy beyond loopback
 
-A proxy reachable from other machines will require TLS and a credential, and will not start without them. Clients that can only change their base URL will get a proxy-access credential per endpoint binding, shown once and stored as a hash; it is not a Run's identity for Scent-Check.
+On main. A metering proxy bound beyond loopback (`--metering-listen 0.0.0.0:<port>`) requires TLS (`--proxy-tls-cert`, `--proxy-tls-key`) and does not start without it. Every call from another machine carries a credential: a Run Key of a Run Hekma did not start, or the endpoint binding's **proxy-access credential** (`hk_pxy_`) in the API-key slot. That credential is shown once and stored as a hash, works only on its binding's prefix, is swapped for the binding's custodied key and never forwarded, and is not a Run's identity for Scent-Check. A supervised agent's Run Key is refused from another machine. Key custody through a proxy beyond loopback is a preview like the rest of custody: it is called supported only once its security criteria pass in CI. See [the metering proxy](metering-proxy.md#beyond-loopback), including [port squatting](metering-proxy.md#port-squatting).
 
 ## What it does not promise
 

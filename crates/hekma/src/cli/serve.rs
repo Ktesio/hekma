@@ -35,8 +35,14 @@ use crate::error::{ServeOptionsInvalid, ServeStartupFailed, ServeStateDirBusy};
 pub struct ServeFlags {
     /// `--stop-window <secs>`.
     pub stop_window: Option<u64>,
-    /// `--metering-listen <port>`.
-    pub metering_listen: u16,
+    /// `--metering-listen <port|ip:port>` (story 22-5: the address too).
+    pub metering_listen: (Option<std::net::IpAddr>, u16),
+    /// `--proxy-tls-cert <pem>` (story 22-5).
+    pub proxy_tls_cert: Option<String>,
+    /// `--proxy-tls-key <pem>` (story 22-5).
+    pub proxy_tls_key: Option<String>,
+    /// `--proxy-public-host <name>` (story 22-5).
+    pub proxy_public_host: Option<String>,
     /// `--no-identity-headers` (story 23-1): send neither
     /// `x-hekma-run-id` nor `x-hekma-labels` to the model provider.
     pub no_identity_headers: bool,
@@ -100,7 +106,11 @@ pub fn run(flags: ServeFlags) -> Result<(), Box<dyn std::error::Error>> {
     let options = hekma_host::ServeOptions {
         state_base: flags.state_dir.map(PathBuf::from),
         stop_window: flags.stop_window,
-        metering_listen_port: flags.metering_listen,
+        metering_listen_port: flags.metering_listen.1,
+        metering_listen_addr: flags.metering_listen.0,
+        proxy_tls_cert: flags.proxy_tls_cert.map(PathBuf::from),
+        proxy_tls_key: flags.proxy_tls_key.map(PathBuf::from),
+        proxy_public_host: flags.proxy_public_host,
         // Story 21-8: a flag overrides the stored setting for this run
         // only; none follows it.
         identity_headers: match (flags.identity_headers, flags.no_identity_headers) {

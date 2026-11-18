@@ -1325,6 +1325,16 @@ pub(crate) struct ProxyDocument {
     /// Why it is not running, present when it is not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Story 22-5: the bound address (`127.0.0.1` unless widened), when
+    /// running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
+    /// Story 22-5: whether the proxy serves TLS (bound beyond loopback).
+    pub tls: bool,
+    /// Story 22-5: the address clients on other machines use, when bound
+    /// beyond loopback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
     /// Story 21-8: whether forwarded calls carry `x-hekma-run-id` and
     /// `x-hekma-labels` on this host run (a binding's override aside).
     pub identity_headers: bool,

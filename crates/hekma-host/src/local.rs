@@ -52,6 +52,10 @@ pub struct Discovery {
     /// running (additive; absent in older files and when it could not bind).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metering_proxy_url: Option<String>,
+    /// Story 22-5: the proxy's address for clients on other machines, when
+    /// it binds beyond loopback (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metering_proxy_public_url: Option<String>,
 }
 
 impl std::fmt::Debug for Discovery {
@@ -209,6 +213,7 @@ mod tests {
             hekma_version: "0.0.0-test".into(),
             autostarted: true,
             metering_proxy_url: Some("http://127.0.0.1:8400".into()),
+            metering_proxy_public_url: None,
         }
     }
 

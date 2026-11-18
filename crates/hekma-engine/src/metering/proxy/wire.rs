@@ -65,12 +65,16 @@ pub(crate) enum WireError {
     HoldFull,
     /// Story 23-4: the host stopped while the call was held.
     HoldInterrupted,
+    /// Story 22-5: a call beyond loopback presented no credential.
+    AuthenticationRequired,
+    /// Story 22-5: a proxy-access credential on another binding's prefix.
+    CredentialOutOfScope,
 }
 
 impl WireError {
     /// Every row (the table tests walk it).
     #[cfg(test)]
-    pub(crate) const ALL: [WireError; 18] = [
+    pub(crate) const ALL: [WireError; 20] = [
         WireError::CredentialInUrl,
         WireError::CustodyUnavailable,
         WireError::BadTarget,
@@ -89,6 +93,8 @@ impl WireError {
         WireError::RunReject,
         WireError::HoldFull,
         WireError::HoldInterrupted,
+        WireError::AuthenticationRequired,
+        WireError::CredentialOutOfScope,
     ];
 
     /// (status, `error.type`, `error.code`, message, retryable). `None`
@@ -228,6 +234,22 @@ impl WireError {
                 "This call was held when the metering proxy stopped. Retry it; it will be held \
                  again.",
                 Some(true),
+            ),
+            WireError::AuthenticationRequired => (
+                401,
+                "hekma_authentication_required",
+                "authentication_required",
+                "This proxy requires a credential on every call. Set your API key to the \
+                 proxy-access credential your operator issued, or send a Run Key.",
+                Some(false),
+            ),
+            WireError::CredentialOutOfScope => (
+                403,
+                "hekma_credential_out_of_scope",
+                "credential_out_of_scope",
+                "This proxy-access credential belongs to a different endpoint binding. Point the \
+                 base URL at the binding it was issued for.",
+                Some(false),
             ),
         }
     }

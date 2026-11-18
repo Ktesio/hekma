@@ -416,13 +416,32 @@ enum Commands {
             value_parser = clap::value_parser!(u64).range(1..=86_400)
         )]
         stop_window: Option<u64>,
-        /// The shared metering proxy's loopback port (default 0 = the port
-        /// recorded for this state directory, else an OS pick that is then
-        /// recorded — one stable address across restarts). A port already in
-        /// use is surfaced and engine-observed agents cannot start until it
-        /// is free (never a silent hop).
-        #[arg(long, value_name = "PORT", default_value_t = 0)]
-        metering_listen: u16,
+        /// The shared metering proxy's port (default 0 = the port recorded
+        /// for this state directory, else an OS pick that is then recorded —
+        /// one stable address across restarts), or an IP:PORT address. A
+        /// bare port binds 127.0.0.1; an address beyond loopback (such as
+        /// 0.0.0.0:8400) needs --proxy-tls-cert and --proxy-tls-key, and every
+        /// call from another machine must carry a credential. A port already
+        /// in use is surfaced, never a silent hop.
+        #[arg(
+            long,
+            value_name = "PORT|IP:PORT",
+            default_value = "0",
+            value_parser = hekma_host::parse_metering_listen
+        )]
+        metering_listen: (Option<std::net::IpAddr>, u16),
+        /// The metering proxy's PEM certificate chain, for a --metering-listen
+        /// address beyond loopback (readable only by its owner)
+        #[arg(long, value_name = "PEM", requires = "proxy_tls_key")]
+        proxy_tls_cert: Option<String>,
+        /// The PEM private key for --proxy-tls-cert (readable only by its
+        /// owner)
+        #[arg(long, value_name = "PEM", requires = "proxy_tls_cert")]
+        proxy_tls_key: Option<String>,
+        /// The host name clients on other machines use for the metering
+        /// proxy, shown in its URLs (display only)
+        #[arg(long, value_name = "NAME")]
+        proxy_public_host: Option<String>,
         /// Send neither x-hekma-run-id nor x-hekma-labels to the model
         /// provider for this run only, whatever `hekma proxy set
         /// identity-headers` stored (identity headers are on by default)
@@ -504,7 +523,15 @@ enum Commands {
         #[arg(
             long,
             hide = true,
-            conflicts_with_all = ["listen", "bearer_secret", "tls_cert", "tls_key"]
+            conflicts_with_all = [
+                "listen",
+                "bearer_secret",
+                "tls_cert",
+                "tls_key",
+                "proxy_tls_cert",
+                "proxy_tls_key",
+                "proxy_public_host"
+            ]
         )]
         autostart: bool,
         /// Internal: the auto-started host's idle window in seconds (default
@@ -1327,6 +1354,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Serve {
             stop_window,
             metering_listen,
+            proxy_tls_cert,
+            proxy_tls_key,
+            proxy_public_host,
             no_identity_headers,
             identity_headers,
             proxy_allowed_hosts,
@@ -1345,6 +1375,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }) => cli::serve::run(cli::serve::ServeFlags {
             stop_window,
             metering_listen,
+            proxy_tls_cert,
+            proxy_tls_key,
+            proxy_public_host,
             no_identity_headers,
             identity_headers,
             proxy_allowed_hosts,

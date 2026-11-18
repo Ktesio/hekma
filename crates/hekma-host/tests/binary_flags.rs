@@ -247,3 +247,58 @@ fn the_tls_paths_reach_the_host_and_an_unreadable_cert_refuses_before_anything_o
     assert!(stderr.contains("missing-cert.pem"), "{stderr}");
     assert!(!state.exists(), "nothing was created: {state:?}");
 }
+
+/// Story 22-5: the binary's proxy flags parse like `hekma serve`'s — a bad
+/// `--metering-listen` or a valueless proxy flag is a usage refusal, and a
+/// parsed wide bind reaches the host's checks (no TLS: refused, naming the
+/// remediation; a missing PEM: refused, naming the path), before anything
+/// is created.
+#[test]
+fn the_proxy_flags_parse_and_reach_the_hosts_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    for (args, expected) in [
+        (
+            vec!["--metering-listen", "proxy.example:8400"],
+            "IP literal",
+        ),
+        (vec!["--metering-listen"], "--metering-listen needs a port"),
+        (vec!["--proxy-tls-cert"], "--proxy-tls-cert needs a value"),
+        (
+            vec!["--proxy-tls-key", "--listen"],
+            "--proxy-tls-key needs a value",
+        ),
+        (
+            vec!["--proxy-public-host"],
+            "--proxy-public-host needs a value",
+        ),
+        (
+            vec!["--metering-listen", "0.0.0.0:0"],
+            "without transport encryption",
+        ),
+        (
+            vec![
+                "--metering-listen",
+                "0.0.0.0:0",
+                "--proxy-tls-cert",
+                "missing-cert.pem",
+                "--proxy-tls-key",
+                "missing-key.pem",
+                "--proxy-public-host",
+                "proxy.example",
+            ],
+            "missing-cert.pem",
+        ),
+    ] {
+        let output = Command::new(hekma_host_bin())
+            .arg("--state-dir")
+            .arg(&state)
+            .args(&args)
+            .output()
+            .expect("the binary must run");
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{args:?}: {stderr}");
+        assert!(!state.exists(), "{args:?} created the state directory");
+    }
+}

@@ -262,6 +262,9 @@ fn a_supervised_launchs_credentials_are_refused_on_a_listener_beyond_loopback() 
     let (cert, pem_key) = (pems.path().join("cert.pem"), pems.path().join("key.pem"));
     std::fs::write(&cert, certified.cert.pem()).unwrap();
     std::fs::write(&pem_key, certified.signing_key.serialize_pem()).unwrap();
+    // Story 22-5: TLS files must be owner-only.
+    hekma_engine::restrict_to_owner(&cert).unwrap();
+    hekma_engine::restrict_to_owner(&pem_key).unwrap();
     let server = Server::start_on(
         state.path().to_path_buf(),
         "0.0.0.0:0",

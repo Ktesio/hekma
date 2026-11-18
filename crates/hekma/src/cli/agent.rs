@@ -6103,6 +6103,7 @@ mod tests {
                 hekma_version: version.to_string(),
                 autostarted: true,
                 metering_proxy_url: None,
+                metering_proxy_public_url: None,
             },
         )
         .unwrap();

@@ -40,6 +40,14 @@ pub(crate) fn load_server_config(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<Arc<rustls::ServerConfig>, String> {
+    // Story 22-5: both files owner-only (the secrets-file rule), for every
+    // listener this loader serves — checked before either is read.
+    for path in [cert_path, key_path] {
+        if path.exists() {
+            hekma_engine::check_owner_only_file(path)
+                .map_err(|reason| format!("the TLS file {reason}"))?;
+        }
+    }
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
         .map_err(|err| {
             format!(
@@ -173,6 +181,10 @@ mod tests {
         std::fs::write(&cert, one.cert.pem()).unwrap();
         std::fs::write(&key, one.signing_key.serialize_pem()).unwrap();
         std::fs::write(&other_key, two.signing_key.serialize_pem()).unwrap();
+        // Story 22-5: TLS files must be owner-only.
+        for path in [&cert, &key, &other_key] {
+            hekma_engine::restrict_to_owner(path).unwrap();
+        }
         assert!(load_server_config(&cert, &key).is_ok());
         let err = load_server_config(&cert, &other_key).unwrap_err();
         // The message is not echoed: it names the key file (a test fixture,
@@ -183,13 +195,16 @@ mod tests {
         assert!(err.contains("no PEM certificate"), "{err}");
     }
 
-    /// A self-signed pair written into `dir`: (cert path, key path).
+    /// A self-signed pair written into `dir`, owner-only: (cert path, key path).
     fn write_pair(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let pair = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert = dir.join("cert.pem");
         let key = dir.join("key.pem");
         std::fs::write(&cert, pair.cert.pem()).unwrap();
         std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
+        // Story 22-5: TLS files must be owner-only.
+        hekma_engine::restrict_to_owner(&cert).unwrap();
+        hekma_engine::restrict_to_owner(&key).unwrap();
         (cert, key)
     }
 
@@ -203,6 +218,7 @@ mod tests {
             "-----BEGIN CERTIFICATE-----\n!!!! not base64 !!!!\n-----END CERTIFICATE-----\n",
         )
         .unwrap();
+        hekma_engine::restrict_to_owner(&corrupt).unwrap();
         // Static assertion messages: a refusal about TLS material is never
         // echoed into the test log.
         let err = load_server_config(&corrupt, &key).unwrap_err();

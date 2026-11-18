@@ -152,17 +152,30 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     // names the remediation instead of guessing.
     let port = engine.recorded_metering_port();
     let base = port.map(|port| format!("http://127.0.0.1:{port}{}", binding.prefix));
+    // Story 22-5: a running host bound beyond loopback records the address
+    // clients on other machines use (`https://`, its public host).
+    let remote = super::agent::state_root()
+        .ok()
+        .and_then(|root| hekma_host::read_discovery(&root).ok())
+        .and_then(|discovery| discovery.metering_proxy_public_url)
+        .map(|url| format!("{url}{}", binding.prefix));
     let value = serde_json::to_value(&binding).unwrap();
     if json {
-        let document = json!({
+        let mut document = json!({
             "schema_version": BINDING_DOCUMENT_SCHEMA_VERSION,
             "binding": value,
             "client_base_url": base,
         });
+        if let Some(remote) = &remote {
+            document["remote_base_url"] = json!(remote);
+        }
         println!("{}", serde_json::to_string_pretty(&document).unwrap());
         return Ok(());
     }
     print_summary(&value, base.as_deref());
+    if let Some(remote) = &remote {
+        println!("  from other machines {remote} (with its proxy-access credential)");
+    }
     for route in &binding.routes {
         println!(
             "  route {} -> {}{}",
@@ -310,8 +323,9 @@ pub fn credential_issue(
              `{name}` on POST /v0/runs/announce, and heartbeats or closes the Runs it creates."
         ),
         BindingCredentialClass::ProxyAccess => eprintln!(
-            "This credential is shown once and is not stored. Nothing accepts it yet; the \
-             release that does will say so."
+            "This credential is shown once and is not stored. Clients on other machines send it \
+             as their API key to the metering proxy bound beyond loopback (--metering-listen \
+             with --proxy-tls-cert and --proxy-tls-key), on binding `{name}`'s prefix only."
         ),
     }
     Ok(())

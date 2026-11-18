@@ -408,8 +408,14 @@ container restart, with no surviving observed agent to re-adopt. The proxy's
 port is recorded in the state directory anyway. Pin it with
 `--metering-listen` when a client in the same container that Hekma did not
 start, reaching the proxy through an endpoint binding, needs a fixed address.
-The proxy listens on `127.0.0.1` only, so a sidecar or a published container
-port cannot reach it.
+By default the proxy listens on `127.0.0.1`, so a sidecar or a published
+container port cannot reach it. To serve clients outside the container, add
+`--metering-listen 0.0.0.0:8400 --proxy-tls-cert /certs/proxy-cert.pem
+--proxy-tls-key /certs/proxy-key.pem` (owner-only PEM files from a read-only
+mount) and publish the port: every call from outside then needs a
+proxy-access credential or a Run Key. See
+[Beyond loopback](metering-proxy.md#beyond-loopback), and its port-squatting
+note for shared machines.
 
 The outbound identity headers (`x-hekma-run-id` and `x-hekma-labels`) are on
 by default. `hekma proxy set identity-headers off` stores the setting in the

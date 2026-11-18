@@ -44,8 +44,25 @@ use crate::store::writer::WriterHandle;
 pub struct MeteringProxyOptions {
     /// Run the proxy (default `true`). A read-only engine never runs one.
     pub enabled: bool,
-    /// The loopback port (`0` = an OS pick).
+    /// The port (`0` = an OS pick).
     pub port: u16,
+    /// Story 22-5: the address to bind; `None` is `127.0.0.1`. An address
+    /// beyond loopback requires [`MeteringProxyOptions::tls`], and every
+    /// call from a non-loopback peer must then carry a credential.
+    pub bind: Option<std::net::IpAddr>,
+    /// Story 22-5: the TLS server configuration a bind beyond loopback
+    /// serves (a loopback peer may still speak plain HTTP, so a supervised
+    /// agent's `http://127.0.0.1` base URL keeps working).
+    pub tls: Option<ProxyTls>,
+    /// Story 22-5: the host name clients on other machines use, shown in
+    /// [`ProxyInfo::public_url`] (display only; without it the bind address
+    /// is shown).
+    pub public_host: Option<String>,
+    /// Story 22-5's TEST SEAM: treat every peer as a remote one (as if it
+    /// connected from another machine), so the beyond-loopback rules can be
+    /// proven over `127.0.0.1` on any host. Never an operator surface.
+    #[doc(hidden)]
+    pub peers_as_remote: bool,
     /// Record the bound port for the state directory and reuse it (the
     /// host sets this; embedders default to an unrecorded ephemeral port).
     pub sticky: bool,
@@ -95,6 +112,10 @@ impl Default for MeteringProxyOptions {
         Self {
             enabled: true,
             port: 0,
+            bind: None,
+            tls: None,
+            public_host: None,
+            peers_as_remote: false,
             sticky: false,
             identity_headers: None,
             max_concurrent_calls: 512,
@@ -109,13 +130,57 @@ impl Default for MeteringProxyOptions {
     }
 }
 
+/// The TLS server configuration of a proxy bound beyond loopback (story
+/// 22-5). Compared by identity: two options are equal when they share the
+/// one configuration.
+#[derive(Clone)]
+pub struct ProxyTls(pub Arc<rustls::ServerConfig>);
+
+impl std::fmt::Debug for ProxyTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProxyTls(..)")
+    }
+}
+
+impl PartialEq for ProxyTls {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ProxyTls {}
+
 /// Where the proxy listens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProxyInfo {
-    /// `http://127.0.0.1:<port>`.
+    /// `http://127.0.0.1:<port>`: the local address (a supervised agent's
+    /// base URL, and every loopback client's).
     pub url: String,
     /// The bound port.
     pub port: u16,
+    /// Story 22-5: the bound address (`127.0.0.1` unless widened).
+    pub bind: std::net::IpAddr,
+    /// Story 22-5: whether the listener serves TLS (a bind beyond
+    /// loopback); a client beyond loopback uses `https://`.
+    pub tls: bool,
+    /// Story 22-5: the address clients on other machines use, when bound
+    /// beyond loopback: `https://`, the public host when given, else the
+    /// bind address.
+    pub public_url: Option<String>,
+}
+
+impl ProxyInfo {
+    /// Whether the listener is bound beyond loopback (story 22-5).
+    pub fn beyond_loopback(&self) -> bool {
+        !self.bind.is_loopback()
+    }
+}
+
+/// Whether a peer address is loopback (story 22-5): `127.0.0.0/8` and
+/// `::1`, an IPv4-mapped loopback included. `0.0.0.0`, `::` and every
+/// routable address are not.
+pub(crate) fn peer_is_loopback(ip: std::net::IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
 }
 
 /// Why the proxy did not start.
@@ -124,9 +189,12 @@ pub enum ProxyStartError {
     /// The port could not be bound (in use, or not permitted).
     #[error("the metering proxy could not listen on 127.0.0.1:{port}: {reason}")]
     Bind { port: u16, reason: String },
-    /// The bound address is not loopback (never widened).
-    #[error("the metering proxy resolved a non-loopback address; it binds 127.0.0.1 only")]
-    NonLoopback,
+    /// Story 22-5: an address beyond loopback without TLS.
+    #[error(
+        "the metering proxy cannot bind {bind} beyond loopback without transport encryption: \
+         pass --proxy-tls-cert and --proxy-tls-key (PEM files), or bind 127.0.0.1"
+    )]
+    NonLoopbackWithoutTls { bind: std::net::IpAddr },
 }
 
 /// The header-read timeout (slowloris).
@@ -162,21 +230,24 @@ impl MeteringProxy {
         deps: ProxyDeps,
     ) -> Result<Self, ProxyStartError> {
         let port = options.port;
-        let std_listener = std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|err| {
-            ProxyStartError::Bind {
+        let bind = options
+            .bind
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let beyond_loopback = !bind.is_loopback();
+        if beyond_loopback && options.tls.is_none() {
+            return Err(ProxyStartError::NonLoopbackWithoutTls { bind });
+        }
+        let std_listener =
+            std::net::TcpListener::bind((bind, port)).map_err(|err| ProxyStartError::Bind {
                 port,
                 reason: err.to_string(),
-            }
-        })?;
+            })?;
         let addr: SocketAddr = std_listener
             .local_addr()
             .map_err(|err| ProxyStartError::Bind {
                 port,
                 reason: err.to_string(),
             })?;
-        if !addr.ip().is_loopback() {
-            return Err(ProxyStartError::NonLoopback);
-        }
         std_listener
             .set_nonblocking(true)
             .map_err(|err| ProxyStartError::Bind {
@@ -223,11 +294,22 @@ impl MeteringProxy {
             allowed_hosts: options.allowed_hosts.clone().into(),
             allowed_origins: options.allowed_origins.clone().into(),
             holds: Arc::new(hold::HoldQueues::new(options.max_held_per_run)),
+            beyond_loopback,
             #[cfg(test)]
             ensure_delay: std::sync::Mutex::new(None),
         });
         let (stop, stop_rx) = tokio::sync::watch::channel(None);
-        let task = handle.spawn(accept_loop(listener, Arc::clone(&shared), stop_rx));
+        let acceptor = options
+            .tls
+            .as_ref()
+            .map(|tls| tokio_rustls::TlsAcceptor::from(Arc::clone(&tls.0)));
+        let task = handle.spawn(accept_loop(
+            listener,
+            Arc::clone(&shared),
+            stop_rx,
+            acceptor,
+            options.peers_as_remote,
+        ));
         let sweeper = spawn_sweeper(
             handle,
             deps.writer,
@@ -241,6 +323,16 @@ impl MeteringProxy {
             info: ProxyInfo {
                 url: format!("http://127.0.0.1:{}", addr.port()),
                 port: addr.port(),
+                bind,
+                tls: options.tls.is_some(),
+                public_url: beyond_loopback.then(|| {
+                    let host = match (options.public_host.as_deref(), bind) {
+                        (Some(host), _) => host.to_string(),
+                        (None, std::net::IpAddr::V6(ip)) => format!("[{ip}]"),
+                        (None, ip) => ip.to_string(),
+                    };
+                    format!("https://{host}:{}", addr.port())
+                }),
             },
             shared,
             stop: Some(stop),
@@ -364,10 +456,69 @@ fn spawn_sweeper(
     })
 }
 
+/// How long a client beyond loopback may take to complete its TLS
+/// handshake (story 22-5; the Control API listener's bound).
+const HANDSHAKE_BOUND: Duration = Duration::from_secs(10);
+
+/// The first byte of a TLS record carrying a handshake (a ClientHello).
+const TLS_HANDSHAKE_RECORD: u8 = 0x16;
+
+/// Serve one connection's HTTP/1.1 calls.
+async fn serve_connection<I>(io: I, shared: Arc<forward::ProxyShared>, peer_loopback: bool)
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |req| {
+        let shared = Arc::clone(&shared);
+        async move {
+            Ok::<_, std::convert::Infallible>(forward::serve(shared, req, peer_loopback).await)
+        }
+    });
+    let _ = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .keep_alive(true)
+        .serve_connection(TokioIo::new(io), service)
+        .await;
+}
+
+/// One accepted connection (story 22-5): without TLS, served as is. With
+/// TLS, a loopback peer that opens with plain HTTP is served as today (a
+/// supervised agent's `http://127.0.0.1` base URL); every other connection
+/// must complete a TLS handshake within the bound, and a failed or
+/// overrunning one closes that connection — a non-loopback peer is never
+/// served in plaintext.
+async fn accept_connection(
+    stream: tokio::net::TcpStream,
+    peer_loopback: bool,
+    shared: Arc<forward::ProxyShared>,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+) {
+    let Some(acceptor) = acceptor else {
+        return serve_connection(stream, shared, peer_loopback).await;
+    };
+    if peer_loopback {
+        let mut first = [0u8; 1];
+        let peeked = tokio::time::timeout(HANDSHAKE_BOUND, stream.peek(&mut first)).await;
+        match peeked {
+            Ok(Ok(1)) if first[0] != TLS_HANDSHAKE_RECORD => {
+                return serve_connection(stream, shared, peer_loopback).await;
+            }
+            Ok(Ok(1)) => {}
+            _ => return,
+        }
+    }
+    if let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE_BOUND, acceptor.accept(stream)).await {
+        serve_connection(tls, shared, peer_loopback).await;
+    }
+}
+
 async fn accept_loop(
     listener: TcpListener,
     shared: Arc<forward::ProxyShared>,
     mut stop: tokio::sync::watch::Receiver<Option<Duration>>,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+    peers_as_remote: bool,
 ) {
     let mut connections = tokio::task::JoinSet::new();
     let grace = loop {
@@ -377,24 +528,16 @@ async fn accept_loop(
                 break grace.unwrap_or(Duration::ZERO);
             }
             accepted = listener.accept() => {
-                let Ok((stream, _peer)) = accepted else { continue };
+                let Ok((stream, peer)) = accepted else { continue };
                 let _ = stream.set_nodelay(true);
-                let io = TokioIo::new(stream);
-                let conn_shared = Arc::clone(&shared);
-                connections.spawn(async move {
-                    let service = service_fn(move |req| {
-                        let shared = Arc::clone(&conn_shared);
-                        async move {
-                            Ok::<_, std::convert::Infallible>(forward::serve(shared, req).await)
-                        }
-                    });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .timer(TokioTimer::new())
-                        .header_read_timeout(HEADER_READ_TIMEOUT)
-                        .keep_alive(true)
-                        .serve_connection(io, service)
-                        .await;
-                });
+                // Story 22-5: each connection's peer scope, stamped once.
+                let peer_loopback = peer_is_loopback(peer.ip()) && !peers_as_remote;
+                connections.spawn(accept_connection(
+                    stream,
+                    peer_loopback,
+                    Arc::clone(&shared),
+                    acceptor.clone(),
+                ));
                 // Reap finished connections so the set stays small.
                 while connections.try_join_next().is_some() {}
             }

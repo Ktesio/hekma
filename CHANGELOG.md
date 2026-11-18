@@ -4,6 +4,16 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — the metering proxy beyond loopback (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **A wider bind:** `--metering-listen` takes an `IP:PORT` beside a bare port (an IP literal; a host name is refused). Beyond loopback it requires TLS through the new `--proxy-tls-cert` and `--proxy-tls-key` (exit `2` without them, before anything opens); `--proxy-public-host` names the address clients use. It stays one listener: a connection from this machine keeps every loopback rule and may speak plain HTTP, so supervised agents are unaffected.
+> - **Every call from another machine authenticates** before its body is read: the binding's proxy-access credential (`hk_pxy_`) in the API-key slot, scoped to its binding's prefix, swapped for the binding's custodied key and never forwarded; or a Run Key of a Run Hekma did not start. A supervised agent's Run Key from another machine is unknown. Proxy-access calls are unscented under Scent-Check.
+> - **Two new `proxy-wire v1` rows:** `401 hekma_authentication_required` and `403 hekma_credential_out_of_scope`.
+> - **Behaviour change:** the TLS certificate and key files, for the proxy and for the Control API's `--tls-cert`/`--tls-key` alike, must be readable only by their owner (mode `0600` on Unix); a looser file now refuses the start.
+> - **Started notice:** the proxy's address beyond loopback, a note while no proxy-access credential is active, and on every bind a line on whether other users could take its port. `GET /v0/proxy` gains `bind`, `tls` and `public_url`; `control.json` gains `metering_proxy_public_url`; `hekma binding show` prints the address for other machines.
+> - **Engine surface (breaking within the unreleased 0.12.0):** `MeteringProxyOptions` gains `bind`, `tls` (`ProxyTls`) and `public_host`; `ProxyInfo` gains `bind`, `tls` and `public_url`; `ProxyStartError::NonLoopback` becomes `NonLoopbackWithoutTls`; new `check_owner_only_file`, `restrict_to_owner`, `interactive_users_hint` and `Engine::proxy_access_active`. No schema change.
+
 > **Unreleased — the identity-header switch and Hekma in front of a gateway (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >

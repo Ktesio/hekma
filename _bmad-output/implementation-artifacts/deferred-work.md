@@ -841,3 +841,17 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-21-8-gateway-complement.md` (Tasks 6: the CLI)
   summary: `hekma binding create` takes no `--identity-headers`; a binding's own setting is set with `binding set` (the create body accepts `identity_headers` on the Control API). `hekma proxy show` learns `forced_by_flag` only from a running host, asked with a bounded call and never started; without one it reports the stored setting.
   evidence: `crates/hekma/src/cli/{binding,proxy}.rs`. Trigger: an Operator asking to create and set in one command.
+
+## From spec-22-5 (the authenticated proxy beyond loopback) — build, 2026-11-14
+
+- source_spec: `spec-22-5-authenticated-proxy-beyond-loopback.md` (Deferrals)
+  summary: A `::1` bind of the proxy stays deferred (23-1's entry); the classification lands (a `::1` peer is loopback, `::` and `0.0.0.0` never are). Certificate provisioning and in-process rotation, mutual TLS, and the proxy-access OTLP counter are not built.
+  evidence: `metering/proxy/mod.rs` (`peer_is_loopback`), `docs/metering-proxy.md` (What is still planned). Trigger: an Operator asking for rotation or mTLS; 24-5 for the counter.
+
+- source_spec: `spec-22-5-authenticated-proxy-beyond-loopback.md` (Verification: the TLS floor and real remote peers)
+  summary: The TLS 1.2 floor comes from rustls's safe defaults and is not tested with a TLS 1.1 client (rustls has none). The remote-peer legs run over 127.0.0.1 through the `peers_as_remote` test seam; the leg with a real routable peer skips on a host that drops connections to its own address (the build machine does) and runs where the runner reaches itself.
+  evidence: `crates/hekma-engine/tests/beyond_loopback_proxy.rs`. Trigger: a CI lane with a second network namespace, or a TLS 1.1 client fixture.
+
+- source_spec: `spec-22-5-authenticated-proxy-beyond-loopback.md` (Tasks 5: the body bound, and the no-leak sweep)
+  summary: An unauthenticated remote call is answered without reading its body and its connection closes (`connection: close`); the spec's sentinel no-leak sweep across a `kill -9` and restart is covered by the reopen leg (revoked across a reopen) and the strip assertion, not by a byte scan of the state directory.
+  evidence: `metering/proxy/forward.rs`, the end-to-end test. Trigger: the independent security review.

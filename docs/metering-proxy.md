@@ -5,7 +5,7 @@ description: "One loopback proxy per state directory meters every model call, at
 
 # The metering proxy
 
-> **On main, not yet released.** The shared metering proxy ships with the next release. It replaces the per-agent metering listener. Key custody is a preview, not yet supported. Scent-Check Modes, [announce](announce.md) and [hold, release, reroute and reject](#hold-release-reroute-and-reject) are on main. Serving beyond loopback is still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **On main, not yet released.** The shared metering proxy ships with the next release. It replaces the per-agent metering listener. Key custody is a preview, not yet supported. Scent-Check Modes, [announce](announce.md) and [hold, release, reroute and reject](#hold-release-reroute-and-reject) are on main, and so is [serving beyond loopback](#beyond-loopback), over TLS and with a credential on every call from another machine. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 Hekma meters model calls by sitting between a client and its model provider. The **metering proxy** is one HTTP listener on `127.0.0.1`, owned by the Service Host (`hekma serve`). Each call it forwards is attributed to a [Run](runs.md), counted once in the usage ledger, checked against that Run's budgets, and relayed back. Supervised agents reach it through the base URL Hekma injects. Any other client reaches it through an **endpoint binding** you create.
 
@@ -15,15 +15,15 @@ This page is the complete contract: where the proxy listens, how a call finds it
 
 | Question | Answer |
 |---|---|
-| Address | `127.0.0.1` only. There is no flag to widen it. |
+| Address | `127.0.0.1` by default. `--metering-listen <IP>:<port>` binds another address (an IP literal, never a host name); beyond loopback it requires TLS and a credential on every call from another machine. See [Beyond loopback](#beyond-loopback). It is always one listener. |
 | Port | `--metering-listen <port>` if you pass it. Otherwise the port recorded for this state directory. Otherwise the OS picks one, and Hekma records it. The port is **sticky**: a restart binds the same one, so clients and adopted agents keep a live address. |
-| Finding it | The started notice (`the metering proxy is listening on http://127.0.0.1:<port>.`), `control.json`, `GET /v0/proxy` and `hekma binding show`. |
+| Finding it | The started notice (`the metering proxy is listening on http://127.0.0.1:<port>.`), `control.json`, `GET /v0/proxy` and `hekma binding show`. Beyond loopback they also name the address clients on other machines use (`https://<public host or bind address>:<port>`). |
 | A taken port | Hekma never moves to another port. The host keeps serving the Control API, says which port is taken and why, and refuses `engine-observed` starts until you free the port or pass another. |
 | Embedding | An embedding application gets the proxy on an ephemeral, unrecorded port. A read-only engine never runs one. |
 
 **The Host and Origin guard.** Before anything else, the proxy checks two request headers. `Host` must be a loopback address (`127.0.0.1` or anything in `127.0.0.0/8`, `::1`, or `localhost`), with any port, or a name you list with `hekma serve --proxy-allowed-hosts <name,...>`. An `Origin` header, which browser pages send and SDKs do not, must be on the list you give with `--proxy-allowed-origins <origin,...>`; by default any `Origin` is refused. A request that fails either check gets `403 hekma_bad_host` before any upstream is dialled. The proxy never adds `Access-Control-*` headers and never answers a browser's preflight permissively. This stops a web page from reaching the proxy through DNS rebinding.
 
-On loopback the proxy asks for no credential. A Run Key tells it *which* Run a call belongs to; it is not a gate. Another OS user on the same machine can reach a loopback port, and can bind it while no host holds it. Treat the proxy as reachable by every local user, and serve it only on machines you control.
+On loopback the proxy asks for no credential. A Run Key tells it *which* Run a call belongs to; it is not a gate. Another OS user on the same machine can reach a loopback port, and can bind it while no host holds it (see [Port squatting](#port-squatting)). Treat the proxy as reachable by every local user, and serve it only on machines you control.
 
 ## How a call finds its Run
 
@@ -189,9 +189,35 @@ There are at most 256 bindings. Changing a binding's prefix or upstream keeps it
 Each binding can also hold one active **announce** credential (`hk_ann_`) and one active **proxy-access** credential (`hk_pxy_`):
 - `hekma binding credential issue` prints the credential once and stores only its hash. Issuing again revokes the previous one.
 - `revoke` works per class, and `list` shows token ids and states.
-- **The announce credential** announces Runs beneath its binding on `POST /v0/runs/announce`, and heartbeats or closes the Runs it created (see [Announce and Leases](announce.md)). **Nothing accepts the proxy-access credential yet;** the proxy beyond loopback will.
+- **The announce credential** announces Runs beneath its binding on `POST /v0/runs/announce`, and heartbeats or closes the Runs it created (see [Announce and Leases](announce.md)).
+- **The proxy-access credential** is what a client on another machine sends as its API key to a proxy bound beyond loopback, on its binding's prefix only (see [Beyond loopback](#beyond-loopback)). On a loopback-bound proxy it is unknown.
 
 Bindings are managed by the Operator only: through `hekma binding` (see [Commands](commands.md)) or `/v0/bindings` (see [Control API](control-api.md)).
+
+## Beyond loopback
+
+By default the proxy binds `127.0.0.1`. To let clients on other machines reach it, bind a wider address with its own TLS certificate and key:
+
+```bash
+hekma serve --metering-listen 0.0.0.0:8400 \
+  --proxy-tls-cert proxy-cert.pem --proxy-tls-key proxy-key.pem \
+  --proxy-public-host proxy.example.com
+```
+
+- **TLS is required.** Without `--proxy-tls-cert` and `--proxy-tls-key`, a bind beyond loopback is refused at start (exit `2`), before anything opens. Both PEM files must be readable only by their owner (mode `0600` on Unix; on Windows the user profile's own access control applies), and so must the Control API's `--tls-cert`/`--tls-key`. TLS 1.2 is the minimum. Self-signed certificates work; use one your clients trust. Hekma does not provision or rotate certificates, so watch their expiry.
+- **One listener, two kinds of peer.** The same port serves both. A connection from this machine (`127.0.0.0/8` or `::1`) keeps every loopback rule, and may speak plain HTTP, so a supervised agent's `http://127.0.0.1:<port>` base URL keeps working. A connection from any other address must complete a TLS handshake within 10 seconds; plain HTTP from another machine is never served.
+- **Every call from another machine carries a credential**, checked before its body is read or any upstream is dialled. It is one of:
+  - the binding's **proxy-access credential** (`hk_pxy_`), sent as the client's API key (`authorization: Bearer …` or `x-api-key`). It works only on its own binding's prefix (elsewhere, `403 hekma_credential_out_of_scope`). It is never forwarded: when the binding holds a custodied key, that key is sent instead, under [key custody's](run-keys.md#key-custody-preview--not-yet-supported) rules; otherwise the call is forwarded with no key, and the provider's own refusal answers. A binding served this way wants a custodied key. A proxy-access credential is not a Run's identity, so its calls are unscented under [Scent-Check](#scent-check);
+  - a **Run Key** of a Run Hekma did not start, in `x-hekma-run-key` or the API-key slot. A supervised agent's Run Key is local by definition: from another machine it is unknown.
+  
+  A call with neither gets `401 hekma_authentication_required`, and its connection closes without its body being read. A call may carry both: the Run Key identifies the Run, and the proxy-access credential must still be valid and in scope.
+- **Issue the credential** with `hekma binding credential issue <name> --class proxy-access`. It is shown once and only its hash is stored; issuing again or `revoke` stops the old one at once (`401 hekma_credential_revoked` for 24 hours, then unknown). Until one is active, the started notice says every call from other machines will be refused.
+- **The Host and Origin guard** applies to a call from another machine only when you configure it: with `--proxy-allowed-hosts` or `--proxy-allowed-origins` set, an unlisted value is `403 hekma_bad_host`; with neither set, TLS and the credential carry that boundary. Calls from this machine keep the loopback rule.
+- **The address you hand out.** `--proxy-public-host` names the host clients use; the started notice, `GET /v0/proxy` (`public_url`), `control.json` and `hekma binding show` show `https://<public host>:<port>`. Without it they show the bind address, which a client may not be able to dial. The bind is never stored: pin the flags in your service definition, or a restart without them binds loopback again.
+
+### Port squatting
+
+The proxy's port is sticky, so while no host is running, another user on the same machine could listen on it and collect what clients send. Whenever the proxy binds, the started notice says whether this machine has other user accounts that can log in, or that Hekma cannot tell. Where it does, use socket activation (systemd or launchd), run Hekma on a machine you do not share, or bind a privileged port where the operating system allows one.
 
 ## Limits and timeouts
 
@@ -223,6 +249,8 @@ No body ever carries a limit, a total, an agent name, a token, a token id, or an
 | 403 | `hekma_bad_host` | The `Host` is not loopback or listed, or an `Origin` is not listed | `false` |
 | 401 | `hekma_unknown_credential` | The credential is not a Run Key Hekma honours | `false` |
 | 401 | `hekma_credential_revoked` | The Run Key was revoked in the last 24 hours | `false` |
+| 401 | `hekma_authentication_required` | A call from another machine to a proxy bound beyond loopback carries no credential | `false` |
+| 403 | `hekma_credential_out_of_scope` | A proxy-access credential on another binding's prefix, or on a Run route | `false` |
 | 401 | `hekma_unscented_call` | The call carries no credential Hekma issued, and its Run's Scent-Check Mode is `enforce` | `false` |
 | 402 | `hekma_budget_block` | A breach latched under `block` or `stop` holds for the Run or a Run above it | `false` |
 | 402 | `hekma_run_reject` | An Operator rejected the Run's (or a Run above it) calls | `false` |
@@ -270,6 +298,6 @@ Earlier releases gave each `engine-observed` agent its own listener on its own p
 - **Key custody, supported:** it is a preview today, until the pending security rulings are recorded and its test criteria pass in CI.
 - **Helpers for CrewAI and LangGraph.**
 - **Incremental streaming relay.**
-- **An authenticated proxy beyond loopback.**
+- **Mutual TLS, and provisioning or rotating the proxy's certificate.**
 
 See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
