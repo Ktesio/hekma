@@ -540,9 +540,10 @@ mod tests {
     async fn a_header_value_that_cannot_ride_http_is_terminal_before_any_dial() {
         // Nothing listens at this endpoint: the attempt fails while BUILDING
         // the request, so it never dials.
-        let client = OtlpClient::new(
+        let client = OtlpClient::with_ca(
             "http://127.0.0.1:9",
             vec![("x-tenant".to_string(), "line\nbreak".to_string())],
+            None,
         )
         .unwrap();
         match client.post_once("{}".to_string()).await {
@@ -565,7 +566,7 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{}",
         ])
         .await;
-        let client = OtlpClient::new(&endpoint, Vec::new()).unwrap();
+        let client = OtlpClient::with_ca(&endpoint, Vec::new(), None).unwrap();
         assert_eq!(
             client.post_once("{}".to_string()).await,
             PostOutcome::Delivered
@@ -581,7 +582,7 @@ mod tests {
         // never a hang.
         let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", silent.local_addr().unwrap());
-        let client = OtlpClient::new(&endpoint, Vec::new()).unwrap();
+        let client = OtlpClient::with_ca(&endpoint, Vec::new(), None).unwrap();
         match client.post_once("{}".to_string()).await {
             PostOutcome::Retryable(message) => {
                 assert!(message.contains("timed out"), "{message}");
@@ -597,7 +598,7 @@ mod tests {
                            Connection: close\r\n\r\n";
         let (endpoint, collector) =
             scripted_collector(vec![unavailable; RETRY_ATTEMPTS as usize]).await;
-        let client = OtlpClient::new(&endpoint, Vec::new()).unwrap();
+        let client = OtlpClient::with_ca(&endpoint, Vec::new(), None).unwrap();
         match deliver(&client, "{}".to_string()).await {
             PostOutcome::Retryable(message) => {
                 assert!(
