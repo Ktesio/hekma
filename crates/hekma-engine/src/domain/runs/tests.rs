@@ -312,13 +312,21 @@ fn a_wire_child_accepts_block_and_refuses_hold_actions_until_they_exist() {
     let (_tmp, store) = store();
     let owner = RunId::mint();
     ops::ensure_supervised(&store, &supervised(&owner, true, true), AT).unwrap();
-    let mut request = ChildRunRequest::under(RunParent::Run(owner.clone()));
-    // `pause`/`stop` below `supervised` keep the depth fallback until wire
-    // hold and reject exist (23-4).
+    // Story 23-4: a child with a wire path accepts its own `pause` and
+    // `stop` (they hold and reject its calls); without one, they are
+    // still refused at open.
+    for action in [BreachAction::Pause, BreachAction::Stop] {
+        let mut request = ChildRunRequest::under(RunParent::Run(owner.clone()));
+        request.limits.breach_action = Some(action);
+        ops::open_child(&store, &request, RunId::mint(), None, AT).unwrap();
+    }
+    let (_other_tmp, other) = self::store();
+    let no_wire = RunId::mint();
+    ops::ensure_supervised(&other, &supervised(&no_wire, false, true), AT).unwrap();
+    let mut request = ChildRunRequest::under(RunParent::Run(no_wire.clone()));
     request.limits.breach_action = Some(BreachAction::Pause);
-    match ops::open_child(&store, &request, RunId::mint(), None, AT) {
+    match ops::open_child(&other, &request, RunId::mint(), None, AT) {
         Err(err @ RunError::ActionUnavailable { .. }) => {
-            assert!(err.to_string().contains("not available yet"), "{err}");
             assert_eq!(err.code(), "action-unavailable");
         }
         other => panic!("expected a refusal, got {other:?}"),
@@ -847,8 +855,10 @@ fn a_depth_change_re_resolves_the_policy_sourced_fallback() {
             rates: Default::default(),
         })
         .unwrap();
+    // Story 23-4: with no wire path (a self-reported agent), the child
+    // cannot hold its calls either, so the Policy's `pause` falls back.
     let owner = RunId::mint();
-    ops::ensure_supervised(&store, &supervised(&owner, true, true), AT).unwrap();
+    ops::ensure_supervised(&store, &supervised(&owner, false, true), AT).unwrap();
     let kid = child(&store, RunParent::Run(owner.clone())).unwrap();
     verb(&store, &kid, set(&[("team", "payments")]), &[], false).unwrap();
     let record = store.run_record(&kid).unwrap().unwrap();

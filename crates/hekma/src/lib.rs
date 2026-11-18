@@ -296,6 +296,84 @@ enum Commands {
         #[command(subcommand)]
         command: CallsCommands,
     },
+    /// Hold a Run's model calls at the metering proxy
+    #[command(about = "Hold a Run's model calls at the metering proxy")]
+    Hold {
+        /// A run id (or use --selector)
+        target: Option<String>,
+        /// Every open Run carrying all these labels (key=value[,key=value...])
+        #[arg(long, value_name = "SELECTOR")]
+        selector: Option<String>,
+        /// Show what would change; change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Act on several Runs without asking
+        #[arg(long)]
+        yes: bool,
+        /// Print the results as one JSON document
+        #[arg(long)]
+        json: bool,
+    },
+    /// Release a held Run's model calls
+    #[command(about = "Release a held Run's model calls")]
+    Release {
+        /// A run id (or use --selector)
+        target: Option<String>,
+        /// Every open Run carrying all these labels (key=value[,key=value...])
+        #[arg(long, value_name = "SELECTOR")]
+        selector: Option<String>,
+        /// Show what would change; change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Act on several Runs without asking
+        #[arg(long)]
+        yes: bool,
+        /// Print the results as one JSON document
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send a Run's model calls to another binding route
+    #[command(about = "Send a Run's model calls to another binding route")]
+    Reroute {
+        /// A run id (or use --selector)
+        target: Option<String>,
+        /// Every open Run carrying all these labels (key=value[,key=value...])
+        #[arg(long, value_name = "SELECTOR")]
+        selector: Option<String>,
+        /// The route to send the calls to (`<binding>/<route>`)
+        #[arg(long, value_name = "BINDING/ROUTE")]
+        via: Option<String>,
+        /// Send the calls back to the Run's own upstream
+        #[arg(long)]
+        off: bool,
+        /// Show what would change; change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Act on several Runs without asking
+        #[arg(long)]
+        yes: bool,
+        /// Print the results as one JSON document
+        #[arg(long)]
+        json: bool,
+    },
+    /// Refuse a Run's model calls at the metering proxy
+    #[command(about = "Refuse a Run's model calls at the metering proxy")]
+    Reject {
+        /// A run id (or use --selector)
+        target: Option<String>,
+        /// Every open Run carrying all these labels (key=value[,key=value...])
+        #[arg(long, value_name = "SELECTOR")]
+        selector: Option<String>,
+        /// Show what would change; change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Act on several Runs without asking
+        #[arg(long)]
+        yes: bool,
+        /// Print the results as one JSON document
+        #[arg(long)]
+        json: bool,
+    },
     /// List the Runs that need you, newest first
     #[command(
         about = "List the Runs that need you, newest first",
@@ -1497,6 +1575,83 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 json,
             } => cli::policy::delete(&name, dry_run, json),
         },
+        Some(Commands::Hold {
+            target,
+            selector,
+
+            dry_run,
+            yes,
+            json,
+        }) => cli::hold::run(
+            cli::hold::HoldVerb::Hold,
+            cli::hold::HoldArgs {
+                target,
+                selector,
+
+                dry_run,
+                yes,
+                json,
+                ..Default::default()
+            },
+        ),
+        Some(Commands::Release {
+            target,
+            selector,
+
+            dry_run,
+            yes,
+            json,
+        }) => cli::hold::run(
+            cli::hold::HoldVerb::Release,
+            cli::hold::HoldArgs {
+                target,
+                selector,
+
+                dry_run,
+                yes,
+                json,
+                ..Default::default()
+            },
+        ),
+        Some(Commands::Reroute {
+            target,
+            selector,
+            via,
+            off,
+            dry_run,
+            yes,
+            json,
+        }) => cli::hold::run(
+            cli::hold::HoldVerb::Reroute,
+            cli::hold::HoldArgs {
+                target,
+                selector,
+                via,
+                off,
+                dry_run,
+                yes,
+                json,
+            },
+        ),
+        Some(Commands::Reject {
+            target,
+            selector,
+
+            dry_run,
+            yes,
+            json,
+        }) => cli::hold::run(
+            cli::hold::HoldVerb::Reject,
+            cli::hold::HoldArgs {
+                target,
+                selector,
+
+                dry_run,
+                yes,
+                json,
+                ..Default::default()
+            },
+        ),
         Some(Commands::Budget { command }) => match command {
             BudgetCommands::Show {
                 target,

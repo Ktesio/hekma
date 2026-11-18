@@ -83,6 +83,8 @@ hekma run revoke-keys run_01JZ6Q9G3S8V2X7K4M1N5P0R2T --no-cascade
 
 A revocation is committed and published before the command returns, so the very next request presenting the key is refused, and a hard kill of the Service Host cannot undo it. Like every write to `state.db`, it is not forced to disk on each commit: an operating-system crash or a power loss can lose the last moment of writes, a revocation included. After one, check with `hekma run keys` and revoke again if needed. By default it cascades: keys of child Runs opened with the revoked keys, and their refresh chains, are revoked too. Revocation never ends a Run; children opened under a revoked key stay open.
 
+A call held at the metering proxy is checked again when it is released: if its Run Key was revoked while it waited, it is refused with `401 hekma_credential_revoked`, never forwarded.
+
 A Run that ends revokes its own keys; its child Runs that outlive it keep theirs. When a supervised agent's process exits and its Run ends, the in-process child Runs that end with it lose their keys in the same write as the exit. Removing an instance (`hekma rm --force`) removes its Runs and their keys with it.
 
 ### Never in a URL

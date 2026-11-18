@@ -620,6 +620,147 @@ ALTER TABLE runs DROP COLUMN created_by_hash;
 /// adapter can declare it.
 pub(crate) const TELEMETRY_SOURCE: &str = "telemetry-reported";
 
+/// One verb disposition reason on a Run (story 23-4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DispositionRow {
+    /// `hold`, `reject` or `reroute`.
+    pub reason: String,
+    /// For a reroute: `binding/route`.
+    pub route: Option<String>,
+    /// `operator`, `host`, or `breach` and the latch for a latched one.
+    pub set_by: String,
+    pub set_at: String,
+}
+
+impl SqliteStore {
+    /// A Run's verb disposition reasons (story 23-4), by reason.
+    pub(crate) fn run_dispositions(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<DispositionRow>, StoreError> {
+        let mut stmt = self
+            .conn()
+            .prepare_cached(
+                "SELECT reason, route, set_by, set_at FROM run_dispositions WHERE run_id = ?1 \
+                 ORDER BY reason",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([run_id.as_str()], |row| {
+                Ok(DispositionRow {
+                    reason: row.get(0)?,
+                    route: row.get(1)?,
+                    set_by: row.get(2)?,
+                    set_at: row.get(3)?,
+                })
+            })
+            .map_err(backend)?;
+        rows.collect::<Result<_, _>>().map_err(backend)
+    }
+
+    /// Set (or replace) one verb disposition reason (story 23-4).
+    pub(crate) fn put_disposition(
+        &self,
+        run_id: &RunId,
+        reason: &str,
+        route: Option<&str>,
+        set_by: &str,
+        at: &str,
+    ) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "INSERT INTO run_dispositions (run_id, reason, route, set_by, set_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (run_id, reason) DO UPDATE SET \
+                 route = excluded.route, set_by = excluded.set_by, set_at = excluded.set_at",
+                rusqlite::params![run_id.as_str(), reason, route, set_by, at],
+            )
+            .map_err(backend)
+            .map(|_| ())
+    }
+
+    /// Clear one verb disposition reason (story 23-4); whether one was set.
+    pub(crate) fn delete_disposition(
+        &self,
+        run_id: &RunId,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        self.conn()
+            .execute(
+                "DELETE FROM run_dispositions WHERE run_id = ?1 AND reason = ?2",
+                rusqlite::params![run_id.as_str(), reason],
+            )
+            .map_err(backend)
+            .map(|n| n > 0)
+    }
+
+    /// The proxy's held-call figures for a Run (story 23-4): the count and
+    /// the oldest held call's start.
+    pub(crate) fn set_held_stats(
+        &self,
+        run_id: &RunId,
+        count: u64,
+        oldest: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "UPDATE runs SET held_call_count = ?2, oldest_held_at = ?3 WHERE run_id = ?1",
+                rusqlite::params![
+                    run_id.as_str(),
+                    i64::try_from(count).unwrap_or(i64::MAX),
+                    oldest
+                ],
+            )
+            .map_err(backend)
+            .map(|_| ())
+    }
+
+    /// A Run's held-call figures and its most recent hold end (story 23-4).
+    pub(crate) fn held_stats(
+        &self,
+        run_id: &RunId,
+    ) -> Result<(u64, Option<String>, Option<String>), StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT held_call_count, oldest_held_at, last_hold_end FROM runs WHERE run_id = ?1",
+                [run_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?.max(0) as u64,
+                        row.get(1)?,
+                        row.get(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(backend)
+            .map(Option::unwrap_or_default)
+    }
+
+    /// Record how a held call of the Run ended (story 23-4).
+    pub(crate) fn set_last_hold_end(&self, run_id: &RunId, cause: &str) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "UPDATE runs SET last_hold_end = ?2 WHERE run_id = ?1",
+                rusqlite::params![run_id.as_str(), cause],
+            )
+            .map_err(backend)
+            .map(|_| ())
+    }
+
+    /// Reset every Run's held-call figures (story 23-4: at open, nothing is
+    /// parked — parked calls are connections, not rows).
+    pub(crate) fn reset_held_stats(&self) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "UPDATE runs SET held_call_count = 0, oldest_held_at = NULL \
+                 WHERE held_call_count <> 0 OR oldest_held_at IS NOT NULL",
+                [],
+            )
+            .map_err(backend)
+            .map(|_| ())
+    }
+}
+
 impl SqliteStore {
     /// The last cumulative value a Run's telemetry reported for
     /// `token_type` (story 23-3), when one was stored.
@@ -677,6 +818,37 @@ CREATE TABLE IF NOT EXISTS telemetry_counters (
     PRIMARY KEY (run_id, token_type)
 );
 ";
+
+/// Schema v22 (story 23-4): the verb disposition reasons (AD-27's shape,
+/// one row per reason per Run; a reroute row names `binding/route`) and the
+/// held-call figures the proxy reports onto `runs` for `hekma ps`.
+const SCHEMA_V22: &str = "\
+CREATE TABLE IF NOT EXISTS run_dispositions (
+    run_id  TEXT NOT NULL,
+    reason  TEXT NOT NULL CHECK (reason IN ('hold','reject','reroute')),
+    route   TEXT,
+    set_by  TEXT NOT NULL,
+    set_at  TEXT NOT NULL,
+    PRIMARY KEY (run_id, reason)
+);
+ALTER TABLE runs ADD COLUMN held_call_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN oldest_held_at TEXT;
+ALTER TABLE runs ADD COLUMN last_hold_end TEXT;
+";
+
+/// Undo v22 on a fully migrated store, for the older upgrade tests.
+#[cfg(test)]
+pub(crate) const UNDO_V22_FOR_TEST: &str = "\
+DROP TABLE run_dispositions;
+ALTER TABLE runs DROP COLUMN held_call_count;
+ALTER TABLE runs DROP COLUMN oldest_held_at;
+ALTER TABLE runs DROP COLUMN last_hold_end;
+";
+
+/// Run the v22 step.
+pub(super) fn migrate_v22(conn: &Connection) -> Result<(), StoreError> {
+    migrate_runs_step(conn, 22, SCHEMA_V22)
+}
 
 /// Undo v21 on a fully migrated store, for the older upgrade tests.
 #[cfg(test)]
@@ -1678,6 +1850,24 @@ impl RunRecords for SqliteStore {
             .map_err(backend)
     }
 
+    fn run_held(
+        &self,
+        run_id: &RunId,
+    ) -> Result<(u64, Option<String>, Option<String>), StoreError> {
+        self.held_stats(run_id)
+    }
+
+    fn run_disposition_reasons(&self, run_id: &RunId) -> Result<Vec<String>, StoreError> {
+        Ok(self
+            .run_dispositions(run_id)?
+            .into_iter()
+            .map(|row| match row.route {
+                Some(route) => format!("{} {route}", row.reason),
+                None => row.reason,
+            })
+            .collect())
+    }
+
     fn open_descendants(&self, root: &RunId) -> Result<u64, StoreError> {
         // Bounded by the nesting limit, so a cycle (impossible through the
         // engine, which never re-parents) cannot loop.
@@ -1934,8 +2124,26 @@ impl RunRecords for SqliteStore {
                     origin: std::sync::Arc::from(row.origin?.as_str()),
                 })
             });
+        // Story 23-4: the verb reasons join the latch-derived ones; a
+        // reroute row resolves to its binding route's target.
+        let mut disposition = crate::domain::runs::snapshot::Disposition::of_latches(&latches);
+        for row in self.run_dispositions(run_id)? {
+            match row.reason.as_str() {
+                "hold" => disposition.verb_hold = true,
+                "reject" => disposition.verb_reject = true,
+                "reroute" => {
+                    disposition.reroute = row
+                        .route
+                        .as_deref()
+                        .and_then(|route| self.reroute_target(route).transpose())
+                        .transpose()?
+                        .map(std::sync::Arc::new);
+                }
+                _ => {}
+            }
+        }
         Ok(crate::domain::runs::snapshot::EntryExtras {
-            disposition: crate::domain::runs::snapshot::Disposition::of_latches(&latches),
+            disposition,
             upstream: upstream.map(std::sync::Arc::from),
             identity,
             custody,

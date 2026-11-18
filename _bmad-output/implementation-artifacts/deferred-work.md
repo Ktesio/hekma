@@ -796,3 +796,34 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-23-3-inbound-otlp-and-observed-runs.md` (Design Notes: one job, and the diff is the idempotence)
   summary: The counter is per (Run, token type), summed over the batch's points; a client that reports several series per token type (one per model, say) must send all of them in every batch, as cumulative exporters do, or the sum goes down and re-bases. A batch with points for several models prices unpriced unless the Run's Policy sets a flat Rate.
   evidence: `domain/runs/telemetry.rs` (`ingest`). Trigger: a client that sends partial series, or a request for per-model pricing of telemetry.
+
+## From spec-23-4 (wire hold, release, reroute and reject) — build, 2026-11-14
+
+- source_spec: `spec-23-4-wire-hold-release-reroute-reject.md` (Tasks: hold.rs; AC: hold-full)
+  summary: The `hold-full` and `held-dropped` Anomalies are not raised; a full queue is a typed 503 and a counted refusal, and a dropped held call names its cause on the Run's `last_hold_end` and in its record.
+  evidence: `metering/proxy/forward.rs` (the hold block). Trigger: the next proxy story, or an Operator report that a full queue went unnoticed.
+
+- source_spec: `spec-23-4-wire-hold-release-reroute-reject.md` (Design Notes: what the proxy can see when a held call ends)
+  summary: A held call's end is recorded as `disconnect` for any dropped connection (an orderly close and a reset are not told apart, so `client-timeout` is never written); `process-exit` (the owning process exiting with calls parked) and `crash` (a hard kill, closed at the next open) are not written as hold ends — the crash closure records outcome `crash` with no `hold_end`.
+  evidence: `metering/proxy/forward.rs` (`CloseGuard`), `store/calls_sqlite.rs` (the crash closure). Trigger: Handoff Mode (24-2), which reworks the connection seam.
+
+- source_spec: `spec-23-4-wire-hold-release-reroute-reject.md` (Tasks: the FR-7 dispatch)
+  summary: A supervised Run whose adapter declares pause `unsupported` still fails fast on `pause`; the wire-hold fallback (qualified, never native) and the matching Breach Action path are not built. `hekma hold` on such a Run works as the explicit wire hold.
+  evidence: `domain/supervisor` (unchanged). Trigger: the follow-up FR-7 amendment story.
+
+- source_spec: `spec-23-4-wire-hold-release-reroute-reject.md` (Tasks: the held-byte budget)
+  summary: A held call is parked before its body is read, so held calls cost connections, not buffered bytes; the `max_held_bytes` budget is not needed and not built. The per-Run cap bounds held connections.
+  evidence: `metering/proxy/forward.rs`. Trigger: none (recorded for the spec's change log).
+
+- source_spec: `spec-23-4-wire-hold-release-reroute-reject.md` (Tasks: drain on a wire Run)
+  summary: `drain` on a wire Run rejects and closes at once; it does not hold, wait out a bounded drain, then reject.
+  evidence: `crates/hekma-host/src/control/routes.rs` (`act_one`). Trigger: a request for a bounded wire drain.
+
+- source_spec: `spec-23-4-wire-hold-release-reroute-reject.md` (Design Notes: a breach pause)
+  summary: A breach latched under `pause` holds a wire Run's calls but does not flip its status to `held` (a verb hold does); 23-2's sweeper may mark such a Run `silent` while its calls are parked.
+  evidence: `domain/runs/snapshot.rs` (`Disposition::of_latches`), `domain/runs/lease.rs`. Trigger: an Operator report of a breach-held Run shown silent.
+
+- source_spec: `spec-23-4-wire-hold-release-reroute-reject.md` (Tasks: the disposition event)
+  summary: The disposition event is a Run event (`disposition-changed`, the cause naming the reason and actor), not a separate `EngineEvent::Disposition` family; no wake notification from the writer — parked calls re-read the snapshot every 250 ms.
+  evidence: `domain/runs/mod.rs` (`RunEventKind::DispositionChanged`), `metering/proxy/hold.rs` (`RECHECK`). Trigger: a consumer needing the held count on the event.
+

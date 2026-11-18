@@ -2327,8 +2327,9 @@ fn caller_policy_cases() -> Vec<Case> {
 
 /// The wire-depth `policy` cases (story 23-1, still 1.4.0): the shared
 /// proxy fences every Run with a wire path, so a Policy's `block` executes
-/// at `wire` and `announced` depth, while `pause` and `stop` there still act
-/// as `warn` with the `depth-fallback` Anomaly. Appended after every case.
+/// at `wire` and `announced` depth. Story 23-4 (still 1.4.0, unreleased):
+/// `pause` there holds the Run's calls and `stop` rejects them, so those
+/// cases now execute too. Appended after every case.
 fn wire_block_policy_cases() -> Vec<Case> {
     use crate::domain::runs::ControlDepth;
     let case = |id: &str, depth: ControlDepth, action: BreachAction| {
@@ -2367,12 +2368,12 @@ fn wire_block_policy_cases() -> Vec<Case> {
             BreachAction::Block,
         ),
         case(
-            "policy-wire-pause-falls-back-at-wire-depth",
+            "policy-wire-pause-holds-at-wire-depth",
             ControlDepth::Wire,
             BreachAction::Pause,
         ),
         case(
-            "policy-wire-stop-falls-back-at-announced-depth",
+            "policy-wire-stop-rejects-at-announced-depth",
             ControlDepth::Announced,
             BreachAction::Stop,
         ),
@@ -3953,8 +3954,9 @@ mod tests {
                 );
                 assert!(expected.fallback.is_none(), "{}", case.id);
             } else {
-                assert_eq!(expected.effective_action, BreachAction::Warn, "{}", case.id);
-                assert!(expected.fallback.is_some(), "{}", case.id);
+                // Story 23-4: `pause` holds and `stop` rejects at wire depth.
+                assert_ne!(expected.effective_action, BreachAction::Warn, "{}", case.id);
+                assert!(expected.fallback.is_none(), "{}", case.id);
             }
         }
     }

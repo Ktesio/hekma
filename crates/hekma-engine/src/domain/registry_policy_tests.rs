@@ -444,7 +444,7 @@ fn a_child_run_at_a_depth_without_the_action_counts_as_a_fallback() {
     let child_record = RunRecord {
         run_id: child.clone(),
         control_depth: ControlDepth::Announced,
-        wire_path: true,
+        wire_path: false, // story 23-4: no wire path, so `pause` falls back
         status: crate::domain::runs::RunStatus::Active,
         anomalies: Vec::new(),
         parent_run_id: Some(seeded.run.clone()),
@@ -1300,7 +1300,7 @@ fn the_dry_run_reports_the_planned_sets_fallback_count() {
     let child_record = RunRecord {
         run_id: child.clone(),
         control_depth: ControlDepth::Announced,
-        wire_path: true,
+        wire_path: false, // story 23-4: no wire path, so `pause` falls back
         status: crate::domain::runs::RunStatus::Active,
         anomalies: Vec::new(),
         parent_run_id: Some(seeded.run.clone()),

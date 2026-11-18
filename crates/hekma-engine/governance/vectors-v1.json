@@ -3461,7 +3461,7 @@
     },
     {
       "kind": "policy",
-      "id": "policy-wire-pause-falls-back-at-wire-depth",
+      "id": "policy-wire-pause-holds-at-wire-depth",
       "covers": [
         "policy-resolution"
       ],
@@ -3508,7 +3508,7 @@
           "cumulative": null
         },
         "action": "pause",
-        "effective_action": "warn",
+        "effective_action": "pause",
         "scent_check": "off",
         "rate": null,
         "sources": {
@@ -3523,16 +3523,12 @@
           },
           "scent_check": "default",
           "rate": "unset"
-        },
-        "fallback": {
-          "policy": "p",
-          "action": "pause"
         }
       }
     },
     {
       "kind": "policy",
-      "id": "policy-wire-stop-falls-back-at-announced-depth",
+      "id": "policy-wire-stop-rejects-at-announced-depth",
       "covers": [
         "policy-resolution"
       ],
@@ -3579,7 +3575,7 @@
           "cumulative": null
         },
         "action": "stop",
-        "effective_action": "warn",
+        "effective_action": "stop",
         "scent_check": "off",
         "rate": null,
         "sources": {
@@ -3594,10 +3590,6 @@
           },
           "scent_check": "default",
           "rate": "unset"
-        },
-        "fallback": {
-          "policy": "p",
-          "action": "stop"
         }
       }
     },

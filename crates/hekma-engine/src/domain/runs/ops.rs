@@ -827,6 +827,24 @@ fn write_labels<S: RunRecords + ?Sized>(
     Ok(())
 }
 
+/// Note a disposition change on `record` (story 23-4): one
+/// `disposition-changed` event whose cause names the reason and the change.
+pub(crate) fn note_disposition<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    record: &RunRecord,
+    cause: String,
+) -> Result<(), StoreError> {
+    note(
+        store,
+        changes,
+        record,
+        RunEventKind::DispositionChanged,
+        Prior::default(),
+        Some(cause),
+    )
+}
+
 /// Note a Caller-label change on `record` (already saved; story 23-2: a
 /// re-announce upserts its Caller labels): one `labels-changed` event with
 /// `cause`. Caller labels never select a Policy (FR-60), so nothing
@@ -1278,9 +1296,14 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
         None
     };
     let (lease_expires_at, last_activity_at) = store.run_lease(run_id)?;
+    let (held_calls, oldest_held_at, last_hold_end) = store.run_held(run_id)?;
     Ok(RunView {
         lease_expires_at,
         last_activity_at,
+        dispositions: store.run_disposition_reasons(run_id)?,
+        held_calls,
+        oldest_held_at,
+        last_hold_end,
         labels: store.run_labels(run_id)?,
         limits: store.run_limits(run_id)?,
         policy: store.run_policy(run_id)?.map(|row| row.resolution),

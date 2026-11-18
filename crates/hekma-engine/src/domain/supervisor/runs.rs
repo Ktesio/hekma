@@ -795,6 +795,23 @@ impl Supervisor {
         })
     }
 
+    /// A wire disposition verb on one Run (story 23-4) and its events.
+    pub(crate) fn set_disposition(
+        &self,
+        registry: &Registry,
+        run_id: &RunId,
+        verb: crate::domain::DispositionVerb,
+        set_by: &str,
+    ) -> Result<crate::domain::DispositionOutcome, RunError> {
+        let id = run_id.clone();
+        let set_by = set_by.to_string();
+        let (outcome, events) = registry.run_job(move |store| {
+            runs::dispositions::apply(store, &id, &verb, &set_by, &crate::time::now_rfc3339())
+        })?;
+        self.publish_run_events(events);
+        Ok(outcome)
+    }
+
     /// The heartbeat job (story 23-2) and its events.
     pub(crate) fn heartbeat(
         &self,

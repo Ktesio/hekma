@@ -179,6 +179,10 @@ Under [key custody](run-keys.md#key-custody-preview--not-yet-supported) (a previ
 
 The secrets file lives in the state directory, so backups, snapshots and sync tools copy it with the volume. Exclude it, or give `hekma serve` its keys through its own environment instead, which the resolver reads first.
 
+## Held calls across a stop
+
+A hold is stored with its Run, so it outlives the Service Host. A graceful stop answers each call the metering proxy is holding with `503 hekma_hold_interrupted` (`x-should-retry: true`); the SDK retries, and the next host holds the call again. A hard kill breaks the held connections; their calls are closed as `crash` at the next start, and the hold is back in place before the new proxy accepts a call.
+
 ## Inbound telemetry
 
 The Control API listener also serves [`POST /v1/metrics`](telemetry.md#inbound-telemetry-v1metrics), OTLP/HTTP+JSON under a binding's announce credential. It is always on and does nothing until you issue an announce credential. It binds nothing new and follows the listener's TLS and loopback rules.

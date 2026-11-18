@@ -139,21 +139,21 @@
       "verb": "pause-resume",
       "column": "wire",
       "behavior": "qualified",
-      "status": "pending",
+      "status": "covered",
       "note": "qualified: holds / releases the Run's calls"
     },
     {
       "verb": "pause-resume",
       "column": "announced",
       "behavior": "qualified",
-      "status": "pending",
+      "status": "covered",
       "note": "qualified: holds / releases the Run's calls"
     },
     {
       "verb": "pause-resume",
       "column": "announced-no-wire",
       "behavior": "qualified",
-      "status": "pending",
+      "status": "covered",
       "note": "qualified: holds / releases the Run's calls"
     },
     {
@@ -181,21 +181,21 @@
       "verb": "stop",
       "column": "wire",
       "behavior": "qualified",
-      "status": "pending",
+      "status": "covered",
       "note": "qualified: rejects further calls, the process keeps running"
     },
     {
       "verb": "stop",
       "column": "announced",
       "behavior": "qualified",
-      "status": "pending",
+      "status": "covered",
       "note": "qualified: rejects further calls and ends the Lease"
     },
     {
       "verb": "stop",
       "column": "announced-no-wire",
       "behavior": "qualified",
-      "status": "pending",
+      "status": "covered",
       "note": "qualified: rejects further calls and ends the Lease"
     },
     {
@@ -265,28 +265,28 @@
       "verb": "hold-release-reroute-reject",
       "column": "wire",
       "behavior": "honored",
-      "status": "pending",
+      "status": "covered",
       "note": "honored"
     },
     {
       "verb": "hold-release-reroute-reject",
       "column": "announced",
       "behavior": "honored",
-      "status": "pending",
+      "status": "covered",
       "note": "honored"
     },
     {
       "verb": "hold-release-reroute-reject",
       "column": "announced-no-wire",
       "behavior": "honored",
-      "status": "pending",
+      "status": "covered",
       "note": "honored"
     },
     {
       "verb": "hold-release-reroute-reject",
       "column": "supervised",
       "behavior": "honored",
-      "status": "pending",
+      "status": "covered",
       "note": "honored"
     },
     {
@@ -307,14 +307,14 @@
       "verb": "breach-action-pause-stop-block",
       "column": "wire",
       "behavior": "honored",
-      "status": "pending",
+      "status": "covered",
       "note": "as the verbs above (block as reject), latched until the ceiling is raised or reset"
     },
     {
       "verb": "breach-action-pause-stop-block",
       "column": "announced",
       "behavior": "honored",
-      "status": "pending",
+      "status": "covered",
       "note": "as the verbs above (block as reject), latched until the ceiling is raised or reset"
     },
     {

@@ -160,7 +160,7 @@ fn render(
                         .display_with_wire(item.record.wire_path),
                     item.custody.as_ref(),
                 )),
-                ui::TableCell::status(item.record.status.as_str()),
+                ui::TableCell::status(status_cell(item)),
                 ui::TableCell::plain(anomalies_cell(item)),
                 ui::TableCell::plain(labels_cell(item)),
                 ui::TableCell::plain(usage_cell(item)),
@@ -393,6 +393,19 @@ fn invalid(message: String) -> Box<dyn std::error::Error> {
     RunInvalid { message }.into()
 }
 
+/// The STATUS cell (story 23-4): a held Run with parked calls shows how
+/// many and how long the oldest has waited.
+pub(crate) fn status_cell(item: &hekma_engine::RunSummary) -> String {
+    let status = item.record.status.as_str();
+    if item.held_calls == 0 {
+        return status.to_string();
+    }
+    match item.oldest_held_age_secs {
+        Some(age) => format!("{status} ({} calls, oldest {age}s)", item.held_calls),
+        None => format!("{status} ({} calls)", item.held_calls),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,6 +439,10 @@ mod tests {
             identity: None,
             before_shared_proxy: false,
             custody: None,
+            dispositions: Vec::new(),
+            held_calls: 0,
+            oldest_held_age_secs: None,
+            last_hold_end: None,
         }
     }
 
@@ -698,5 +715,16 @@ mod tests {
         .unwrap_err();
         assert!(err.is::<RunInvalid>(), "{err}");
         assert!(err.to_string().contains("no-equals"), "{err}");
+    }
+
+    #[test]
+    fn a_held_run_shows_its_parked_calls_and_the_oldest_age() {
+        let mut item = summary("run_01JZ6Q9G3S8V2X7K4M1N5P0R2T", false);
+        item.record.status = hekma_engine::RunStatus::Held;
+        assert_eq!(status_cell(&item), "held");
+        item.held_calls = 3;
+        assert_eq!(status_cell(&item), "held (3 calls)");
+        item.oldest_held_age_secs = Some(12);
+        assert_eq!(status_cell(&item), "held (3 calls, oldest 12s)");
     }
 }

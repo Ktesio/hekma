@@ -206,9 +206,10 @@ impl super::SqliteStore {
             .execute(
                 "INSERT OR IGNORE INTO calls.calls (call_id, run_id, token_id, control_depth, \
                  binding, disposition, outcome, status, status_class, model, input_tokens, \
-                 output_tokens, cached_tokens, started_at, ended_at, latency_us, upstream_us) \
+                 output_tokens, cached_tokens, started_at, ended_at, latency_us, upstream_us, \
+                 hold_end) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                 ?16, ?17)",
+                 ?16, ?17, ?18)",
                 rusqlite::params![
                     record.call_id,
                     record.run_id.as_str(),
@@ -227,6 +228,7 @@ impl super::SqliteStore {
                     record.ended_at,
                     record.latency_us.min(i64::MAX as u64) as i64,
                     opt_i64(record.upstream_us),
+                    record.hold_end,
                 ],
             )
             .map_err(backend)?;

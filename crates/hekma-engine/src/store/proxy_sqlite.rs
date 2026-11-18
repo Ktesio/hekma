@@ -429,6 +429,27 @@ impl super::SqliteStore {
     }
 
     /// A binding's routes, by name.
+    /// The reroute target `binding/route` names (story 23-4), or `None`
+    /// when the binding or the route no longer exists.
+    pub(crate) fn reroute_target(
+        &self,
+        reference: &str,
+    ) -> Result<Option<crate::domain::runs::snapshot::RerouteTarget>, StoreError> {
+        let Some((binding, route)) = reference.split_once('/') else {
+            return Ok(None);
+        };
+        Ok(self
+            .binding_routes(binding)?
+            .into_iter()
+            .find(|row| row.route == route)
+            .map(|row| crate::domain::runs::snapshot::RerouteTarget {
+                binding: binding.to_string(),
+                route: row.route,
+                upstream: std::sync::Arc::from(row.upstream.as_str()),
+                custodied_key: row.custodied_key,
+            }))
+    }
+
     pub(crate) fn binding_routes(&self, name: &str) -> Result<Vec<RouteRow>, StoreError> {
         let mut stmt = self
             .conn()

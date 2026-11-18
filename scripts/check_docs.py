@@ -148,6 +148,11 @@ KT_COMMANDS = {
     "calls",
     "ps",
     "serve",
+    # Story 23-4: the hold family is top-level.
+    "hold",
+    "release",
+    "reroute",
+    "reject",
 }
 # `hekma run` owns its own subcommand tree (crates/hekma/src/lib.rs `RunCommands`).
 RUN_COMMANDS = {"open", "close", "show", "keys", "revoke-keys"}

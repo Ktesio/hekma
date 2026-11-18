@@ -703,6 +703,10 @@ mod tests {
             custody: None,
             last_activity_at: None,
             lease_expires_at: None,
+            dispositions: Vec::new(),
+            held_calls: 0,
+            oldest_held_at: None,
+            last_hold_end: None,
         }
     }
 

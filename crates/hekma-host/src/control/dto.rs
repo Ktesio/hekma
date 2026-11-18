@@ -1024,6 +1024,44 @@ pub(crate) struct SetActRequest {
     pub timeout_ms: Option<u64>,
 }
 
+/// `POST /v0/runs/{id}/reroute` (story 23-4): the route, or `null` to
+/// return the Run to its own upstream.
+#[derive(Deserialize)]
+pub(crate) struct RerouteRequest {
+    /// `<binding>/<route>`, or `null`.
+    pub route: Option<String>,
+}
+
+/// The hold-family set forms (story 23-4): the set token, and for reroute
+/// the route (or `null`).
+#[derive(Deserialize)]
+pub(crate) struct SetDispositionRequest {
+    /// The token `POST /v0/runs/select` answered.
+    pub set_token: String,
+    /// `reroute` only.
+    #[serde(default)]
+    pub route: Option<String>,
+}
+
+/// A hold-family verb's answer on one Run (story 23-4).
+#[derive(Serialize)]
+pub(crate) struct DispositionDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The Run.
+    pub run_id: String,
+    /// Whether the verb changed anything.
+    pub changed: bool,
+    /// The verb reasons standing afterwards.
+    pub reasons: Vec<String>,
+    /// What the verb does and does not do.
+    pub note: &'static str,
+}
+
+/// The note every hold-family answer carries.
+pub(crate) const DISPOSITION_NOTE: &str = "This acts on the Run's model calls at the metering \
+     proxy. The process keeps running, and calls already sent complete and are billed.";
+
 /// `PATCH /v0/runs/labels` — bind and unbind labels on a selected set.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

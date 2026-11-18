@@ -98,16 +98,54 @@ impl RevokedSet {
     }
 }
 
-/// The `block` and breach reasons of a Run (story 23-1, AD-25): one bit
-/// per `(dimension, scope)` in [`crate::domain::FENCE_REASON_ORDER`].
-/// Shaped for the hold/reject/reroute reasons a later story adds.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Where a rerouted Run's calls go (story 23-4): a route an Operator
+/// configured on a binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RerouteTarget {
+    pub binding: String,
+    pub route: String,
+    /// The route's upstream base URL.
+    pub upstream: Arc<str>,
+    /// The route's own custodied-key reference (`secret:NAME`), when set.
+    pub custodied_key: Option<String>,
+}
+
+/// What the proxy does with a call (story 23-4, AD-25's precedence).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Effective<'a> {
+    /// Refused: a verb reject, or a breach latched under `block` or `stop`.
+    Reject,
+    /// Parked: a verb hold, or a breach latched under `pause`.
+    Hold,
+    /// Forwarded to the route.
+    Reroute(&'a RerouteTarget),
+    /// Forwarded as usual.
+    Pass,
+}
+
+/// A Run's disposition reasons (story 23-1, AD-25; story 23-4 fills the
+/// verb reasons): breach bits — one per `(dimension, scope)` in
+/// [`crate::domain::FENCE_REASON_ORDER`], by the latch's action — and the
+/// verb reasons from `run_dispositions`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Disposition {
     /// Reasons latched under `block`: the proxy refuses the Run's (and its
     /// descendants') non-safe calls while any is set.
     pub breach_block: u8,
+    /// Reasons latched under `pause` at a depth with a wire path (story
+    /// 23-4): the Run's calls are held.
+    pub breach_pause: u8,
+    /// Reasons latched under `stop` at a depth with a wire path (story
+    /// 23-4): the Run's calls are refused, as under `block`.
+    pub breach_stop: u8,
     /// Reasons latched under any action: `x-hekma-breach` names them.
     pub breach_latched: u8,
+    /// An Operator's hold (story 23-4).
+    pub verb_hold: bool,
+    /// An Operator's reject (story 23-4).
+    pub verb_reject: bool,
+    /// An Operator's reroute (story 23-4).
+    pub reroute: Option<Arc<RerouteTarget>>,
 }
 
 impl Disposition {
@@ -130,19 +168,45 @@ impl Disposition {
             .collect()
     }
 
-    /// The disposition of a Run's latch rows.
+    /// The disposition of a Run's latch rows. Story 23-4: a latch under
+    /// `pause` holds and one under `stop` refuses — the proxy only reads
+    /// these for a Run with a wire path (a process-owning Run's own
+    /// `pause`/`stop` act on its process).
     pub(crate) fn of_latches(
         latches: &[(crate::domain::LatchKey, crate::domain::BreachAction)],
     ) -> Self {
+        use crate::domain::BreachAction;
         let mut disposition = Self::default();
         for (key, action) in latches {
             let bit = Self::bit(*key);
             disposition.breach_latched |= bit;
-            if *action == crate::domain::BreachAction::Block {
-                disposition.breach_block |= bit;
+            match action {
+                BreachAction::Block => disposition.breach_block |= bit,
+                BreachAction::Pause => disposition.breach_pause |= bit,
+                BreachAction::Stop => disposition.breach_stop |= bit,
+                BreachAction::Warn => {}
             }
         }
         disposition
+    }
+
+    /// The breach reasons that refuse a call (`block`, and `stop`).
+    pub(crate) fn refusing_breaches(&self) -> u8 {
+        self.breach_block | self.breach_stop
+    }
+
+    /// What the proxy does with a call (AD-25's precedence: reject and
+    /// breach `block`/`stop` > hold and breach `pause` > reroute > pass).
+    pub(crate) fn effective(&self) -> Effective<'_> {
+        if self.verb_reject || self.refusing_breaches() != 0 {
+            Effective::Reject
+        } else if self.verb_hold || self.breach_pause != 0 {
+            Effective::Hold
+        } else if let Some(target) = &self.reroute {
+            Effective::Reroute(target)
+        } else {
+            Effective::Pass
+        }
     }
 }
 
@@ -354,6 +418,19 @@ impl RunSnapshot {
         for entry in &chain {
             over.breach_block |= entry.disposition.breach_block;
             over.breach_latched |= entry.disposition.breach_latched;
+            // Story 23-4: the hold, reject and reroute reasons apply
+            // beneath their Run too; the nearest reroute wins.
+            // A process-owning Run's own breach `pause`/`stop` act on its
+            // process (the supervisor's ladder), not on its calls.
+            if !entry.record.process_owner {
+                over.breach_pause |= entry.disposition.breach_pause;
+                over.breach_stop |= entry.disposition.breach_stop;
+            }
+            over.verb_hold |= entry.disposition.verb_hold;
+            over.verb_reject |= entry.disposition.verb_reject;
+            if over.reroute.is_none() {
+                over.reroute.clone_from(&entry.disposition.reroute);
+            }
             if let Some((_, bits)) = self.pending_routes.get(&entry.record.run_id) {
                 over.breach_block |= bits;
             }

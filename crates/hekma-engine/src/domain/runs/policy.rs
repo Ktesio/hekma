@@ -1773,9 +1773,25 @@ mod tests {
 
     #[test]
     fn an_action_the_depth_cannot_execute_falls_back_to_warn() {
+        // Story 23-4: with a wire path an announced Run's `pause` holds its
+        // calls; with none (an announced child of a self-reported agent) it
+        // still falls back.
         let mut input = input(&[("team", "core")]);
         input.depth = ControlDepth::Announced;
         input.wire_path = true;
+        input.policies = vec![
+            PolicyRecord::default_policy(),
+            policy(
+                "p",
+                "team=core",
+                PolicyLimits {
+                    breach_action: Some(BreachAction::Pause),
+                    ..PolicyLimits::default()
+                },
+            ),
+        ];
+        assert_eq!(resolve(&input).effective_action, BreachAction::Pause);
+        input.wire_path = false;
         input.policies = vec![
             PolicyRecord::default_policy(),
             policy(

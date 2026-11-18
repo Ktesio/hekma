@@ -2489,7 +2489,10 @@ impl Engine {
                 .ok_or_else(|| RunError::NotFound {
                     run_id: run_id.as_str().to_string(),
                 })?;
-            crate::domain::runs::verbs::run_verb_target(verb, &record)?;
+            // Story 23-4: on a wire Run the verb maps to a disposition.
+            if crate::domain::runs::verbs::disposition_for(verb, &record).is_none() {
+                crate::domain::runs::verbs::run_verb_target(verb, &record)?;
+            }
             Ok(record)
         })
         .await
@@ -2776,6 +2779,30 @@ impl Engine {
             let registry = inner.registry.lock().expect("registry mutex poisoned");
             let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
             supervisor.ingest_telemetry(&registry, report, inner.leases)
+        })
+        .await
+    }
+
+    /// Hold, release, reroute or reject one Run's model calls at the shared
+    /// Metering Proxy (story 23-4). Each verb sets or clears only its own
+    /// reason; the proxy acts on the strongest over the Run's ancestor chain
+    /// (reject > hold > reroute > pass) from the next published snapshot.
+    /// A Run with no wire path fails fast naming its depth or Metering
+    /// Source. `set_by` is recorded (`operator`, `host`).
+    pub async fn set_disposition(
+        &self,
+        run_id: &str,
+        verb: crate::domain::DispositionVerb,
+        set_by: &str,
+    ) -> Result<crate::domain::DispositionOutcome, RunError> {
+        self.refuse_if_read_only().map_err(RunError::Store)?;
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        let set_by = set_by.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.set_disposition(&registry, &run_id, verb, &set_by)
         })
         .await
     }
@@ -4146,6 +4173,18 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.ingest_telemetry(report))
+    }
+
+    /// Blocking twin of [`Engine::set_disposition`].
+    pub fn set_disposition(
+        &self,
+        run_id: &str,
+        verb: crate::domain::DispositionVerb,
+        set_by: &str,
+    ) -> Result<crate::domain::DispositionOutcome, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.set_disposition(run_id, verb, set_by))
     }
 
     /// Blocking twin of [`Engine::heartbeat`].

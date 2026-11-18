@@ -624,6 +624,26 @@ A label set here is bound with origin `label-verb`: it outranks the agent's
 `labels.<key>` configuration and any caller label on the key, and stays with
 the Run across a relaunch.
 
+## `hekma hold|release|reject <run-id|--selector <selector>>` / `hekma reroute <run-id|--selector <selector>> --via <binding>/<route>|--off` `[--dry-run] [--yes] [--json]`
+
+Act on a Run's model calls at the [metering proxy](metering-proxy.md#hold-release-reroute-and-reject): hold them, release them, send them to another binding route, or refuse them. The process keeps running, and calls already sent complete and are billed.
+
+```bash
+hekma hold run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
+hekma reroute --selector team=core --via openai/backup --yes
+hekma release --selector team=core --yes
+hekma reroute run_01JZ6Q9G3S8V2X7K4M1N5P0R2T --off
+hekma reject run_01JZ6Q9G3S8V2X7K4M1N5P0R2T --json
+```
+
+- Each verb sets or clears only its own reason, and prints the reasons standing afterwards. `release` leaves a reroute or a reject in place; a reject lasts until the Run ends.
+- `reroute` takes exactly one of `--via <binding>/<route>` (a route stored with `hekma binding route add`) or `--off`.
+- Held calls are released in the order they arrived, each checked again first. Each Run holds at most 32; past that, calls get a retryable `503 hekma_hold_full`.
+- `--selector`, `--dry-run`, `--yes` and `--json` work as for every set-taking verb: the set is listed and confirmed when it holds more than one Run, and each Run reports its own result.
+- Exit `3` for an unknown Run, `4` for a Run whose state refuses the verb (ended, `observed`, or calls that skip the metering proxy), `2` for an invalid request.
+
+`hekma agent pause`, `resume`, `stop` and `drain` given such a Run's id act on its calls the same way (`pause` holds, `resume` releases, `stop` and `drain` reject and end the Run), with a note saying so.
+
 ## `hekma budget show|set <run-id|agent|--selector <selector>> [flags] [--dry-run] [--yes] [--json]`
 
 Read and set the limits of Runs (see [Runs: limits on a Run](runs.md#run-limits)).

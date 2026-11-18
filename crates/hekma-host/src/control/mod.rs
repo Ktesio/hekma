@@ -242,6 +242,15 @@ fn router(state: ApiState) -> Router {
         // Story 23-3: inbound OTLP/HTTP+JSON under an announce credential.
         .route("/v1/metrics", post(crate::otlp::intake::metrics_intake))
         .route("/v0/runs/{id}/heartbeat", post(routes::run_heartbeat))
+        // Story 23-4: the hold family, single-Run and set forms.
+        .route("/v0/runs/{id}/hold", post(routes::run_hold))
+        .route("/v0/runs/{id}/release", post(routes::run_release))
+        .route("/v0/runs/{id}/reject", post(routes::run_reject))
+        .route("/v0/runs/{id}/reroute", post(routes::run_reroute))
+        .route("/v0/runs/hold", post(routes::runs_hold))
+        .route("/v0/runs/release", post(routes::runs_release))
+        .route("/v0/runs/reject", post(routes::runs_reject))
+        .route("/v0/runs/reroute", post(routes::runs_reroute))
         .route("/v0/runs/{id}/revoke-keys", post(routes::run_revoke_keys))
         .route("/v0/runs/{id}/keys", get(routes::run_keys))
         // Story 21-6: the Run-grain lifecycle verbs, Run-level limits, and

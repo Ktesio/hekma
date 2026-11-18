@@ -109,7 +109,10 @@ use crate::ports::{
 /// v21 (story 23-3): `telemetry_counters`, the last cumulative token count
 /// inbound telemetry reported per (Run, token type) — see
 /// [`super::runs_sqlite`].
-pub(crate) const SCHEMA_VERSION: i64 = 21;
+/// v22 (story 23-4): wire dispositions — `run_dispositions` (the verb
+/// hold/reject/reroute reasons) and the held-call columns on `runs` — see
+/// [`super::runs_sqlite`].
+pub(crate) const SCHEMA_VERSION: i64 = 22;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -772,6 +775,11 @@ fn migrate(
     // crash-atomic step, one-way, no backfill).
     if version < 21 {
         super::runs_sqlite::migrate_v21(conn)?;
+    }
+    // Story 23-4: v22 adds the wire dispositions (one crash-atomic step,
+    // one-way, no backfill).
+    if version < 22 {
+        super::runs_sqlite::migrate_v22(conn)?;
     }
     Ok(notes)
 }

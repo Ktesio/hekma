@@ -727,6 +727,13 @@ pub(crate) fn commit_proxied_call(
 ) -> Result<(), StoreError> {
     let store = ctx.store();
     store.insert_call_record(&close.record)?;
+    // Story 23-4: a held call that ended without a release names how on
+    // its Run (`last_hold_end`).
+    if let Some(end) = close.record.hold_end.as_deref() {
+        if !matches!(end, "released" | "rerouted" | "rejected") {
+            store.set_last_hold_end(&close.record.run_id, end)?;
+        }
+    }
     // Story 23-2: every identified call is activity on its Run — a refused
     // one too (a client still trying is alive): `last_activity_at` moves,
     // a held Lease extends, a `silent` Run returns to `active`.
