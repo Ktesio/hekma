@@ -4,6 +4,11 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — Control API body shapes.**
+> Announced ahead of the release that ships it:
+>
+> - **`start`, `stop` and `drain` bodies must be JSON objects.** A present body that is not the JSON object shape is refused `400 invalid_body` before anything runs, naming the expected shape: the bare sequence forms serde's derived reader used to accept (`[true]` a detached start, `[30]` a stop window, `[1500]` a drain bound) are refusals now. A body with a duplicate key (`{"timeout_ms":1,"timeout_ms":null}`) stays a `400 invalid_body`, as before — the derived visitor has always rejected repeated keys; only the sequence forms change behaviour. A truly absent body still means each verb's own default — the manifest drain tier or the engine's stop window.
+
 > **Unreleased — bound labels: `hekma label` (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >
