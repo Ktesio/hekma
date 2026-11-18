@@ -238,6 +238,8 @@ fn router(state: ApiState) -> Router {
         // path: the credential names its Run), revoke a Run's keys, list
         // a Run's key metadata.
         .route("/v0/runs/refresh", post(routes::run_refresh))
+        .route("/v0/runs/announce", post(routes::run_announce))
+        .route("/v0/runs/{id}/heartbeat", post(routes::run_heartbeat))
         .route("/v0/runs/{id}/revoke-keys", post(routes::run_revoke_keys))
         .route("/v0/runs/{id}/keys", get(routes::run_keys))
         // Story 21-6: the Run-grain lifecycle verbs, Run-level limits, and

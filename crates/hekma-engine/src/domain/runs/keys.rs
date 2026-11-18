@@ -717,6 +717,14 @@ pub(crate) fn open_child_as<S: RunRecords + crate::ports::RunStore + ?Sized>(
                     max: super::MAX_CALLER_OPEN_CHILDREN,
                 });
             }
+            // Story 23-2 (L8): the root's whole subtree is capped too, so a
+            // key cannot fan out 1,000 children on every level.
+            if super::announce::root_is_full(store, &parent_id)? {
+                return Err(RunError::TooManyCallerRuns {
+                    scope: format!("the Run tree above `{}`", parent_id.as_str()),
+                    max: super::MAX_ROOT_OPEN_DESCENDANTS,
+                });
+            }
         }
     }
     let minted = run_id.clone();

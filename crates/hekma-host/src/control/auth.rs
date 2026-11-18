@@ -28,7 +28,10 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use hekma_engine::{CredentialMatch, PresentedState, SecretString, TokenClass};
+use hekma_engine::{
+    AnnounceCredential, AnnounceCredentialState, CredentialMatch, PresentedState, SecretString,
+    TokenClass,
+};
 
 use super::error::ApiError;
 use super::ApiState;
@@ -45,7 +48,8 @@ pub(crate) enum CredentialClass {
     RunKey,
     /// A single-use refresh credential (`hk_ref_`).
     Refresh,
-    /// An announce credential (`hk_ann_`): no route yet takes one.
+    /// A binding's announce credential (`hk_ann_`, story 23-2): announce
+    /// beneath its binding, and heartbeat or close the Runs it created.
     Announce,
     /// A per-binding proxy-access credential (`hk_pxy_`): nothing accepts
     /// one in this release (the authenticated proxy beyond loopback does).
@@ -75,11 +79,10 @@ impl CredentialClass {
 }
 
 /// The route families a credential may be presented on (the matrix's
-/// columns, story 22-1). `Proxy`, `Heartbeat` and `OtlpIntake` have no
-/// Control API route yet; their cells are pinned for the stories that add
-/// them.
+/// columns, story 22-1). `Proxy` and `OtlpIntake` have no Control API
+/// route; their cells are pinned for the stories that add them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // `Proxy`, `Heartbeat`, `OtlpIntake`: pinned, no route yet.
+#[allow(dead_code)] // `Proxy`, `OtlpIntake`: pinned, no route here.
 pub(crate) enum RouteFamily {
     /// Every route that is not one of the Caller families: the fleet,
     /// instances, config, labels, Policies, the listing, a Run's read,
@@ -95,8 +98,11 @@ pub(crate) enum RouteFamily {
     RunRefresh,
     /// The shared Metering Proxy (no consumer until it exists).
     Proxy,
-    /// A Run's heartbeat (with Leases).
+    /// `POST /v0/runs/{id}/heartbeat` — renew a Run's Lease (story 23-2).
     Heartbeat,
+    /// `POST /v0/runs/announce` — announce a Run beneath a binding (story
+    /// 23-2).
+    Announce,
     /// OTLP intake.
     OtlpIntake,
 }
@@ -104,7 +110,7 @@ pub(crate) enum RouteFamily {
 impl RouteFamily {
     /// Every family (the matrix's columns).
     #[cfg(test)]
-    pub(crate) const ALL: [RouteFamily; 8] = [
+    pub(crate) const ALL: [RouteFamily; 9] = [
         RouteFamily::Operator,
         RouteFamily::RunOpen,
         RouteFamily::RunClose,
@@ -113,6 +119,7 @@ impl RouteFamily {
         RouteFamily::Proxy,
         RouteFamily::Heartbeat,
         RouteFamily::OtlpIntake,
+        RouteFamily::Announce,
     ];
 
     /// The family a Control API request belongs to, by method and path.
@@ -121,6 +128,8 @@ impl RouteFamily {
         match (method, segments.as_slice()) {
             (&Method::POST, ["", "v0", "runs"]) => RouteFamily::RunOpen,
             (&Method::POST, ["", "v0", "runs", "refresh"]) => RouteFamily::RunRefresh,
+            (&Method::POST, ["", "v0", "runs", "announce"]) => RouteFamily::Announce,
+            (&Method::POST, ["", "v0", "runs", _, "heartbeat"]) => RouteFamily::Heartbeat,
             (&Method::POST, ["", "v0", "runs", _, "close"]) => RouteFamily::RunClose,
             (&Method::PATCH, ["", "v0", "runs", _, "limits"]) => RouteFamily::RunLimits,
             _ => RouteFamily::Operator,
@@ -137,12 +146,19 @@ impl CredentialClass {
         use RouteFamily as F;
         match (self, family) {
             (C::OperatorBearer, F::Operator | F::RunOpen | F::RunClose | F::RunLimits) => true,
-            (C::OperatorBearer, F::RunRefresh | F::Proxy | F::Heartbeat | F::OtlpIntake) => false,
-            (C::RunKey, F::RunOpen | F::RunClose | F::RunLimits | F::Proxy) => true,
-            (C::RunKey, F::Operator | F::RunRefresh | F::Heartbeat | F::OtlpIntake) => false,
+            (
+                C::OperatorBearer,
+                F::RunRefresh | F::Proxy | F::Heartbeat | F::OtlpIntake | F::Announce,
+            ) => false,
+            // Story 23-2: a Run Key heartbeats its own subtree (the job
+            // checks the subtree).
+            (C::RunKey, F::RunOpen | F::RunClose | F::RunLimits | F::Proxy | F::Heartbeat) => true,
+            (C::RunKey, F::Operator | F::RunRefresh | F::OtlpIntake | F::Announce) => false,
             (C::Refresh, F::RunRefresh) => true,
             (C::Refresh, _) => false,
-            (C::Announce, F::Heartbeat | F::OtlpIntake) => true,
+            // Story 23-2: announce beneath its binding; heartbeat or close
+            // only the Runs it created (the jobs check `created_by_hash`).
+            (C::Announce, F::Announce | F::Heartbeat | F::OtlpIntake | F::RunClose) => true,
             (C::Announce, _) => false,
             (C::ProxyAccess, _) => false,
         }
@@ -160,6 +176,9 @@ pub(crate) enum Authority {
     /// A refresh credential, passed to the refresh job (which reads the
     /// store: refresh credentials are never in the snapshot).
     Refresh(Arc<SecretString>),
+    /// A binding's announce credential (story 23-2), re-validated by each
+    /// job it reaches.
+    Announcer(AnnounceCredential),
 }
 
 impl Authority {
@@ -171,7 +190,18 @@ impl Authority {
         match self {
             Authority::Operator => Ok(hekma_engine::RunActor::Operator),
             Authority::Caller(matched) => Ok(matched.actor()),
-            Authority::Refresh(_) => Err(ApiError::forbidden()),
+            Authority::Refresh(_) | Authority::Announcer(_) => Err(ApiError::forbidden()),
+        }
+    }
+
+    /// The engine actor for a Lease verb (story 23-2: heartbeat, close):
+    /// the Operator, a Run Key's Caller, or an announcer.
+    pub(crate) fn lease_actor(&self) -> Result<hekma_engine::LeaseActor, ApiError> {
+        match self {
+            Authority::Announcer(credential) => {
+                Ok(hekma_engine::LeaseActor::Announcer(credential.clone()))
+            }
+            other => other.actor().map(hekma_engine::LeaseActor::Actor),
         }
     }
 }
@@ -459,7 +489,7 @@ async fn authorize(
     presented: Option<&str>,
     family: RouteFamily,
 ) -> Result<Authority, ApiError> {
-    let Some((_, secret)) = presented.and_then(hekma_engine::parse_presented) else {
+    let Some((class, secret)) = presented.and_then(hekma_engine::parse_presented) else {
         return match state.resolver.resolve(presented) {
             Some(class) if class.allows(family) => Ok(Authority::Operator),
             Some(_) => Err(ApiError::forbidden()),
@@ -470,6 +500,9 @@ async fn authorize(
         };
     };
     let presented = presented.unwrap_or_default();
+    if class == TokenClass::Announce {
+        return authorize_announcer(state, presented, family).await;
+    }
     // Resolve before anything is locked or written: the lock-free snapshot,
     // then one read on the engine's credential reader. Only a credential
     // that resolves goes further.
@@ -518,6 +551,40 @@ async fn authorize(
         state.auth_diagnostics.unresolved(Some(presented));
     }
     gated
+}
+
+/// Resolve and authorize an announce credential (story 23-2): one read on
+/// the engine's credential reader — never a lock or a writer job.
+async fn authorize_announcer(
+    state: &ApiState,
+    presented: &str,
+    family: RouteFamily,
+) -> Result<Authority, ApiError> {
+    match state.engine.announce_credential(presented).await {
+        Ok(AnnounceCredentialState::Active(credential)) => {
+            if CredentialClass::Announce.allows(family) {
+                Ok(Authority::Announcer(credential))
+            } else {
+                Err(ApiError::forbidden())
+            }
+        }
+        Ok(AnnounceCredentialState::Revoked) => Err(ApiError::credential_revoked()),
+        Ok(AnnounceCredentialState::Unknown) => {
+            if let Some(class) = state.resolver.resolve(Some(presented)) {
+                return if class.allows(family) {
+                    Ok(Authority::Operator)
+                } else {
+                    Err(ApiError::forbidden())
+                };
+            }
+            state.auth_diagnostics.unresolved(Some(presented));
+            Err(ApiError::unauthorized())
+        }
+        Err(err) => {
+            state.auth_diagnostics.check_failed(&err.to_string());
+            Err(ApiError::credential_check_failed())
+        }
+    }
 }
 
 /// The decision over a recognised engine credential (pure): P5 first — a
@@ -618,14 +685,17 @@ mod tests {
             (C::OperatorBearer, F::Proxy, false),
             (C::OperatorBearer, F::Heartbeat, false),
             (C::OperatorBearer, F::OtlpIntake, false),
+            (C::OperatorBearer, F::Announce, false),
             (C::RunKey, F::Operator, false),
             (C::RunKey, F::RunOpen, true),
             (C::RunKey, F::RunClose, true),
             (C::RunKey, F::RunLimits, true),
             (C::RunKey, F::RunRefresh, false),
             (C::RunKey, F::Proxy, true),
-            (C::RunKey, F::Heartbeat, false),
+            // Story 23-2: a Run Key heartbeats its own subtree.
+            (C::RunKey, F::Heartbeat, true),
             (C::RunKey, F::OtlpIntake, false),
+            (C::RunKey, F::Announce, false),
             (C::Refresh, F::Operator, false),
             (C::Refresh, F::RunOpen, false),
             (C::Refresh, F::RunClose, false),
@@ -634,14 +704,17 @@ mod tests {
             (C::Refresh, F::Proxy, false),
             (C::Refresh, F::Heartbeat, false),
             (C::Refresh, F::OtlpIntake, false),
+            (C::Refresh, F::Announce, false),
             (C::Announce, F::Operator, false),
             (C::Announce, F::RunOpen, false),
-            (C::Announce, F::RunClose, false),
+            // Story 23-2: an announcer closes the Runs it created.
+            (C::Announce, F::RunClose, true),
             (C::Announce, F::RunLimits, false),
             (C::Announce, F::RunRefresh, false),
             (C::Announce, F::Proxy, false),
             (C::Announce, F::Heartbeat, true),
             (C::Announce, F::OtlpIntake, true),
+            (C::Announce, F::Announce, true),
             (C::ProxyAccess, F::Operator, false),
             (C::ProxyAccess, F::RunOpen, false),
             (C::ProxyAccess, F::RunClose, false),
@@ -650,6 +723,7 @@ mod tests {
             (C::ProxyAccess, F::Proxy, false),
             (C::ProxyAccess, F::Heartbeat, false),
             (C::ProxyAccess, F::OtlpIntake, false),
+            (C::ProxyAccess, F::Announce, false),
         ];
         assert_eq!(table.len(), C::ALL.len() * F::ALL.len());
         for (class, family, allowed) in table {
@@ -688,7 +762,8 @@ mod tests {
         )
         .is_ok());
         // Every class × family cell through the gate agrees with the table;
-        // the announce credential is refused on every Control API family.
+        // the announce credential is refused on every Control API family but
+        // its own (announce, heartbeat, close — story 23-2).
         for class in [
             TokenClass::RunKey,
             TokenClass::Refresh,
@@ -707,7 +782,6 @@ mod tests {
         for family in [
             RouteFamily::Operator,
             RouteFamily::RunOpen,
-            RouteFamily::RunClose,
             RouteFamily::RunLimits,
             RouteFamily::RunRefresh,
         ] {
@@ -726,6 +800,24 @@ mod tests {
         // A refresh credential acts as no one: never the Operator.
         let refresh = Authority::Refresh(Arc::new(SecretString::new("hk_ref_x")));
         assert!(refresh.actor().unwrap_err().is_forbidden());
+        assert!(refresh.lease_actor().unwrap_err().is_forbidden());
+        // Story 23-2: an announcer is no Run actor, but is a Lease actor.
+        let announcer = Authority::Announcer(hekma_engine::AnnounceCredential {
+            binding: "openai".to_string(),
+            token_id: "0123456789ab".to_string(),
+            hash: hekma_engine::TokenHash::of_token("hk_ann_x"),
+        });
+        assert!(announcer.actor().unwrap_err().is_forbidden());
+        assert!(matches!(
+            announcer.lease_actor(),
+            Ok(hekma_engine::LeaseActor::Announcer(_))
+        ));
+        assert!(matches!(
+            Authority::Operator.lease_actor(),
+            Ok(hekma_engine::LeaseActor::Actor(
+                hekma_engine::RunActor::Operator
+            ))
+        ));
         // A supervised launch's refresh credential follows the same
         // loopback-only rule as its Run Key.
         assert!(gate(
@@ -750,6 +842,10 @@ mod tests {
             (Method::POST, "/v0/runs", F::RunOpen),
             (Method::GET, "/v0/runs", F::Operator),
             (Method::POST, "/v0/runs/refresh", F::RunRefresh),
+            (Method::POST, "/v0/runs/announce", F::Announce),
+            (Method::GET, "/v0/runs/announce", F::Operator),
+            (Method::POST, "/v0/runs/run_1/heartbeat", F::Heartbeat),
+            (Method::GET, "/v0/runs/run_1/heartbeat", F::Operator),
             (Method::POST, "/v0/runs/run_1/close", F::RunClose),
             (Method::POST, "/v0/runs/close", F::Operator),
             (Method::PATCH, "/v0/runs/run_1/limits", F::RunLimits),

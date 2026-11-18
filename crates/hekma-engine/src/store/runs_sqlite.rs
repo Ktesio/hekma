@@ -183,7 +183,7 @@ pub(super) fn selector_arms_sql(selector: &Selector, first: usize) -> (String, V
 ///   proxy); `process_owner = 1` marks the supervised Run that owns the
 ///   instance's process, at most one non-ended per instance (partial unique
 ///   index). `anomalies` is a sorted comma list (`''` = none), indexed for
-///   exception-first reads. `lease_expires_at` stays NULL until Leases exist.
+///   exception-first reads. `lease_expires_at` stayed NULL until v20 gave Runs Leases.
 /// * `run_labels` — `key=value` with its source; indexed on (key, value)
 ///   for Selector matching.
 /// * `run_limits` — ceilings set directly on a Run (dimension, scope).
@@ -572,6 +572,80 @@ ALTER TABLE runs ADD COLUMN custody_reason TEXT;
 ALTER TABLE runs ADD COLUMN custody_origin TEXT;
 ALTER TABLE runs ADD COLUMN custody_key_ref TEXT;
 ";
+
+/// Schema v20 (story 23-2): Leases. Two additive columns (`lease_expires_at`
+/// has been reserved, always NULL, since v13) and the two partial indexes the sweeper reads (open, non-process-owner Runs by Lease
+/// expiry and by last activity); `last_activity_at` is seeded from
+/// `updated_at` for open Runs. No Run's status or depth changes here.
+const SCHEMA_V20: &str = "\
+ALTER TABLE runs ADD COLUMN last_activity_at TEXT;
+ALTER TABLE runs ADD COLUMN created_by_hash BLOB;
+UPDATE runs SET last_activity_at = updated_at WHERE status <> 'ended';
+CREATE INDEX IF NOT EXISTS idx_runs_lease ON runs(lease_expires_at)
+    WHERE status <> 'ended' AND process_owner = 0 AND lease_expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_runs_activity ON runs(last_activity_at)
+    WHERE status <> 'ended' AND process_owner = 0;
+";
+
+/// The sweep's Lease pass (story 23-2): rides `idx_runs_lease` (its
+/// predicate repeated literally, so SQLite uses the partial index).
+pub(crate) const SWEEP_LEASE_SQL: &str = "SELECT run_id FROM runs \
+     WHERE status <> 'ended' AND process_owner = 0 AND lease_expires_at IS NOT NULL \
+     AND lease_expires_at < ?1 AND status = 'active' ORDER BY lease_expires_at LIMIT ?2";
+
+/// The sweep's inactivity pass for Runs with no Lease (story 23-2): rides
+/// `idx_runs_activity`.
+pub(crate) const SWEEP_INACTIVE_SQL: &str = "SELECT run_id FROM runs \
+     WHERE status <> 'ended' AND process_owner = 0 AND last_activity_at < ?1 \
+     AND lease_expires_at IS NULL AND status = 'active' ORDER BY last_activity_at LIMIT ?2";
+
+/// The sweep's end pass (story 23-2): a Run `silent` since before the
+/// cutoff saw no activity since then either, so `idx_runs_activity` bounds
+/// the read; `updated_at` (the silent marking's time) decides.
+pub(crate) const SWEEP_SILENT_SQL: &str = "SELECT run_id FROM runs \
+     WHERE status <> 'ended' AND process_owner = 0 AND last_activity_at < ?1 \
+     AND status = 'silent' AND updated_at < ?1 ORDER BY last_activity_at LIMIT ?2";
+
+/// Undo v20 on a fully migrated store, for the older upgrade tests.
+#[cfg(test)]
+pub(crate) const UNDO_V20_FOR_TEST: &str = "\
+DROP INDEX idx_runs_lease;
+DROP INDEX idx_runs_activity;
+ALTER TABLE runs DROP COLUMN last_activity_at;
+ALTER TABLE runs DROP COLUMN created_by_hash;
+";
+
+/// Run the v20 step (DDL + stamp) in one `BEGIN IMMEDIATE`, stepping aside
+/// when another process finished it while this one waited.
+pub(super) fn migrate_v20(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
+    let body = || -> Result<bool, StoreError> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(backend)?;
+        if version >= 20 {
+            return Ok(false);
+        }
+        conn.execute_batch(SCHEMA_V20).map_err(backend)?;
+        conn.execute_batch("PRAGMA user_version = 20")
+            .map_err(backend)?;
+        Ok(true)
+    };
+    match body() {
+        Ok(true) => conn.execute_batch("COMMIT").map_err(|err| {
+            let _ = conn.execute_batch("ROLLBACK");
+            backend(err)
+        }),
+        Ok(false) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
+}
 
 /// Undo v19 on a fully migrated store, for the older upgrade tests (they
 /// stamp a lower version and reopen; v19's columns must be gone first).
@@ -1374,6 +1448,108 @@ impl RunRecords for SqliteStore {
         self.records(&sql, rusqlite::params_from_iter(params))
     }
 
+    fn run_lease(&self, run_id: &RunId) -> Result<(Option<String>, Option<String>), StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT lease_expires_at, last_activity_at FROM runs WHERE run_id = ?1",
+                [run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(backend)
+            .map(Option::unwrap_or_default)
+    }
+
+    fn set_run_lease(
+        &self,
+        run_id: &RunId,
+        lease_expires_at: Option<&str>,
+        last_activity_at: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "UPDATE runs SET lease_expires_at = ?2, \
+                 last_activity_at = COALESCE(?3, last_activity_at) WHERE run_id = ?1",
+                rusqlite::params![run_id.as_str(), lease_expires_at, last_activity_at],
+            )
+            .map_err(backend)
+            .map(|_| ())
+    }
+
+    fn touch_run_activity(&self, run_id: &RunId, at: &str) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "UPDATE runs SET last_activity_at = ?2 WHERE run_id = ?1",
+                rusqlite::params![run_id.as_str(), at],
+            )
+            .map_err(backend)
+            .map(|_| ())
+    }
+
+    fn runs_going_silent(
+        &self,
+        now: &str,
+        inactive_before: &str,
+        limit: usize,
+    ) -> Result<Vec<RunId>, StoreError> {
+        let mut ids = Vec::new();
+        for (sql, cutoff) in [
+            (SWEEP_LEASE_SQL, now),
+            (SWEEP_INACTIVE_SQL, inactive_before),
+        ] {
+            let mut stmt = self.conn().prepare(sql).map_err(backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params![cutoff, limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(backend)?;
+            for row in rows {
+                ids.push(RunId::from_wire(row.map_err(backend)?));
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        ids.truncate(limit);
+        Ok(ids)
+    }
+
+    fn silent_runs_past(
+        &self,
+        silent_before: &str,
+        limit: usize,
+    ) -> Result<Vec<RunId>, StoreError> {
+        let mut stmt = self.conn().prepare(SWEEP_SILENT_SQL).map_err(backend)?;
+        let rows = stmt
+            .query_map(rusqlite::params![silent_before, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(backend)?;
+        rows.map(|row| row.map(RunId::from_wire).map_err(backend))
+            .collect()
+    }
+
+    fn set_run_created_by(&self, run_id: &RunId, hash: &[u8]) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "UPDATE runs SET created_by_hash = ?2 WHERE run_id = ?1",
+                rusqlite::params![run_id.as_str(), hash],
+            )
+            .map_err(backend)
+            .map(|_| ())
+    }
+
+    fn run_created_by(&self, run_id: &RunId) -> Result<Option<Vec<u8>>, StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT created_by_hash FROM runs WHERE run_id = ?1",
+                [run_id.as_str()],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()
+            .map_err(backend)
+            .map(Option::flatten)
+    }
+
     fn identity_run(&self, binding: &str, external_id: &str) -> Result<Option<RunId>, StoreError> {
         self.conn()
             .query_row(
@@ -1391,6 +1567,25 @@ impl RunRecords for SqliteStore {
             .query_row(
                 "SELECT COUNT(*) FROM runs WHERE parent_run_id = ?1 AND status <> 'ended'",
                 [run_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n.max(0) as u64)
+            .map_err(backend)
+    }
+
+    fn open_descendants(&self, root: &RunId) -> Result<u64, StoreError> {
+        // Bounded by the nesting limit, so a cycle (impossible through the
+        // engine, which never re-parents) cannot loop.
+        self.conn()
+            .query_row(
+                "WITH RECURSIVE beneath(id, depth) AS ( \
+                     SELECT run_id, 1 FROM runs WHERE parent_run_id = ?1 \
+                     UNION ALL \
+                     SELECT r.run_id, b.depth + 1 FROM runs r JOIN beneath b \
+                     ON r.parent_run_id = b.id WHERE b.depth < ?2) \
+                 SELECT COUNT(*) FROM runs r JOIN beneath b ON r.run_id = b.id \
+                 WHERE r.status <> 'ended'",
+                rusqlite::params![root.as_str(), crate::domain::MAX_RUN_NESTING as i64],
                 |row| row.get::<_, i64>(0),
             )
             .map(|n| n.max(0) as u64)

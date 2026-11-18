@@ -539,6 +539,39 @@ impl fmt::Debug for IssuedCredentials {
     }
 }
 
+/// A binding's announce credential (`hk_ann_`) as the store resolved it
+/// (story 23-2, [`crate::Engine::announce_credential`]). Carries no token:
+/// its hash rides as an opaque [`TokenHash`] so each job re-validates it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AnnounceCredential {
+    /// The binding it was issued for (its announce namespace).
+    pub binding: String,
+    /// Its token id (a label).
+    pub token_id: String,
+    /// The hash, for the in-job re-validation.
+    pub hash: TokenHash,
+}
+
+impl fmt::Debug for AnnounceCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnnounceCredential")
+            .field("binding", &self.binding)
+            .field("token_id", &self.token_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a presented announce credential is (story 23-2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnnounceCredentialState {
+    /// Nothing was ever issued with this value.
+    Unknown,
+    /// It was issued and has been revoked (or its binding replaced it).
+    Revoked,
+    /// It is active.
+    Active(AnnounceCredential),
+}
+
 /// A presented credential the published snapshot recognised
 /// ([`crate::Engine::authenticate`]). Carries no token; its hash rides as an
 /// opaque [`TokenHash`] so a Caller-authorized job can re-validate the row.

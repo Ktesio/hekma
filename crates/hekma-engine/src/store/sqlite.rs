@@ -103,7 +103,10 @@ use crate::ports::{
 /// `runs.custody_state`/`custody_reason`/`custody_origin`/`custody_key_ref`
 /// (additive, no backfill: a Run live at upgrade honestly reads
 /// `pre-custody`) — see [`super::runs_sqlite`].
-pub(crate) const SCHEMA_VERSION: i64 = 19;
+/// v20 (story 23-2): Leases — `runs.last_activity_at`
+/// (seeded from `updated_at` for open Runs), `created_by_hash`, and the two
+/// partial indexes the sweeper reads (`lease_expires_at` exists since v13) — see [`super::runs_sqlite`].
+pub(crate) const SCHEMA_VERSION: i64 = 20;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -758,6 +761,9 @@ fn migrate(
     // default for existing rows).
     if version < 19 {
         super::runs_sqlite::migrate_v19(conn)?;
+    }
+    if version < 20 {
+        super::runs_sqlite::migrate_v20(conn)?;
     }
     Ok(notes)
 }

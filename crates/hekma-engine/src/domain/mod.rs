@@ -76,10 +76,11 @@ pub use cost::{
     CostEvaluator, EstimateLabel, Micros, Rate, MICROS_PER_DOLLAR,
 };
 pub use credential::{
-    parse_presented, CredentialChange, CredentialError, CredentialEvent, CredentialMatch,
-    CredentialSummary, IssuedCredentials, MintedToken, PresentedState, RevokeOutcome,
-    RevokedCredential, TokenClass, TokenHash, TokenState, ANNOUNCE_PREFIX,
-    CREDENTIAL_EVENT_SCHEMA_VERSION, REFRESH_PREFIX, RUN_KEY_PREFIX, TOKEN_BODY_LEN, TOKEN_ID_LEN,
+    parse_presented, AnnounceCredential, AnnounceCredentialState, CredentialChange,
+    CredentialError, CredentialEvent, CredentialMatch, CredentialSummary, IssuedCredentials,
+    MintedToken, PresentedState, RevokeOutcome, RevokedCredential, TokenClass, TokenHash,
+    TokenState, ANNOUNCE_PREFIX, CREDENTIAL_EVENT_SCHEMA_VERSION, REFRESH_PREFIX, RUN_KEY_PREFIX,
+    TOKEN_BODY_LEN, TOKEN_ID_LEN,
 };
 pub use error::{EngineError, RegistryError};
 pub use event::{
@@ -111,6 +112,7 @@ pub use outbox::{
 pub use registry::{Registry, RemoveDisposition};
 pub use registry_policy::{PolicyChange, PolicyOutcome};
 pub use resync::{ResyncBatch, ResyncCursor};
+pub use runs::announce::{Announced, LeaseActor};
 pub use runs::{
     decode_cursor, encode_cursor, ended_run_cutoff, CustodyView, LatchedBreach, ListRunsQuery,
     ListingCounts, ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument,
@@ -133,7 +135,7 @@ pub use runs::{
     LimitActor, LimitsDirection, RunLifecycleVerb, RunLimitChange, RunLimitField, RunLimitsOutcome,
     RunLimitsResults, RunLimitsView, RunVerbError,
 };
-pub use runs::{OpenedRun, RunActor, MAX_CALLER_OPEN_CHILDREN};
+pub use runs::{OpenedRun, RunActor, MAX_CALLER_OPEN_CHILDREN, MAX_ROOT_OPEN_DESCENDANTS};
 // Story 23-1: Operator endpoint bindings.
 pub use runs::bindings::{
     Binding, BindingChange, BindingCredential, BindingCredentialClass, BindingError, BindingEvent,

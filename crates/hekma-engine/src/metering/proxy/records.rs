@@ -57,6 +57,8 @@ pub(crate) struct RecordPump {
     pub inbox: Arc<EvaluationInbox>,
     pub stats: Arc<RecordStats>,
     pub diagnostics: Arc<dyn Fn(String) + Send + Sync>,
+    /// Story 23-2: the Lease knobs (a close renews its Run's Lease).
+    pub leases: crate::domain::runs::lease::LeaseOptions,
     /// cfg(test) seam: fail the next N close jobs before they write.
     #[cfg(test)]
     pub fail_closes: Arc<AtomicU64>,
@@ -141,6 +143,7 @@ fn submit_close(
     let job_close = close.clone();
     let runs = Arc::clone(&pump.runs);
     let inbox = Arc::clone(&pump.inbox);
+    let leases = pump.leases;
     #[cfg(test)]
     let fail = Arc::clone(&pump.fail_closes);
     #[cfg(test)]
@@ -159,7 +162,7 @@ fn submit_close(
             if take_one(&prerecord) {
                 ctx.store().insert_call_record(&job_close.record)?;
             }
-            pipeline::commit_proxied_call(ctx, job_close, &runs, &inbox)
+            pipeline::commit_proxied_call(ctx, job_close, &runs, &inbox, &leases)
         },
         move |outcome| match outcome {
             Ok(()) => drop(permit),

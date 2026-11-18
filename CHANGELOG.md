@@ -4,6 +4,19 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — announce and Leases: Runs for clients Hekma did not start (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **Two announce channels, one identity.** A proxied call carrying `x-hekma-announce: <id>` claims `<id>` beneath its binding (labelled or not), or a child beneath a Run Key or Run route; `POST /v0/runs/announce` claims it beneath the presented announce credential's binding (`{"external_id", "labels"?}`). Both use the namespaces `x-hekma-run` hints use, so a Run discovered on the wire and announced later stays one Run (depth `wire → announced`, one `depth-changed` event). An announce wins over a hint on the same call.
+> - **Issued once per Run.** The announce that creates a Run returns its Run Key and refresh credential once: in the `201` of the endpoint, or in the new `proxy-wire v1` response headers `x-hekma-run-key` and `x-hekma-refresh` on the announcing call (whatever status it answers, a fenced `402` included), with `cache-control: no-store`. Announcing an open identity again renews it and updates its Caller labels (`200`, no headers) and issues nothing, so a revoked key stays revoked. The endpoint's key can draw key custody; the header's never does.
+> - **Leases and `silent`.** An announced Run holds a Lease (60 s), renewed by every attributed call, a refused one included, and by the new `POST /v0/runs/{id}/heartbeat` (`204`; `409 run-ended`). The Service Host that owns the metering proxy sweeps every 5 s: a lapsed Lease, or 15 minutes without traffic for a Run with no Lease, marks the Run `silent` (one `status-changed` event); 60 minutes silent ends it with cause `silent-window`, its keys revoked at once. Silence never stops anything, and its next call or heartbeat brings it back. A binding's Run and the unattributed Run now end this way too and are recreated by the next call. Supervised Runs are never swept.
+> - **The authority matrix opens.** The announce credential (`hk_ann_`) announces beneath its binding and heartbeats or closes only the Runs it created; a Run Key heartbeats its own subtree. Every other class on the announce route is `403 forbidden`.
+> - **A per-root cap.** A Run's whole subtree holds at most 1,000 open Runs that Callers opened or announced (`409 too-many-children`; the header channel stays on the parent instead). The Operator and Hosts are not capped.
+> - **Scent-Check:** an announcing call is served under every mode, `enforce` included; under `shadow` the announced Run gets the `unscented` Anomaly.
+> - **Visible.** `hekma run show` prints LEASE and LAST SEEN; Run documents gain `lease_expires_at` and `last_activity_at`.
+> - **One-way upgrade.** The first open migrates `state.db` to schema 20 (`runs.last_activity_at`, seeded from `updated_at` for open Runs, `runs.created_by_hash`, and two partial indexes for the sweeper). No Run's status or depth changes at upgrade.
+> - **Engine surface within the unreleased `hekma-engine` 0.12.0** (no version bump): `Engine::announce_credential`, `announce`, `heartbeat` and `close_run_by` with their `Blocking` twins; `AnnounceCredential`, `AnnounceCredentialState`, `Announced`, `LeaseActor`, `LeaseOptions` (on `MeteringProxyOptions.leases`) and its default constants; `RunError::TooManyCallerRuns`; `MAX_ROOT_OPEN_DESCENDANTS`; `RunView.lease_expires_at` and `last_activity_at`.
+
 > **Unreleased — Scent-Check Modes act at the metering proxy (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >

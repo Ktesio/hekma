@@ -491,6 +491,30 @@ impl super::SqliteStore {
             .map(|n| n == 1)
     }
 
+    /// The binding and state of the announce credential with this hash
+    /// (story 23-2): `(binding, token id, active)`, or `None` when no
+    /// announce credential was ever issued with it.
+    pub(crate) fn announce_credential(
+        &self,
+        hash: &crate::domain::credential::TokenHash,
+    ) -> Result<Option<(String, String, bool)>, StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT binding, token_id, state FROM binding_credentials \
+                 WHERE token_hash = ?1 AND class = 'announce'",
+                [hash.as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)? == "active",
+                    ))
+                },
+            )
+            .optional()
+            .map_err(backend)
+    }
+
     /// Insert one active binding credential.
     pub(crate) fn insert_binding_credential(
         &self,

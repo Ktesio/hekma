@@ -98,8 +98,10 @@ checks the class against the authority matrix for the route's family. The
 token (from `control.json`) and the `--bearer-secret` value. Both work on both
 listeners. [Run Keys](#run-keys) and refresh credentials are issued by the
 engine and resolved by their hash; a credential whose class a route does not
-allow answers a typed `403 forbidden`. Announce and Node credentials arrive
-later.
+allow answers a typed `403 forbidden`. A binding's announce credential
+(`hk_ann_`) is resolved the same way, by its hash, on the announce, heartbeat
+and close routes (see [Announce and heartbeat](#announce-and-heartbeat)). Node
+credentials arrive later.
 
 A missing or wrong credential — including several `Authorization` fields, a
 scheme other than `Bearer`, or an empty value — answers `401 unauthorized` with
@@ -154,6 +156,8 @@ masked, exactly as the CLI displays it).
 | `GET` | `/v0/runs/{id}` | One Run: its row, labels, limits, subtree usage and open children | 200 |
 | `POST` | `/v0/runs/{id}/close` | Close a child Run (idempotent; a Run that owns an agent's process is a 409 — stop the instance) | 200 + the Run |
 | `POST` | `/v0/runs/refresh` | Trade a refresh credential (the bearer) once for a new Run Key and refresh credential (below) | 200 + the new pair |
+| `POST` | `/v0/runs/announce` | Announce a Run beneath the bearer announce credential's binding: `{"external_id", "labels"?}` (below) | 201 + `Location` + the Run and its pair once, or 200 + the renewed Run |
+| `POST` | `/v0/runs/{id}/heartbeat` | Renew a Run's Lease (below); `409 run-ended` on an ended Run | 204 |
 | `POST` | `/v0/runs/{id}/revoke-keys` | Revoke a Run's keys, and by default every key issued under them: `{"cascade": bool}` (Operator only, below) | 200 |
 | `GET` | `/v0/runs/{id}/keys` | A Run's credentials by token id, class, state and launch generation, never a value (Operator only, below) | 200 |
 | `GET` | `/v0/runs/{id}/labels` | One Run's labels, bound and caller, each with its `source` and (bound) `origin` | 200 |
@@ -212,7 +216,7 @@ A refusal carries an `error.code`:
 | `binding-limit` | 409 | 256 bindings, or 16 routes on one binding, already exist |
 | `binding-legacy-route` | 409 | A `/` binding while an upgraded agent holds the legacy root route |
 
-The binding credentials are issued and listed now. Nothing accepts either class yet; the answer's `note` says so.
+The binding credentials are issued and listed now. The announce credential is accepted on the [announce, heartbeat and close](#announce-and-heartbeat) routes; nothing accepts a proxy-access credential yet. The answer's `note` says which.
 
 ## Per-call records
 
@@ -330,12 +334,12 @@ Run with no `credentials`.
 **The authority matrix.** Every route belongs to one family, and every
 credential class is allowed on some families only:
 
-| Class | Operator routes | `POST /v0/runs` | `POST /v0/runs/{id}/close` | `PATCH /v0/runs/{id}/limits` | `POST /v0/runs/refresh` |
-|---|---|---|---|---|---|
-| Operator/Host bearer | yes | yes | yes | yes | `403 forbidden` |
-| Run Key | `403 forbidden` | within its subtree | within its subtree | tighten only, within its subtree | `403 forbidden` |
-| Refresh credential | `403 forbidden` | `403 forbidden` | `403 forbidden` | `403 forbidden` | yes |
-| Announce credential | `403 forbidden` | `403 forbidden` | `403 forbidden` | `403 forbidden` | `403 forbidden` |
+| Class | Operator routes | `POST /v0/runs` | `POST /v0/runs/{id}/close` | `PATCH /v0/runs/{id}/limits` | `POST /v0/runs/refresh` | `POST /v0/runs/announce` | `POST /v0/runs/{id}/heartbeat` |
+|---|---|---|---|---|---|---|---|
+| Operator/Host bearer | yes | yes | yes | yes | `403 forbidden` | `403 forbidden` | `403 forbidden` |
+| Run Key | `403 forbidden` | within its subtree | within its subtree | tighten only, within its subtree | `403 forbidden` | `403 forbidden` | within its subtree |
+| Refresh credential | `403 forbidden` | `403 forbidden` | `403 forbidden` | `403 forbidden` | yes | `403 forbidden` | `403 forbidden` |
+| Announce credential | `403 forbidden` | `403 forbidden` | the Runs it created | `403 forbidden` | `403 forbidden` | beneath its binding | the Runs it created |
 
 "Operator routes" is everything else: the fleet, instances, configuration,
 labels, Policies, the listing, `GET /v0/runs/{id}`, events, export, the
@@ -344,7 +348,8 @@ as its Run's **Caller**: it may open a child under its own Run or a
 descendant (the child's labels are caller labels, and its own pair comes back
 once), close a descendant, and tighten limits on its subtree — never raise
 one (`403 raise-forbidden`). Any other Run is `403 run-out-of-scope`. A Run
-Key may keep at most 1000 open children under one parent (`409
+Key may keep at most 1000 open children under one parent, and a Run's whole
+subtree at most 1000 open Runs that Callers opened or announced (`409
 too-many-children`); the operator bearer is not capped. A supervised agent's
 key, and its refresh credential, are refused (`401 unauthorized`) on a
 `--listen` listener that is not loopback; a listener bound to `0.0.0.0`
@@ -379,6 +384,62 @@ and clears `credential-reuse`. `keys` lists a Run's credentials — token id,
 class (`run-key`, `refresh`, `announce`), state (`active`, `retired`,
 `revoked`), launch generation, `issued_by` (a token id), times and the
 revocation cause — never a value or a hash.
+
+### Announce and heartbeat
+
+A client Hekma did not start [announces](announce.md) itself under its
+binding's announce credential (`hekma binding credential issue <binding>
+--class announce`):
+
+```text
+POST /v0/runs/announce         Bearer hk_ann_…
+  {"external_id": "job-7", "labels": {"step": "plan"}}
+POST /v0/runs/{id}/heartbeat   Bearer hk_run_…, or the creating hk_ann_…
+POST /v0/runs/{id}/close       Bearer hk_run_…, or the creating hk_ann_…
+```
+
+The announce claims `external_id` in the credential's binding namespace, the
+one an `x-hekma-run` split uses, so a split Run announced later stays one Run.
+A new identity, or one whose Run has ended, answers `201` with the Run at depth
+`observed` (it has made no call yet), its `lease_expires_at` set, and its
+custody-eligible pair once, with `Cache-Control: no-store`:
+
+```json
+{
+  "schema_version": 1,
+  "run": {
+    "run_id": "run_…",
+    "control_depth": "observed",
+    "lease_expires_at": "2026-11-13T12:01:00Z",
+    "…": "…"
+  },
+  "created": true,
+  "credentials": {
+    "run_key": "hk_run_…",
+    "refresh_credential": "hk_ref_…",
+    "token_id": "3f9a1c0b7d2e",
+    "refresh_token_id": "a81b44c90f13"
+  },
+  "note": "This Run Key is shown once and is not stored. Keep it somewhere safe."
+}
+```
+
+An identity whose Run is open answers `200` with `"created": false`, the
+renewed Run and no `credentials`: its Lease is renewed and its Caller labels
+replaced, and no new Run Key is issued, so a revoked key stays revoked. The
+external id is 1 to 128 visible ASCII characters and at most 16 labels ride
+it (`400 invalid-request`); a Caller label on a key the binding sets is `409
+label-bound`; a full binding (1000 open announced or split Runs) or subtree
+is `409 too-many-children`. A revoked announce credential is `401
+credential-revoked`.
+
+A heartbeat renews the Run's Lease, granting one to a Run that held none, and
+brings a `silent` Run back to `active`. It answers `204`; a Run outside the
+Run Key's subtree, or one the announce credential did not create, is `403
+run-out-of-scope`, and an ended Run is `409 run-ended`, naming the announce
+path. The announce credential closes only the Runs it created (`403
+run-out-of-scope` otherwise); the Run ends with cause `closed` and its keys
+are revoked.
 
 ### Never in a URL
 

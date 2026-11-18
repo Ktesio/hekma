@@ -513,7 +513,8 @@ hekma run close run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
 `show` prints the Run's CONTROL depth (`supervised (no wire)` when its calls
 skip the metering proxy), its CUSTODY when it owns a process (`on`, or `off`
 with the reason: `no-held-key`, `opted-out` or `pre-custody`; see
-[key custody](run-keys.md#key-custody-preview--not-yet-supported)), status, Anomalies, parent, instance, labels with
+[key custody](run-keys.md#key-custody-preview--not-yet-supported)), status, LEASE and LAST SEEN when it has them (an
+[announced](announce.md) Run's Lease, and its last call or heartbeat), Anomalies, parent, instance, labels with
 their source (`bound, config`, `bound, label-verb` or `caller`), limits, subtree usage and open children. A child's usage counts
 on every ancestor, and every ancestor's ceilings apply to it. `close` ends a
 child Run (closing an ended one changes nothing); a Run that owns an agent's
@@ -753,7 +754,7 @@ hekma binding credential list openai [--json]
 - `set` changes the prefix, the upstream, the labels (`--label` replaces the whole set; `--clear-labels` removes them) or the custodied-key reference (`--clear-custodied-key` removes it). A prefix or upstream change keeps the binding's Runs. A label change updates its open Runs.
 - `delete` ends the binding's Run and its split Runs with cause `binding-removed`. Further calls on its prefix get `404 hekma_no_route`.
 - `route add|remove` manages up to 16 **reroute routes** per binding. They are stored and checked now, and used when reroute ships.
-- `credential issue --class announce|proxy-access` prints the binding's credential once, on stdout, with a note on stderr: `hk_ann_…` for announce, `hk_pxy_…` for proxy-access. Only its hash is stored. Issuing again revokes the previous credential of that class. `revoke` works per class, and `list` shows token ids and states, never a value. **Nothing accepts either credential yet**; the releases that add announce and the proxy beyond loopback will.
+- `credential issue --class announce|proxy-access` prints the binding's credential once, on stdout, with a note on stderr: `hk_ann_…` for announce, `hk_pxy_…` for proxy-access. Only its hash is stored. Issuing again revokes the previous credential of that class. `revoke` works per class, and `list` shows token ids and states, never a value. The announce credential [announces](announce.md) Runs beneath its binding, and heartbeats or closes the Runs it created; the note says so. **Nothing accepts a proxy-access credential yet**; the release that adds the proxy beyond loopback will.
 
 There are at most 256 bindings. A refusal names the field or the clash: a bad prefix, upstream or reference, a duplicate name or prefix, or a `/` binding while an upgraded agent holds the legacy route. A refusal exits `2`, and a missing binding or route exits `3`. The same operations are on the Control API under [`/v0/bindings`](control-api.md), for the Operator bearer only.
 

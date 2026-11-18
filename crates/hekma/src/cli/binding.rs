@@ -277,13 +277,12 @@ pub fn credential_issue(
     class: &str,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let wire = BindingCredentialClass::from_wire(class)
-        .ok_or_else(|| {
-            invalid(format!(
-                "`{class}` is not a credential class (announce, proxy-access)"
-            ))
-        })?
-        .as_str();
+    let parsed = BindingCredentialClass::from_wire(class).ok_or_else(|| {
+        invalid(format!(
+            "`{class}` is not a credential class (announce, proxy-access)"
+        ))
+    })?;
+    let wire = parsed.as_str();
     let path = format!("/v0/bindings/{name}/credentials");
     let routed = route("POST", &path, Some(json!({ "class": wire }))).map_err(routed_error)?;
     let answer = routed.value.unwrap_or(Value::Null);
@@ -295,10 +294,16 @@ pub fn credential_issue(
     }
     // The token's one delivery: stdout, with the never-again note on stderr.
     println!("{}", answer["token"].as_str().unwrap_or_default());
-    eprintln!(
-        "This credential is shown once and is not stored. Nothing accepts it yet; the \
-         release that does will say so."
-    );
+    match parsed {
+        BindingCredentialClass::Announce => eprintln!(
+            "This credential is shown once and is not stored. It announces Runs beneath binding \
+             `{name}` on POST /v0/runs/announce, and heartbeats or closes the Runs it creates."
+        ),
+        BindingCredentialClass::ProxyAccess => eprintln!(
+            "This credential is shown once and is not stored. Nothing accepts it yet; the \
+             release that does will say so."
+        ),
+    }
     Ok(())
 }
 

@@ -511,6 +511,129 @@ fn hints_name_children_split_bindings_and_are_ignored_beneath_the_unattributed_r
     assert_eq!(attribution, run("run_P"));
 }
 
+/// Story 23-2: an `x-hekma-announce` claims the hint namespaces — a child
+/// beneath a key or a route, `binding:<name>` beneath ANY binding (never
+/// ignored, unlike a hint beneath the unattributed Run) — wins over a hint
+/// on the same call, never draws custody, and a malformed one is ignored.
+#[test]
+fn an_announce_claims_the_hint_namespaces_and_wins_over_a_hint() {
+    use crate::domain::runs::announce::{AnnounceClaim, AnnounceScope};
+    let w = world();
+    let claim =
+        |scope: AnnounceScope, external: &str, labels: Vec<(String, String)>| AnnounceClaim {
+            scope,
+            external: external.into(),
+            caller_labels: labels,
+            credentialed: false,
+            created_by: None,
+            issuer: "announce".into(),
+            wire: true,
+        };
+    // Beneath a labelled binding, with Caller labels: `binding:openai`,
+    // falling back to the binding's own Run.
+    let f = CallFacts {
+        announce: Some("job-7"),
+        hint_labels: Some("step=plan"),
+        ..facts("/openai/v1")
+    };
+    let (target, attribution, ignored) = call(identify(&w.snapshot, &f));
+    assert!(!ignored);
+    assert!(target.custody.is_none() && target.token_id.is_none());
+    assert_eq!(
+        attribution,
+        Attribution::Announce {
+            claim: claim(
+                AnnounceScope::Binding("openai".into()),
+                "job-7",
+                vec![("step".into(), "plan".into())]
+            ),
+            fallback: Some(RunId::from_wire("run_B")),
+            fallback_identity: None,
+        }
+    );
+    // Beneath an unlabelled binding: still its own `binding:plain` claim,
+    // falling back to the unattributed Run.
+    let f = CallFacts {
+        announce: Some("job-8"),
+        ..facts("/plain/v1")
+    };
+    let (_, attribution, ignored) = call(identify(&w.snapshot, &f));
+    assert!(!ignored);
+    assert_eq!(
+        attribution,
+        Attribution::Announce {
+            claim: claim(AnnounceScope::Binding("plain".into()), "job-8", Vec::new()),
+            fallback: None,
+            fallback_identity: Some(WireIdentity::Unattributed),
+        }
+    );
+    // Beneath a Run route and beneath a Run Key: a child.
+    let f = CallFacts {
+        announce: Some("task"),
+        ..facts("/_hekma/runs/run_P/chat")
+    };
+    let (_, attribution, _) = call(identify(&w.snapshot, &f));
+    assert_eq!(
+        attribution,
+        Attribution::Announce {
+            claim: claim(
+                AnnounceScope::Parent(RunId::from_wire("run_P")),
+                "task",
+                Vec::new()
+            ),
+            fallback: Some(RunId::from_wire("run_P")),
+            fallback_identity: None,
+        }
+    );
+    let f = CallFacts {
+        run_key: Some(&w.other_key),
+        announce: Some("task"),
+        ..facts("/openai/v1")
+    };
+    let (target, attribution, _) = call(identify(&w.snapshot, &f));
+    assert!(target.token_id.is_some());
+    let Attribution::Announce { claim: c, .. } = attribution else {
+        panic!("an announce: {attribution:?}");
+    };
+    assert_eq!(c.scope, AnnounceScope::Parent(RunId::from_wire("run_O")));
+    // An announce and a hint: the announce wins, the hint is counted.
+    let f = CallFacts {
+        announce: Some("job-7"),
+        hint: Some("seen"),
+        ..facts("/openai/v1")
+    };
+    let (_, attribution, ignored) = call(identify(&w.snapshot, &f));
+    assert!(ignored, "the hint is counted as ignored");
+    assert!(matches!(attribution, Attribution::Announce { .. }));
+    // A malformed announce is ignored (counted); a blank one is none.
+    for bad in ["has space", &"x".repeat(129)] {
+        let f = CallFacts {
+            announce: Some(bad),
+            ..facts("/openai/v1")
+        };
+        let (_, attribution, ignored) = call(identify(&w.snapshot, &f));
+        assert!(ignored, "{bad}");
+        assert_eq!(attribution, run("run_B"));
+    }
+    let f = CallFacts {
+        announce: Some("  "),
+        ..facts("/openai/v1")
+    };
+    let (_, attribution, ignored) = call(identify(&w.snapshot, &f));
+    assert!(!ignored);
+    assert_eq!(attribution, run("run_B"));
+    // A revoked key with an announce: the refusal wins, nothing is claimed.
+    let f = CallFacts {
+        run_key: Some(&w.revoked_key),
+        announce: Some("job-7"),
+        ..facts("/openai/v1")
+    };
+    assert_eq!(
+        refused(&identify(&w.snapshot, &f)),
+        Some(Refusal::CredentialRevoked)
+    );
+}
+
 /// Story 22-2 (P4): custody is drawn ONLY by a custody-eligible Run Key —
 /// in the API-key slot or in `x-hekma-run-key` — whose Run (or an
 /// ancestor, or its binding) holds a key; everything else is forwarded as
