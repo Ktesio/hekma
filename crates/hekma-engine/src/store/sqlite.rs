@@ -116,7 +116,10 @@ use crate::ports::{
 /// `proxy_state.identity_headers` (the root, on by default) and
 /// `run_bindings.identity_headers` (the per-binding override) — see
 /// [`super::runs_sqlite`].
-pub(crate) const SCHEMA_VERSION: i64 = 27;
+/// v28 (story 22-4): each Run's bypass detection slice —
+/// `runs.bypass_detection` (`unreported` for every existing row),
+/// `bypass_reason` and `bypass_hosts` (additive, no backfill).
+pub(crate) const SCHEMA_VERSION: i64 = 28;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -835,6 +838,11 @@ fn migrate(
             "ALTER TABLE agent_runtime ADD COLUMN shim_socket TEXT;\n\
              ALTER TABLE agent_runtime ADD COLUMN shim_launch_id TEXT;",
         )?;
+    }
+    // Story 22-4: v28 adds each Run's bypass detection slice (additive; an
+    // existing Run honestly reads `unreported`).
+    if version < 28 {
+        super::runs_sqlite::migrate_runs_step(conn, 28, super::runs_sqlite::V28_DDL)?;
     }
     Ok(notes)
 }

@@ -53,6 +53,8 @@ pub(crate) struct ShimLauncher {
 pub(crate) struct ProcBackend {
     direct: backends::Backend,
     shim: Option<ShimLauncher>,
+    /// Story 22-4: the provider-host list a new Shim starts with.
+    bypass: Option<std::sync::Arc<crate::domain::bypass::BypassFeed>>,
 }
 
 /// A supervised process: held directly, or through its Shim.
@@ -107,6 +109,40 @@ impl ProcBackend {
         ProcBackend {
             direct: backends::current(),
             shim: None,
+            bypass: None,
+        }
+    }
+
+    /// Story 22-4: the feed a Shim launch takes its provider-host list from.
+    pub(crate) fn set_bypass_feed(
+        &mut self,
+        feed: Option<std::sync::Arc<crate::domain::bypass::BypassFeed>>,
+    ) {
+        self.bypass = feed;
+    }
+
+    /// Story 22-4: the newest bypass report a Shim handle has not yet
+    /// handed over, once.
+    pub(crate) fn take_bypass_report(
+        &self,
+        handle: &mut ProcHandle,
+    ) -> Option<crate::ports::RunBypassRow> {
+        let ProcHandle::Shim(shim) = handle else {
+            return None;
+        };
+        shim.client.take_pushed_bypass().and_then(report_row)
+    }
+
+    /// Story 22-4: replace a Shim's provider-host list. A 1.0 Shim refuses
+    /// the request; it simply keeps not checking.
+    pub(crate) fn push_bypass_hosts(
+        &self,
+        handle: &mut ProcHandle,
+        config: &crate::shim::proto::BypassConfig,
+    ) -> bool {
+        match handle {
+            ProcHandle::Shim(shim) => shim.client.set_bypass_hosts(config.clone()).is_ok(),
+            ProcHandle::Direct(_) => false,
         }
     }
 
@@ -171,6 +207,11 @@ impl ProcBackend {
         // The Shim starts with a cleared environment, so a launch that
         // inherits the engine's environment carries it explicitly.
         let mut dto = ShimSpawn::of(spec);
+        dto.bypass = self
+            .bypass
+            .as_ref()
+            .and_then(|feed| feed.config())
+            .map(Box::new);
         if spec.inherit_env {
             let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
             env.extend(spec.env.clone());
@@ -216,6 +257,9 @@ impl ProcBackend {
                 Err(ShimClientError::Io(_)) => return Ok(None),
                 Err(err) => return Err(err),
             };
+        // Story 22-4: the Shim's report so far is applied as a push.
+        let mut client = client;
+        client.hold_bypass(status.bypass);
         Ok(Some(ProcHandle::Shim(ShimHandle {
             client,
             endpoint: endpoint.clone(),
@@ -266,6 +310,16 @@ impl ProcBackend {
             ),
         }
     }
+}
+
+/// A Shim's report as the Run's stored slice; `None` for a 1.0 Shim's
+/// absent report.
+fn report_row(report: crate::shim::proto::BypassReport) -> Option<crate::ports::RunBypassRow> {
+    (!report.state.is_empty()).then_some(crate::ports::RunBypassRow {
+        detection: report.state,
+        reason: report.reason,
+        hosts: report.hosts,
+    })
 }
 
 fn connect_with_retry(

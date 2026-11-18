@@ -35,8 +35,8 @@ pub use process_backend::{
     StdinState, StopOutcome, KILL_CONFIRM_TIMEOUT, STDIN_WRITE_TIMEOUT,
 };
 pub(crate) use run_store::{
-    clamp_page, NewRun, OutboxAppend, OutboxBounds, Page, Rollup, RunCustodyRow, RunRecords,
-    RunStore, TokenRow, PAGE_MAX,
+    clamp_page, NewRun, OutboxAppend, OutboxBounds, Page, Rollup, RunBypassRow, RunCustodyRow,
+    RunRecords, RunStore, TokenRow, PAGE_MAX,
 };
 pub use secret_resolver::{
     file_permissions_error, mode_is_owner_only, CompositeSecretResolver, EnvSecretResolver,

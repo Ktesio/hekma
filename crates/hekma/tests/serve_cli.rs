@@ -1491,6 +1491,7 @@ fn a_real_shim_process_keeps_its_child_across_a_disconnect_and_leaves_once_ackno
             pipe_stdout: false,
             inherit_env: false,
             capture_mode: "full".into(),
+            bypass: None,
         })
         .unwrap();
     drop(engine);

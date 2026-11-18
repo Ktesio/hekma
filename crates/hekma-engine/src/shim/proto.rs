@@ -55,6 +55,31 @@ pub struct ShimSpawn {
     pub pipe_stdout: bool,
     pub inherit_env: bool,
     pub capture_mode: String,
+    /// Story 22-4 (`shim-rpc` 1.1): the provider hosts and their addresses
+    /// the Shim compares its tree's connections against; absent from a
+    /// 1.0 engine (no detection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass: Option<Box<BypassConfig>>,
+}
+
+/// Story 22-4: what bypass detection compares against, and how often.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BypassConfig {
+    pub interval_ms: u64,
+    pub hosts: Vec<crate::domain::bypass::ProviderHost>,
+}
+
+/// Story 22-4: what the Shim has seen of its tree.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BypassReport {
+    /// `unreported` (no check yet, or no detection), `active` (checked),
+    /// or `unavailable` (the tree could not be read; see `reason`).
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The listed hosts the tree held a connection to, set-once, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
 }
 
 impl ShimSpawn {
@@ -74,6 +99,7 @@ impl ShimSpawn {
             pipe_stdout: spec.pipe_stdout,
             inherit_env: spec.inherit_env,
             capture_mode: spec.capture_mode.as_str().to_string(),
+            bypass: None,
         }
     }
 
@@ -158,6 +184,12 @@ pub enum Op {
     Status,
     /// The engine has the buffered exit; the Shim may leave.
     AckExit,
+    /// Story 22-4 (`shim-rpc` 1.1): replace the provider-host list (a
+    /// refreshed resolution, or the first list for a Shim launched before
+    /// one existed).
+    BypassHosts {
+        bypass: BypassConfig,
+    },
 }
 
 impl std::fmt::Debug for Request {
@@ -172,6 +204,7 @@ impl std::fmt::Debug for Request {
             Op::Poll => "Poll".into(),
             Op::Status => "Status".into(),
             Op::AckExit => "AckExit".into(),
+            Op::BypassHosts { bypass } => format!("BypassHosts {{ {} hosts }}", bypass.hosts.len()),
         };
         write!(f, "Request {{ id: {}, {op} }}", self.id)
     }
@@ -198,6 +231,9 @@ pub struct ShimStatus {
     pub env_dropped: bool,
     /// The child has a stdin pipe.
     pub has_stdin: bool,
+    /// Story 22-4: the bypass report (absent from a 1.0 Shim).
+    #[serde(default)]
+    pub bypass: BypassReport,
 }
 
 /// Why a request was refused.
@@ -272,6 +308,8 @@ pub enum ShimFrame {
     Reply { id: u64, outcome: Outcome },
     /// The child exited (pushed to the connected engine).
     Exit { exit: ExitRecord },
+    /// Story 22-4: the bypass report changed (a new host, or a state).
+    Bypass { report: BypassReport },
 }
 
 impl ShimFrame {
@@ -334,6 +372,7 @@ mod tests {
             pipe_stdout: false,
             inherit_env: false,
             capture_mode: "full".into(),
+            bypass: None,
         };
         let spawn = Request {
             id: 2,

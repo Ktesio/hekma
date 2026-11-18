@@ -1,11 +1,11 @@
 ---
 title: "Run Keys and key custody"
-description: "Each Run's own credential: issued per launch, shown once, stored as a hash, revoked on exit, end or demand. Key custody is in preview; Scent-Check Modes act at the metering proxy; bypass detection is planned."
+description: "Each Run's own credential: issued per launch, shown once, stored as a hash, revoked on exit, end or demand. Key custody is in preview; Scent-Check Modes act at the metering proxy; bypass detection is a preview for agents in their own Shim."
 ---
 
 # Run Keys and key custody
 
-> **On main, not yet released.** Run Keys ship with the next release. Key custody is on main as a preview, not yet supported. Scent-Check Modes are on main too. The authenticated proxy beyond loopback is on main too. Bypass detection is still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **On main, not yet released.** Run Keys ship with the next release. Key custody is on main as a preview, not yet supported. Scent-Check Modes are on main too. The authenticated proxy beyond loopback is on main too. Bypass detection is on main as a preview, for agents in their own Shim; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 > This page mirrors [hekma.ktesio.dev/docs/run-keys/](https://hekma.ktesio.dev/docs/run-keys/), where it is kept current.
 
@@ -196,7 +196,7 @@ Key custody keeps your provider key away from the agent. It is not a sandbox.
 
 - **Anything running as your OS user.** The agent runs as you. A process running as you — the agent's own shell tool included — can read Hekma's secrets file, which sits in Hekma's state directory beside the agents' homes; run `hekma` with your authority, including `hekma agent config get --reveal`; and edit Hekma's configuration. A `--reveal` of a custodied key is recorded as an event, but a determined process does not need it. Running agents as a separate OS user is not supported yet.
 - **A compromised agent.** Custody limits what an agent can leak by accident or be talked into leaking. It does not contain an agent that sets out to misuse your machine.
-- **Other credentials.** An agent that finds another way to reach a provider — a login stored in your home directory, another environment, a different machine — is not using your custodied key. Hekma does not see those calls; bypass detection is planned.
+- **Other credentials.** An agent that finds another way to reach a provider — a login stored in your home directory, another environment, a different machine — is not using your custodied key. Hekma does not meter those calls; [bypass detection](#bypass-detection-preview) can notice a direct connection from a supervised agent's process tree.
 - **Hekma's own memory.** While `hekma serve` runs, it holds your key in memory. On Linux it marks itself non-dumpable, so other processes running as you cannot read its environment or memory and a crash writes no core file. On macOS and Windows, a process running as you, or a full crash dump, may expose it; leave full crash dumps off for `hekma`.
 - **Copies of the secrets file.** Backups and sync tools copy Hekma's state directory like any other. Exclude the secrets file, or keep your keys in the environment of `hekma serve` instead.
 
@@ -233,15 +233,38 @@ A call is **scented** when a valid Run Key identifies it: sent in `x-hekma-run-k
 - **Attribution, not access control.** On your machine any process can obtain an identity, by announcing one; Scent-Check is about knowing which Run a call belongs to. Custody's protection does not depend on the mode.
 - `enforce` is never a default.
 
+## Bypass detection (preview)
+
+When an agent runs in its own [Shim](hosting.md#agents-in-their-own-shim-a-preview), the Shim checks the agent's process tree every 5 seconds for established TCP connections to a known provider host, and reports what it finds on the agent's Run.
+
+**The provider-host list.** The built-in provider hosts (the ones key custody knows), every endpoint binding's upstream, every open Run's upstream, and every origin pinned beside a held key. Every agent is checked against the whole list, so an agent calling a provider that is not its own is noticed too. Hekma resolves the hosts to addresses, re-resolves them every 60 seconds and keeps the last good addresses when a lookup fails; the Shim compares each connection's address and port.
+
+| The Run | A connection to a listed host is |
+|---|---|
+| Key custody on | The `bypass` **Anomaly**: `hekma ps` lists the Run with `bypass[<host>]`, and the OTLP counter `hekma.bypass.detected` counts it by provider host. |
+| Key custody off | Informational: `hekma ps --all` notes the host and that custody is off, so direct calls are expected. |
+| No wire path (the agent holds its own provider key) | Informational: noted the same way, with that reason. |
+
+- Each host is reported once per Run, at most 8 hosts, each as a `bypass-detected` Run event. Hosts stay on the Run until it ends.
+- Detection never stops, pauses or fences a Run.
+- **The detection state.** `hekma run show` and `--json` carry every supervised Run's state: `active` (checked every 5 seconds; no hosts means none was seen), `unavailable` with the reason (the process tree could not be read), or `unreported` (no report yet: the first check is pending, or the agent does not run in a Shim). Hekma never reports a Run as checked without having checked it.
+- **Where it works.** Linux (from `/proc`) and macOS (from the kernel's per-process socket information). Windows does not run agents in a Shim yet, so its Runs stay `unreported`; other Unix systems report `unavailable`.
+
+**Limits.** Bypass detection is a signal, not a guarantee:
+
+- It notices a connection. It does not prove a call was made, and it does not contain an agent.
+- Traffic through another proxy, VPN or tunnel shows as a connection to that proxy, not to the provider.
+- HTTP/3 runs over UDP, not TCP, so it is not seen.
+- A connection that opens and closes between two checks can be missed. One held across two checks is always caught.
+- Only the agent's process tree is watched. A process outside it, or one that left it, is not.
+- Hosts that share addresses (behind one CDN) are named together, and a host whose addresses changed since the last lookup can be missed for up to a minute. A finding names hosts; it is not a verdict.
+- A Shim keeps its findings while no engine is connected and hands them to the next one. A Shim that exits first loses them.
+
 ## What is coming
 
 ### Held calls
 
 When wire hold ships, calls held at the proxy will be re-checked when they are released, so a key revoked while a call waits is refused then.
-
-### Bypass detection
-
-The small supervisor that will own each supervised process (the Shim) will watch its process tree for direct connections to known provider hosts. A bypass will show as an Anomaly naming the Run and host, and as an OTLP counter; it never stops the Run. Where an OS gives no reliable signal, detection is reported as "unavailable", never as clean.
 
 ### An authenticated proxy beyond loopback
 

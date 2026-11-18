@@ -106,6 +106,11 @@ struct BuiltinProvider {
 /// The built-in provider table, v1. Additions are additive and docs-versioned
 /// (`docs/metering-proxy.md`); each entry's paths cover that provider's
 /// SYNCHRONOUS inference endpoints only.
+/// Story 22-4: the built-in provider hosts (bypass detection's base list).
+pub(crate) fn builtin_provider_hosts() -> impl Iterator<Item = &'static str> {
+    BUILTIN_PROVIDERS.iter().map(|provider| provider.host)
+}
+
 const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
     BuiltinProvider {
         host: "api.openai.com",

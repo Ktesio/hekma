@@ -883,6 +883,18 @@ pub(super) fn migrate_v21(conn: &Connection) -> Result<(), StoreError> {
     migrate_runs_step(conn, 21, SCHEMA_V21)
 }
 
+/// Story 22-4 (schema v28): each Run's bypass detection slice.
+pub(super) const V28_DDL: &str = "ALTER TABLE runs ADD COLUMN bypass_detection TEXT NOT NULL \
+     DEFAULT 'unreported';\n\
+     ALTER TABLE runs ADD COLUMN bypass_reason TEXT;\n\
+     ALTER TABLE runs ADD COLUMN bypass_hosts TEXT NOT NULL DEFAULT '';";
+
+/// Test-only: undo v28 (the upgrade tests rebuild older shapes).
+#[cfg(test)]
+pub(crate) const UNDO_V28_FOR_TEST: &str = "ALTER TABLE runs DROP COLUMN bypass_detection; \
+     ALTER TABLE runs DROP COLUMN bypass_reason; \
+     ALTER TABLE runs DROP COLUMN bypass_hosts;";
+
 /// One crash-atomic runs-schema step: the DDL and its `user_version` stamp
 /// in one `BEGIN IMMEDIATE`, skipped when another process already ran it.
 pub(super) fn migrate_runs_step(
@@ -2102,6 +2114,48 @@ impl RunRecords for SqliteStore {
                 key_ref,
             })
         }))
+    }
+
+    fn set_run_bypass(
+        &self,
+        run_id: &RunId,
+        row: &crate::ports::RunBypassRow,
+    ) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "UPDATE runs SET bypass_detection = ?2, bypass_reason = ?3, bypass_hosts = ?4 \
+                 WHERE run_id = ?1",
+                rusqlite::params![
+                    run_id.as_str(),
+                    row.detection,
+                    row.reason,
+                    row.hosts.join(",")
+                ],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn run_bypass(&self, run_id: &RunId) -> Result<Option<crate::ports::RunBypassRow>, StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT bypass_detection, bypass_reason, bypass_hosts FROM runs WHERE run_id = ?1",
+                [run_id.as_str()],
+                |row| {
+                    let hosts: String = row.get(2)?;
+                    Ok(crate::ports::RunBypassRow {
+                        detection: row.get(0)?,
+                        reason: row.get(1)?,
+                        hosts: hosts
+                            .split(',')
+                            .filter(|host| !host.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                    })
+                },
+            )
+            .optional()
+            .map_err(backend)
     }
 
     fn recently_revoked_keys(

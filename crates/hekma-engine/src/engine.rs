@@ -314,6 +314,28 @@ struct EngineInner {
     /// Story 24-5: inbound telemetry points accepted and skipped since open
     /// (the exporter's `hekma.telemetry.received`).
     telemetry_points: [std::sync::atomic::AtomicU64; 2],
+    /// Story 22-4: the provider-host list Shims compare against (`None`
+    /// when launches are direct).
+    bypass_feed: Option<Arc<crate::domain::bypass::BypassFeed>>,
+}
+
+impl EngineInner {
+    /// Story 22-4: re-compose and re-resolve the provider-host list from
+    /// the published snapshot (no lock held while resolving) and push a
+    /// changed list to every live Shim (under the supervisor lock: one
+    /// local request per Shim).
+    fn refresh_bypass_hosts(&self) {
+        let Some(feed) = &self.bypass_feed else {
+            return;
+        };
+        let snapshot = self.run_snapshot.current();
+        if let Some(config) = feed.refresh(&snapshot) {
+            self.supervisor
+                .lock()
+                .expect("supervisor mutex poisoned")
+                .push_bypass_hosts(&config);
+        }
+    }
 }
 
 /// The counters the OTLP exporter samples at each flush (story 24-5): the
@@ -614,10 +636,15 @@ impl Engine {
                 detail: err.to_string(),
             })?;
         // Story 24-1: launches go through a Shim when one is configured.
+        // Story 22-4: and each Shim watches its tree against the provider
+        // list (refreshed by the reaper task, never under a lock).
+        let bypass_feed = (shim_exe.is_some() && crate::backends::shim_supported())
+            .then(|| Arc::new(crate::domain::bypass::BypassFeed::default()));
         supervisor.set_shim_launcher(shim_exe.map(|exe| crate::domain::ShimLauncher {
             exe,
             state_dir: registry.paths.state_base().to_path_buf(),
         }));
+        supervisor.set_bypass_feed(bypass_feed.clone());
         // Story 18-3: thread the TEST SCALING SEAM through — `None` (every
         // production caller) leaves the pinned 30 s window untouched.
         if let Some(window) = stable_run_window_override {
@@ -666,6 +693,7 @@ impl Engine {
             leases,
             identity_headers_flag,
             telemetry_points: Default::default(),
+            bypass_feed,
         });
 
         // (1) Orphan adoption on open (AC-B / AI-7 / AI-8). Reconcile BEFORE the
@@ -747,6 +775,7 @@ impl Engine {
             leases: crate::domain::runs::lease::LeaseOptions::default(),
             identity_headers_flag: None,
             telemetry_points: Default::default(),
+            bypass_feed: None,
         });
         Ok(Self {
             rt: Arc::new(rt),
@@ -1304,6 +1333,20 @@ impl Engine {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
+                // Story 22-4: refresh the provider-host list when it is due
+                // (DNS with no lock held; the snapshot is lock-free), and
+                // hand a changed list to every live Shim.
+                if inner
+                    .bypass_feed
+                    .as_ref()
+                    .is_some_and(|feed| feed.refresh_due(&inner.run_snapshot.current()))
+                {
+                    let refresh_inner = Arc::clone(&inner);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        refresh_inner.refresh_bypass_hosts();
+                    })
+                    .await;
+                }
                 let poll_inner = Arc::clone(&inner);
                 let plans = tokio::task::spawn_blocking(move || {
                     let registry = poll_inner.registry.lock().expect("registry mutex poisoned");

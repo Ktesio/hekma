@@ -845,6 +845,96 @@ pub(crate) fn note_reconciled<S: RunRecords + ?Sized>(
     )
 }
 
+/// Fold one bypass report into `record`'s slice (story 22-4): set-once per
+/// listed host (at most [`MAX_BYPASS_HOSTS_PER_RUN`](crate::domain::bypass::MAX_BYPASS_HOSTS_PER_RUN);
+/// a host not on `listed` is dropped — a Shim reports only what it was
+/// given), the detection state, one `bypass-detected` event per new host
+/// and one `bypass-detection-changed` event per state change. A new host on
+/// a Run whose calls go through Hekma with key custody on raises the
+/// `bypass` Anomaly; otherwise the event says why direct calls are
+/// expected. Nothing acts on the Run. An ended Run is left alone.
+pub(crate) fn record_bypass<S: RunRecords + RunStore + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    record: RunRecord,
+    report: &crate::ports::RunBypassRow,
+    listed: &std::collections::BTreeSet<String>,
+    at: &str,
+) -> Result<(), StoreError> {
+    use crate::domain::bypass::{bypass_verdict, BypassVerdict, MAX_BYPASS_HOSTS_PER_RUN};
+    if record.is_ended() {
+        return Ok(());
+    }
+    let stored = store.run_bypass(&record.run_id)?.unwrap_or_default();
+    let mut next = stored.clone();
+    next.detection = report.detection.clone();
+    next.reason = report.reason.clone();
+    let state_changed = next.detection != stored.detection || next.reason != stored.reason;
+    let mut fresh = Vec::new();
+    for host in &report.hosts {
+        if !listed.contains(host) || next.hosts.contains(host) {
+            continue;
+        }
+        if next.hosts.len() >= MAX_BYPASS_HOSTS_PER_RUN {
+            break;
+        }
+        next.hosts.push(host.clone());
+        fresh.push(host.clone());
+    }
+    if !state_changed && fresh.is_empty() {
+        return Ok(());
+    }
+    next.hosts.sort();
+    store.set_run_bypass(&record.run_id, &next)?;
+    let custody_on = store
+        .run_custody(&record.run_id)?
+        .is_some_and(|row| row.state == "on");
+    let verdict = bypass_verdict(record.wire_path, Some(custody_on));
+    let mut record = record;
+    if !fresh.is_empty()
+        && verdict == BypassVerdict::Anomaly
+        && !record.anomalies.contains(&Anomaly::Bypass)
+    {
+        let mut anomalies = record.anomalies.clone();
+        anomalies.push(Anomaly::Bypass);
+        let status = record.status;
+        if let Some(updated) = move_to(store, changes, record.clone(), status, anomalies, None, at)?
+        {
+            record = updated;
+        }
+    }
+    for host in fresh {
+        let cause = match verdict {
+            BypassVerdict::Anomaly => host,
+            BypassVerdict::NoWire => format!("{host} (informational: no-wire)"),
+            BypassVerdict::CustodyOff => format!("{host} (informational: custody-off)"),
+        };
+        note(
+            store,
+            changes,
+            &record,
+            RunEventKind::BypassDetected,
+            Prior::default(),
+            Some(cause),
+        )?;
+    }
+    if state_changed {
+        let cause = match &next.reason {
+            Some(reason) => format!("{}: {reason}", next.detection),
+            None => next.detection.clone(),
+        };
+        note(
+            store,
+            changes,
+            &record,
+            RunEventKind::BypassDetectionChanged,
+            Prior::default(),
+            Some(cause),
+        )?;
+    }
+    Ok(())
+}
+
 /// Note a disposition change on `record` (story 23-4): one
 /// `disposition-changed` event whose cause names the reason and the change.
 pub(crate) fn note_disposition<S: RunRecords + ?Sized>(
@@ -1308,8 +1398,18 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
         cost_micros: rollup.cost,
         estimate: EstimateLabel::Estimated,
     };
+    let custody_row = store.run_custody(run_id)?;
+    let bypass = if record.process_owner {
+        Some(super::listing::BypassView::of(
+            store.run_bypass(run_id)?,
+            &record,
+            custody_row.as_ref(),
+        ))
+    } else {
+        None
+    };
     let custody = if record.process_owner {
-        Some(super::listing::CustodyView::of(store.run_custody(run_id)?))
+        Some(super::listing::CustodyView::of(custody_row))
     } else {
         None
     };
@@ -1330,6 +1430,7 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
         usage,
         record,
         custody,
+        bypass,
     })
 }
 

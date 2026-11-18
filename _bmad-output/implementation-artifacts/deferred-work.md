@@ -861,6 +861,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-24-5-otlp-metrics-v2.md` (Tasks: the bypass feed)
   summary: `hekma.bypass.detected` is not emitted: bypass detection (22-4) is not built yet (24-5 was built before 24-1 and 22-4). The family, its `hekma.provider.host` attribute and its exemplars join when 22-4 lands.
   evidence: `crates/hekma-host/src/otlp/v2.rs` (module docs). Trigger: 22-4's build.
+  **Resolved 2026-11-14 by the 22-4 build:** `hekma.bypass.detected` is emitted (by `hekma.provider.host`, depth and allow-listed labels, the Run as exemplar), counting the `bypass` Anomaly only.
 
 - source_spec: `spec-24-5-otlp-metrics-v2.md` (Records: 23-4's counters)
   summary: Held calls and wire dispositions have no OTLP counter; 23-4 excluded them without promising a shape here.
@@ -926,3 +927,20 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: The Control API cannot tell a Host from the Operator (one bearer class), so API submissions record `operator`.
   evidence: `crates/hekma-host/src/control/routes.rs` (`run_reconcile`). Trigger: a separate Host credential class (AD-20).
 
+## From spec-22-4 (bypass detection in the Shim) — build, 2026-11-14
+
+- source_spec: `spec-22-4-bypass-detection-in-the-shim.md` (T3: Windows)
+  summary: No Windows enumerator: Shims run on Unix only (24-1 phase 2), so Windows Runs stay `unreported`. The Job-list plus `GetExtendedTcpTable` enumerator lands with the Windows Shim.
+  evidence: `crates/hekma-engine/src/backends/mod.rs` (`tree_remote_addrs`). Trigger: the Windows Shim (24-1's named-pipe phase).
+
+- source_spec: `spec-22-4-bypass-detection-in-the-shim.md` (Verification: the cost gate)
+  summary: No `perf-budgets --bypass` scenario: the per-poll cost (≤ 5 ms at ≤ 64 tree processes) is not measured in CI.
+  evidence: `crates/hekma-engine/src/backends/unix/bypass.rs`. Trigger: a Host report of Shim CPU use, or the next perf-budgets pass.
+
+- source_spec: `spec-22-4-bypass-detection-in-the-shim.md` (T1: resolution failures)
+  summary: A failed provider-host resolution keeps the last good addresses silently; the spec's one rate-limited diagnostic is not emitted. A host never resolved is listed with no addresses and never matches.
+  evidence: `crates/hekma-engine/src/domain/bypass.rs` (`HostResolver`). Trigger: an Operator unable to tell why a host is never reported.
+
+- source_spec: `spec-22-4-bypass-detection-in-the-shim.md` (T5: the `no-shim` state)
+  summary: A Run launched directly (no Shim) stays `unreported` rather than storing `unavailable (no-shim)`.
+  evidence: `crates/hekma-engine/src/domain/supervisor/mod.rs` (`record_bypass_reports`). Trigger: Handoff Mode making the Shim the default, when a direct launch becomes the exception worth naming.

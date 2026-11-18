@@ -546,6 +546,13 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// custody (`pre-custody`) or stores none.
     fn run_custody(&self, run_id: &RunId) -> Result<Option<RunCustodyRow>, StoreError>;
 
+    /// Record a Run's bypass detection slice (story 22-4, schema v28).
+    fn set_run_bypass(&self, run_id: &RunId, row: &RunBypassRow) -> Result<(), StoreError>;
+
+    /// A Run's stored bypass detection slice (story 22-4); `None` for an
+    /// unknown Run. A row never reported reads `unreported` with no hosts.
+    fn run_bypass(&self, run_id: &RunId) -> Result<Option<RunBypassRow>, StoreError>;
+
     /// The Run Keys revoked at or after `since` (RFC 3339), newest first,
     /// at most `limit` (story 23-1: the recently-revoked set at open).
     fn recently_revoked_keys(
@@ -579,6 +586,19 @@ pub(crate) struct TokenRow {
     pub issued_at: String,
     pub revoked_at: Option<String>,
     pub revoke_cause: Option<String>,
+}
+
+/// One Run's bypass detection slice (story 22-4, schema v28): host names
+/// and a state only — never an address.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RunBypassRow {
+    /// `unreported`, `active` or `unavailable`.
+    pub detection: String,
+    /// Why detection is `unavailable`.
+    pub reason: Option<String>,
+    /// The listed hosts its tree reached directly, sorted, at most
+    /// [`crate::domain::bypass::MAX_BYPASS_HOSTS_PER_RUN`].
+    pub hosts: Vec<String>,
 }
 
 /// One stored Run custody row (story 22-2, schema v19): what a launch froze

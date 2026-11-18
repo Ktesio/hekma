@@ -205,6 +205,13 @@ the variable, nothing changes. What happens to Shim-held agents when the
 host stops (keep them for the next host, or stop them) is still to be
 decided; today a draining host stops them as before.
 
+Each Shim also watches its agent's process tree for direct connections to
+known provider hosts, every 5 seconds, and the host records what it finds on
+the agent's Run: [bypass detection](run-keys.md#bypass-detection-preview).
+The host resolves the provider-host list and hands it to each Shim; the Shim
+itself does no DNS. A Shim keeps its findings while no host is connected and
+hands them to the next host.
+
 ## Retention
 
 The same host keeps the state directory from growing without bound. An ended Run keeps its full detail for seven days, then is reduced to its totals, labels and end cause; per-call records are kept for seven days, then their daily file is deleted whole. The host does this when it starts and then once a day. Change either window with `hekma run retention --runs <days>` or `--calls <days>`, or `PUT /v0/retention`, from 1 to 3650 days; usage records, events and the export outbox are not touched.
