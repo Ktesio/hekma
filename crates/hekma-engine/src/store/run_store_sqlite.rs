@@ -1287,4 +1287,43 @@ mod tests {
         assert_eq!(append.seq, 42);
         assert_eq!(store.outbox_bounds().unwrap().ack, Some(41));
     }
+
+    #[test]
+    fn an_instance_less_usage_row_advances_the_fold_without_touching_any_rollup() {
+        // A usage row with no instance has no per-instance rollup to fold
+        // into: the fold passes over it (the watermark still moves past it,
+        // so it is never re-read) and every instance's rollup stays zero.
+        let store = store_with("known");
+        store
+            .conn()
+            .execute(
+                "INSERT INTO usage_events (instance_id, run_id, input_tokens, output_tokens, \
+                 metering_source, occurred_at) \
+                 VALUES (NULL, 'run-free', 7, 3, 'self-reported', '2026-10-31T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        fold_unfolded_rows(store.conn()).unwrap();
+        let (watermark, highest): (i64, i64) = store
+            .conn()
+            .query_row(
+                "SELECT (SELECT folded_through FROM usage_rollup_meta WHERE id = 1), \
+                 (SELECT MAX(id) FROM usage_events)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(watermark, highest, "the fold moved past the row");
+        assert_eq!(
+            store.instance_rollup(&name("known")).unwrap(),
+            Rollup::zero()
+        );
+        let rollup_rows: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM usage_rollup_run", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rollup_rows, 0, "no Run rollup is invented for it");
+    }
 }
