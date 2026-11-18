@@ -96,7 +96,7 @@ fn control(op: &'static str, err: ShimClientError) -> BackendError {
 /// A fresh launch id: 16 random bytes, hex.
 fn launch_id() -> Result<String, BackendError> {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).map_err(|err| BackendError::Spawn {
+    getrandom::fill(&mut bytes).map_err(|err| BackendError::Spawn {
         exec: "hekma shim".to_string(),
         detail: format!("no launch id could be drawn: {err}"),
     })?;

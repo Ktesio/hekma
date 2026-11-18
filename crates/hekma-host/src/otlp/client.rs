@@ -482,4 +482,136 @@ mod tests {
             Some((0, "quota".to_string()))
         );
     }
+
+    #[test]
+    fn the_port_rule_finds_no_port_in_an_unterminated_ipv6_literal() {
+        // The numeric-port rule only judges a port it can find, and an
+        // unterminated IPv6 literal carries none. Whether the endpoint as a
+        // whole is refused is the other checks' business, not this rule's.
+        assert!(port_is_numeric("[::1"));
+        // A terminated literal with a non-numeric port is still refused.
+        assert!(!port_is_numeric("[::1]:otlp"));
+    }
+
+    /// A loopback collector that answers each scripted raw response on its
+    /// own connection, in order, after reading the full request. Resolves to
+    /// how many requests it answered.
+    async fn scripted_collector(
+        responses: Vec<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut answered = 0;
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0, "the client closed before sending its request");
+                    request.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+                answered += 1;
+            }
+            answered
+        });
+        (format!("http://{addr}"), task)
+    }
+
+    #[tokio::test]
+    async fn a_header_value_that_cannot_ride_http_is_terminal_before_any_dial() {
+        // Nothing listens at this endpoint: the attempt fails while BUILDING
+        // the request, so it never dials.
+        let client = OtlpClient::with_ca(
+            "http://127.0.0.1:9",
+            vec![("x-tenant".to_string(), "line\nbreak".to_string())],
+            None,
+        )
+        .unwrap();
+        match client.post_once("{}".to_string()).await {
+            PostOutcome::Terminal(message) => {
+                assert!(message.contains("could not build the POST"), "{message}");
+                assert!(
+                    !message.contains("line\nbreak"),
+                    "the header value is never echoed: {message}"
+                );
+            }
+            other => panic!("expected a terminal build failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_response_body_cut_short_still_counts_as_delivered_by_its_status() {
+        // The status decides the class; a body that ends before its declared
+        // length is drain hygiene only, never a lost batch.
+        let (endpoint, collector) = scripted_collector(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{}",
+        ])
+        .await;
+        let client = OtlpClient::with_ca(&endpoint, Vec::new(), None).unwrap();
+        assert_eq!(
+            client.post_once("{}".to_string()).await,
+            PostOutcome::Delivered
+        );
+        assert_eq!(collector.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_collector_that_accepts_and_never_answers_is_retryable_at_the_post_bound() {
+        // The listener is bound but never accepts: the connection lands in
+        // the kernel's backlog, the request is written, and no answer ever
+        // comes. The attempt ends at its own bound as a RETRYABLE outcome,
+        // never a hang.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", silent.local_addr().unwrap());
+        let client = OtlpClient::with_ca(&endpoint, Vec::new(), None).unwrap();
+        match client.post_once("{}".to_string()).await {
+            PostOutcome::Retryable(message) => {
+                assert!(message.contains("timed out"), "{message}");
+            }
+            other => panic!("expected a retryable timeout, got {other:?}"),
+        }
+        drop(silent);
+    }
+
+    #[tokio::test]
+    async fn a_collector_that_stays_unavailable_spends_the_whole_retry_budget() {
+        let unavailable = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+                           Connection: close\r\n\r\n";
+        let (endpoint, collector) =
+            scripted_collector(vec![unavailable; RETRY_ATTEMPTS as usize]).await;
+        let client = OtlpClient::with_ca(&endpoint, Vec::new(), None).unwrap();
+        match deliver(&client, "{}".to_string()).await {
+            PostOutcome::Retryable(message) => {
+                assert!(
+                    message.contains("503"),
+                    "the last outcome names it: {message}"
+                );
+            }
+            other => panic!("expected the last retryable outcome, got {other:?}"),
+        }
+        assert_eq!(
+            collector.await.unwrap(),
+            RETRY_ATTEMPTS as usize,
+            "every attempt in the budget reached the collector, and no more"
+        );
+    }
 }
