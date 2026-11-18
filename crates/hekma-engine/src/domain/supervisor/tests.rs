@@ -9290,3 +9290,714 @@ fn engine_open_ends_a_run_whose_relaunch_never_ran() {
     // The relaunch running after all reopens the same Run.
     let _ = name;
 }
+
+// ---- Degraded and rare arms: Run bookkeeping, re-applied latches, the
+// adopted truncate, cooperative commit failures ----------------------------
+
+/// Run `sql` against the instance's state DB through its own connection —
+/// the fault fixture the ledger tests use (a dropped or renamed table, a
+/// trigger that refuses one write).
+fn state_db_exec(state: &Path, sql: &str) {
+    let conn = rusqlite::Connection::open(state.join("state.db")).unwrap();
+    conn.execute_batch(sql).unwrap();
+}
+
+#[test]
+fn run_bookkeeping_failures_are_surfaced_and_never_fail_the_caller() {
+    // Run writes are bookkeeping: an adopted Run that cannot be synced, the
+    // no-process sweep at engine open and a label re-sync after a config
+    // write each name the failure on the diagnostic surface and return.
+    let (state, _manifest, registry) = setup_fake("runfault", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("runfault").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    state_db_exec(state.path(), "DROP TABLE runs;");
+
+    let run_id = RunId::mint();
+    sup.sync_adopted_run(&registry, &name, &run_id, "self-reported");
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains(&format!(
+            "runfault: the adopted Run `{run_id}` could not be brought up to date"
+        )),
+        "the adopted-Run sync failure is named:\n{text}"
+    );
+    assert!(
+        text.contains("refresh at the next start or adoption"),
+        "{text}"
+    );
+
+    sup.end_runs_without_a_process(&registry);
+    assert!(
+        sink_text(&buffer).contains("the Runs of agents with no process could not be ended ("),
+        "the no-process sweep failure is named:\n{}",
+        sink_text(&buffer)
+    );
+
+    sup.sync_run_labels(&registry, &name);
+    assert!(
+        sink_text(&buffer).contains(
+            "runfault: the configuration was written, but the open Run's bound labels \
+             could not be updated"
+        ),
+        "the label re-sync failure is named:\n{}",
+        sink_text(&buffer)
+    );
+    assert_eq!(
+        state_of(&registry, "runfault"),
+        LifecycleState::Registered,
+        "no Run failure touches the lifecycle record"
+    );
+}
+
+#[test]
+fn a_transition_whose_run_projection_fails_still_commits_and_says_so() {
+    // The Run projection runs in its own savepoint: a transition whose Run
+    // status cannot be written still commits, and the lost projection is
+    // surfaced instead of silently leaving the Run behind.
+    let (state, _manifest, registry) = setup_fake("runproj", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "runproj").unwrap();
+    state_db_exec(state.path(), "ALTER TABLE runs RENAME TO runs_unavailable;");
+    sup.stop(&registry, "runproj", Some(Duration::from_secs(5)))
+        .unwrap();
+    assert_eq!(
+        state_of(&registry, "runproj"),
+        LifecycleState::Stopped,
+        "the transitions committed"
+    );
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains(
+            "runproj: the transition is recorded, but its Run's status could not be updated"
+        ),
+        "the failed projection is named:\n{text}"
+    );
+    assert!(
+        text.contains("the Run catches up at the next transition"),
+        "{text}"
+    );
+}
+
+#[test]
+fn run_usage_for_an_instance_with_no_process_meters_as_self_reported() {
+    // With no supervised process there is no metering source to borrow: the
+    // committed event is attributed to the neutral `self-reported` source.
+    let (state, _manifest, registry) = setup_fake("runidle", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("runidle").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let run = RunId::mint();
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 7,
+            output_tokens: 3,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(ledger_totals(state.path(), "runidle"), (1, 7));
+    let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+    let source: String = conn
+        .query_row(
+            "SELECT e.metering_source FROM usage_events e \
+             JOIN agent_instances i ON i.id = e.instance_id WHERE i.name = ?1",
+            ["runidle"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(source, "self-reported");
+}
+
+#[test]
+fn an_engine_open_note_reaches_the_installed_diagnostic_sink() {
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.emit_open_note("the import skipped 2 legacy lines");
+    assert_eq!(
+        sink_text(&buffer).trim_end(),
+        "[hekma] the import skipped 2 legacy lines"
+    );
+}
+
+#[test]
+fn a_queued_restart_survives_a_peer_that_panicked_holding_the_queue() {
+    // Poison recovery at its honest scope: a peer panicking while it held
+    // the queue lock leaves the Vec valid, so a plan queued afterwards is
+    // still taken by the next pass instead of vanishing.
+    let sup = Supervisor::with_backoff(fast_backoff());
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = sup.pending_restarts.lock().unwrap();
+        panic!("a peer panics while holding the restart queue");
+    }));
+    assert!(panicked.is_err());
+    assert!(
+        sup.pending_restarts.is_poisoned(),
+        "the fixture premise: the queue lock is poisoned"
+    );
+    let name = InstanceName::new("poisoned").unwrap();
+    sup.queue_pending_restart(RestartPlan {
+        name: name.clone(),
+        attempt: 2,
+        delay: Duration::from_millis(40),
+    });
+    let taken = sup.drain_pending_restarts();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].name, name);
+    assert_eq!(taken[0].attempt, 2);
+    assert!(
+        sup.drain_pending_restarts().is_empty(),
+        "a take empties the queue"
+    );
+}
+
+#[test]
+fn a_restart_requested_cause_without_detail_renders_the_bare_code() {
+    // A hand-built event carries no declared-class detail; the suffix still
+    // spells the wire tag and the exit code.
+    let cause = TransitionCause::RestartRequested {
+        code: 75,
+        detail: None,
+    };
+    assert_eq!(cause_suffix(&cause), " (restart-requested: exit code 75)");
+}
+
+#[test]
+fn a_relaunch_with_an_unreadable_config_re_applies_nothing_and_stays_quiet() {
+    // Without a readable configuration there is no configured action to
+    // match a latch against: nothing is re-applied (the next evaluation
+    // reads the config again), and nothing is announced.
+    let (_state, _manifest, registry) = setup_fake("latchcfg", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("latchcfg").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let run = RunId::mint();
+    sup.record_token_breach(
+        &registry,
+        &name,
+        &run,
+        BreachScope::PerRun,
+        10,
+        12,
+        BreachAction::Pause,
+        "self-reported",
+    );
+    std::fs::write(registry.paths().instance_config(&name), "[budget\nbroken").unwrap();
+    let buffer = install_capture_sink(&mut sup);
+    sup.reapply_latched_actions(&registry, &name, &run);
+    assert_eq!(
+        sink_text(&buffer),
+        "",
+        "an unreadable config re-applies nothing"
+    );
+    assert_eq!(state_of(&registry, "latchcfg"), LifecycleState::Registered);
+}
+
+#[test]
+fn a_relaunch_whose_breach_records_cannot_be_read_says_the_latch_is_not_re_applied() {
+    let (state, _manifest, registry) = setup_fake("latchread", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("latchread").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    state_db_exec(state.path(), "DROP TABLE breach_events;");
+    sup.reapply_latched_actions(&registry, &name, &RunId::mint());
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("latchread: the relaunched Run's breach records could not be read"),
+        "the unreadable breach records are named:\n{text}"
+    );
+    assert!(
+        text.contains("a `pause` or `stop` it had already fired is not re-applied"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_relaunch_re_applies_a_latched_dollar_pause_with_its_cost_cause() {
+    // The money dimension of the relaunch re-apply: a per-run Cost Cap that
+    // already fired `pause` is executed again under its dollar cause. With no
+    // process held the pause cannot be honored, and that is surfaced too.
+    let (_state, _manifest, registry) = setup_fake("latchusd", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("latchusd").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[cost.rate]\ninput = \"1000.00\"\noutput = \"1000.00\"\n\
+         [budget.dollars]\nper_run = \"0.05\"\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    let run = RunId::mint();
+    // The Run's per-run Cost Cap fired `pause` before the process died: the
+    // breach row and its latch are on file ($0.10 observed over $0.05).
+    let fired = BudgetBreachEvent::new_cost(
+        "latchusd",
+        run.as_str(),
+        BreachScope::PerRun,
+        Micros(50_000),
+        Micros(100_000),
+        EstimateLabel::Estimated,
+        BreachAction::Pause,
+        "self-reported",
+        now_rfc3339(),
+    );
+    registry
+        .writer()
+        .call(move |ctx| crate::domain::pipeline::record_breach(ctx, &fired))
+        .unwrap();
+    let breaches = Supervisor::read_breach_events(&registry, "latchusd").unwrap();
+    assert_eq!(breaches.len(), 1, "the dollar breach is on file");
+    assert_eq!(breaches[0].dimension, BreachDimension::Dollars);
+    let unhonored = |text: &str| {
+        text.lines()
+            .filter(|l| l.contains("budget breach pause could not be honored"))
+            .count()
+    };
+    let before = unhonored(&sink_text(&buffer));
+
+    sup.reapply_latched_actions(&registry, &name, &run);
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains(
+            "latchusd: the Restart Policy relaunched this instance into the same Run, whose \
+             dollars per-run ceiling had already fired `pause` — re-applying it"
+        ),
+        "the re-apply names the dollar latch:\n{text}"
+    );
+    assert_eq!(
+        unhonored(&text),
+        before + 1,
+        "the re-applied pause runs and its refusal is surfaced:\n{text}"
+    );
+    assert_eq!(
+        Supervisor::read_breach_events(&registry, "latchusd")
+            .unwrap()
+            .len(),
+        1,
+        "a re-apply records no second breach"
+    );
+}
+
+#[test]
+fn a_kept_runs_dollar_spend_fences_its_relaunch_and_an_unreadable_config_fences_nothing() {
+    // The Run-start fence's money arm over a KEPT Run: its per-run dollar
+    // cost counts, so a relaunch that already crossed a per-run `block` Cost
+    // Cap is fenced before its first call; a fresh Run starts at zero. A
+    // configuration that cannot be read raises nothing.
+    let (_state, _manifest, registry, _rt, name) = setup_block_instance(
+        "fencekeptusd",
+        "http://127.0.0.1:9",
+        &[
+            ("cost.rate.input", "1000.00"),
+            ("cost.rate.output", "1000.00"),
+            ("budget.dollars.per_run", "0.05"),
+        ],
+    );
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let kept = RunId::mint();
+    sup.ingest_usage(
+        &registry,
+        &name,
+        &kept,
+        "engine-observed",
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 100,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+        DrainMode::MidRun,
+    )
+    .unwrap();
+    let fresh = crate::metering::WireFence::default();
+    assert!(!sup.run_start_fence(&registry, &name, &fresh, None));
+    assert!(fresh.refusal().is_none());
+    let relaunched = crate::metering::WireFence::default();
+    assert!(sup.run_start_fence(&registry, &name, &relaunched, Some(&kept)));
+    assert_eq!(relaunched.refusal().unwrap().code, "dollars_per_run");
+
+    std::fs::write(registry.paths().instance_config(&name), "[budget\nbroken").unwrap();
+    let unreadable = crate::metering::WireFence::default();
+    assert!(!sup.run_start_fence(&registry, &name, &unreadable, Some(&kept)));
+    assert!(unreadable.refusal().is_none());
+}
+
+#[test]
+fn a_raw_log_over_its_cap_with_an_unconsumed_partial_line_is_not_truncated() {
+    // The truncate needs BOTH consumers past the cut: a partial trailing line
+    // the usage drain has not consumed yet means unread bytes, so the cut is
+    // deferred, never forced. Once the line completes, the truncate lands.
+    let (_state, _manifest, registry) = setup_fake("truncpart", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("truncpart").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.agent_log_cap_override = Some(64);
+    sup.start(&registry, "truncpart").unwrap();
+    let log = registry.agent_output_log_path(&name);
+    // Wait for the agent's own ready line first, so nothing the agent
+    // writes later completes the partial line or moves the length.
+    let ready_by = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("fake_agent ready")
+    {
+        assert!(
+            Instant::now() < ready_by,
+            "the agent never wrote its ready line"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let partial = "a partial agent line that has not reached its newline yet, well past the cap";
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(partial.as_bytes())
+        .unwrap();
+    let len_before = std::fs::metadata(&log).unwrap().len();
+    assert!(
+        len_before >= 64,
+        "the fixture premise: the file reached the cap"
+    );
+
+    sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
+    sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
+    assert_eq!(
+        std::fs::metadata(&log).unwrap().len(),
+        len_before,
+        "unread bytes are never destroyed"
+    );
+    assert!(
+        sup.running.get(&name).unwrap().usage_cursor < len_before,
+        "the usage cursor still sits before the partial line"
+    );
+    assert!(
+        !sink_text(&buffer).contains("was truncated to 0"),
+        "no truncation is announced while a consumer lags"
+    );
+
+    // The line completes: both consumers catch up and the cut lands.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(b"\n")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !sink_text(&buffer).contains("was truncated to 0") {
+        assert!(
+            Instant::now() < deadline,
+            "the deferred truncate never landed:\n{}",
+            sink_text(&buffer)
+        );
+        sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = sup.stop(&registry, "truncpart", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn an_adopted_raw_log_truncate_failure_latches_one_notice_until_a_truncate_succeeds() {
+    // An adopted handle has no capture tailer, so the usage drain is the raw
+    // file's only reader and the engine truncates the file itself. A failed
+    // truncate is a deferral announced ONCE per continuous failure; the next
+    // success truncates to 0, snaps the cursor and re-arms the latch.
+    let (state, _manifest, registry) = setup_fake("trunadopt", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("trunadopt").unwrap();
+    let mut sup1 = Supervisor::with_backoff(fast_backoff());
+    let mut record = crash_engine_leaving_record(&mut sup1, &registry, "trunadopt");
+    record.detach = false;
+    record.owner = Some(crate::ports::ProcessFingerprint::new(999_999_998, 1));
+    registry.write_spawn_record(&record).unwrap();
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup2);
+    sup2.agent_log_cap_override = Some(64);
+    assert_eq!(
+        sup2.adopt_orphans(&registry),
+        1,
+        "the dead-owner record adopts"
+    );
+    assert!(
+        sup2.log_capture_for(&name).is_none(),
+        "the fixture premise: an adopted handle holds no capture"
+    );
+    let log = registry.agent_output_log_path(&name);
+    append_usage_lines(&log, &[(1, 4, 2), (2, 5, 3)]);
+    let len = std::fs::metadata(&log).unwrap().len();
+    assert!(len >= 64, "the fixture premise: the file reached the cap");
+
+    let original_perms = std::fs::metadata(&log).unwrap().permissions();
+    let mut read_only = original_perms.clone();
+    read_only.set_readonly(true);
+    std::fs::set_permissions(&log, read_only).unwrap();
+    // A privileged runner ignores the read-only bit; the failure leg needs
+    // the open-for-write to actually be refused.
+    let write_refused = std::fs::OpenOptions::new().write(true).open(&log).is_err();
+    let failed_notice = "trunadopt: agent.log reached the 0MB capture bound but the truncate \
+                         failed; deferring (this notice latches until a truncate succeeds)";
+    if write_refused {
+        sup2.drain_usage_for(&registry, &name, DrainMode::MidRun);
+        sup2.drain_usage_for(&registry, &name, DrainMode::MidRun);
+        let text = sink_text(&buffer);
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.strip_prefix("[hekma] ") == Some(failed_notice))
+                .count(),
+            1,
+            "ONE deferral notice per continuous failure:\n{text}"
+        );
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().len(),
+            len,
+            "a failed truncate leaves the file whole"
+        );
+        assert_eq!(
+            sup2.running.get(&name).unwrap().usage_cursor,
+            len,
+            "the drain itself still consumed the block"
+        );
+    }
+
+    std::fs::set_permissions(&log, original_perms).unwrap();
+    sup2.drain_usage_for(&registry, &name, DrainMode::MidRun);
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("trunadopt: agent.log reached the 0MB capture bound and was truncated to 0"),
+        "the adopted truncate is announced:\n{text}"
+    );
+    assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+    assert_eq!(sup2.running.get(&name).unwrap().usage_cursor, 0);
+    assert_eq!(
+        ledger_totals(state.path(), "trunadopt"),
+        (2, 9),
+        "both events committed exactly once across the deferral"
+    );
+    sup2.stop(&registry, "trunadopt", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn an_adoption_surfaces_unreadable_breach_records_and_a_stuck_launch_generation() {
+    // Adoption never fails on bookkeeping: a resumed Run whose breach records
+    // cannot be read re-raises no fence and says so, and a launch generation
+    // that cannot be advanced falls back to the stored one and says so.
+    let (state, _manifest, registry) = setup_fake("adoptfault", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("adoptfault").unwrap();
+    let mut sup1 = Supervisor::with_backoff(fast_backoff());
+    let mut record = crash_engine_leaving_record(&mut sup1, &registry, "adoptfault");
+    record.detach = false;
+    record.owner = Some(crate::ports::ProcessFingerprint::new(999_999_998, 1));
+    registry.write_spawn_record(&record).unwrap();
+    let stored_generation = registry.launch_generation(&name).unwrap();
+    state_db_exec(
+        state.path(),
+        "ALTER TABLE breach_events RENAME TO breach_events_unavailable;\n\
+         CREATE TRIGGER launch_generation_fault BEFORE UPDATE OF launch_generation \
+         ON agent_instances BEGIN SELECT RAISE(ABORT, 'injected launch-generation fault'); END;",
+    );
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup2);
+    assert_eq!(
+        sup2.adopt_orphans(&registry),
+        1,
+        "the adoption still succeeds"
+    );
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("adoptfault: the resumed Run's breach records could not be read")
+            && text.contains("a `block` fence it carried is not re-raised"),
+        "the unreadable breach records are named:\n{text}"
+    );
+    assert!(
+        text.contains("adoptfault: the adopted instance's launch generation could not be advanced")
+            && text.contains("injected launch-generation fault"),
+        "the stuck generation is named with its cause:\n{text}"
+    );
+    assert_eq!(
+        sup2.running.get(&name).unwrap().launch_generation,
+        stored_generation,
+        "the fallback is the stored generation"
+    );
+
+    state_db_exec(
+        state.path(),
+        "DROP TRIGGER launch_generation_fault;\n\
+         ALTER TABLE breach_events_unavailable RENAME TO breach_events;",
+    );
+    sup2.stop(&registry, "adoptfault", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn start_refuses_a_managed_memory_dir_path_blocked_by_a_file() {
+    // The attached managed memory directory cannot be ensured when a regular
+    // file sits at its path: the start is refused LOUD, pre-transition, with
+    // the I/O cause named, and nothing is launched.
+    let (_state, _manifest, registry) = setup_fake("memblocked", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("memblocked").unwrap();
+    registry
+        .attach_memory(name.as_str(), MemoryBackingKind::Filesystem)
+        .unwrap();
+    let managed = registry.paths().agent_memory_dir(&name);
+    std::fs::remove_dir_all(&managed).unwrap();
+    std::fs::write(&managed, b"not a directory").unwrap();
+
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let err = sup.start(&registry, "memblocked").unwrap_err();
+    let EngineError::Log { detail, path, .. } = &err else {
+        panic!("expected EngineError::Log for the blocked memory dir, got {err:?}");
+    };
+    assert!(
+        detail.starts_with("could not ensure the managed memory directory: "),
+        "the refusal names the ensure step: {detail}"
+    );
+    assert_eq!(path, &managed.to_string_lossy());
+    assert!(sup.running.is_empty(), "nothing was launched");
+    assert_eq!(
+        state_of(&registry, "memblocked"),
+        LifecycleState::Registered
+    );
+    assert!(managed.is_file(), "the blocking file is left as found");
+}
+
+/// Register a cooperative pause pair instance (`--touch` sentinels for the
+/// commands) under a fresh state dir and start it detached.
+fn start_coop_pair(name: &str) -> (tempfile::TempDir, tempfile::TempDir, Registry, Supervisor) {
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_coop_pair_manifest(
+        manifest.path(),
+        name,
+        &["--linger-ms", "600000"],
+        &["--touch", "pause.sentinel"],
+        &["--touch", "resume.sentinel"],
+        None,
+    );
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(name, &AdapterRef::Manifest(manifest.path().to_path_buf()))
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start_detached(&registry, name).unwrap();
+    (state, manifest, registry, sup)
+}
+
+#[test]
+fn a_drain_whose_pause_commit_fails_after_the_command_ran_is_surfaced_and_returned() {
+    // The drain's pause command RAN, then the ledger refused the paused
+    // edge: the divergence is named (command ran, record failed) and the
+    // error is returned instead of a silent stop.
+    let (_state, _manifest, registry, mut sup) = start_coop_pair("draindiv");
+    let name = InstanceName::new("draindiv").unwrap();
+    let buffer = install_capture_sink(&mut sup);
+
+    break_instance_event_log(&mut sup, &name);
+    let err = sup.drain(&registry, "draindiv", None).unwrap_err();
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains(
+            "draindiv: the drain's pause command already ran, but recording the \
+             running→paused transition failed"
+        ),
+        "the divergence names both sides:\n{text}"
+    );
+    assert!(
+        text.contains(&err.to_string()),
+        "the note carries the returned error: {err}\n{text}"
+    );
+    assert_eq!(state_of(&registry, "draindiv"), LifecycleState::Running);
+
+    repair_instance_event_log(&mut sup, &name);
+    sup.stop(&registry, "draindiv", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn cooperative_resume_divergence_after_the_command_ran_points_at_resume_again() {
+    // The resume twin of the pause divergence: the declared RESUME command
+    // ran and the paused→running edge was refused. Re-running `resume` is
+    // the recovery (the gate still accepts paused → running).
+    let (_state, _manifest, registry, mut sup) = start_coop_pair("coopresdiv");
+    let name = InstanceName::new("coopresdiv").unwrap();
+    let buffer = install_capture_sink(&mut sup);
+    sup.pause(&registry, "coopresdiv").unwrap();
+    assert_eq!(state_of(&registry, "coopresdiv"), LifecycleState::Paused);
+
+    break_instance_event_log(&mut sup, &name);
+    let _err = sup.resume(&registry, "coopresdiv").unwrap_err();
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("the resume command already ran, but recording the paused→running"),
+        "the note names the side that already happened:\n{text}"
+    );
+    assert!(
+        text.contains("recovery: hekma agent resume coopresdiv"),
+        "a failed RESUME commit realigns by resuming again:\n{text}"
+    );
+    assert_eq!(state_of(&registry, "coopresdiv"), LifecycleState::Paused);
+
+    repair_instance_event_log(&mut sup, &name);
+    sup.stop(&registry, "coopresdiv", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn raw_output_reads_refuse_an_invalid_instance_name() {
+    let (_state, _manifest, registry) = setup_fake("rawname", &["--linger-ms", "600000"]);
+    let sup = Supervisor::with_backoff(fast_backoff());
+    let err = sup
+        .read_raw_output_since(&registry, "Not A Name", None)
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::InvalidName { name, .. } if name == "Not A Name"),
+        "{err:?}"
+    );
+    let err = sup
+        .prime_raw_backlog(&registry, "Not A Name", 10)
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::InvalidName { name, .. } if name == "Not A Name"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn adopted_paused_attached_child_notes_it_stays_paused_until_a_session_acts() {
+    // The adopted-PAUSED note, ATTACHED arm: a record that is not detached
+    // has no session-exit resume, so the note says the pause holds until an
+    // engine session resumes or stops it.
+    let (_s, _m, registry) = setup_pause_guaranteed("adoppatt", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("adoppatt").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start_detached(&registry, "adoppatt").unwrap();
+    sup.pause(&registry, "adoppatt").unwrap();
+    assert_eq!(state_of(&registry, "adoppatt"), LifecycleState::Paused);
+    make_dead_owner_record(&registry, &name);
+    let mut record = registry.spawn_record(&name).unwrap().unwrap();
+    record.detach = false;
+    registry.write_spawn_record(&record).unwrap();
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup2);
+    assert_eq!(sup2.adopt_orphans(&registry), 1);
+    let text = wait_for_sink_line(
+        &buffer,
+        "adopted a PAUSED instance",
+        "the adopted-paused note",
+    );
+    assert!(
+        text.contains("it stays paused until an engine session resumes or stops it"),
+        "the attached arm names who ends the pause: {text}"
+    );
+    assert!(
+        !text.contains("on this session's exit the child is resumed"),
+        "an attached record has no session-exit resume: {text}"
+    );
+    assert_eq!(state_of(&registry, "adoppatt"), LifecycleState::Paused);
+    let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
+}
