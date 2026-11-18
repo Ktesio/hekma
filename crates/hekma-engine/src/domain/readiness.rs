@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use hekma_adapter_api::ReadinessProbe;
 
-use crate::ports::{ProcessBackend, ProcessStatus};
+use crate::ports::ProcessStatus;
 
 use super::probe_kinds::{file_fresh, http_get_attempt};
 
@@ -119,10 +119,10 @@ pub(crate) enum ProbeOutcome {
 ///   and the timeout names why.
 /// * `home` — the Agent Home, which a relative `file-fresh` path resolves
 ///   against.
-pub(crate) fn run_probe(
+pub(crate) fn run_probe<B: crate::ports::ProcessBackend>(
     gate: &hekma_adapter_api::ReadinessGate,
-    backend: &crate::backends::Backend,
-    handle: &mut crate::backends::Handle,
+    backend: &B,
+    handle: &mut B::Handle,
     log_path: Option<&Path>,
     log_start_offset: u64,
     home: &Path,
@@ -272,6 +272,7 @@ fn log_contains(path: &Path, start_offset: u64, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::ProcessBackend as _;
     use std::io::Write as _;
 
     // -- describe ----------------------------------------------------------

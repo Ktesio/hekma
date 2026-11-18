@@ -76,7 +76,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # pulled on Unix; the cfg lives in Cargo.toml (the OS-cfg CI gate greps *.rs, not
 # manifests). Minimal features — nix is heavily feature-gated. MSRV 1.69.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["signal", "process"] }
+# Story 24-1: `socket` + `user` for the Shim's peer-uid check (getpeereid
+# on macOS/BSD, SO_PEERCRED on Linux) and the owner's uid.
+nix = { version = "0.31", features = ["signal", "process", "socket", "user"] }
 
 # Windows ProcessBackend (AD-4): one Job Object per Agent Instance
 # (CreateJobObjectW / AssignProcessToJobObject / SetInformationJobObject

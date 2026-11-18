@@ -4,6 +4,16 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — the Shim, part two: agents in their own Shim, a preview (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **Off by default.** With `EngineOptions::shim_exe` set (and `hekma serve` with `HEKMA_SHIM=1`), each supervised agent is launched through its own Shim. The agent then outlives the engine, and the next engine reconnects to it. Unix only; ACP agents stay held directly.
+> - **Dropping an engine does not stop a Shim-held agent;** only an explicit stop or `shutdown` does.
+> - **Engine surface (breaking within the unreleased 0.12.0):**
+>   - `EngineOptions` gains `shim_exe`;
+>   - `SpawnRecord` gains `shim` (`ShimRecord`);
+>   - `state.db` migrates one way to schema 27.
+
 > **Unreleased — reconciliation: confirmed usage beside the estimate (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >
@@ -28,6 +38,12 @@ Release automation updates this file with a pull request after each `vMAJOR.MINO
 > - **Lock timing for diagnosis.** `Engine::set_lock_timing` and `Engine::lock_hold_stats` record how long each call site holds the engine's two locks. This is additive, and off by default.
 > - **Publishing Run changes no longer copies every open Run.** The data path's Run snapshot keeps its maps as a shared base plus small shared change layers, folded periodically, so a commit that changes a few Runs costs the same at a hundred open Runs or a million. Nothing about what readers see changes.
 > - **Engine surface (additive):** `Engine::retention`, `Engine::set_retention`, `Engine::compacted_run`, and `RetentionSettings`, `RetentionChange`, `RetentionView`, `CompactionState`, `CompactedRun`, `RetentionError` with the `RETENTION_*` bounds. `state.db` migrates one way to schema 25 (24: retention; 25: two indexes).
+
+> **Unreleased — the Shim, part one (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **Internal, nothing changes yet:** a hidden `hekma shim` command and the `hekma-engine::shim` module add the Shim, the small supervisor that will own each supervised process so it survives the engine. The supervisor does not use it yet; agents start, stop and adopt exactly as before. A `shim-host-key` file (owner-only) is created in the state directory only when a Shim is used.
+> - **Engine surface (additive):** the public `shim` module (`run`, `connect`, `socket_path`, the `proto`, `secret`, `server` and `client` submodules) and `backends::shim_listen`/`shim_connect` (Unix; Windows returns unsupported until the named-pipe transport lands). No schema change.
 
 > **Unreleased — `otlp-metrics v2`: telemetry grouped by depth, Policy and labels (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:

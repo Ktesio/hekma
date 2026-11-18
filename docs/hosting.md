@@ -193,6 +193,18 @@ The Service Host that owns the metering proxy also runs its **sweeper**: every 5
 
 A Host embedding the engine sets the windows in `MeteringProxyOptions.leases` (`LeaseOptions { lease_secs, wire_inactivity_secs, silent_window_secs, sweep_interval_secs }`, defaults 60, 900, 3600 and 5). They are host settings, not Policy limits.
 
+## Agents in their own Shim (a preview)
+
+Set `HEKMA_SHIM=1` in the environment of `hekma serve` (or of the `hekma`
+command that starts the host) and the host launches each agent through its
+own small supervisor, a Shim, which this binary runs as the hidden internal
+command `hekma shim`. The Shim owns the agent's process, so the agent keeps
+running when the host exits or crashes, and the next host reconnects to it.
+Unix only, and ACP agents stay held directly. It is off by default: without
+the variable, nothing changes. What happens to Shim-held agents when the
+host stops (keep them for the next host, or stop them) is still to be
+decided; today a draining host stops them as before.
+
 ## Retention
 
 The same host keeps the state directory from growing without bound. An ended Run keeps its full detail for seven days, then is reduced to its totals, labels and end cause; per-call records are kept for seven days, then their daily file is deleted whole. The host does this when it starts and then once a day. Change either window with `hekma run retention --runs <days>` or `--calls <days>`, or `PUT /v0/retention`, from 1 to 3650 days; usage records, events and the export outbox are not touched.

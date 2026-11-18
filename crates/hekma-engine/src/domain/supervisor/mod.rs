@@ -567,7 +567,7 @@ fn plan_follow(bytes: &[u8], cursor: u64) -> FollowPlan {
 /// lifetime alongside the handle, exactly like the handle map it replaced.
 struct Supervised {
     /// The backend-owned process handle (group/job control).
-    handle: backends::Handle,
+    handle: proc::ProcHandle,
     /// The current Run this instance is in (spine AD-7) — minted at `starting`.
     run_id: RunId,
     /// The declared Metering Source wire string (`self-reported` / `engine-observed`),
@@ -807,7 +807,7 @@ pub(crate) enum ServeOptionsRefused {
 /// ingestion adapter, and the [`BackoffSchedule`] the restart executor uses
 /// (production 1s×2 cap 60s; tests inject a scaled one).
 pub struct Supervisor {
-    backend: backends::Backend,
+    backend: proc::ProcBackend,
     running: HashMap<InstanceName, Supervised>,
     usage_source: SelfReportedUsageSource,
     backoff: BackoffSchedule,
@@ -1084,6 +1084,12 @@ pub(crate) enum StopFault {
 }
 
 impl Supervisor {
+    /// Story 24-1: launch supervised processes through a Shim from now on
+    /// (`None`: directly). Open-time, like the serve options.
+    pub(crate) fn set_shim_launcher(&mut self, launcher: Option<proc::ShimLauncher>) {
+        self.backend.set_shim(launcher);
+    }
+
     /// Construct an empty supervisor with the current OS's process backend and
     /// the PRODUCTION backoff schedule (1s base, ×2, 60s cap — spine AD-15).
     /// The engine's production constructor is [`Supervisor::with_runtime`];
@@ -1091,7 +1097,7 @@ impl Supervisor {
     /// exercise self-reported / lifecycle paths.
     pub fn new() -> Self {
         Self {
-            backend: backends::current(),
+            backend: proc::ProcBackend::new(),
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff: BackoffSchedule::production(),
@@ -1150,7 +1156,7 @@ impl Supervisor {
     /// unchanged.
     pub fn with_runtime(_runtime: tokio::runtime::Handle) -> Self {
         Self {
-            backend: backends::current(),
+            backend: proc::ProcBackend::new(),
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff: BackoffSchedule::production(),
@@ -1208,7 +1214,7 @@ impl Supervisor {
     #[cfg(test)]
     pub(crate) fn with_backoff(backoff: BackoffSchedule) -> Self {
         Self {
-            backend: backends::current(),
+            backend: proc::ProcBackend::new(),
             running: HashMap::new(),
             usage_source: SelfReportedUsageSource::new(),
             backoff,
@@ -2446,6 +2452,7 @@ mod commit;
 mod drain;
 mod interaction;
 mod lifecycle;
+pub(crate) mod proc;
 
 pub use drain::DrainOutcome;
 mod reaper;
