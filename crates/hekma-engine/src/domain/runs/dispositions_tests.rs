@@ -17,6 +17,7 @@ fn store() -> SqliteStore {
             labels: vec![("team".into(), "core".into())],
             created_at: "t".into(),
             updated_at: "t".into(),
+            identity_headers: None,
         })
         .unwrap();
     for (route, upstream, key) in [

@@ -319,7 +319,10 @@ fn router(state: ApiState) -> Router {
         )
         // Story 23-1: where the shared Metering Proxy listens (or why it is
         // not running).
-        .route("/v0/proxy", get(routes::proxy_show))
+        .route(
+            "/v0/proxy",
+            get(routes::proxy_show).patch(routes::proxy_update),
+        )
         // Live events (SSE).
         .route("/v0/events", get(sse::live_events))
         // The ephemeral-host export surface (story 17-4): the global outbox

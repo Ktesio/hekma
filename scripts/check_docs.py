@@ -145,6 +145,7 @@ KT_COMMANDS = {
     "policy",
     "budget",
     "binding",
+    "proxy",
     "calls",
     "ps",
     "serve",

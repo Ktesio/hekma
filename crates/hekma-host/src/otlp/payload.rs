@@ -315,6 +315,8 @@ impl MetricState {
             // Story 22-2: a reveal names a secret, never a value, and has
             // no metric — ignored.
             EngineEvent::SecretRevealed(_) => {}
+            // Story 21-8: a proxy setting has no metric — ignored.
+            EngineEvent::ProxySetting(_) => {}
         }
     }
 

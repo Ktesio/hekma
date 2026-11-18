@@ -4,6 +4,17 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — the identity-header switch and Hekma in front of a gateway (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **A stored switch:** `hekma proxy set identity-headers on|off` (and `PATCH /v0/proxy`, Operator bearer only) turns the outbound `x-hekma-run-id` and `x-hekma-labels` headers on or off for every forwarded call. It is stored in the state directory, so an auto-started host reads it, and it applies to the very next call with no restart. One `proxy_setting` event per change. `hekma proxy show` reads it without starting anything; `GET /v0/proxy` gains `identity_headers`, `stored_identity_headers` and `forced_by_flag`.
+> - **Per binding:** `hekma binding set <name> --identity-headers on|off|inherit` (the binding's `identity_headers` field) wins over the stored setting; `inherit` follows it again.
+> - **Per run:** `hekma serve --identity-headers` joins `--no-identity-headers`; either overrides the stored setting until that host stops, is never stored, and the started notice says when it disagrees. Passing both is a usage error.
+> - **Unchanged:** the header names, what they carry (the Run's id and labels, never content or a credential), the default (on) and the strip rule for a client's own `x-hekma-*` headers.
+> - **New page:** `docs/gateways.md`, Hekma in front of LiteLLM, Portkey or a similar gateway, with two example recipes.
+> - **Engine surface (breaking within the unreleased 0.12.0):** `MeteringProxyOptions.identity_headers` is now `Option<bool>` (`None` follows the stored setting); `EngineEvent` gains `ProxySetting`; `BindingSpec`, `Binding`, `BindingPatch` and `BindingEvent` gain `identity_headers`; new `Engine::proxy_settings` and `Engine::set_proxy_identity_headers`.
+> - `state.db` migrates one way to schema 23.
+
 > **Unreleased — hold, release, reroute and reject at the metering proxy (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >

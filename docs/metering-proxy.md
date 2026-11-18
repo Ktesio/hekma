@@ -81,11 +81,11 @@ This Run Key never draws key custody. Past a cap, the call stays on the parent o
 - Hop-by-hop headers are handled as any proxy handles them.
 - The outbound URL is the upstream base URL, plus the path after the prefix, plus the query. The proxy checks that its scheme, host and port still equal the upstream's before it dials, so a crafted path cannot send the call elsewhere. A `CONNECT` request, or an absolute-form target naming another host, is refused with `400 hekma_bad_target`. Redirects are relayed to the client, never followed.
 - Streaming requests that ask for `"stream": true` get `stream_options.include_usage` added (unless they set `stream_options` themselves), so the final usage frame can be counted.
-- Two **identity headers** are added, unless you start the host with `--no-identity-headers`:
+- Two **identity headers** are added, unless they are turned off:
   - `x-hekma-run-id`, the Run's id;
   - `x-hekma-labels`, the Run's labels as sorted, percent-encoded `key=value` items joined by commas.
 
-  Neither ever carries a token, a token id or request content. **They are on by default, so your model provider receives each call's Run id and labels.** Turn them off if that is not what you want.
+  Neither ever carries a token, a token id or request content. **They are on by default, so your model provider receives each call's Run id and labels.** Turn them off if that is not what you want: `hekma proxy set identity-headers off` stores the setting and applies it to the very next call, `hekma binding set <name> --identity-headers on|off|inherit` sets one binding's own, and `hekma serve --no-identity-headers` or `--identity-headers` overrides the stored setting for one run. A binding's own setting wins, then the serve flag, then the stored setting. See [Hekma in front of a gateway](gateways.md#turning-the-identity-headers-off).
 
 **Under key custody** (a preview; see [Run Keys and key custody](run-keys.md#key-custody-preview--not-yet-supported)):
 - The call must be presented with a Run Key issued to a supervised agent or a credentialed open. Its Run, a Run above it, or its binding, must hold a provider key.
@@ -247,8 +247,8 @@ The `402` body and headers are unchanged from earlier releases; see [Governance]
 | `x-hekma-labels` | Request | The hint's or announce's Caller labels |
 | `x-hekma-announce` | Request | Claim this identity (see [Announce](#announce)) |
 | `x-hekma-*` | Request | Every one is removed before forwarding |
-| `x-hekma-run-id` | Outbound | The Run's id (unless `--no-identity-headers`) |
-| `x-hekma-labels` | Outbound | The Run's labels (unless `--no-identity-headers`) |
+| `x-hekma-run-id` | Outbound | The Run's id (unless the identity headers are off) |
+| `x-hekma-labels` | Outbound | The Run's labels (unless the identity headers are off) |
 | `x-hekma-breach` | Response | The latched breaches of the Run or a Run above it |
 | `x-hekma-run-key` | Response | A first announce's new Run Key, once |
 | `x-hekma-refresh` | Response | A first announce's new refresh credential, once |

@@ -850,6 +850,27 @@ pub(super) fn migrate_v22(conn: &Connection) -> Result<(), StoreError> {
     migrate_runs_step(conn, 22, SCHEMA_V22)
 }
 
+/// Schema v23 (story 21-8): the outbound identity-header switch — the
+/// durable root setting on `proxy_state` (an absent row, or `1`, is on) and
+/// the per-binding override on `run_bindings` (`NULL` inherits the root).
+const SCHEMA_V23: &str = "\
+ALTER TABLE proxy_state ADD COLUMN identity_headers INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE run_bindings ADD COLUMN identity_headers TEXT
+    CHECK (identity_headers IN ('on','off') OR identity_headers IS NULL);
+";
+
+/// Undo v23 on a fully migrated store, for the older upgrade tests.
+#[cfg(test)]
+pub(crate) const UNDO_V23_FOR_TEST: &str = "\
+ALTER TABLE proxy_state DROP COLUMN identity_headers;
+ALTER TABLE run_bindings DROP COLUMN identity_headers;
+";
+
+/// Run the v23 step.
+pub(super) fn migrate_v23(conn: &Connection) -> Result<(), StoreError> {
+    migrate_runs_step(conn, 23, SCHEMA_V23)
+}
+
 /// Undo v21 on a fully migrated store, for the older upgrade tests.
 #[cfg(test)]
 pub(crate) const UNDO_V21_FOR_TEST: &str = "DROP TABLE telemetry_counters;";

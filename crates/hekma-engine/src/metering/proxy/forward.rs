@@ -100,7 +100,9 @@ pub(crate) struct ProxyShared {
     pub snapshot: Arc<SnapshotPublisher>,
     pub pump: Arc<RecordPump>,
     pub client: ForwardClient,
-    pub identity_headers: bool,
+    /// Story 21-8: this run's serve-flag override of the stored
+    /// identity-header setting (`None` follows the stored setting).
+    pub identity_headers_flag: Option<bool>,
     pub inflight: Arc<Semaphore>,
     /// The admission slots' total.
     pub max_calls: usize,
@@ -1336,7 +1338,16 @@ async fn serve_resolved(
             }
         }
     }
-    if shared.identity_headers {
+    // Story 21-8: the switch resolves per call from the snapshot current
+    // at the forward (a released or rerouted call reads the setting of its
+    // forward): the binding's override, else this run's flag, else the
+    // stored root.
+    if shared
+        .snapshot
+        .current()
+        .bindings
+        .identity_headers_for(shared.identity_headers_flag, binding.as_deref())
+    {
         if let Ok(value) = HeaderValue::from_str(run_id.as_str()) {
             parts
                 .headers

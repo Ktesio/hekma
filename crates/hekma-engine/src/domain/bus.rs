@@ -150,6 +150,10 @@ pub enum EngineEvent {
     /// printed an instance's held provider key. Names the secret, never a
     /// value; committed before the value prints.
     SecretRevealed(super::custody::SecretRevealedEvent),
+    /// A shared-proxy Operator setting changed (story 21-8): today the
+    /// root outbound identity-header switch. Committed with its outbox row
+    /// in the job that made the change; names the setting and its value.
+    ProxySetting(super::runs::bindings::ProxySettingEvent),
 }
 
 /// The in-supervisor handle to the event bus: a cloneable pair of

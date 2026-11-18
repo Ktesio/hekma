@@ -290,6 +290,12 @@ enum Commands {
         #[command(subcommand)]
         command: BindingCommands,
     },
+    /// Show or change the metering proxy's settings
+    #[command(about = "Show or change the metering proxy's settings")]
+    Proxy {
+        #[command(subcommand)]
+        command: ProxyCommands,
+    },
     /// Read the metering proxy's per-call records
     #[command(about = "Read the metering proxy's per-call records")]
     Calls {
@@ -418,9 +424,14 @@ enum Commands {
         #[arg(long, value_name = "PORT", default_value_t = 0)]
         metering_listen: u16,
         /// Send neither x-hekma-run-id nor x-hekma-labels to the model
-        /// provider (identity headers are on by default)
-        #[arg(long)]
+        /// provider for this run only, whatever `hekma proxy set
+        /// identity-headers` stored (identity headers are on by default)
+        #[arg(long, conflicts_with = "identity_headers")]
         no_identity_headers: bool,
+        /// Send x-hekma-run-id and x-hekma-labels to the model provider for
+        /// this run only, whatever `hekma proxy set identity-headers` stored
+        #[arg(long)]
+        identity_headers: bool,
         /// Host header values the metering proxy accepts besides 127.0.0.1,
         /// ::1 and localhost (comma-separated; any other Host is refused)
         #[arg(long, value_name = "NAME,...", value_delimiter = ',')]
@@ -767,6 +778,10 @@ enum BindingCommands {
         /// Remove the custodied-key reference
         #[arg(long)]
         clear_custodied_key: bool,
+        /// Whether this binding's calls carry the identity headers: on, off,
+        /// or inherit (follow the proxy setting)
+        #[arg(long, value_name = "on|off|inherit", value_parser = ["on", "off", "inherit"])]
+        identity_headers: Option<String>,
         /// Print the result as JSON
         #[arg(long)]
         json: bool,
@@ -785,6 +800,30 @@ enum BindingCommands {
     Credential {
         #[command(subcommand)]
         command: BindingCredentialCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProxyCommands {
+    /// Show the proxy's address and whether forwarded calls carry the
+    /// identity headers (reads only; starts nothing)
+    Show {
+        /// Print the settings as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a setting; it applies to the next forwarded call
+    Set {
+        /// The setting: identity-headers (x-hekma-run-id and x-hekma-labels
+        /// on forwarded calls)
+        #[arg(value_parser = ["identity-headers"])]
+        setting: String,
+        /// on or off
+        #[arg(value_parser = ["on", "off"])]
+        value: String,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1289,6 +1328,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             stop_window,
             metering_listen,
             no_identity_headers,
+            identity_headers,
             proxy_allowed_hosts,
             proxy_allowed_origins,
             state_dir,
@@ -1306,6 +1346,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             stop_window,
             metering_listen,
             no_identity_headers,
+            identity_headers,
             proxy_allowed_hosts,
             proxy_allowed_origins,
             state_dir,
@@ -1464,6 +1505,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }),
             CallsCommands::Show { call_id, json } => cli::calls::show(&call_id, json),
         },
+        Some(Commands::Proxy { command }) => match command {
+            ProxyCommands::Show { json } => cli::proxy::show(json),
+            ProxyCommands::Set { value, json, .. } => cli::proxy::set(value == "on", json),
+        },
         Some(Commands::Binding { command }) => match command {
             BindingCommands::List { after, limit, json } => {
                 cli::binding::list(after, limit.unwrap_or(100), json)
@@ -1492,6 +1537,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 clear_labels,
                 custodied_key,
                 clear_custodied_key,
+                identity_headers,
                 json,
             } => cli::binding::set(cli::binding::SetArgs {
                 name,
@@ -1501,6 +1547,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 clear_labels,
                 custodied_key,
                 clear_custodied_key,
+                identity_headers,
                 json,
             }),
             BindingCommands::Delete { name } => cli::binding::delete(&name),

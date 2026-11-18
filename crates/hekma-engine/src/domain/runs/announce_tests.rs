@@ -18,6 +18,7 @@ fn binding(name: &str, labels: Vec<(String, String)>) -> BindingRow {
         labels,
         created_at: "t".into(),
         updated_at: "t".into(),
+        identity_headers: None,
     }
 }
 
