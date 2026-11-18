@@ -6195,6 +6195,7 @@ mod tests {
             dollar_cap: Some("1.50".to_string()),
             breach_action: Some("warn".to_string()),
             external_id: Some("job-7".to_string()),
+            print_key: false,
             json: false,
         };
         // No host serves the root (and a unit test never starts one): the
@@ -6333,6 +6334,7 @@ mod tests {
             ],
             limits: Default::default(),
             external_id: None,
+            issue_credentials: false,
         });
         // A planned removal of a Caller label the verb never bound.
         let planned = label(label_args(
