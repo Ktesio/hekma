@@ -333,10 +333,14 @@ fn the_usage_and_breach_hooks_write_the_journal_too() {
         )
         .unwrap();
     // A cumulative ceiling of 60 tokens: 30/event, so event 2 CROSSES it —
-    // the default pause action fires the paused transition (budget.rs's
+    // `pause` (set explicitly; the shipped default is `warn` since
+    // Policies landed) fires the paused transition (budget.rs's
     // determinism anchor).
     facade
         .set_config("hooked", "budget.tokens.cumulative", "60")
+        .unwrap();
+    facade
+        .set_config("hooked", "budget.breach_action", "pause")
         .unwrap();
     facade.start("hooked").unwrap();
 

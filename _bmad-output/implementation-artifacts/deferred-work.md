@@ -479,3 +479,29 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-21-9-bound-labels.md` (Design Notes: the planners)
   summary: A configured key replaces a Caller label on the same key, and if the configuration later drops the key, the Caller's value does not come back (the Caller row was replaced, not shadowed). The same holds for a verb label set over a Caller key and then removed. Bound wins by design; the Caller can set the label again where its surface allows.
   evidence: `domain/runs/labels.rs` (`plan_config_sync`, `plan_label_change`). Trigger: an operator or Host report of a lost Caller label, or story 23.1 if identity-header labels need to survive an Operator override.
+
+## Deferred from: implementation of spec-21-3-policies (2026-11-10)
+
+- source_spec: `spec-21-3-policies.md` (Design Notes: Scent-Check in 21-3)
+  summary: Scent-Check behavior (`off`/`shadow`/`enforce`) does not exist; 21-3 stores the field on every Policy row, resolves it through the tie order and refuses `shadow`/`enforce` at create/change with `scent-unavailable`. The modes take effect — and Q9's per-environment default is decided — with story 22.3, which never overwrites an Operator-edited default Policy.
+  evidence: `domain/runs/policy.rs` (`ScentCheckMode`, the resolver's scent arm), `registry_policy.rs` (`ScentUnavailable` refusal); PRD §13 Q9 interim. Trigger: story 22.3.
+
+- source_spec: `spec-21-3-policies.md` (Design Notes: the policy change job)
+  summary: A Policy change's re-arm covers the POLICY trigger only; `hekma budget` and plain config-write raises re-arm with story 21.6 (which generalizes the same rule and clears matching fence reasons), and Selector set tokens on the Control API are 21.6's too — the CLI resolves a Selector locally today.
+  evidence: `registry_policy.rs::re_arm` (the policy-change job); FR-60's budget-trigger sibling lands with 21.6. Trigger: story 21.6.
+
+- source_spec: `spec-21-3-policies.md` (Design Notes: What 21-3 does NOT do)
+  summary: Wire Runs' enforcement through the shared proxy — the snapshot entry carries the resolution but nothing reads it on a call path until 23.1; until then depths below `supervised` execute no action (the depth fallback covers them honestly). `hekma ps` (21.5) carries the "kept on pause by upgrade" note to the Run-first surface; today the note lives on `fleet`/`show`/`run show`.
+  evidence: `runs/policy.rs` (the snapshot entry), `cli/agent.rs::breach_default_note`; FR-49's verb×depth table. Trigger: stories 23.1, 21.5.
+
+- source_spec: `spec-21-3-policies.md` (I/O Impact Matrix)
+  summary: The hekma-engine semver baseline does NOT move for 21-3 — the orchestrator ruled (2026-11-09) that every story in this unreleased cycle stays on 0.12.0, whose 0.11→0.12 bump already permits breaking changes; the new `EngineEvent`/`Anomaly`/`RunError` variants and `FleetEntry` field are breaking additions within the unreleased 0.12.0, announced in the Unreleased banners. No follow-up baseline bump is owed for this story.
+  evidence: CHANGELOG.md + docs/RELEASE_NOTES.md Unreleased banners; 21-2's 0.11→0.12 bump (PR #376). Trigger: none.
+
+- source_spec: `spec-21-3-policies.md` (Verification — the bench)
+  summary: The 21-1 writer bench's AFTER numbers on this branch: 10,000 pipeline events seeded at ~6,583/s (two runs: 6,583/s and 6,704/s on one build, ±2% noise), acked write p99 257 µs, usage-commit-to-decision 1.39 ms — inside 21-1's gates (batch ≤250 ms, acked p99 ≤50 ms, commit-to-action ≤1 s). The BEFORE side (the merge-base build) was not rebuilt in this session to keep the in-flight suite's target dir stable; the per-event path added one `Arc` clone and the pure resolve over a one-Policy set beside the existing config read, and the two same-build runs' spread already brackets the expected delta.
+  evidence: `registry_policy.rs` (`PolicyCache`, `resolved_limits`); `store/writer/tests.rs::writer_bench_default_seed` runs of 2026-11-10. Trigger: story 24.4's scale benchmark, or the independent review demanding the base-build number.
+
+- source_spec: `spec-21-3-policies.md` (independent review round 4 — READY with follow-ups)
+  summary: Multi-engine edges the final review rated low, left for a follow-up. (1) A supervising engine that drains usage in the same tick just after another engine's raise evaluates against its stale cached ceiling and latches again; its reload re-check never releases latches, so that key stays latched for the Run (mostly under `warn`). (2) A policy-change job stamps its own fingerprint, which also covers another engine's change committed just before it, so that change's reload re-check is skipped (a raised `block` fence stays up, fail-closed; a lowering fires one call late). (3) The relaunch re-apply reads latches with `unwrap_or_default()`, so a read error skips re-applying a latched `pause` with no diagnostic. (4) The reload re-check lifts the fence before evaluating (a tiny window) and skips silently on a read error. (5) The fingerprint has one-second resolution, and its `:` and `|` separators could be ambiguous (practically unreachable). (6) A child priced at a stored Policy Rate keeps it after an instance `cost.rate.*` write. (7) With a degraded cache, `block` on an instance with no wire listener acts as `warn`. Tests: the L1 fingerprint test can pass across a second boundary even with its fix reverted, the N6 facade test does not pin its "nothing claimed, no event" branch, and the new supervisor tests leave a 10-minute `fake_agent` running when an assertion fails.
+  evidence: `domain/supervisor/usage.rs` (relaunch re-apply, reload re-check), `domain/registry_policy.rs` (change job stamp, fingerprint). Trigger: the first multi-engine deployment (embedder plus host), story 21.6 (which reworks the re-arm), or any report of a latch that never re-fires.

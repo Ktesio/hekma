@@ -336,6 +336,9 @@ fn adoption_helper_subprocess() {
             facade
                 .set_config("napbud", "budget.tokens.cumulative", "15")
                 .unwrap();
+            facade
+                .set_config("napbud", "budget.breach_action", "pause")
+                .unwrap();
             facade.start("napbud").unwrap();
             let db = state.join("state.db");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -384,6 +387,9 @@ fn adoption_helper_subprocess() {
             // cumulative ceiling of 15 is crossed by the very first event.
             facade
                 .set_config("budgeted", "budget.tokens.cumulative", "15")
+                .unwrap();
+            facade
+                .set_config("budgeted", "budget.breach_action", "pause")
                 .unwrap();
             facade.start("budgeted").unwrap();
             // Deterministic (committed state, not a sleep): wait for ≥1 ledger
@@ -525,6 +531,9 @@ fn adoption_helper_subprocess() {
                 .unwrap();
             facade
                 .set_config("awaybud", "budget.tokens.cumulative", "15")
+                .unwrap();
+            facade
+                .set_config("awaybud", "budget.breach_action", "pause")
                 .unwrap();
             facade.start_detached("awaybud").unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -2445,6 +2454,9 @@ fn adopting_an_over_budget_run_with_no_recorded_breach_fires_at_adoption() {
     );
     facade
         .set_config("away", "budget.tokens.cumulative", "15")
+        .unwrap();
+    facade
+        .set_config("away", "budget.breach_action", "pause")
         .unwrap();
     drop(engine);
 

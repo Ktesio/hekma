@@ -190,6 +190,12 @@ enum Commands {
         #[command(subcommand)]
         command: LabelCommands,
     },
+    /// Set limits for the Runs a Selector matches
+    #[command(about = "Set limits for the Runs a Selector matches")]
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommands,
+    },
     /// Serve a state directory as a long-running host
     #[command(
         about = "Serve a state directory as a long-running host",
@@ -327,6 +333,118 @@ enum RunCommands {
         /// The run id
         run_id: String,
         /// Print the Run as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// The limit flags `hekma policy create` and `change` share.
+#[derive(clap::Args, Clone, Debug, Default)]
+struct PolicyLimitArgs {
+    /// Per-run token ceiling
+    #[arg(long, value_name = "N")]
+    tokens_per_run: Option<u64>,
+    /// Cumulative token ceiling (over the agent's life)
+    #[arg(long, value_name = "N")]
+    tokens_cumulative: Option<u64>,
+    /// Per-run Cost Cap in dollars (an estimate from Rates you set)
+    #[arg(long, value_name = "DOLLARS")]
+    dollars_per_run: Option<String>,
+    /// Cumulative Cost Cap in dollars (an estimate from Rates you set)
+    #[arg(long, value_name = "DOLLARS")]
+    dollars_cumulative: Option<String>,
+    /// What a breach does: warn, pause, stop or block
+    #[arg(long, value_name = "ACTION")]
+    breach_action: Option<String>,
+    /// Input price in dollars per 1M tokens
+    #[arg(long, value_name = "DOLLARS")]
+    rate_input: Option<String>,
+    /// Output price in dollars per 1M tokens
+    #[arg(long, value_name = "DOLLARS")]
+    rate_output: Option<String>,
+    /// Cached-input price in dollars per 1M tokens (defaults to the input price)
+    #[arg(long, value_name = "DOLLARS")]
+    rate_cached: Option<String>,
+}
+
+impl From<PolicyLimitArgs> for cli::policy::LimitFlags {
+    fn from(args: PolicyLimitArgs) -> Self {
+        Self {
+            tokens_per_run: args.tokens_per_run,
+            tokens_cumulative: args.tokens_cumulative,
+            dollars_per_run: args.dollars_per_run,
+            dollars_cumulative: args.dollars_cumulative,
+            breach_action: args.breach_action,
+            rate_input: args.rate_input,
+            rate_output: args.rate_output,
+            rate_cached: args.rate_cached,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum PolicyCommands {
+    /// List every Policy, the default Policy included
+    List {
+        /// Print the Policies as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one Policy
+    Show {
+        /// The Policy's name
+        name: String,
+        /// Print the Policy as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a Policy for the Runs a Selector matches by bound label
+    Create {
+        /// The Policy's name (lowercase letters, digits, - and _)
+        name: String,
+        /// The bound labels of the Runs it governs (key=value[,key=value...])
+        #[arg(long, value_name = "SELECTOR")]
+        selector: String,
+        #[command(flatten)]
+        limits: PolicyLimitArgs,
+        /// Show what it would match and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a Policy, the default Policy included
+    Change {
+        /// The Policy's name (`default` for the default Policy)
+        name: String,
+        /// A new Selector (not on the default Policy)
+        #[arg(long, value_name = "SELECTOR")]
+        selector: Option<String>,
+        #[command(flatten)]
+        limits: PolicyLimitArgs,
+        /// Limits to clear: tokens-per-run, tokens-cumulative, dollars-per-run,
+        /// dollars-cumulative, breach-action, rate, or rate:<model>
+        #[arg(long, value_name = "LIMIT", value_delimiter = ',')]
+        clear: Vec<String>,
+        /// On the default Policy: the model the --rate-* flags price
+        #[arg(long, value_name = "MODEL")]
+        rate_for: Option<String>,
+        /// Show what it would change and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a Policy (the default Policy cannot be deleted)
+    Delete {
+        /// The Policy's name
+        name: String,
+        /// Show what it would re-resolve and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as JSON
         #[arg(long)]
         json: bool,
     },
@@ -707,6 +825,47 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }),
             RunCommands::Close { run_id, json } => cli::run::close(&run_id, json),
             RunCommands::Show { run_id, json } => cli::run::show(&run_id, json),
+        },
+        Some(Commands::Policy { command }) => match command {
+            PolicyCommands::List { json } => cli::policy::list(json),
+            PolicyCommands::Show { name, json } => cli::policy::show(&name, json),
+            PolicyCommands::Create {
+                name,
+                selector,
+                limits,
+                dry_run,
+                json,
+            } => cli::policy::create(cli::policy::WriteArgs {
+                name,
+                selector: Some(selector),
+                limits: limits.into(),
+                clear: Vec::new(),
+                rate_for: None,
+                dry_run,
+                json,
+            }),
+            PolicyCommands::Change {
+                name,
+                selector,
+                limits,
+                clear,
+                rate_for,
+                dry_run,
+                json,
+            } => cli::policy::change(cli::policy::WriteArgs {
+                name,
+                selector,
+                limits: limits.into(),
+                clear,
+                rate_for,
+                dry_run,
+                json,
+            }),
+            PolicyCommands::Delete {
+                name,
+                dry_run,
+                json,
+            } => cli::policy::delete(&name, dry_run, json),
         },
         Some(Commands::Label { command }) => {
             let (verb, args, selector, dry_run, yes, json) = match command {
