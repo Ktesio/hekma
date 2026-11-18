@@ -195,13 +195,27 @@ mod tests {
         assert!(err.contains("no PEM certificate"), "{err}");
     }
 
-    /// A self-signed pair written into `dir`: (cert path, key path).
+    /// TLS files must be owner-only (story 22-5), so a test file that
+    /// should reach the PEM checks is written 0600.
+    fn owner_only(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
+    /// A self-signed pair written into `dir`, owner-only: (cert path, key path).
     fn write_pair(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let pair = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert = dir.join("cert.pem");
         let key = dir.join("key.pem");
         std::fs::write(&cert, pair.cert.pem()).unwrap();
         std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
+        owner_only(&cert);
+        owner_only(&key);
         (cert, key)
     }
 
@@ -215,6 +229,7 @@ mod tests {
             "-----BEGIN CERTIFICATE-----\n!!!! not base64 !!!!\n-----END CERTIFICATE-----\n",
         )
         .unwrap();
+        owner_only(&corrupt);
         // Static assertion messages: a refusal about TLS material is never
         // echoed into the test log.
         let err = load_server_config(&corrupt, &key).unwrap_err();
