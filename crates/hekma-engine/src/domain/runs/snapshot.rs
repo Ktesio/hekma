@@ -14,6 +14,8 @@
 //! publishes its own snapshot from its own writer.
 
 use std::collections::HashMap;
+
+use super::layered::Layered;
 use std::sync::{Arc, RwLock};
 
 use super::{Label, PolicyResolution, RunLimits, RunRecord};
@@ -412,20 +414,21 @@ pub(crate) fn entry_of(
 pub(crate) struct RunSnapshot {
     /// Bumped on every publish.
     pub generation: u64,
-    /// Every non-ended Run by id.
-    pub runs: HashMap<RunId, Arc<RunEntry>>,
+    /// Every non-ended Run by id. Story 24-4: a delta-log map, so a
+    /// publish copies only the changed entries.
+    pub runs: Layered<RunId, Arc<RunEntry>>,
     /// Each instance's open process-owning Run.
-    pub owners: HashMap<String, RunId>,
+    pub owners: Layered<String, RunId>,
     /// Story 22-1: the active Run Keys and announce credentials of
     /// non-ended Runs, by hash. Refresh credentials are never here (a
     /// refresh is a write, and reuse detection reads retired rows).
-    pub keys: HashMap<TokenHash, Arc<KeyEntry>>,
+    pub keys: Layered<TokenHash, Arc<KeyEntry>>,
     /// Story 23-1: the Run Keys revoked in the last 24 hours (bounded).
     pub revoked: Arc<RevokedSet>,
     /// Story 23-1: the Operator endpoint bindings.
     pub bindings: Arc<BindingTable>,
     /// Story 23-1: open Runs by their `(namespace, external id)` identity.
-    pub identities: HashMap<(String, String), RunId>,
+    pub identities: Layered<(String, String), RunId>,
     /// Story 23-1: the one adopted pre-proxy observed Run that receives
     /// calls matching no binding and no Run route (the legacy root route).
     pub legacy_root: Option<RunId>,
@@ -646,7 +649,17 @@ impl RunSnapshot {
                 next.runs.insert(id, Arc::new(entry));
             }
         }
+        next.seal();
         next
+    }
+
+    /// Share every map's pending layer (story 24-4), folding a map whose
+    /// deltas outgrew their bound.
+    fn seal(&mut self) {
+        self.runs.seal();
+        self.owners.seal();
+        self.keys.seal();
+        self.identities.seal();
     }
 }
 
@@ -825,6 +838,11 @@ impl SnapshotPublisher {
             }
         }
         next.revoked = Arc::new(revoked);
+        // A reload is a fresh base by design (off the hot path).
+        next.runs.fold();
+        next.owners.fold();
+        next.keys.fold();
+        next.identities.fold();
         *guard = Arc::new(next);
     }
 }
@@ -937,6 +955,75 @@ mod tests {
         // An empty publish is a no-op.
         publisher.publish(Vec::new());
         assert_eq!(publisher.current().generation, third.generation);
+    }
+
+    #[test]
+    fn a_publish_over_many_open_runs_copies_only_its_changes() {
+        // Story 24-4: 100,000 open Runs, then publishes of 8 changed entries
+        // each — the base map is shared (no whole-map copy), old readers
+        // keep their view, an ended entry is gone from the next one, and a
+        // reload is a fresh base.
+        let publisher = SnapshotPublisher::default();
+        let seeded: Vec<RunEntry> = (0..100_000)
+            .map(|i| entry(&format!("run_{i}"), None, false, RunStatus::Active))
+            .collect();
+        publisher.publish_reload(seeded, Vec::new());
+        let base = publisher.current();
+        assert_eq!(base.runs.len(), 100_000);
+        let mut previous = Arc::clone(&base);
+        for round in 0..20u32 {
+            let mut changes: Vec<RunEntry> = (0..8)
+                .map(|i| {
+                    entry(
+                        &format!("run_{}", round * 8 + i),
+                        None,
+                        false,
+                        RunStatus::Held,
+                    )
+                })
+                .collect();
+            changes.push(entry(
+                &format!("run_{}", 50_000 + round),
+                None,
+                false,
+                RunStatus::Ended,
+            ));
+            publisher.publish(changes);
+            let next = publisher.current();
+            assert!(
+                next.runs.shares_base_with(&base.runs),
+                "round {round} copied the base"
+            );
+            assert_eq!(
+                next.run(&RunId::from_wire(format!("run_{}", round * 8)))
+                    .unwrap()
+                    .record
+                    .status,
+                RunStatus::Held
+            );
+            assert!(next
+                .run(&RunId::from_wire(format!("run_{}", 50_000 + round)))
+                .is_none());
+            assert_eq!(
+                previous
+                    .run(&RunId::from_wire(format!("run_{}", round * 8)))
+                    .unwrap()
+                    .record
+                    .status,
+                RunStatus::Active,
+                "an older reader keeps its view"
+            );
+            previous = next;
+        }
+        assert_eq!(previous.runs.len(), 100_000 - 20);
+        assert!(previous.runs.layers() <= crate::domain::runs::layered::MAX_LAYERS);
+        publisher.publish_reload(
+            vec![entry("run_only", None, false, RunStatus::Active)],
+            Vec::new(),
+        );
+        let reloaded = publisher.current();
+        assert_eq!(reloaded.runs.len(), 1);
+        assert_eq!(reloaded.runs.layers(), 0);
     }
 
     #[test]

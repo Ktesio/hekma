@@ -156,7 +156,7 @@ KT_COMMANDS = {
     "reject",
 }
 # `hekma run` owns its own subcommand tree (crates/hekma/src/lib.rs `RunCommands`).
-RUN_COMMANDS = {"open", "close", "show", "keys", "revoke-keys"}
+RUN_COMMANDS = {"open", "close", "show", "keys", "revoke-keys", "retention"}
 # `hekma label` owns its own subcommand tree (crates/hekma/src/lib.rs `LabelCommands`).
 LABEL_COMMANDS = {"set", "remove"}
 # `hekma budget` owns its own subcommand tree (crates/hekma/src/lib.rs

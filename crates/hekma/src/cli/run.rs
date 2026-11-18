@@ -266,11 +266,164 @@ pub fn close(run_id: &str, json: bool) -> Result<(), Box<dyn std::error::Error>>
     render(&view, json, "closed")
 }
 
-/// `hekma run show <run-id>` — one Run, read-only.
+/// `hekma run show <run-id>` — one Run, read-only. A Run compacted past
+/// the retention window answers its summary (story 24-4), never a bare
+/// not-found.
 pub fn show(run_id: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_read_only_engine()?;
-    let view = engine.blocking().run(run_id).map_err(map_run_error)?;
+    let view = match engine.blocking().run(run_id) {
+        Ok(view) => view,
+        Err(RunError::NotFound { .. }) => match engine.blocking().compacted_run(run_id) {
+            Ok(Some(compacted)) => return render_compacted(&compacted, json),
+            _ => {
+                return Err(map_run_error(RunError::NotFound {
+                    run_id: run_id.to_string(),
+                }))
+            }
+        },
+        Err(err) => return Err(map_run_error(err)),
+    };
     render(&view, json, "")
+}
+
+/// The `--json` document for a compacted Run.
+#[derive(Serialize)]
+struct CompactedDocument<'a> {
+    schema_version: u32,
+    compacted_run: &'a hekma_engine::CompactedRun,
+}
+
+fn render_compacted(
+    run: &hekma_engine::CompactedRun,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json {
+        let document = CompactedDocument {
+            schema_version: RUN_DOCUMENT_SCHEMA_VERSION,
+            compacted_run: run,
+        };
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        return Ok(());
+    }
+    print!("{}", render_compacted_text(run));
+    Ok(())
+}
+
+fn render_compacted_text(run: &hekma_engine::CompactedRun) -> String {
+    let mut out = format!(
+        "run {} (compacted)\n  This Run was compacted: its usage totals, labels and end cause \
+         are kept. Its other detail was removed after the retention window.\n",
+        run.run_id
+    );
+    out.push_str(&format!("  depth      {}\n", run.control_depth));
+    out.push_str(&format!("  created    {}\n", run.created_at));
+    out.push_str(&format!(
+        "  ended      {} ({})\n",
+        run.ended_at,
+        if run.end_cause.is_empty() {
+            "no cause recorded"
+        } else {
+            run.end_cause.as_str()
+        }
+    ));
+    out.push_str(&format!("  compacted  {}\n", run.compacted_at));
+    out.push_str(&format!(
+        "  usage      {} in / {} out / cached {}, {}\n",
+        run.input_tokens,
+        run.output_tokens,
+        run.cached_tokens,
+        hekma_engine::render_dollars(
+            hekma_engine::Micros(run.cost_micros),
+            hekma_engine::EstimateLabel::Estimated
+        )
+    ));
+    if run.labels.is_empty() {
+        out.push_str("  labels     none\n");
+    } else {
+        let labels: Vec<String> = run
+            .labels
+            .iter()
+            .map(|label| format!("{}={}", label.key, label.value))
+            .collect();
+        out.push_str(&format!("  labels     {}\n", labels.join(", ")));
+    }
+    out
+}
+
+/// The `--json` document for the retention settings.
+#[derive(Serialize)]
+struct RetentionDocument<'a> {
+    schema_version: u32,
+    settings: &'a hekma_engine::RetentionSettings,
+    compaction: &'a hekma_engine::CompactionState,
+}
+
+/// `hekma run retention [--runs N] [--calls N] [--json]` (story 24-4): with
+/// no window, read the state directory (nothing starts); with one, a
+/// `PUT /v0/retention` routed to the local Service Host.
+pub fn retention(
+    runs: Option<u32>,
+    calls: Option<u32>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let view = if runs.is_none() && calls.is_none() {
+        let engine = open_read_only_engine()?;
+        engine.blocking().retention().map_err(|err| {
+            Box::new(AgentStore {
+                message: format!("the retention settings could not be read: {err}"),
+            }) as Box<dyn std::error::Error>
+        })?
+    } else {
+        let routed = route(
+            "PUT",
+            "/v0/retention",
+            Some(json!({
+                "run_retention_days": runs,
+                "calls_retention_days": calls,
+            })),
+        )
+        .map_err(|err| match err {
+            RoutedError::Call(CallError::Coded { code, message }) => map_run_code(&code, message),
+            other => other.into_diagnostic(),
+        })?;
+        let document = routed.value.unwrap_or(Value::Null);
+        hekma_engine::RetentionView {
+            settings: serde_json::from_value(document["settings"].clone())?,
+            compaction: serde_json::from_value(document["compaction"].clone())?,
+        }
+    };
+    if json {
+        let document = RetentionDocument {
+            schema_version: RUN_DOCUMENT_SCHEMA_VERSION,
+            settings: &view.settings,
+            compaction: &view.compaction,
+        };
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        return Ok(());
+    }
+    print!("{}", render_retention_text(&view));
+    Ok(())
+}
+
+fn render_retention_text(view: &hekma_engine::RetentionView) -> String {
+    let settings = &view.settings;
+    let mut out = format!(
+        "ended Runs        kept in full for {} day(s), then reduced to their totals, labels and \
+         end cause\nper-call records  kept for {} day(s), then their file is deleted whole\n",
+        settings.run_retention_days, settings.calls_retention_days
+    );
+    match &view.compaction.last_pass_at {
+        Some(at) => out.push_str(&format!(
+            "compaction        last pass {at}; {} Run(s) compacted and {} file(s) deleted so \
+             far\n",
+            view.compaction.runs_compacted, view.compaction.segments_dropped
+        )),
+        None => out.push_str(
+            "compaction        no pass yet (the Service Host runs one when it starts, then \
+             daily)\n",
+        ),
+    }
+    out
 }
 
 /// The Run in a routed write's answer (`{"run": …}`), or the refusal mapped

@@ -277,8 +277,14 @@ struct EngineInner {
     /// owning Service Host's supervisor holds), since its own supervisor is
     /// empty.
     read_only: bool,
-    registry: Mutex<Registry>,
-    supervisor: Mutex<Supervisor>,
+    /// Story 24-4 (AD-18 Step 0): the state directory's paths, held OUTSIDE
+    /// the registry mutex, so path arithmetic takes no lock.
+    paths: crate::paths::EnginePaths,
+    /// Story 24-4 (AD-18 Step 1): the two engine locks record their holds
+    /// per call site when lock timing is on ([`Engine::set_lock_timing`]).
+    registry: crate::domain::timed_mutex::TimedMutex<Registry>,
+    supervisor: crate::domain::timed_mutex::TimedMutex<Supervisor>,
+    lock_timing: Arc<crate::domain::timed_mutex::LockTiming>,
     /// The supervisor's event bus clone (story 7-2): held OUTSIDE the mutex so
     /// [`Engine::subscribe`] hands out receivers without ever contending on
     /// the supervisor lock. Both clones share one broadcast channel.
@@ -617,14 +623,26 @@ impl Engine {
         let run_snapshot = Arc::clone(registry.run_publisher());
         let credential_reader = Mutex::new(registry.open_credential_reader(false)?);
         let calls_dir = registry.calls_dir();
+        let paths = registry.paths.clone();
         let leases = metering_proxy.leases;
         let identity_headers_flag = metering_proxy.identity_headers;
+        let lock_timing = Arc::new(crate::domain::timed_mutex::LockTiming::default());
         let inner = Arc::new(EngineInner {
             metering_proxy: Mutex::new(proxy),
             metering_proxy_error: proxy_error,
             read_only: false,
-            registry: Mutex::new(registry),
-            supervisor: Mutex::new(supervisor),
+            paths,
+            registry: crate::domain::timed_mutex::TimedMutex::new(
+                "registry",
+                Arc::clone(&lock_timing),
+                registry,
+            ),
+            supervisor: crate::domain::timed_mutex::TimedMutex::new(
+                "supervisor",
+                Arc::clone(&lock_timing),
+                supervisor,
+            ),
+            lock_timing,
             events,
             run_snapshot,
             credential_reader,
@@ -688,12 +706,24 @@ impl Engine {
         let run_snapshot = Arc::clone(registry.run_publisher());
         let credential_reader = Mutex::new(registry.open_credential_reader(true)?);
         let calls_dir = registry.calls_dir();
+        let paths = registry.paths.clone();
+        let lock_timing = Arc::new(crate::domain::timed_mutex::LockTiming::default());
         let inner = Arc::new(EngineInner {
             metering_proxy: Mutex::new(None),
             metering_proxy_error: None,
             read_only: true,
-            registry: Mutex::new(registry),
-            supervisor: Mutex::new(supervisor),
+            paths,
+            registry: crate::domain::timed_mutex::TimedMutex::new(
+                "registry",
+                Arc::clone(&lock_timing),
+                registry,
+            ),
+            supervisor: crate::domain::timed_mutex::TimedMutex::new(
+                "supervisor",
+                Arc::clone(&lock_timing),
+                supervisor,
+            ),
+            lock_timing,
             events,
             run_snapshot,
             credential_reader,
@@ -776,6 +806,7 @@ impl Engine {
             inbox: supervisor.proxy_inbox(),
             diagnostics,
             custody: Arc::clone(custody),
+            calls_dir: Some(registry.calls_dir()),
         };
         match crate::metering::proxy::MeteringProxy::start(rt.handle(), &chosen, deps) {
             Ok(proxy) => {
@@ -1379,15 +1410,29 @@ impl Engine {
         self.inner.events.subscribe_sequenced()
     }
 
+    /// Switch lock timing on or off (story 24-4, AD-18 Step 1). While on,
+    /// every hold of the engine's registry and supervisor locks is recorded
+    /// against its call site; switching on clears earlier records. Off by
+    /// default; a diagnostic surface for lock-contention work, not a
+    /// stable contract.
+    pub fn set_lock_timing(&self, on: bool) {
+        self.inner.lock_timing.set_enabled(on);
+    }
+
+    /// The recorded lock holds per call site, the longest first (story
+    /// 24-4, AD-18 Step 1): each site's hold count, max and p99 over its
+    /// most recent holds. Empty while lock timing is off.
+    pub fn lock_hold_stats(&self) -> Vec<crate::domain::timed_mutex::LockHoldStats> {
+        self.inner.lock_timing.snapshot()
+    }
+
     /// The engine-computed Agent Home path for `name` (display helper).
     ///
-    /// Pure path arithmetic — no I/O, no blocking pool needed.
+    /// Pure path arithmetic — no I/O, no blocking pool, and (story 24-4,
+    /// AD-18 Step 0) no lock: a stop holding the registry for seconds never
+    /// delays it.
     pub fn agent_home(&self, name: &InstanceName) -> PathBuf {
-        self.inner
-            .registry
-            .lock()
-            .expect("registry mutex poisoned")
-            .agent_home(name)
+        self.inner.paths.agent_home(name)
     }
 
     /// Register a new Agent Instance of a native `kind`.
@@ -2494,6 +2539,70 @@ impl Engine {
                 .run_view(&run_id)
         })
         .await
+    }
+
+    /// A compacted Run's summary (story 24-4): what an ended Run keeps once
+    /// it is past the Run retention window — its id, usage totals, labels,
+    /// end cause, Control Depth and timestamps. `None` when `run_id` was
+    /// never compacted. Reads only.
+    pub async fn compacted_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::domain::runs::retention::CompactedRun>, crate::ports::StoreError>
+    {
+        let inner = Arc::clone(&self.inner);
+        let run_id = run_id.to_string();
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .compacted_run(&run_id)
+        })
+        .await
+    }
+
+    /// The retention windows and the compaction state (story 24-4). Reads
+    /// only.
+    pub async fn retention(
+        &self,
+    ) -> Result<crate::domain::runs::retention::RetentionView, crate::ports::StoreError> {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .retention_view()
+        })
+        .await
+    }
+
+    /// Change the retention windows (story 24-4): the Run window moves the
+    /// listing's ended-Run cutoff and the compaction pass together; the
+    /// calls window moves when per-call record files are deleted. A window
+    /// outside 1..=3650 days is [`RetentionError::Invalid`].
+    ///
+    /// [`RetentionError::Invalid`]: crate::domain::runs::retention::RetentionError::Invalid
+    pub async fn set_retention(
+        &self,
+        change: crate::domain::runs::retention::RetentionChange,
+    ) -> Result<
+        crate::domain::runs::retention::RetentionView,
+        crate::domain::runs::retention::RetentionError,
+    > {
+        change.validate()?;
+        self.refuse_if_read_only()?;
+        let inner = Arc::clone(&self.inner);
+        Ok(self
+            .run_blocking(move || {
+                inner
+                    .registry
+                    .lock()
+                    .expect("registry mutex poisoned")
+                    .set_retention(change)
+            })
+            .await?)
     }
 
     /// The open Run that owns an instance's supervised process (story
@@ -3678,7 +3787,11 @@ impl Engine {
             if let Some(err) = capture_read_refusal(mode, &iname, true, &registry) {
                 return Err(err);
             }
-            Supervisor::read_agent_log(&registry, &name)
+            // Story 24-4 (AD-18 Step 0): the lookup and the paths under the
+            // guard; the whole-file read after it drops.
+            let paths = Supervisor::agent_log_paths(&registry, &name)?;
+            drop(registry);
+            Supervisor::read_agent_log_at(&paths)
         })
         .await
     }
@@ -3712,7 +3825,9 @@ impl Engine {
             if let Some(err) = capture_read_refusal(mode, &iname, true, &registry) {
                 return Err(err);
             }
-            Supervisor::read_agent_log_since(&registry, &name, cursor)
+            let paths = Supervisor::agent_log_paths(&registry, &name)?;
+            drop(registry);
+            Supervisor::read_agent_log_since_at(&paths, cursor)
         })
         .await
     }
@@ -4116,6 +4231,33 @@ impl Blocking<'_> {
     /// Blocking twin of [`Engine::run`].
     pub fn run(&self, run_id: &str) -> Result<RunView, RunError> {
         self.engine.rt.block_on(self.engine.run(run_id))
+    }
+
+    /// Blocking twin of [`Engine::compacted_run`].
+    pub fn compacted_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::domain::runs::retention::CompactedRun>, crate::ports::StoreError>
+    {
+        self.engine.rt.block_on(self.engine.compacted_run(run_id))
+    }
+
+    /// Blocking twin of [`Engine::retention`].
+    pub fn retention(
+        &self,
+    ) -> Result<crate::domain::runs::retention::RetentionView, crate::ports::StoreError> {
+        self.engine.rt.block_on(self.engine.retention())
+    }
+
+    /// Blocking twin of [`Engine::set_retention`].
+    pub fn set_retention(
+        &self,
+        change: crate::domain::runs::retention::RetentionChange,
+    ) -> Result<
+        crate::domain::runs::retention::RetentionView,
+        crate::domain::runs::retention::RetentionError,
+    > {
+        self.engine.rt.block_on(self.engine.set_retention(change))
     }
 
     /// Blocking twin of [`Engine::instance_run`].
@@ -5719,6 +5861,49 @@ mod tests {
             std::fs::read(&db).unwrap(),
             before,
             "the reads wrote nothing"
+        );
+    }
+
+    #[test]
+    fn agent_home_takes_no_lock_and_a_log_read_holds_the_registry_only_for_its_lookup() {
+        // Story 24-4 (AD-18 Step 0): with the registry mutex held by
+        // another thread, `agent_home` still answers at once (it used to
+        // block on the lock), and a log read's file work runs after the
+        // guard drops (the read returns the same lines either way).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        engine.blocking().register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        let expected = engine.inner.paths.agent_home(&name);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let inner = Arc::clone(&engine.inner);
+        let holder = std::thread::spawn(move || {
+            let _guard = inner.registry.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+        });
+        locked_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(engine.agent_home(&name), expected);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        // The split read answers what the one-piece read answered.
+        let log = expected.join("logs").join("output.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "").unwrap();
+        let registry = engine.inner.registry.lock().unwrap();
+        let whole = Supervisor::read_agent_log(&registry, "demo").unwrap();
+        let paths = Supervisor::agent_log_paths(&registry, "demo").unwrap();
+        drop(registry);
+        assert_eq!(Supervisor::read_agent_log_at(&paths).unwrap(), whole);
+        assert_eq!(
+            Supervisor::read_agent_log_since_at(&paths, 0).unwrap().1,
+            whole.1
+        );
+        assert!(
+            Supervisor::agent_log_paths(&engine.inner.registry.lock().unwrap(), "ghost").is_err()
         );
     }
 

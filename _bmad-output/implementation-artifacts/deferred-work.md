@@ -874,3 +874,25 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: `hekma.run.anomalies` counts a flag once when a Run gains it; the exporter keeps each open Run's current flags (only Runs with a flag) and forgets a Run when it ends, so memory grows with the number of open Runs carrying an Anomaly.
   evidence: `crates/hekma-host/src/otlp/v2.rs` (`run_anomalies`). Trigger: the Run-scale benchmark (24-4) measuring exporter memory.
 
+## From spec-24-4 (scale substrate) — phase 1 build, 2026-11-14
+
+- source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (Phase 3 leftovers)
+  summary: The listing's selector arms still build the match set twice, listing reads still assemble under the registry mutex (no reader pool), and the ladder does not compose the proxy scenario (`run_scale_proxy_p99_le_10ms`). The ladder, the covering count index and the two scale fixes it found landed in phase 3.
+  evidence: `crates/hekma-engine/src/store/runs_sqlite.rs` (`listing_arms`), `crates/hekma-engine/src/domain/registry.rs` (`list_runs`). Trigger: phase 4, with AD-18 Steps 0–4.
+
+- source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (Phase 4)
+  summary: AD-18 Steps 2–4 (named scopes with the debt ratchet, the `StoreGate` splits, `SupervisorShared`/`InstanceState`) and Step 1's full 25-instance adversarial fixture are not built yet. Step 0 landed in phase 4a. Step 1's `TimedMutex` and the tightened 6 s isolation bound landed in phase 4b, where the instrument showed a stuck send holding both engine locks for its whole bound.
+  evidence: `crates/hekma-engine/src/engine.rs` (bare `.lock()` sites). Trigger: phase 4 of the story.
+
+- source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (O2: usage events at compaction)
+  summary: Compaction keeps a Run's `usage_events` rows until O2 is ruled; deleting them would also change what the event resync replays for an instance.
+  evidence: `crates/hekma-engine/src/store/retention_sqlite.rs` (`compact_one`). Trigger: Islam's O2 ruling.
+
+- source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (the compacted read over the API)
+  summary: `GET /v0/runs/{id}` answers 404 for a compacted Run; only `hekma run show` and `Engine::compacted_run` read the summary.
+  evidence: `crates/hekma-host/src/control/routes.rs`. Trigger: a Host asking for compacted Runs over the API.
+
+- source_spec: `spec-24-4-scale-substrate-and-the-run-scale-benchmark.md` (Design: new deferrals)
+  summary: Outbox and export retention at Run scale; a calls-file size cap (with names that sort after the day's first file); `ANALYZE`, which the engine never runs.
+  evidence: the spec's Design Notes. Trigger: a Host report of outbox growth or of a daily calls file above a stated size; the Run-scale ladder showing a planner miss.
+

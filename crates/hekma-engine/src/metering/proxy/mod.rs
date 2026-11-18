@@ -220,6 +220,9 @@ pub(crate) struct ProxyDeps {
     /// Story 22-2: the custody cache — the swap's value source (in-memory
     /// only, refreshed off the hot path).
     pub custody: Arc<crate::domain::custody::CustodyCache>,
+    /// Story 24-4: the calls directory, whose files past the calls
+    /// retention window the daily pass deletes whole (`None`: no files).
+    pub calls_dir: Option<std::path::PathBuf>,
 }
 
 impl MeteringProxy {
@@ -312,6 +315,7 @@ impl MeteringProxy {
         ));
         let sweeper = spawn_sweeper(
             handle,
+            deps.calls_dir,
             deps.writer,
             Arc::clone(&shared.pump.runs),
             Arc::clone(&shared.pump.inbox),
@@ -403,8 +407,10 @@ impl Drop for MeteringProxy {
 /// or idle Runs `silent` and ends Runs silent past the window, publishing
 /// before return; the Run events reach the bus through the evaluation
 /// inbox (drained on the reaper tick).
+#[allow(clippy::too_many_arguments)]
 fn spawn_sweeper(
     handle: &tokio::runtime::Handle,
+    calls_dir: Option<std::path::PathBuf>,
     writer: WriterHandle,
     runs: Arc<SnapshotPublisher>,
     inbox: Arc<EvaluationInbox>,
@@ -421,11 +427,19 @@ fn spawn_sweeper(
         let sweep_every = Duration::from_secs(leases.sweep_interval_secs.max(1));
         let mut last_sweep: Option<std::time::Instant> = None;
         let mut last_note: Option<std::time::Instant> = None;
+        // Story 24-4: the retention pass runs at start and then daily.
+        let mut last_retention: Option<std::time::Instant> = None;
+        let retention_every =
+            Duration::from_secs(crate::domain::runs::retention::COMPACTION_INTERVAL_SECS);
         let _ = writer
             .call_async(|ctx| ctx.store().reset_held_stats())
             .await;
         loop {
             tick.tick().await;
+            if last_retention.is_none_or(|at| at.elapsed() >= retention_every) {
+                last_retention = Some(std::time::Instant::now());
+                retention_pass(&writer, calls_dir.as_deref(), &diagnostics).await;
+            }
             let reports = holds.take_reports();
             if !reports.is_empty() {
                 let _ = writer
@@ -468,6 +482,92 @@ fn spawn_sweeper(
             }
         }
     })
+}
+
+/// One retention pass (story 24-4): compact the ended Runs past the Run
+/// window in bounded writer jobs, delete whole the calls files past the
+/// calls window, record what was done, and say so in one line when
+/// anything was. A store error stops the pass early; the next one resumes.
+async fn retention_pass(
+    writer: &WriterHandle,
+    calls_dir: Option<&std::path::Path>,
+    diagnostics: &Arc<dyn Fn(String) + Send + Sync>,
+) {
+    use crate::domain::runs::retention;
+    use crate::store::retention_sqlite::CompactionKey;
+    let Ok(settings) = writer
+        .call_async(|ctx| ctx.store().retention_settings())
+        .await
+    else {
+        return;
+    };
+    let now = crate::time::now_unix_secs();
+    let at = crate::time::format_rfc3339(now);
+    let cutoff = retention::cutoff_for(now, settings.run_retention_days);
+    let mut key = CompactionKey::default();
+    let mut runs = 0u64;
+    let mut stopped: Option<crate::ports::StoreError> = None;
+    let mut busy = 0;
+    loop {
+        let (cutoff, from, at) = (cutoff.clone(), key.clone(), at.clone());
+        let step = writer
+            .call_async(move |ctx| {
+                ctx.store()
+                    .compact_ended_runs(&cutoff, &from, retention::COMPACTION_BATCH, &at)
+            })
+            .await;
+        match step {
+            Ok(step) => {
+                runs += step.compacted;
+                match step.next {
+                    Some(next) => key = next,
+                    None => break,
+                }
+            }
+            // A busy writer applied nothing: wait a moment and retry, a few
+            // times at most.
+            Err(crate::ports::StoreError::Busy { .. }) if busy < 5 => {
+                busy += 1;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(err) => {
+                stopped = Some(err);
+                break;
+            }
+        }
+    }
+    let mut files = 0;
+    if let Some(dir) = calls_dir {
+        let head = writer
+            .call_async(|ctx| Ok(ctx.store().calls_head_path()))
+            .await
+            .ok()
+            .flatten();
+        let cutoff = retention::cutoff_for(now, settings.calls_retention_days);
+        let cutoff_date = cutoff.get(..10).unwrap_or("").to_string();
+        let dir = dir.to_path_buf();
+        files = tokio::task::spawn_blocking(move || {
+            crate::store::calls_sqlite::drop_expired_segments(&dir, head.as_deref(), &cutoff_date)
+        })
+        .await
+        .unwrap_or(0);
+    }
+    let noted = at.clone();
+    let _ = writer
+        .call_async(move |ctx| ctx.store().note_compaction(runs, files, &noted))
+        .await;
+    if runs > 0 || files > 0 {
+        diagnostics(format!(
+            "retention: {runs} ended Run(s) past the {}-day window were compacted and {files} \
+             per-call record file(s) past the {}-day window were deleted",
+            settings.run_retention_days, settings.calls_retention_days
+        ));
+    }
+    if let Some(err) = stopped {
+        diagnostics(format!(
+            "the retention pass stopped early ({err}); the next pass carries on"
+        ));
+    }
 }
 
 /// How long a client beyond loopback may take to complete its TLS

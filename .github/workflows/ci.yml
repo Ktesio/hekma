@@ -727,6 +727,24 @@ jobs:
             exit 1
           }
           target/release/examples/perf-budgets --calls-seed 100000
+      - name: Run the Run-scale ladder at 100k (story 24-4; regressions fail this job)
+        # The SIXTH explicit run (story 24-4): 10 000 Runs seeded and
+        # measured, then 100 000; gates the first hekma ps page (p99 < 1 s),
+        # the acked Run write with its snapshot publish (p99 <= 50 ms, p50 <=
+        # 10 ms) and that p50 not growing with the Run count (<= 3x the 10k
+        # figure). Standalone (no --baseline). The 1M rung is run by hand and
+        # recorded in docs/testing.md.
+        timeout-minutes: 15
+        env:
+          PERF_BUDGETS_REPORT_PATH: perf-budgets-scale-report.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/release/examples/perf-budgets || {
+            echo "::error::perf-budgets binary not found at target/release/examples/perf-budgets — the build step above failed or the output path moved."
+            exit 1
+          }
+          target/release/examples/perf-budgets --run-scale 100000
       - name: Upload the measured report (artifact)
         # The measured record of record also lives in this job's log; the
         # artifact makes it downloadable for trend inspection. `if: always()`
@@ -744,6 +762,7 @@ jobs:
             perf-budgets-ps-report.json
             perf-budgets-proxy-report.json
             perf-budgets-calls-report.json
+            perf-budgets-scale-report.json
           if-no-files-found: warn
 
   agents-in-ci:

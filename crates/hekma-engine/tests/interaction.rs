@@ -784,6 +784,8 @@ fn a_stuck_instances_send_times_out_and_does_not_block_a_different_instances_sen
         .unwrap();
     facade.start("stuck").unwrap();
     facade.start("healthy").unwrap();
+    // Story 24-4 (AD-18 Step 1): time every engine-lock hold from here on.
+    engine.set_lock_timing(true);
 
     // Far larger than any realistic OS pipe buffer (Linux defaults to
     // 64KiB) — `stuck` never reads its stdin, so a write of this size WILL
@@ -816,9 +818,9 @@ fn a_stuck_instances_send_times_out_and_does_not_block_a_different_instances_sen
              instance's bounded wait elapses: {healthy_result:?}"
         );
         assert!(
-            healthy_elapsed < Duration::from_secs(9),
-            "healthy's send must be bounded to roughly the stuck call's timeout (5s), \
-             never blocked indefinitely by an unrelated instance: {healthy_elapsed:?}"
+            healthy_elapsed < Duration::from_secs(6),
+            "healthy's send must be bounded by the stuck call's timeout (5s) plus 1s of \
+             slack, never blocked indefinitely by an unrelated instance: {healthy_elapsed:?}"
         );
 
         stuck_handle.join().expect("stuck thread must not panic")
@@ -834,9 +836,29 @@ fn a_stuck_instances_send_times_out_and_does_not_block_a_different_instances_sen
         other => panic!("expected InteractionTimedOut, got {other:?}"),
     }
     assert!(
-        stuck_elapsed < Duration::from_secs(9),
-        "the stuck send must return within roughly 2x its bound (5s), not indefinitely: \
-         {stuck_elapsed:?}"
+        stuck_elapsed < Duration::from_secs(6),
+        "the stuck send must return within its bound (5s) plus 1s of slack, not \
+         indefinitely: {stuck_elapsed:?}"
+    );
+    // Story 24-4 (AD-18 Step 1): the instrumentation names the coupling.
+    // The stuck send holds BOTH engine locks for about its 5s bound (the
+    // registry, then the supervisor, at one site each) — the cross-instance
+    // coupling the later lock-model steps split; every other hold is short.
+    let holds = engine.lock_hold_stats();
+    for lock in ["registry", "supervisor"] {
+        let longest = holds
+            .iter()
+            .find(|stats| stats.lock == lock)
+            .unwrap_or_else(|| panic!("no {lock} hold recorded: {holds:?}"));
+        assert!(
+            longest.max_ms >= 4_000.0 && longest.max_ms < 6_000.0,
+            "the stuck send held the {lock} lock about its 5s bound: {holds:?}"
+        );
+        assert!(longest.site.contains("engine.rs"), "{holds:?}");
+    }
+    assert!(
+        holds.iter().filter(|stats| stats.max_ms >= 1_000.0).count() == 2,
+        "only the stuck send's two holds are long: {holds:?}"
     );
 
     // Property #3: a SUBSEQUENT send to the SAME (now-permanently-timed-out)
