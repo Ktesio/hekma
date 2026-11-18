@@ -761,6 +761,10 @@ impl Supervisor {
             wire_path: metering_source == "engine-observed",
             labels: self.bound_labels(registry, &name),
             fresh: kept_run_id.is_none(),
+            // Story 21-3: the Run resolves at creation (the 21-9 deferral),
+            // with fresh caller-side inputs; an unreadable configuration
+            // fail-closes the action to `pause`, never to nothing-set.
+            inputs: Some(registry.resolve_inputs_fail_closed(&name)),
         };
         let launch_generation =
             match registry.write_spawn_record_new_launch(&record, supervised_run) {

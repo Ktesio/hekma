@@ -322,6 +322,7 @@ mod bench {
 
     fn job(instance: &str, run: &str, sequence: u64, ceiling: u64) -> UsageJob {
         UsageJob {
+            row_rate: None,
             event: UsageEvent {
                 instance: instance.to_string(),
                 run_id: RunId::from_wire(run),

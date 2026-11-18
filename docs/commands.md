@@ -522,7 +522,42 @@ hekma label remove --selector team=core tier --yes
 
 A label set here is bound with origin `label-verb`: it outranks the agent's
 `labels.<key>` configuration and any caller label on the key, and stays with
-the Run across a relaunch. `remove` takes back such a label; when the
+the Run across a relaunch.
+
+## `hekma policy list|show|create|change|delete <name> [flags] [--dry-run] [--json]`
+
+Manage Policies — standing limits that apply to every Run their Selector
+matches (see [Policies and the warn default](policies.md)).
+
+```bash
+hekma policy create nightly-research \
+  --selector team=research,env=prod \
+  --tokens-per-run 2000000 --dollars-per-run 25 --breach-action pause
+hekma policy change default --rate-for gpt-4.1 --rate-input 2.00 --rate-output 8.00
+hekma policy change default --clear rate:gpt-4.1
+hekma policy change nightly-research --clear dollars-per-run
+hekma policy delete nightly-research
+```
+
+| Argument / flag | Meaning |
+|---|---|
+| `list`, `show` | Read Policies (read-only: no Service Host starts for these) |
+| `create <name> --selector <selector>` | A new Policy; the name is 1-63 characters of lowercase letters, digits, `-` and `_` |
+| `--tokens-per-run/-cumulative N`, `--dollars-per-run/-cumulative $X` | Token ceilings and Cost Caps (dollars parse like `25` or `0.0001`) |
+| `--breach-action <warn\|pause\|stop\|block>` | The Breach Action for these ceilings |
+| `--rate-input $X --rate-output $X [--rate-cached $X]` | A flat Rate for the Policy's matched Runs |
+| `change <name> ...` | Set limits (a set field wins), `--clear <limit>[,<limit>]` removes one (`tokens-per-run`, `dollars-per-run`, `breach-action`, `rate`, …) |
+| `change default --rate-for <model> ...` | Price a model in the default Policy's Rate table; `--clear rate:<model>` removes the entry |
+| `--dry-run` | Report what the change would match (and how many matched Runs fall back to `warn` at their depth); write nothing |
+| `--json` | The versioned documents `show`/`list`/the write answers render |
+
+Every change applies at once to every matched open Run: a ceiling lowered to
+or below a Run's usage breaches it now, and raising one re-arms the breach so
+the next crossing fires again. The `default` Policy — no ceilings, Breach
+Action `warn`, an empty Rate table you can fill — cannot be deleted or given
+a Selector; change it instead. Exit codes: `3` when no Policy has the name,
+`2` for a malformed request, a taken name, or the default Policy's reserved
+shape. Writes route through the local Service Host like every write. `remove` takes back such a label; when the
 configuration binds the same key, its value returns. Removing a label that
 comes from configuration is refused, naming the `labels.<key>` key to change
 with `hekma agent config set`; removing a caller label is refused; removing an

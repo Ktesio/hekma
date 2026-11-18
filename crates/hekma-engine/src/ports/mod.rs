@@ -20,6 +20,7 @@
 mod memory_backing;
 mod process_backend;
 mod run_store;
+pub(crate) use run_store::{OpenOwnerFacts, PolicyRecords, ResolutionFacts};
 mod secret_resolver;
 mod state_store;
 mod usage_source;

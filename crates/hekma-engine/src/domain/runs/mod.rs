@@ -38,6 +38,11 @@ pub(crate) mod snapshot;
 pub mod verbs;
 
 pub use labels::{validate_label_key, validate_label_value, LabelChange, LabelOutcome};
+pub use policy::{
+    BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyEvent, PolicyEventKind,
+    PolicyLimits, PolicyRecord, PolicyResolution, ResolveInputs, RunPolicy, ScentCheckMode,
+    UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
+};
 pub use selector::{Selector, SelectorScope, MAX_SELECTED_RUNS};
 pub use verbs::{verb_cell, CellBehavior, RunVerb, VerbCell, RUN_VERBS};
 
@@ -56,11 +61,16 @@ pub const HOST_IDENTITY_BINDING: &str = "host";
 
 /// How far Hekma controls a Run — a strict ladder, each rung including the
 /// one below (PRD Glossary). `supervised (no wire)` is depth `supervised`
-/// with `wire_path: false` on every surface (AD-25).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// with `wire_path: false` on every surface (AD-25). `Default` is the
+/// ladder's lowest rung (a resolution input with no depth named resolves
+/// the least control).
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum ControlDepth {
     /// Known from its telemetry or announcement only.
+    #[default]
     Observed,
     /// Its model traffic crosses the Metering Proxy.
     Wire,
@@ -163,8 +173,9 @@ impl RunStatus {
 }
 
 /// A condition Hekma makes loud (PRD Glossary). An Anomaly never acts on a
-/// Run by itself. Story 21-2 stores these three; later stories add the
-/// unscented, bypass, silent and policy-fallback kinds.
+/// Run by itself. Story 21-2 stores the first three; 21-3 adds the
+/// unpriced-model kind; later stories add the unscented, bypass and silent
+/// kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Anomaly {
@@ -177,10 +188,19 @@ pub enum Anomaly {
     /// A Breach Action set on the Run cannot execute at its current depth
     /// and acts as `warn`; cleared when the depth supports it again.
     DepthFallback,
+    /// A resolved Cost Cap has no resolvable Rate (a Policy-supplied cap on
+    /// an unpriced model), so the cap cannot fire; cleared when a Rate
+    /// resolves (story 21-3 — never silently inert).
+    UnpricedModel,
 }
 
 impl Anomaly {
-    const ALL: [Anomaly; 3] = [Anomaly::Breach, Anomaly::Failed, Anomaly::DepthFallback];
+    const ALL: [Anomaly; 4] = [
+        Anomaly::Breach,
+        Anomaly::Failed,
+        Anomaly::DepthFallback,
+        Anomaly::UnpricedModel,
+    ];
 
     /// The stable wire form.
     pub fn as_str(&self) -> &'static str {
@@ -188,6 +208,7 @@ impl Anomaly {
             Anomaly::Breach => "breach",
             Anomaly::Failed => "failed",
             Anomaly::DepthFallback => "depth-fallback",
+            Anomaly::UnpricedModel => "unpriced-model",
         }
     }
 
@@ -442,6 +463,9 @@ pub struct RunView {
     pub labels: Vec<Label>,
     /// Limits set directly on the Run.
     pub limits: RunLimits,
+    /// Its stored Policy resolution, when one exists (story 21-3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyResolution>,
     /// Its subtree usage.
     pub usage: RunUsage,
     /// How many of its children have not ended.
@@ -557,6 +581,10 @@ pub struct RunEvent {
     /// `config`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<String>,
+    /// The names of the Policies that supplied the Run's limits after the
+    /// change (story 21-3, AD-14: `default` counts; empty when none did).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<String>,
     /// RFC 3339 time of the change.
     pub at: String,
 }
@@ -677,6 +705,40 @@ pub enum RunError {
         /// [`MAX_SELECTED_RUNS`].
         max: usize,
     },
+    /// No Policy has this name (story 21-3).
+    #[error("no Policy is named `{name}`")]
+    PolicyNotFound {
+        /// The name asked for.
+        name: String,
+    },
+    /// A Policy with this name already exists (story 21-3): change it
+    /// instead of creating it again.
+    #[error(
+        "a Policy named `{name}` already exists — change it with `hekma policy change {name}`"
+    )]
+    PolicyExists {
+        /// The existing Policy's name.
+        name: String,
+    },
+    /// The `default` Policy's reserved shape forbids the change (story
+    /// 21-3): it cannot be deleted or carry a Selector — it is the
+    /// fallback every Run resolves through.
+    #[error("the default Policy {what} — it is the fallback every Run resolves through, and every limit it carries applies to every Run")]
+    PolicyDefault {
+        /// What it cannot do (`"cannot be deleted"`, `"cannot carry a Selector"`).
+        what: &'static str,
+    },
+    /// A Scent-Check Mode other than `off` before Scent-Check ships
+    /// (story 21-3, PRD §13 Q9's interim): an accepted-but-inert mode
+    /// would be a silent no-op.
+    #[error(
+        "Scent-Check Modes land with their own story — only `off` is accepted for now; `{mode}` \
+         does nothing until then"
+    )]
+    ScentUnavailable {
+        /// The refused mode.
+        mode: String,
+    },
     /// A malformed request field.
     #[error("{field}: {reason}")]
     Invalid {
@@ -706,6 +768,10 @@ impl RunError {
             RunError::LabelNotBound { .. } => "label-not-bound",
             RunError::LabelBound { .. } => "label-bound",
             RunError::TooManyRuns { .. } => "too-many-runs",
+            RunError::PolicyNotFound { .. } => "policy-not-found",
+            RunError::PolicyExists { .. } => "policy-exists",
+            RunError::PolicyDefault { .. } => "policy-default",
+            RunError::ScentUnavailable { .. } => "scent-unavailable",
             RunError::Invalid { .. } => "invalid-request",
             RunError::Store(_) => "store",
         }

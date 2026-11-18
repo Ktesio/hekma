@@ -72,7 +72,8 @@ use crate::domain::{
     TransitionEvent,
 };
 use crate::domain::{
-    ChildRunRequest, LabelChange, LabelOutcome, RunError, RunId, RunRecord, RunView, Selector,
+    ChildRunRequest, LabelChange, LabelOutcome, PolicyChange, PolicyOutcome, PolicyRecord,
+    RunError, RunId, RunRecord, RunView, Selector,
 };
 use crate::ports::{LogCaptureMode, SpawnRecord};
 use crate::shutdown::DrainOutcome;
@@ -548,9 +549,16 @@ impl Engine {
         // reaper starts so an adopted process is already held when the first poll
         // runs (and a phantom row is already `failed`).
         {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut registry = inner.registry.lock().expect("registry mutex poisoned");
             let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
             supervisor.adopt_orphans(&registry);
+            // Story 21-3: publish what the open produced (the policy sweep's
+            // Run events, the FR-21 upgrade's one event) on the bus — they
+            // are already durable in the outbox; this makes them live too
+            // for any subscriber seated before the engine was handed out.
+            for event in registry.take_open_events() {
+                supervisor.publish(event);
+            }
         }
 
         // (2) Spawn the crash-detection reaper on the engine's runtime. It is
@@ -947,6 +955,13 @@ impl Engine {
                 ),
                 Err(_) => None,
             };
+            // Story 21-3 (the perf-budgets ratchet): ONE batched read of
+            // every instance's Policy-resolution facts (the open
+            // process-owning Runs' rows, labels and limits, and the
+            // kept-on-pause markers), in the same AI-16 shape as the spawn
+            // records above. A failed batch (`None`) falls back to each
+            // row's own read, so it degrades one row at a time.
+            let resolution_facts = registry.fleet_resolution_facts();
             let entries = instances
                 .into_iter()
                 .map(|instance| {
@@ -954,6 +969,7 @@ impl Engine {
                         &registry,
                         &supervisor,
                         records.as_ref(),
+                        resolution_facts.as_ref(),
                         instance,
                         inner.read_only,
                     )
@@ -997,6 +1013,7 @@ impl Engine {
                 &registry,
                 &supervisor,
                 Some(&records),
+                None,
                 instance,
                 inner.read_only,
             ))
@@ -1014,6 +1031,7 @@ impl Engine {
         registry: &Registry,
         supervisor: &Supervisor,
         records: Option<&HashMap<InstanceName, SpawnRecord>>,
+        resolution_facts: Option<&crate::domain::registry_policy::FleetResolutionFacts>,
         instance: AgentInstance,
         read_only: bool,
     ) -> FleetEntry {
@@ -1123,25 +1141,30 @@ impl Engine {
                 .unwrap_or_default(),
             None => crate::domain::UsageTotals::zero(),
         };
-        // Story 3-3 dollar surface: resolve the CURRENT Rate/cap + action ONCE
-        // through the SAME live config resolve enforcement uses (so the Fleet view
-        // matches what enforcement sees). A degraded read → no Rate / no budget
-        // (honest absence), never failing the Fleet. Story 14-3 (T2): the SAME
-        // resolved effective config decides the acp kind's ACTIVE metering source
-        // (the `metering.upstream_base_url` opt-in), so the surfaced source matches
+        // Story 3-3 dollar surface + story 21-3 (the resolved limits): the
+        // CURRENT Rate/cap/action resolve ONCE through the ONE Policy
+        // resolver (`Registry::resolved_limits` — explicit config, the
+        // kept-on-pause marker, matching Policies, the default Policy), so
+        // the Fleet view matches what enforcement sees, names the source of
+        // every limit, and reads `warn` for a fresh ungoverned instance. A
+        // degraded read fails closed (honest absence), never failing the
+        // Fleet. Story 14-3 (T2): the SAME resolved effective config decides
+        // the acp kind's ACTIVE metering source (the
+        // `metering.upstream_base_url` opt-in), so the surfaced source matches
         // what the start seam did — the snapshot alone would always read
         // self-reported for the acp builtin.
         let effective_opt = registry
             .effective_config(&instance.name, crate::domain::ConfigLayer::empty())
             .ok();
-        let (rate, cost_cap, action) = effective_opt
-            .as_ref()
-            .map(|effective| {
-                let (_token_budget, action) = crate::domain::resolve_token_budget(effective);
-                let (rate, cost_cap, _cost_action) = crate::domain::resolve_cost(effective);
-                (rate, cost_cap, action)
-            })
-            .unwrap_or_else(|| (None, crate::domain::CostCap::none(), Default::default()));
+        let (resolution, breach_default_upgraded) = registry.resolved_limits_from_batch(
+            &instance.name,
+            current_run_id.as_ref(),
+            effective_opt.as_ref(),
+            resolution_facts,
+        );
+        let rate = resolution.rate;
+        let cost_cap = resolution.dollars;
+        let action = resolution.effective_action;
         let is_acp = crate::acp::is_acp_kind(&instance.kind);
         let metering_source = if is_acp {
             // The active source for the acp kind resolves from the effective
@@ -1180,18 +1203,17 @@ impl Engine {
                 base
             }
         };
-        // Story 3-2 budget surface + story 3-3 dollar cap surface (AC9/AC10): the
-        // CURRENT resolved Token Budget + Cost Cap + Breach Action + remaining per
-        // scope, from the SAME effective config the Rate/action above resolved
-        // (one read — the AI-63 "double effective_config fold" debt shrinks by
-        // one here). TOKEN remaining is `usage` tokens; DOLLAR cap/remaining are
-        // present ONLY when a Rate exists (a cap with no Rate is inert — AC-B).
-        // An instance with NEITHER a budget nor an enforceable cap surfaces an
-        // honest absent budget (never a fabricated ceiling).
-        let budget = effective_opt.as_ref().and_then(|effective| {
-            let (token_budget, _action) = crate::domain::resolve_token_budget(effective);
+        // Story 3-2 budget surface + story 3-3 dollar cap surface (AC9/AC10),
+        // resolved through the ONE Policy resolver since story 21-3 (the
+        // same `resolution` the Rate/action above used): the CURRENT
+        // resolved Token Budget + Cost Cap + Breach Action + remaining per
+        // scope. TOKEN remaining is `usage` tokens; DOLLAR cap/remaining are
+        // present ONLY when a Rate exists (a cap with no Rate is inert —
+        // AC-B). An instance with NEITHER a budget nor an enforceable cap
+        // surfaces an honest absent budget (never a fabricated ceiling).
+        let budget = effective_opt.as_ref().and_then(|_effective| {
             crate::domain::BudgetView::from_budget_and_cost(
-                &token_budget,
+                &resolution.tokens,
                 &cost_cap,
                 action,
                 current_run.total_tokens(),
@@ -1200,6 +1222,7 @@ impl Engine {
                 current_run_cost,
                 cumulative_cost,
                 label,
+                &resolution.sources.budget_policy_names(),
             )
         });
         // The active Metering Source is visible in Fleet detail (AC-C), resolved
@@ -1243,6 +1266,9 @@ impl Engine {
         } else {
             None
         };
+        // Story 21-3: the FR-21 "kept on pause by upgrade" marker rides the
+        // row (rendered as the note; the explicit-key write clears it). It
+        // was read with the resolution above, in the same snapshot.
         FleetEntry {
             name: instance.name,
             kind: instance.kind,
@@ -1268,6 +1294,7 @@ impl Engine {
             // `None` — omitted — for a stopped / never-started instance).
             supervision,
             recorded_state,
+            breach_default_upgraded,
             agent_home: instance.agent_home,
         }
     }
@@ -1715,6 +1742,23 @@ impl Engine {
                     .expect("supervisor mutex poisoned")
                     .sync_run_labels(&registry, &iname);
             }
+            // Story 21-3: an explicit `budget.breach_action` write clears
+            // the FR-21 upgrade marker (the "kept on pause" note ends), and
+            // a budget or Rate write re-resolves the instance's open
+            // process-owning Run's Policies in the same change.
+            let mut warnings = warnings;
+            if key == crate::domain::config::BUDGET_BREACH_ACTION_KEY {
+                if let Some(note) = registry.clear_breach_default_marker(&iname) {
+                    warnings.push(note);
+                }
+            }
+            if key.starts_with("budget.") || key.starts_with("cost.rate.") {
+                inner
+                    .supervisor
+                    .lock()
+                    .expect("supervisor mutex poisoned")
+                    .sync_run_policy(&registry, &iname);
+            }
             Ok(warnings)
         })
         .await
@@ -1824,6 +1868,122 @@ impl Engine {
                 .lock()
                 .expect("registry mutex poisoned")
                 .select_runs(&selector)
+        })
+        .await
+    }
+
+    /// Every stored Policy (story 21-3, PRD FR-60), the `default` Policy
+    /// included, ordered by name. Reads only.
+    pub async fn policies(&self) -> Result<Vec<PolicyRecord>, RunError> {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .policies()
+                .map_err(RunError::Store)
+        })
+        .await
+    }
+
+    /// One stored Policy by name (story 21-3); [`RunError::PolicyNotFound`]
+    /// when none has it. Reads only.
+    pub async fn policy(&self, name: &str) -> Result<PolicyRecord, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .policy(&name)
+                .map_err(RunError::Store)?
+                .ok_or(RunError::PolicyNotFound { name })
+        })
+        .await
+    }
+
+    /// Create a Policy (story 21-3, PRD FR-60): Operator- or Host-set limits
+    /// for the Runs its Selector matches by bound label. Refused with
+    /// [`RunError::PolicyExists`] when the name is taken. The change applies
+    /// to every matched open Run at once — a ceiling at or below a Run's
+    /// usage breaches in the same writer job — and commits one `policy`
+    /// event. The outcome reports how many Runs matched and how many fall
+    /// back to `warn` at their Control Depth. `dry_run` plans and writes
+    /// nothing.
+    pub async fn create_policy(
+        &self,
+        change: PolicyChange,
+        dry_run: bool,
+    ) -> Result<PolicyOutcome, RunError> {
+        if !dry_run {
+            self.refuse_if_read_only().map_err(RunError::Store)?;
+        }
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            if registry
+                .policy(&change.name)
+                .map_err(RunError::Store)?
+                .is_some()
+            {
+                return Err(RunError::PolicyExists { name: change.name });
+            }
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.change_policy(&registry, change, dry_run)
+        })
+        .await
+    }
+
+    /// Change a Policy, the `default` Policy included (story 21-3): set
+    /// limits, clear them, and (on `default`) edit the model-keyed Rate
+    /// table. [`RunError::PolicyNotFound`] when no Policy has the name.
+    /// Follows the latest: every matched open Run re-resolves at once; a
+    /// lowered ceiling at or below usage breaches, a raised one above usage
+    /// re-arms the latch and clears the matching `block` fence reasons.
+    /// `dry_run` plans and writes nothing.
+    pub async fn change_policy(
+        &self,
+        change: PolicyChange,
+        dry_run: bool,
+    ) -> Result<PolicyOutcome, RunError> {
+        if !dry_run {
+            self.refuse_if_read_only().map_err(RunError::Store)?;
+        }
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            if registry
+                .policy(&change.name)
+                .map_err(RunError::Store)?
+                .is_none()
+            {
+                return Err(RunError::PolicyNotFound { name: change.name });
+            }
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.change_policy(&registry, change, dry_run)
+        })
+        .await
+    }
+
+    /// Delete a Policy (story 21-3); its matched Runs re-resolve under the
+    /// remaining Policies. The `default` Policy cannot be deleted.
+    /// `dry_run` reports the Runs it would re-resolve and writes nothing.
+    pub async fn delete_policy(
+        &self,
+        name: &str,
+        dry_run: bool,
+    ) -> Result<PolicyOutcome, RunError> {
+        if !dry_run {
+            self.refuse_if_read_only().map_err(RunError::Store)?;
+        }
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.delete_policy(&registry, &name, dry_run)
         })
         .await
     }
@@ -2586,6 +2746,45 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.select_runs(selector))
     }
 
+    /// Blocking twin of [`Engine::policies`].
+    pub fn policies(&self) -> Result<Vec<PolicyRecord>, RunError> {
+        self.engine.rt.block_on(self.engine.policies())
+    }
+
+    /// Blocking twin of [`Engine::policy`].
+    pub fn policy(&self, name: &str) -> Result<PolicyRecord, RunError> {
+        self.engine.rt.block_on(self.engine.policy(name))
+    }
+
+    /// Blocking twin of [`Engine::create_policy`].
+    pub fn create_policy(
+        &self,
+        change: PolicyChange,
+        dry_run: bool,
+    ) -> Result<PolicyOutcome, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.create_policy(change, dry_run))
+    }
+
+    /// Blocking twin of [`Engine::change_policy`].
+    pub fn change_policy(
+        &self,
+        change: PolicyChange,
+        dry_run: bool,
+    ) -> Result<PolicyOutcome, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.change_policy(change, dry_run))
+    }
+
+    /// Blocking twin of [`Engine::delete_policy`].
+    pub fn delete_policy(&self, name: &str, dry_run: bool) -> Result<PolicyOutcome, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.delete_policy(name, dry_run))
+    }
+
     /// Blocking [`Engine::reveal_secrets`] (story 2-4, AC-C/AC11). The
     /// `config get --reveal` un-mask uses this to fetch the resolved cleartext of
     /// the secret leaves.
@@ -2884,6 +3083,7 @@ mod tests {
                     wire_path: false,
                     labels: Vec::new(),
                     fresh: true,
+                    inputs: None,
                 })
                 .unwrap();
         }
@@ -2951,6 +3151,7 @@ mod tests {
                     wire_path: false,
                     labels: vec![Label::bound("team", "payments")],
                     fresh: true,
+                    inputs: None,
                 })
                 .unwrap();
         }
@@ -3099,6 +3300,118 @@ mod tests {
         }
         drop(engine);
         assert!(!base.exists(), "a read-only open creates nothing");
+    }
+
+    #[test]
+    fn the_blocking_policy_facades_round_trip_and_a_budget_write_re_resolves() {
+        // The blocking twins of the async Policy facade, end to end over one
+        // engine: create (dry then real), show, list, change, delete — and
+        // the `budget.*` config write's same-job re-resolution of the open
+        // Run (the review round's creation-time resolution made the Run
+        // resolvable from the start).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        facade.register("demo", "mock").unwrap();
+        facade.set_config("demo", "labels.team", "core").unwrap();
+        let change = PolicyChange {
+            name: "cap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(2_000),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        };
+        // The dry run plans and writes nothing.
+        let dry = facade.create_policy(change.clone(), true).unwrap();
+        assert_eq!(dry.matched, 0);
+        assert!(facade.policy("cap").is_err());
+        // The real create answers, the list carries it, the change edits it.
+        let created = facade.create_policy(change, false).unwrap();
+        assert_eq!(created.matched, 0);
+        assert_eq!(facade.policy("cap").unwrap().name, "cap");
+        assert!(facade
+            .policies()
+            .unwrap()
+            .iter()
+            .any(|record| record.name == "cap"));
+        facade
+            .change_policy(
+                PolicyChange {
+                    name: "cap".to_string(),
+                    selector: None,
+                    set: crate::domain::PolicyLimits {
+                        tokens_per_run: Some(3_000),
+                        ..Default::default()
+                    },
+                    clear: Vec::new(),
+                    rates: Default::default(),
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            facade.policy("cap").unwrap().limits.tokens_per_run,
+            Some(3_000)
+        );
+        // A `budget.*` write on an instance with an open Run re-resolves it
+        // in the same job: the run's stored resolution carries the explicit
+        // ceiling (the Run is created by the registry; the mock cannot
+        // start).
+        let owner = RunId::mint();
+        {
+            let registry = engine.inner.registry.lock().unwrap();
+            registry
+                .ensure_supervised_run(crate::domain::runs::ops::SupervisedRun {
+                    instance: InstanceName::new("demo").unwrap(),
+                    run_id: owner.clone(),
+                    wire_path: false,
+                    labels: vec![crate::domain::Label::bound("team", "core")],
+                    fresh: true,
+                    inputs: None,
+                })
+                .unwrap();
+        }
+        facade
+            .set_config("demo", "budget.tokens.per_run", "1234")
+            .unwrap();
+        let run = facade.run(owner.as_str()).unwrap();
+        assert_eq!(run.policy.as_ref().unwrap().tokens.per_run, Some(1_234));
+        // A `budget.breach_action` write is the FR-21 marker-clearing
+        // key: the action re-resolves, and a kept-on-pause marker (one is
+        // seeded here as the upgrade would leave it) clears in the same
+        // write.
+        {
+            let registry = engine.inner.registry.lock().unwrap();
+            registry
+                .writer
+                .call(|ctx| {
+                    ctx.store().execute_batch_for_test(
+                        "INSERT INTO breach_default_upgrade (instance_id, listed_at, done_at) \
+                         VALUES ((SELECT id FROM agent_instances WHERE name = 'demo'), 't', 't')",
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert!(facade.fleet().unwrap()[0].breach_default_upgraded);
+        facade
+            .set_config("demo", "budget.breach_action", "warn")
+            .unwrap();
+        assert!(!facade.fleet().unwrap()[0].breach_default_upgraded);
+        let run = facade.run(owner.as_str()).unwrap();
+        assert_eq!(
+            run.policy.as_ref().unwrap().effective_action,
+            crate::domain::BreachAction::Warn
+        );
+        // The delete dry run plans; the real delete removes it.
+        let dry = facade.delete_policy("cap", true).unwrap();
+        assert!(dry.record.is_none());
+        assert!(facade.policy("cap").is_ok());
+        facade.delete_policy("cap", false).unwrap();
+        assert!(facade.policy("cap").is_err());
     }
 
     #[test]

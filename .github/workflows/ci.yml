@@ -760,7 +760,7 @@ jobs:
             .github/fixtures/agents-in-ci-adapter.toml > "$leg/manifest/adapter.toml"
           "$hekma" agent register ci-bot --manifest "$leg/manifest"
           "$hekma" agent config set ci-bot budget.tokens.cumulative 100000
-          "$hekma" agent config set ci-bot budget.breach_action pause
+          "$hekma" agent config set ci-bot budget.breach_action stop
           "$hekma" agent config set ci-bot cost.rate.input 3.00
           "$hekma" agent config set ci-bot cost.rate.output 15.00
           "$hekma" agent start ci-bot --detach
@@ -791,7 +791,7 @@ jobs:
           # breach leg validates its enforcement; this pins its projection).
           s_limit=$(jq -r '.instance.budget.cumulative_limit // empty' "$leg/show.json")
           s_action=$(jq -r '.instance.budget.breach_action // empty' "$leg/show.json")
-          if [ "$s_limit" != "100000" ] || [ "$s_action" != "pause" ]; then
+          if [ "$s_limit" != "100000" ] || [ "$s_action" != "stop" ]; then
             echo "::error::success leg: show --json budget block missing/wrong (limit=$s_limit action=$s_action)"
             cat "$leg/show.json"
             exit 1
@@ -837,15 +837,18 @@ jobs:
             cat "$leg/final.json"
             exit 1
           fi
-      - name: Breach leg — the 90-token ceiling pauses the agent; the row proves it
+      - name: Breach leg — the 90-token ceiling stops the agent; the row proves it
         # The proven recipe: fixed 10-in/20-out sentinels against a cumulative
-        # ceiling of 90 tokens crosses at event 3. No rate is configured on
-        # this leg, and the summary's dollar cell renders the honest absence
-        # (`—`, never a fabricated $0.00) only AFTER the absence is asserted
-        # from `usage --json`. The breach proof is the paused
-        # Fleet row + budget fields (cumulative_limit 90, remaining clamped
-        # to 0, breach_action pause) read through `show --json` — the CLI
-        # has no breach exit code and the lane does not pretend otherwise.
+        # ceiling of 90 tokens crosses at event 3, and the recipe sets the
+        # Breach Action to `stop` explicitly (the default is `warn` since
+        # Policies landed — a spend cap in CI must end the job, not just
+        # record). No rate is configured on this leg, and the summary's
+        # dollar cell renders the honest absence (`—`, never a fabricated
+        # $0.00) only AFTER the absence is asserted from `usage --json`. The
+        # breach proof is the stopped Fleet row + budget fields
+        # (cumulative_limit 90, remaining clamped to 0, breach_action stop)
+        # read through `show --json` — the CLI has no breach exit code and
+        # the lane does not pretend otherwise.
         env:
           KTESIO_NO_UPDATE_CHECK: "1"
         shell: bash
@@ -859,23 +862,23 @@ jobs:
             .github/fixtures/agents-in-ci-adapter.toml > "$leg/manifest/adapter.toml"
           "$hekma" agent register ci-breach --manifest "$leg/manifest"
           "$hekma" agent config set ci-breach budget.tokens.cumulative 90
-          "$hekma" agent config set ci-breach budget.breach_action pause
+          "$hekma" agent config set ci-breach budget.breach_action stop
           "$hekma" agent start ci-breach --detach
-          paused=""
+          stopped=""
           for i in $(seq 1 60); do
             "$hekma" agent show ci-breach --json > "$leg/show.json" || { sleep 1; continue; }
             state=$(jq -r '.instance.state // empty' "$leg/show.json")
             limit=$(jq -r '.instance.budget.cumulative_limit // empty' "$leg/show.json")
             remaining=$(jq -r '.instance.budget.cumulative_remaining // empty' "$leg/show.json")
             action=$(jq -r '.instance.budget.breach_action // empty' "$leg/show.json")
-            if [ "$state" = "paused" ] && [ "$limit" = "90" ] && [ "$remaining" = "0" ] && [ "$action" = "pause" ]; then
-              paused=1
+            if [ "$state" = "stopped" ] && [ "$limit" = "90" ] && [ "$remaining" = "0" ] && [ "$action" = "stop" ]; then
+              stopped=1
               break
             fi
             sleep 1
           done
-          if [ -z "$paused" ]; then
-            echo "::error::breach leg: the agent never reached paused with its budget fields within the bound; last read:"
+          if [ -z "$stopped" ]; then
+            echo "::error::breach leg: the agent never reached stopped with its budget fields within the bound; last read:"
             cat "$leg/show.json"
             exit 1
           fi
@@ -883,7 +886,7 @@ jobs:
           out_tok=$(jq -r '.instance.usage.cumulative_output_tokens // 0' "$leg/show.json")
           total=$((in_tok + out_tok))
           if [ "$total" -lt 90 ]; then
-            echo "::error::breach leg: the paused row shows only $total committed tokens, below the 90 ceiling"
+            echo "::error::breach leg: the stopped row shows only $total committed tokens, below the 90 ceiling"
             cat "$leg/show.json"
             exit 1
           fi
@@ -899,16 +902,17 @@ jobs:
             echo "## Agents in CI — breach leg"
             echo ""
             echo "ci-breach crossed its cumulative ceiling of ${limit} tokens"
-            echo "(committed ${total}: ${in_tok} in / ${out_tok} out) and was paused by the"
+            echo "(committed ${total}: ${in_tok} in / ${out_tok} out) and was stopped by the"
             echo "configured Breach Action (\`${action}\`). There is no dedicated breach"
-            echo "exit code — this paused Fleet row IS the proof."
+            echo "exit code — this stopped Fleet row IS the proof."
             echo ""
             echo "| agent | state | ceiling tok | remaining | breach action | committed tok | cost |"
             echo "|-------|-------|-------------|-----------|---------------|---------------|------|"
             printf '| %s | %s | %s | %s | %s | %s | — (no rate configured) |\n' \
               ci-breach "$state" "$limit" "$remaining" "$action" "$total"
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-          "$hekma" agent stop ci-breach --timeout 0
+          # No teardown stop: the breach's `stop` already stopped the agent
+          # (asserted above), and stopping a stopped agent is refused (exit 4).
 
   docs:
     name: docs
@@ -1595,6 +1599,7 @@ jobs:
               "no-retro-repricing",
               "block-fence",
               "ancestor-ceilings",
+              "policy-resolution",
           }
           missing = expected - tags
           assert not missing, f"uncovered rules: {sorted(missing)}"
@@ -1602,6 +1607,7 @@ jobs:
           assert kinds.get("derivation"), f"no derivation cases: {kinds}"
           assert kinds.get("fence"), f"no fence cases: {kinds}"
           assert kinds.get("chain"), f"no chain cases: {kinds}"
+          assert kinds.get("policy"), f"no policy cases: {kinds}"
           for case in document["cases"]:
               if case["kind"] != "chain":
                   continue

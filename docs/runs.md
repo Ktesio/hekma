@@ -79,6 +79,11 @@ Which verbs work depends on the depth; “no” means the verb fails at once wit
 | `send`, `attach` | no | no | no | as the adapter declares |
 | hold, release, reroute, reject | no | yes | yes | yes |
 
+`hekma run show --json` also carries the Run's resolved [Policy](policies.md)
+limits — each with its source (the Run, the agent's configuration, a Policy
+by name, or the default Policy) — plus the `depth-fallback` and
+`unpriced-model` Anomalies a Policy can raise.
+
 **Run Status** is `active`, `held`, `silent` (no recent heartbeat or traffic), `stale` (its machine is unreachable) or `ended`. An **Anomaly** is a condition Hekma makes loud, such as a budget breach or a Run gone `silent`. It never acts on a Run, and no Run is stopped for running long: only a verb you run or a [Policy](policies.md) you configure acts on one.
 
 ## How it will work

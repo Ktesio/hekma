@@ -100,9 +100,77 @@ impl Supervisor {
     /// per-channel drains are independent cursors over independent files, so
     /// a line can never be ingested twice.
     pub(super) fn drain_usage_all(&mut self, registry: &Registry) {
+        // Story 21-3 (review round 2): the cross-process policy-cache check
+        // rides the tick (one tiny aggregate read — never per event). A
+        // degraded reload is SURFACED here, once per continuous degraded
+        // state (the open notes are drained only at open and would grow
+        // unbounded); a healthy tick re-arms the notice (and a failed load
+        // retries next tick). A successful RELOAD re-checks this engine's
+        // supervised Runs: another engine's raise unlatched rows (its own
+        // fence reasons must lift), and its lowering or new ceiling fires
+        // here under this engine's fence and lifecycle (round 3, M1).
+        let refresh = registry.refresh_policy_cache();
+        match refresh.degraded {
+            Some(note) => {
+                if !self.policies_degraded_noted {
+                    self.policies_degraded_noted = true;
+                    self.emit_diagnostic(&format!(
+                        "the Policies could not be reloaded: {note} — enforcement continues \
+                         under the last good set with the breach action held at pause"
+                    ));
+                }
+            }
+            None => {
+                if self.policies_degraded_noted && !registry.policy_cache_degraded() {
+                    self.policies_degraded_noted = false;
+                }
+            }
+        }
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
+        if refresh.reloaded {
+            self.recheck_after_policy_reload(registry, &names);
+        }
         for name in names {
             self.drain_self_reported_for(registry, &name, DrainMode::MidRun);
+        }
+    }
+
+    /// Re-check the supervised Runs after the policy set reloaded (story
+    /// 21-3, review round 3 M1): another engine's change may have
+    /// unlatched a Run (lift this engine's fence reasons whose latch rows
+    /// are gone) or lowered a ceiling / added one this engine supervises
+    /// (evaluate now, under this engine's own fence and lifecycle — the
+    /// foreign engine cannot latch what it cannot execute).
+    fn recheck_after_policy_reload(&mut self, registry: &Registry, names: &[InstanceName]) {
+        for name in names {
+            let Some(supervised) = self.running.get(name) else {
+                continue;
+            };
+            let Some(run_id) = registry.open_process_run(name).ok().flatten() else {
+                continue;
+            };
+            // Lift fence reasons whose latch rows are gone (a foreign
+            // raise unlatched them in the shared store).
+            if let Some(fence) = supervised
+                .observed_listener
+                .as_ref()
+                .map(ObservedListener::fence)
+            {
+                let latched = match registry.latches(&run_id) {
+                    Ok(latches) => latches.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+                    Err(_) => continue,
+                };
+                for reason in fence.reasons() {
+                    if !latched.contains(&reason) {
+                        fence.clear(reason);
+                    }
+                }
+            }
+            // Evaluate: a lowered or newly-added ceiling this engine
+            // supervises fires here (enforce_budget is idempotent under
+            // the latch rows).
+            let metering_source = supervised.metering_source.clone();
+            self.enforce_budget(registry, name, &run_id, &metering_source);
         }
     }
 
@@ -889,9 +957,33 @@ impl Supervisor {
             .running
             .get(name)
             .map_or(0, |supervised| supervised.launch_generation);
+        // Story 21-3 (review round 2): usage attributed to a CHILD Run
+        // prices at the child's OWN resolved Rate (its Policy's flat Rate)
+        // — the ledger is per-Run priced, so a child-only Policy Cost Cap
+        // sees cost priced at the child's Rate, not the owner's (or none).
+        // The owner's own usage prices at the evaluator's Rate as before.
+        let row_rate = if self.running.get(name).map(|s| &s.run_id) == Some(run_id) {
+            None
+        } else {
+            match registry.run_rate(run_id) {
+                Ok(rate) => rate,
+                Err(err) => {
+                    // Best effort with a surfaced note: the row prices at
+                    // the owner's Rate (or unpriced) — never silently, and
+                    // no retro-repricing exists to repair it later.
+                    self.emit_diagnostic(&format!(
+                        "{}: the attributed Run's Rate could not be read ({err}); its usage row \
+                         prices at the owning Run's Rate",
+                        name.as_str(),
+                    ));
+                    None
+                }
+            }
+        };
         let job = pipeline::UsageJob {
             event,
             generation,
+            row_rate,
             eval: self.eval_input(registry, name, run_id, metering_source),
         };
         match registry
@@ -951,12 +1043,15 @@ impl Supervisor {
         }
     }
 
-    /// The pipeline's evaluator inputs for one instance and Run (story 21-1):
-    /// the LIVE resolved budget, Rate, cap and actions (AC-B — a change while
-    /// `running` applies on the very next event), whether the instance is
-    /// supervised, and its wire fence. A malformed on-disk layer degrades to
-    /// "no budget / no Rate" (best-effort — never a crash mid-ingestion), the
-    /// same degrade the in-supervisor evaluator took.
+    /// The pipeline's evaluator inputs for one instance and Run (story
+    /// 21-1): the LIVE resolved limits (AC-B — a change while `running`
+    /// applies on the very next event), whether the instance is
+    /// supervised, and its wire fence. Since story 21-3 the limits resolve
+    /// through the ONE Policy resolver (`Registry::resolved_limits`):
+    /// explicit Run limits, explicit instance config, the kept-on-pause
+    /// marker, matching Policies and the default Policy — the same pure
+    /// function every surface calls. A failed config or store read fails
+    /// CLOSED to `pause` arms (AD-7: never the new default by accident).
     pub(super) fn eval_input(
         &self,
         registry: &Registry,
@@ -964,25 +1059,27 @@ impl Supervisor {
         run_id: &RunId,
         metering_source: &str,
     ) -> pipeline::EvalInput {
-        let effective = registry.effective_config(name, ConfigLayer::empty()).ok();
-        let (token_budget, token_action) = effective
-            .as_ref()
-            .map(config::resolve_token_budget)
-            .unwrap_or((TokenBudget::default(), BreachAction::Pause));
-        let (rate, cost_cap, cost_action) = effective
-            .as_ref()
-            .map(config::resolve_cost)
-            .unwrap_or((None, CostCap::default(), BreachAction::Pause));
+        // The ARMS resolve for the instance's process-owning Run — the
+        // pipeline's process level (`pipeline::levels_for`) — so a child
+        // Run's own `run_limits` never leak into the instance arms (each
+        // level's own ceilings ride its own level) and the instance's
+        // explicit ceilings still apply however usage is attributed. The
+        // attributed `run_id` stays the evaluation's target. Passing no
+        // Run lets `resolved_limits` read the open process-owning Run
+        // itself — and a FAILED read fail-closes INSIDE it (pause, arms
+        // kept, note carried), never a silent label-less resolve.
+        let _ = run_id;
+        let resolution = registry.resolved_limits(name, None);
         let supervised = self.running.get(name);
         pipeline::EvalInput {
             name: name.clone(),
             run_id: run_id.clone(),
             metering_source: metering_source.to_string(),
-            token_budget,
-            token_action,
-            rate,
-            cost_cap,
-            cost_action,
+            token_budget: resolution.tokens,
+            token_action: resolution.effective_action,
+            rate: resolution.rate,
+            cost_cap: resolution.dollars,
+            cost_action: resolution.effective_action,
             supervised: supervised.is_some(),
             fence: supervised
                 .and_then(|supervised| supervised.observed_listener.as_ref())
@@ -1065,7 +1162,7 @@ impl Supervisor {
     /// executes its action in commit order, as before: when a token breach
     /// already paused the instance, the dollar breach's pause meets the
     /// transition gate and says so on the diagnostic surface.
-    fn apply_evaluation(
+    pub(super) fn apply_evaluation(
         &mut self,
         registry: &Registry,
         name: &InstanceName,
@@ -1173,18 +1270,12 @@ impl Supervisor {
         (token, dollar)
     }
 
-    /// Whether the instance's CURRENT resolved Breach Action is `block` for
-    /// either dimension (story 19-2). A failed config read is `false` — the
-    /// same degrade `enforce_budget` takes (it returns early on that read).
+    /// Whether the instance's CURRENT resolved Breach Action is `block`
+    /// (story 19-2; story 21-3: the resolution, not the config alone — a
+    /// Policy can supply `block`). A failed read is `false` — the same
+    /// degrade `enforce_budget` takes (it returns early on that read).
     pub(super) fn block_configured(&self, registry: &Registry, name: &InstanceName) -> bool {
-        registry
-            .effective_config(name, ConfigLayer::empty())
-            .map(|effective| {
-                let (_budget, token_action) = config::resolve_token_budget(&effective);
-                let (_rate, _cap, cost_action) = config::resolve_cost(&effective);
-                token_action == BreachAction::Block || cost_action == BreachAction::Block
-            })
-            .unwrap_or(false)
+        registry.resolved_limits(name, None).effective_action == BreachAction::Block
     }
 
     /// The RUN-START fence evaluation (story 19-2): before a Run's process
@@ -1210,11 +1301,15 @@ impl Supervisor {
         fence: &crate::metering::WireFence,
         kept_run: Option<&RunId>,
     ) -> bool {
-        let Ok(effective) = registry.effective_config(name, ConfigLayer::empty()) else {
-            return false;
-        };
-        let (budget, token_action) = config::resolve_token_budget(&effective);
-        let (rate, cost_cap, cost_action) = config::resolve_cost(&effective);
+        // Story 21-3: the Run-start fence resolves through the ONE Policy
+        // resolver — a Policy can supply the ceilings and the `block`
+        // action, not only the instance config.
+        let resolution = registry.resolved_limits(name, kept_run);
+        let budget = resolution.tokens;
+        let token_action = resolution.effective_action;
+        let rate = resolution.rate;
+        let cost_cap = resolution.dollars;
+        let cost_action = resolution.effective_action;
         if token_action != BreachAction::Block && cost_action != BreachAction::Block {
             return false;
         }
@@ -1254,7 +1349,7 @@ impl Supervisor {
     /// listener could not be re-bound — cannot be fenced: the breach stays
     /// recorded, acts as `warn`, and the diagnostic says so loudly (AI-18;
     /// never a silent no-op).
-    fn note_block(
+    pub(super) fn note_block(
         &self,
         registry: &Registry,
         name: &InstanceName,
@@ -1317,7 +1412,12 @@ impl Supervisor {
     /// silently escalate to stop (AC6), we surface the honest diagnostic on the
     /// engine log (the breach event already captured the fact). All best-effort:
     /// never a supervisor crash.
-    fn enforce_pause(&mut self, registry: &Registry, name: &InstanceName, cause: TransitionCause) {
+    pub(super) fn enforce_pause(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        cause: TransitionCause,
+    ) {
         match self.pause_with_cause(registry, name, cause) {
             Ok(_) => {}
             Err(e) => {
@@ -1346,11 +1446,11 @@ impl Supervisor {
         name: &InstanceName,
         run_id: &RunId,
     ) {
-        let Ok(effective) = registry.effective_config(name, ConfigLayer::empty()) else {
-            return;
-        };
-        let (_budget, token_action) = config::resolve_token_budget(&effective);
-        let (_rate, _cap, cost_action) = config::resolve_cost(&effective);
+        // Story 21-3: the latched actions re-apply under the RESOLVED
+        // action (a Policy can supply it), not the config alone.
+        let resolution = registry.resolved_limits(name, Some(run_id));
+        let token_action = resolution.effective_action;
+        let cost_action = resolution.effective_action;
         let breaches = match registry.reader().run_breaches(name, run_id) {
             Ok(breaches) => breaches,
             Err(err) => {
@@ -1365,6 +1465,14 @@ impl Supervisor {
                 return;
             }
         };
+        // Round 3, L3: only breaches whose `(dimension, scope)` is STILL
+        // latched re-apply — the Operator may have raised the ceiling
+        // since (the raise unlatches), and re-applying a spent breach
+        // paused a relaunched agent under a ceiling it no longer crosses.
+        let latch_rows: Vec<crate::domain::LatchKey> = registry
+            .latches(run_id)
+            .map(|rows| rows.into_iter().map(|(key, _)| key).collect())
+            .unwrap_or_default();
         let latched = breaches.into_iter().rev().find(|event| {
             let configured = match event.dimension {
                 BreachDimension::Tokens => token_action,
@@ -1372,6 +1480,7 @@ impl Supervisor {
             };
             event.action == configured
                 && matches!(event.action, BreachAction::Pause | BreachAction::Stop)
+                && latch_rows.contains(&crate::domain::LatchKey::new(event.dimension, event.scope))
         });
         let Some(event) = latched else {
             return;
@@ -1411,7 +1520,12 @@ impl Supervisor {
     /// as the WHY marker on the `running → stopping` edge (the stop path itself
     /// records the graceful/forced escalation on the terminal edge). Best-effort:
     /// a stop error is logged, never a crash (the breach is already recorded).
-    fn enforce_stop(&mut self, registry: &Registry, name: &InstanceName, cause: TransitionCause) {
+    pub(super) fn enforce_stop(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        cause: TransitionCause,
+    ) {
         match self.stop_with_cause(registry, name, cause) {
             Ok(_) => {}
             Err(e) => {
@@ -1503,7 +1617,14 @@ impl Supervisor {
     /// Append a committed breach to the instance's `breaches.log` mirror
     /// (story 21-1: best-effort, after commit — state.db holds the record, so
     /// a failed mirror is a diagnostic, never a lost breach).
-    fn mirror_breach(&self, registry: &Registry, name: &InstanceName, event: &BudgetBreachEvent) {
+    /// `pub(super)`: the policy-change job's unsupervised-instance breach
+    /// surface (supervisor/runs.rs) mirrors the same way.
+    pub(super) fn mirror_breach(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        event: &BudgetBreachEvent,
+    ) {
         let path = registry.instance_breach_log_path(name);
         let mirrored = path
             .parent()
