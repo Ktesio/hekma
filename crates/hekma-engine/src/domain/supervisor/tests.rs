@@ -6109,6 +6109,272 @@ fn the_release_pass_reconciles_an_already_dead_paused_child() {
 }
 
 #[test]
+fn the_release_pass_names_a_signal_death_for_an_own_paused_child() {
+    // The OWN-CHILD `None` arm of the release reconcile (issue #387): the
+    // paused detached child was SPAWNED by this engine, so its code-less exit
+    // is a SIGNAL termination (`try_wait` held the authoritative status; on
+    // Unix `code() == None` ⟺ WIFSIGNALED) — the cause must say "terminated
+    // by signal" and must NOT claim the adopted arm, because the process IS
+    // this engine's child. Windows skips: a Windows kill (TerminateProcess)
+    // exit carries a code, so the None arm is not honestly reachable there
+    // (the same rationale as the reaper's sibling pin,
+    // `crash_cause_for_a_signal_death_says_signal_without_inventing_a_code`).
+    if OsId::current() == OsId::Windows {
+        return;
+    }
+    let (_state, _manifest, registry) =
+        setup_pause_guaranteed("sigrel", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("sigrel").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, "sigrel").unwrap();
+    sup.pause(&registry, "sigrel").unwrap();
+    assert_eq!(state_of(&registry, "sigrel"), LifecycleState::Paused);
+
+    // The engine's OWN child dies while the row reads paused (suspended, then
+    // killed out-of-band — the release-time discovery premise).
+    let pid = {
+        let supervised = sup.running.get(&name).unwrap();
+        sup.backend.pid(&supervised.handle)
+    };
+    test_kill_pid(pid);
+    // Bounded wait until the death is reaped (poll reaps the direct child).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let exited = {
+            let supervised = sup.running.get_mut(&name).unwrap();
+            sup.backend
+                .poll(&mut supervised.handle)
+                .map(|status| status.is_exited())
+                .unwrap_or(true)
+        };
+        if exited {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the killed child never registered as exited"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    sup.release_detached_paused(&registry);
+
+    assert_eq!(
+        state_of(&registry, "sigrel"),
+        LifecycleState::Failed,
+        "the signal-killed own child reconciles to failed, never to running"
+    );
+    let events = Supervisor::read_events(&registry, "sigrel").unwrap();
+    let reconcile = events
+        .iter()
+        .find(|e| e.prior_state == LifecycleState::Paused && e.new_state == LifecycleState::Failed)
+        .expect("the crashed reconcile edge must be recorded");
+    let cause = serde_json::to_string(&reconcile.cause).unwrap();
+    assert!(
+        cause.contains("terminated by signal"),
+        "an own child's code-less exit must name the signal: {cause}"
+    );
+    assert!(
+        !cause.contains("adopted process is not this engine's child"),
+        "an own child must not be called an adopted process: {cause}"
+    );
+    assert!(
+        !cause.contains("exit code unavailable"),
+        "an own child's signal exit must not claim the unavailable arm: {cause}"
+    );
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("sigrel: the paused detached child had already exited")
+            && text.contains("terminated by signal"),
+        "the surfaced reconcile note must carry the signal wording: {text}"
+    );
+}
+
+#[test]
+fn the_release_pass_keeps_the_adopted_wording_for_an_adopted_paused_child() {
+    // The ADOPTED `None` arm of the release reconcile (issue #387): the
+    // paused row was ADOPTED from a previous engine, so its code is
+    // unrecoverable BY STRUCTURE (`kill(pid, 0)` + the start-time fingerprint
+    // — this engine is not the parent and holds no ExitStatus) — the cause
+    // keeps the exact AI-13 wording and must NOT assert a signal it cannot
+    // prove. Windows skips: the adopted poll reads the real code via
+    // GetExitCodeProcess, so a killed adopted child lands in the CODED arm
+    // there and the None arm is not honestly reachable (the reaper's Windows
+    // note).
+    if OsId::current() == OsId::Windows {
+        return;
+    }
+    let (_state, _manifest, registry) =
+        setup_pause_guaranteed("adoprel", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("adoprel").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start_detached(&registry, "adoprel").unwrap();
+    sup.pause(&registry, "adoprel").unwrap();
+    assert_eq!(state_of(&registry, "adoprel"), LifecycleState::Paused);
+    // A prior engine's record: the NEXT open adopts, and the re-held row
+    // carries `adopted == true`.
+    make_dead_owner_record(&registry, &name);
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    assert_eq!(sup2.adopt_orphans(&registry), 1);
+    assert!(
+        sup2.running.get(&name).unwrap().adopted,
+        "the re-held row must be the adopted shape"
+    );
+
+    // The adopted child dies OUT OF BAND. Its REAL parent (the first
+    // supervisor's still-held handle) must reap the zombie first — a
+    // zombie reads as alive to the adopted `kill(pid, 0)` probe, so only
+    // the reaped pid is honestly gone to the adopter.
+    let pid = {
+        let supervised = sup2.running.get(&name).unwrap();
+        sup2.backend.pid(&supervised.handle)
+    };
+    test_kill_pid(pid);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let exited = {
+            let supervised = sup.running.get_mut(&name).unwrap();
+            sup.backend
+                .poll(&mut supervised.handle)
+                .map(|status| status.is_exited())
+                .unwrap_or(true)
+        };
+        if exited {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the killed child never registered as exited to its real parent"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    sup2.release_detached_paused(&registry);
+
+    assert_eq!(
+        state_of(&registry, "adoprel"),
+        LifecycleState::Failed,
+        "the dead adopted child reconciles to failed at release"
+    );
+    let events = Supervisor::read_events(&registry, "adoprel").unwrap();
+    let reconcile = events
+        .iter()
+        .find(|e| e.prior_state == LifecycleState::Paused && e.new_state == LifecycleState::Failed)
+        .expect("the crashed reconcile edge must be recorded");
+    let cause = serde_json::to_string(&reconcile.cause).unwrap();
+    assert!(
+        cause.contains("exit code unavailable")
+            && cause.contains("adopted process is not this engine's child"),
+        "the adopted arm keeps the exact AI-13 wording: {cause}"
+    );
+    assert!(
+        !cause.contains("terminated by signal"),
+        "an adopted exit must not assert a signal it cannot prove: {cause}"
+    );
+}
+
+#[test]
+fn the_release_pass_reconciles_a_self_exited_cooperatively_paused_child_with_its_code() {
+    // The Some(code) twin of the already-dead reconcile (review round 1): a
+    // COOPERATIVELY paused detached child is alive and unsuspended, so it
+    // can SELF-EXIT with a real code while the row reads `paused` — the
+    // release probe then reaps a waitable exit code and the crashed edge
+    // NAMES it (never the unavailable-code wording a signal-killed or
+    // adopted corpse carries, never a fake paused→running resume). The
+    // 6s self-exit budget gives the preceding cooperative pause a wide
+    // margin on a cold runner.
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_coop_pair_manifest(
+        manifest.path(),
+        "coopex",
+        &["--exit-with", "7:6000"],
+        &["--touch", "pause.sentinel"],
+        &["--touch", "resume.sentinel"],
+        None,
+    );
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "coopex",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("coopex").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, "coopex").unwrap();
+    // The cooperative pause commits well inside the 6s self-exit budget.
+    sup.pause(&registry, "coopex").unwrap();
+    assert_eq!(state_of(&registry, "coopex"), LifecycleState::Paused);
+
+    // The child self-exits with code 7 while the row reads paused (the
+    // release-time discovery premise, the waitable-code variant).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let exited = {
+            let supervised = sup.running.get_mut(&name).unwrap();
+            sup.backend
+                .poll(&mut supervised.handle)
+                .map(|status| status.is_exited())
+                .unwrap_or(true)
+        };
+        if exited {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the self-exiting child never registered as exited"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    sup.release_detached_paused(&registry);
+
+    assert_eq!(
+        state_of(&registry, "coopex"),
+        LifecycleState::Failed,
+        "the self-exited paused child reconciles to failed, never to running"
+    );
+    let events = Supervisor::read_events(&registry, "coopex").unwrap();
+    let reconcile = events
+        .iter()
+        .find(|e| e.prior_state == LifecycleState::Paused && e.new_state == LifecycleState::Failed)
+        .expect("the crashed reconcile edge must be recorded");
+    let cause = serde_json::to_string(&reconcile.cause).unwrap();
+    assert!(
+        cause.contains("crashed")
+            && cause.contains("exited before engine release")
+            && cause.contains("exited with code 7"),
+        "the reconcile edge names the reaped exit code: {cause}"
+    );
+    assert!(
+        !cause.contains("exit code unavailable"),
+        "a waitable child must never read as the adopted-corpse variant: {cause}"
+    );
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("coopex: the paused detached child had already exited"),
+        "the reconcile must be surfaced: {text}"
+    );
+    assert!(
+        text.contains("exited with code 7"),
+        "the surfaced note carries the code too: {text}"
+    );
+    // The stale record was settled: no live spawn record survives the dead
+    // child (a later open never adopt-attempts the pid).
+    assert!(
+        registry.spawn_record(&name).unwrap().is_none()
+            || registry
+                .spawn_record(&name)
+                .unwrap()
+                .is_some_and(|record| record.fingerprint.pid == 0),
+        "the settled record is gone or a pid-0 seed"
+    );
+}
+
+#[test]
 fn the_release_pass_leaves_a_cooperatively_paused_detached_child_paused() {
     // The COOPERATIVE arm (18-4, review round 1 B2): a detached child paused
     // via its DECLARED pause command has no OS suspension to undo, and no
@@ -7626,6 +7892,85 @@ fn cooperative_pause_divergence_after_the_command_ran_is_surfaced() {
     // Repair the log so the teardown's own transitions land.
     repair_instance_event_log(&mut sup, &name);
     sup.stop(&registry, "coopdiv", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn cooperative_resume_divergence_after_the_command_ran_is_surfaced() {
+    // AI-18's post-commit divergence arm (18-4), the RESUME direction: the
+    // declared RESUME command already RAN, then the ledger REFUSES the
+    // paused→running transition — the note names BOTH sides (command ran /
+    // record failed) plus the RESUME recovery verb (a failed RESUME commit
+    // realigns by re-running `resume`: the gate accepts paused→running and
+    // a well-formed command re-runs harmlessly), the error is returned, and
+    // the durable row keeps reading `paused` until that recovery runs —
+    // which the disarm-and-retry leg then proves end to end.
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_coop_pair_manifest(
+        manifest.path(),
+        "coopres",
+        &["--linger-ms", "600000"],
+        &["--touch", "pause.sentinel"],
+        &["--touch", "resume.sentinel"],
+        None,
+    );
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "coopres",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("coopres").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, "coopres").unwrap();
+    // The cooperative pause commits cleanly first — the row must read paused.
+    sup.pause(&registry, "coopres").unwrap();
+    assert_eq!(state_of(&registry, "coopres"), LifecycleState::Paused);
+
+    break_instance_event_log(&mut sup, &name);
+    let _err = sup.resume(&registry, "coopres").unwrap_err();
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("the resume command already ran"),
+        "the note names the side that already happened:\n{text}"
+    );
+    assert!(
+        text.contains("recording the paused→running transition failed"),
+        "the note names the failed record: {text}"
+    );
+    assert!(
+        text.contains("diverge") && text.contains("recovery:"),
+        "the note names the divergence and the recovery: {text}"
+    );
+    assert!(
+        text.contains("hekma agent resume coopres"),
+        "a failed RESUME commit realigns by re-running resume: {text}"
+    );
+    // The ledger refused: the durable row keeps reading paused — exactly the
+    // state the recovery note assumes.
+    assert_eq!(state_of(&registry, "coopres"), LifecycleState::Paused);
+
+    // The documented recovery, end to end: disarm the fault and re-run the
+    // verb — the gate still accepts paused→running, the well-formed command
+    // re-runs harmlessly, and the edge lands with the cooperative cause.
+    repair_instance_event_log(&mut sup, &name);
+    sup.resume(&registry, "coopres").unwrap();
+    assert_eq!(state_of(&registry, "coopres"), LifecycleState::Running);
+    let events = Supervisor::read_events(&registry, "coopres").unwrap();
+    let resumed = events
+        .iter()
+        .find(|e| e.prior_state == LifecycleState::Paused && e.new_state == LifecycleState::Running)
+        .expect("the retry's paused→running edge must be recorded");
+    let cause = serde_json::to_string(&resumed.cause).unwrap();
+    assert!(
+        cause.contains("resume-cooperative"),
+        "the recovery edge carries the cooperative cause: {cause}"
+    );
+
+    sup.stop(&registry, "coopres", Some(Duration::from_secs(5)))
         .unwrap();
 }
 
