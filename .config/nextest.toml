@@ -110,11 +110,19 @@ filter = "kind(lib) & package(hekma-engine)"
 test-group = "engine-integration-serial"
 
 # Unbounded test-group, referenced ONLY by the `parallel-heavy` profile below.
-# A profile override must assign a test-group; max-threads at i32::MAX turns
-# the group into a no-op throttle that restores nextest's default UNLIMITED
-# concurrency for the tests routed to it.
+# A profile override must assign a test-group; a max-threads far above any
+# runner's test-thread count turns the group into a no-op throttle that
+# restores nextest's default concurrency for the tests routed to it.
+#
+# Keep the number small (2026-11-16): nextest reserves each DEFINED group's
+# slot heap up front at every run start, used or not (future-queue's
+# `SlotReservations::with_capacity(max_threads)`, 8 bytes a slot). At i32::MAX
+# that was a 16 GiB request ("memory allocation of 17179869176 bytes failed"),
+# which Linux refuses when a runner is short on memory: 16 ubuntu test runs
+# aborted that way between 2026-11-13 and 11-16, before any test ran. 512 asks
+# for 4 KiB and is still far above any CI runner's core count.
 [test-groups.unbounded]
-max-threads = 2147483647
+max-threads = 512
 
 # `parallel-heavy` — the windows-latest CI leg's profile (adopted
 # 2026-10-27): the SAME suite, the SAME retries / slow-timeout /
