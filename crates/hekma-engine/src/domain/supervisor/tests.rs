@@ -5796,16 +5796,17 @@ fn the_release_pass_names_a_signal_death_for_an_own_paused_child() {
     // The engine's OWN child dies while the row reads paused (suspended, then
     // killed out-of-band — the release-time discovery premise).
     let pid = {
-        let supervised = sup.running.get(&name).unwrap();
-        sup.backend.pid(&supervised.handle)
+        let supervised = sup.instances.running.get(&name).unwrap();
+        sup.shared.backend.pid(&supervised.handle)
     };
     test_kill_pid(pid);
     // Bounded wait until the death is reaped (poll reaps the direct child).
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let exited = {
-            let supervised = sup.running.get_mut(&name).unwrap();
-            sup.backend
+            let supervised = sup.instances.running.get_mut(&name).unwrap();
+            sup.shared
+                .backend
                 .poll(&mut supervised.handle)
                 .map(|status| status.is_exited())
                 .unwrap_or(true)
@@ -5880,7 +5881,7 @@ fn the_release_pass_keeps_the_adopted_wording_for_an_adopted_paused_child() {
     let mut sup2 = Supervisor::with_backoff(fast_backoff());
     assert_eq!(sup2.adopt_orphans(&registry), 1);
     assert!(
-        sup2.running.get(&name).unwrap().adopted,
+        sup2.instances.running.get(&name).unwrap().adopted,
         "the re-held row must be the adopted shape"
     );
 
@@ -5889,15 +5890,16 @@ fn the_release_pass_keeps_the_adopted_wording_for_an_adopted_paused_child() {
     // zombie reads as alive to the adopted `kill(pid, 0)` probe, so only
     // the reaped pid is honestly gone to the adopter.
     let pid = {
-        let supervised = sup2.running.get(&name).unwrap();
-        sup2.backend.pid(&supervised.handle)
+        let supervised = sup2.instances.running.get(&name).unwrap();
+        sup2.shared.backend.pid(&supervised.handle)
     };
     test_kill_pid(pid);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let exited = {
-            let supervised = sup.running.get_mut(&name).unwrap();
-            sup.backend
+            let supervised = sup.instances.running.get_mut(&name).unwrap();
+            sup.shared
+                .backend
                 .poll(&mut supervised.handle)
                 .map(|status| status.is_exited())
                 .unwrap_or(true)
@@ -5976,8 +5978,9 @@ fn the_release_pass_reconciles_a_self_exited_cooperatively_paused_child_with_its
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let exited = {
-            let supervised = sup.running.get_mut(&name).unwrap();
-            sup.backend
+            let supervised = sup.instances.running.get_mut(&name).unwrap();
+            sup.shared
+                .backend
                 .poll(&mut supervised.handle)
                 .map(|status| status.is_exited())
                 .unwrap_or(true)
@@ -10944,7 +10947,7 @@ fn a_raw_log_over_its_cap_with_an_unconsumed_partial_line_is_not_truncated() {
         "unread bytes are never destroyed"
     );
     assert!(
-        sup.running.get(&name).unwrap().usage_cursor < len_before,
+        sup.instances.running.get(&name).unwrap().usage_cursor < len_before,
         "the usage cursor still sits before the partial line"
     );
     assert!(
@@ -11029,7 +11032,7 @@ fn an_adopted_raw_log_truncate_failure_latches_one_notice_until_a_truncate_succe
             "a failed truncate leaves the file whole"
         );
         assert_eq!(
-            sup2.running.get(&name).unwrap().usage_cursor,
+            sup2.instances.running.get(&name).unwrap().usage_cursor,
             len,
             "the drain itself still consumed the block"
         );
@@ -11043,7 +11046,7 @@ fn an_adopted_raw_log_truncate_failure_latches_one_notice_until_a_truncate_succe
         "the adopted truncate is announced:\n{text}"
     );
     assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
-    assert_eq!(sup2.running.get(&name).unwrap().usage_cursor, 0);
+    assert_eq!(sup2.instances.running.get(&name).unwrap().usage_cursor, 0);
     assert_eq!(
         ledger_totals(state.path(), "trunadopt"),
         (2, 9),
@@ -11090,7 +11093,7 @@ fn an_adoption_survives_unreadable_breach_records_and_a_stuck_launch_generation(
         "nothing on those surfaces is read or written at adoption:\n{text}"
     );
     assert_eq!(
-        sup2.running.get(&name).unwrap().launch_generation,
+        sup2.instances.running.get(&name).unwrap().launch_generation,
         stored_generation,
         "the adopted instance stays on the stored generation"
     );
@@ -11128,7 +11131,7 @@ fn start_refuses_a_managed_memory_dir_path_blocked_by_a_file() {
         "the refusal names the ensure step: {detail}"
     );
     assert_eq!(path, &managed.to_string_lossy());
-    assert!(sup.running.is_empty(), "nothing was launched");
+    assert!(sup.instances.running.is_empty(), "nothing was launched");
     assert_eq!(
         state_of(&registry, "memblocked"),
         LifecycleState::Registered
