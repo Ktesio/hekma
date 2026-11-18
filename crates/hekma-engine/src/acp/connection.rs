@@ -1287,4 +1287,56 @@ mod tests {
         let _ = child.wait();
         let _ = std::fs::remove_file(&guard);
     }
+
+    #[test]
+    fn a_second_prompt_while_a_turn_is_in_flight_is_refused_before_any_write() {
+        // One turn at a time: with a turn already in flight the prompt is
+        // refused as InFlight — never a write that would interleave two
+        // turns' chunks (the stdin half here is gone, so a write would have
+        // failed on the Failed arm instead).
+        let conn = routing_connection();
+        conn.set_session_id("s-1".to_string());
+        *conn.inner.prompt_id.lock().unwrap() = Some(7);
+        assert_eq!(
+            conn.send_prompt("again").unwrap_err(),
+            PromptError::InFlight
+        );
+        assert!(conn.turn_in_flight());
+    }
+
+    #[test]
+    fn a_reader_told_to_shut_down_fails_every_pending_waiter_and_clears_the_turn() {
+        // Teardown courtesy: a reader that stops (here the shutdown flag is
+        // already set, so it reads nothing) fails every still-registered
+        // waiter at once — a bounded handshake never waits out its whole
+        // timeout after the stream is gone — and clears the in-flight turn.
+        let mut child = std::process::Command::new(hekma_conformance::fake_agent_bin())
+            .args(["--exit-fast", "0"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn a piped process for the stdout half");
+        let stdout = child.stdout.take().expect("stdout pipe");
+        let conn = routing_connection();
+        let waiter = conn.register_waiter(conn.next_request_id());
+        *conn.inner.prompt_id.lock().unwrap() = Some(3);
+        conn.inner.shutdown.store(true, Ordering::Relaxed);
+        let raw = tempfile::TempDir::new().unwrap();
+        run_reader(
+            "teardown".to_string(),
+            stdout,
+            raw.path().join("raw.log"),
+            None,
+            Arc::clone(&conn.inner),
+        );
+        let answer = waiter
+            .try_recv()
+            .expect("the waiter is answered before the reader returns");
+        assert_eq!(
+            answer.unwrap_err(),
+            "the agent's stdout stream ended before the response arrived"
+        );
+        assert!(!conn.turn_in_flight(), "the turn can never complete now");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
