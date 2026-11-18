@@ -1011,6 +1011,7 @@ mod tests {
             last_activity_at: None,
             lease_expires_at: None,
             reconciled: None,
+            bypass: None,
             dispositions: Vec::new(),
             held_calls: 0,
             oldest_held_at: None,
