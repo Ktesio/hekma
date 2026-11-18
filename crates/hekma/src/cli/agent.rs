@@ -6349,15 +6349,13 @@ mod tests {
         assert!(err.is::<RunInvalidState>(), "{err}");
         assert!(
             err.to_string()
-                .starts_with("1 of 1 Runs were not labeled; the first refusal:"),
+                .starts_with("1 of 1 Runs would not be labeled; the first refusal:"),
             "{err}"
         );
         let err = unrouted.unwrap_err();
         assert!(err.is::<ServiceHostUnavailable>(), "{err}");
-        assert!(
-            err.to_string().starts_with("1 of 1 Runs were not labeled;"),
-            "{err}"
-        );
+        // With no host to route to, nothing was matched: the refusal is the
+        // unreachable host itself, with no "N of M Runs" summary.
         assert!(err.to_string().contains("hekma serve"), "{err}");
         assert!(
             !hekma_host::control_file(tmp.path()).exists(),
