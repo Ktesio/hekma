@@ -182,4 +182,91 @@ mod tests {
         let err = load_server_config(&key, &key).unwrap_err();
         assert!(err.contains("no PEM certificate"), "{err}");
     }
+
+    /// A self-signed pair written into `dir`: (cert path, key path).
+    fn write_pair(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let pair = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, pair.cert.pem()).unwrap();
+        std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
+        (cert, key)
+    }
+
+    #[test]
+    fn a_certificate_block_with_a_corrupt_body_is_refused_as_invalid_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cert, key) = write_pair(dir.path());
+        let corrupt = dir.path().join("corrupt.pem");
+        std::fs::write(
+            &corrupt,
+            "-----BEGIN CERTIFICATE-----\n!!!! not base64 !!!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        // Static assertion messages: a refusal about TLS material is never
+        // echoed into the test log.
+        let err = load_server_config(&corrupt, &key).unwrap_err();
+        assert!(
+            err.contains("is not valid PEM"),
+            "a corrupt block is not PEM"
+        );
+        assert!(err.contains("corrupt.pem"), "the refusal names the file");
+    }
+
+    #[test]
+    fn a_good_certificate_with_a_missing_or_keyless_key_file_names_the_key_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, _key) = write_pair(dir.path());
+        let missing = dir.path().join("absent-key.pem");
+        let err = load_server_config(&cert, &missing).unwrap_err();
+        assert!(
+            err.contains("could not read a PEM private key from"),
+            "a missing key file has no key to read"
+        );
+        assert!(err.contains("absent-key.pem"), "the refusal names the key");
+        // A key slot that holds only a certificate has no key to read either.
+        let err = load_server_config(&cert, &cert).unwrap_err();
+        assert!(
+            err.contains("could not read a PEM private key from"),
+            "a certificate in the key slot has no key to read"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tls_listener_reports_its_bound_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = write_pair(dir.path());
+        let config = load_server_config(&cert, &key).unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = tcp.local_addr().unwrap();
+        let (listener, task) = TlsListener::new(tcp, config).unwrap();
+        let reported = axum::serve::Listener::local_addr(&listener).unwrap();
+        assert_eq!(reported, bound);
+        assert!(reported.ip().is_loopback());
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn an_accept_after_the_accept_task_is_gone_never_resolves() {
+        // At shutdown the accept task is aborted; the router's accept must
+        // then park forever (the graceful shutdown ends the serve future),
+        // never hand back a connection or spin.
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = write_pair(dir.path());
+        let config = load_server_config(&cert, &key).unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut listener, task) = TlsListener::new(tcp, config).unwrap();
+        task.abort();
+        let _ = task.await;
+        let accepted = tokio::time::timeout(
+            Duration::from_millis(100),
+            axum::serve::Listener::accept(&mut listener),
+        )
+        .await;
+        assert!(
+            accepted.is_err(),
+            "with no accept task left, accept parks instead of resolving"
+        );
+    }
 }
