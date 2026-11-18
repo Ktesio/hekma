@@ -694,6 +694,7 @@ mod tests {
             policy: None,
             usage: hekma_engine::RunUsage::default(),
             open_children: 0,
+            custody: None,
         }
     }
 
