@@ -10748,15 +10748,15 @@ fn a_kept_runs_dollar_spend_fences_its_relaunch_and_an_unreadable_config_fences_
     // cost counts, so a relaunch that already crossed a per-run `block` Cost
     // Cap is fenced before its first call; a fresh Run starts at zero. A
     // configuration that cannot be read raises nothing.
-    let (_state, _manifest, registry, _rt, name) = setup_block_instance(
-        "fencekeptusd",
-        "http://127.0.0.1:9",
-        &[
-            ("cost.rate.input", "1000.00"),
-            ("cost.rate.output", "1000.00"),
-            ("budget.dollars.per_run", "0.05"),
-        ],
-    );
+    let (_state, _manifest, registry) = setup_fake("fencekeptusd", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("fencekeptusd").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget]\nbreach_action = \"block\"\n\
+         [cost.rate]\ninput = \"1000.00\"\noutput = \"1000.00\"\n\
+         [budget.dollars]\nper_run = \"0.05\"\n",
+    )
+    .unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let kept = RunId::mint();
     sup.ingest_usage(
@@ -10773,17 +10773,19 @@ fn a_kept_runs_dollar_spend_fences_its_relaunch_and_an_unreadable_config_fences_
         DrainMode::MidRun,
     )
     .unwrap();
-    let fresh = crate::metering::WireFence::default();
-    assert!(!sup.run_start_fence(&registry, &name, &fresh, None));
-    assert!(fresh.refusal().is_none());
-    let relaunched = crate::metering::WireFence::default();
-    assert!(sup.run_start_fence(&registry, &name, &relaunched, Some(&kept)));
-    assert_eq!(relaunched.refusal().unwrap().code, "dollars_per_run");
+    assert_eq!(sup.run_start_fence(&registry, &name, None), 0);
+    assert_eq!(
+        sup.run_start_fence(&registry, &name, Some(&kept)),
+        reason_bit(BreachDimension::Dollars, BreachScope::PerRun),
+        "the kept Run's spent per-run Cost Cap raises its reason bit"
+    );
 
     std::fs::write(registry.paths().instance_config(&name), "[budget\nbroken").unwrap();
-    let unreadable = crate::metering::WireFence::default();
-    assert!(!sup.run_start_fence(&registry, &name, &unreadable, Some(&kept)));
-    assert!(unreadable.refusal().is_none());
+    assert_eq!(
+        sup.run_start_fence(&registry, &name, Some(&kept)),
+        0,
+        "an unreadable configuration fences nothing"
+    );
 }
 
 #[test]

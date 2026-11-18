@@ -6049,6 +6049,7 @@ mod tests {
                 token: "ab".repeat(32),
                 hekma_version: version.to_string(),
                 autostarted: true,
+                metering_proxy_url: None,
             },
         )
         .unwrap();
