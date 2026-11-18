@@ -1,11 +1,11 @@
 ---
 title: "Run Keys and key custody"
-description: "Each Run's own credential: issued per launch, shown once, stored as a hash, revoked on exit, end or demand. Key custody is in preview; Scent-Check and bypass detection are planned."
+description: "Each Run's own credential: issued per launch, shown once, stored as a hash, revoked on exit, end or demand. Key custody is in preview; Scent-Check Modes act at the metering proxy; bypass detection is planned."
 ---
 
 # Run Keys and key custody
 
-> **On main, not yet released.** Run Keys ship with the next release. Key custody is on main as a preview, not yet supported. Scent-Check Modes, bypass detection and the authenticated proxy beyond loopback are still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **On main, not yet released.** Run Keys ship with the next release. Key custody is on main as a preview, not yet supported. Scent-Check Modes are on main too. Bypass detection and the authenticated proxy beyond loopback are still planned; see [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 > This page mirrors [hekma.ktesio.dev/docs/run-keys/](https://hekma.ktesio.dev/docs/run-keys/), where it is kept current.
 
@@ -201,19 +201,31 @@ Key custody keeps your provider key away from the agent. It is not a sandbox.
 - **On a shared machine,** another user can listen on the proxy's port while Hekma is not running and collect Run Keys and prompts. Run Hekma on a machine you do not share.
 - **Run Keys reach your agent's logs.** If an agent prints its environment, its Run Key lands in its output log. Revoke it if that log leaves your machine.
 
-## What is coming
+## Scent-Check Modes
 
-### Scent-Check Modes
+A **Scent-Check Mode**, set per [Policy](policies.md), decides what the metering proxy does with a call that carries no credential Hekma issued.
 
-A **Scent-Check Mode**, set per [Policy](policies.md), will decide what happens to a call without a valid Run Key:
+A call is **scented** when a valid Run Key identifies it: sent in `x-hekma-run-key`, or in the API-key slot under [key custody](#key-custody-preview--not-yet-supported). Every other call is **unscented**, including:
+
+- a call on a labelled endpoint binding, or a split Run beneath it;
+- a call that lands on the unattributed Run;
+- a call on an agent's own Run route (`/_hekma/runs/<run id>`) that does not present its Run Key. A supervised agent's base URL names its Run, but that is not an identity: any local process can use the same URL. The agent becomes scented once custody is on, or once it sends the Run Key it already has in `HEKMA_RUN_KEY`.
 
 | Mode | An unscented call is |
 |---|---|
-| `off` | Not checked. |
-| `shadow` | Served and recorded as an **Anomaly**: listed and counted in OTLP, never acting on the Run. |
-| `enforce` | Refused with a typed response. |
+| `off` | Served, unchecked. |
+| `shadow` | Served. The Run it lands on gets the `unscented` **Anomaly** on the first such call (one event; `hekma ps` lists the Run), and the proxy counts it. |
+| `enforce` | Refused with `401 hekma_unscented_call`, before anything is forwarded. The per-call record says `enforce`. |
 
-The default Policy starts at `off`, and `enforce` is never a default. Only `off` is accepted today. The mode governs identity only and never changes what a [Breach Action](https://hekma.ktesio.dev/docs/concepts/#breach-action) does. A caller cannot lower it.
+- **The default is `off`, everywhere.** The default Policy is seeded `off`, and Hekma never changes it on upgrade, so a default Policy you edited stays as you left it. There is no per-environment default: to check identities, write a Policy, for example `hekma policy create prod --selector env=prod --scent-check shadow`.
+- **The strictest mode up the chain applies.** A call is checked under the strictest mode of its Run and every Run above it, so a child Run under an `enforce` parent is `enforce`, whatever Policies its own labels select.
+- **Only tighter.** A Run's own Caller (its Run Key) may raise its Run's mode with `scent_check` on `PATCH /v0/runs/{id}/limits`, never lower it. The Operator sets modes on Policies.
+- **An unknown or revoked Run Key is refused under every mode** (`401 hekma_unknown_credential`, `401 hekma_credential_revoked`): a key that fails is a failed authentication, not a missing identity.
+- **Breach Actions do not change.** A latched `block` still refuses first with its `402`, under every mode, and `warn`, `pause` and `stop` behave the same under every mode. Unlike `block`, `enforce` has no exemption for `GET`, `HEAD` or `OPTIONS`.
+- **Attribution, not access control.** On your machine any process can obtain an identity; Scent-Check is about knowing which Run a call belongs to. Custody's protection does not depend on the mode.
+- `enforce` is never a default.
+
+## What is coming
 
 ### Held calls
 
@@ -233,10 +245,6 @@ A proxy reachable from other machines will require TLS and a credential, and wil
 - An agent that prints its own environment to its output log puts its key there. Revoke it with `hekma run revoke-keys`.
 - Possession is the only binding: whoever holds a Run Key or a refresh credential can use it.
 - Key custody keeps the provider key away from the agent's process and files once it ships. It does not contain a compromised agent. Hekma is not a sandbox, and key custody will get a security review before these docs describe it as supported.
-
-## Open questions
-
-- **The default Scent-Check Mode per environment.** The proposal is `off` on a laptop, `shadow` under a long-running host, and `enforce` only by choice. Until it is decided, the default Policy starts at `off`, and the decision will never overwrite a default Policy you have edited.
 
 ## Read next
 

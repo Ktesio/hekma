@@ -730,3 +730,17 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-22-2-key-custody.md` (Design Notes: the engine-observed refusal)
   summary: An `engine-observed` agent whose provider key Hekma does not hold is refused at start (AD-22, FR-19); one whose upstream is a local `http` gateway must opt out of custody (`provider.custody = "off"`), because a custodied key goes only over `https`.
   evidence: `domain/supervisor/spawn.rs` `custody_start`; 40 existing tests now hold a key with custody off. Trigger: Islam's answer to ledger item 29 (keep, narrow, or a grace release).
+
+## From spec-22-3 (Scent-Check Modes) — build, 2026-11-13
+
+- source_spec: `spec-22-3-scent-check-modes.md` (Ask First O7)
+  summary: No OTLP counter for unscented calls yet; the count surfaces through the `unscented` Anomaly, the proxy's counters and its once-a-minute note.
+  evidence: `metering/proxy/forward.rs` `unscented_served` / `unscented_refused`. Trigger: `otlp-metrics v2` (24-5).
+
+- source_spec: `spec-22-3-scent-check-modes.md` (Design Notes: what 22-3 does not do)
+  summary: Per-call records do not carry a `scented` field, and the Host read surface cannot filter unscented calls (only `disposition=enforce` refusals).
+  evidence: `domain/calls.rs` (no column); the unscented flag rides only to the close job. Trigger: a Host asking to list unscented served calls (a calls-store field).
+
+- source_spec: `spec-22-3-scent-check-modes.md` (the I/O matrix's reserved rows)
+  summary: Credentialed and uncredentialed announce, and proxy-access-only calls, have no Scent-Check rows yet.
+  evidence: the matrix's reserved row. Trigger: 23.2 (announce) and 22.5 (proxy-access acceptance).

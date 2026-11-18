@@ -232,3 +232,55 @@ fn a_policy_round_trip_through_the_service_host() {
     let run = hekma(&["policy", "show", "default"]);
     assert!(run.success, "the default survives every delete");
 }
+
+#[test]
+fn a_policy_takes_every_scent_check_mode_and_refuses_an_unknown_one() {
+    // Story 22-3: `--scent-check off|shadow|enforce` on create and change
+    // (no more scent-unavailable); an unknown mode is a usage error (2)
+    // before any host starts; `--clear scent-check` removes it.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let hekma = |args: &[&str]| run_hekma_agent(args, &ctx.project_dir, state_dir);
+
+    let run = hekma(&[
+        "policy",
+        "create",
+        "scenty",
+        "--selector",
+        "team=core",
+        "--scent-check",
+        "loud",
+    ]);
+    assert_eq!(run.code, Some(2), "stderr: {}", run.stderr);
+    assert!(run.stderr.contains("--scent-check"), "{}", run.stderr);
+
+    let run = hekma(&[
+        "policy",
+        "create",
+        "scenty",
+        "--selector",
+        "team=core",
+        "--scent-check",
+        "shadow",
+    ]);
+    assert!(run.success, "stderr: {}", run.stderr);
+    for mode in ["enforce", "off", "shadow"] {
+        let run = hekma(&["policy", "change", "scenty", "--scent-check", mode]);
+        assert!(run.success, "{mode}: {}", run.stderr);
+        let show = hekma(&["policy", "show", "scenty", "--json"]);
+        assert!(show.success, "stderr: {}", show.stderr);
+        assert_eq!(
+            json(&show.stdout)["policy"]["limits"]["scent_check"],
+            mode,
+            "{}",
+            show.stdout
+        );
+    }
+    let run = hekma(&["policy", "change", "scenty", "--clear", "scent-check"]);
+    assert!(run.success, "stderr: {}", run.stderr);
+    let show = hekma(&["policy", "show", "scenty", "--json"]);
+    assert!(json(&show.stdout)["policy"]["limits"]
+        .get("scent_check")
+        .is_none());
+}

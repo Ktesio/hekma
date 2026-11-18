@@ -793,7 +793,7 @@ mod seams {
         (status, body.unwrap_or_default())
     }
 
-    fn engine_with_binding(
+    pub(super) fn engine_with_binding(
         labels: &[(&str, &str)],
     ) -> (tempfile::TempDir, Engine, u16, Arc<AtomicUsize>) {
         let state = tempfile::tempdir().unwrap();
@@ -955,5 +955,158 @@ mod seams {
         }
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(input_tokens(&engine), 20, "each call counted exactly once");
+    }
+}
+
+/// Story 22-3: the Scent-Check Modes at the proxy, end to end against a
+/// labelled binding (whose calls carry no Run Key, so they are unscented).
+mod scent {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    use crate::domain::runs::policy::ScentCheckMode;
+    use crate::domain::runs::{Anomaly, PolicyLimits, RunEventKind};
+    use crate::{CallsQuery, EngineEvent, ListRunsQuery, ListingView, PolicyChange};
+
+    fn raw(port: u16, method: &str, path: &str, extra: &str) -> (u16, String) {
+        let body = if method == "POST" {
+            r#"{"model":"gpt-demo"}"#
+        } else {
+            ""
+        };
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        stream
+            .write_all(
+                format!(
+                    "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n{extra}\
+                     content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut answer = String::new();
+        let _ = stream.read_to_string(&mut answer);
+        let status = answer
+            .split(' ')
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0);
+        (status, answer)
+    }
+
+    fn mode(scent: ScentCheckMode) -> PolicyChange {
+        PolicyChange {
+            name: "scent".into(),
+            selector: Some("team=core".parse().unwrap()),
+            set: PolicyLimits {
+                scent_check: Some(scent),
+                ..PolicyLimits::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        }
+    }
+
+    fn binding_run_anomalies(engine: &crate::Engine) -> Vec<Anomaly> {
+        engine
+            .blocking()
+            .list_runs(ListRunsQuery {
+                view: ListingView::All,
+                limit: 0,
+                ..ListRunsQuery::default()
+            })
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|run| run.labels.iter().any(|label| label.key == "team"))
+            .map(|run| run.record.anomalies)
+            .unwrap_or_default()
+    }
+
+    fn wait_for(what: &str, check: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !check() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn shadow_serves_and_marks_once_and_enforce_refuses_unscented_calls_only() {
+        let (_state, engine, port, served) = super::seams::engine_with_binding(&[("team", "core")]);
+        let facade = engine.blocking();
+        let mut events = facade.subscribe();
+
+        // `shadow`: served, and the binding's Run gets `unscented` once.
+        facade
+            .create_policy(mode(ScentCheckMode::Shadow), false)
+            .unwrap();
+        for _ in 0..2 {
+            let (status, answer) = raw(port, "POST", "/gw/v1/chat", "");
+            assert_eq!(status, 200, "{answer}");
+        }
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+        wait_for("the unscented Anomaly", || {
+            binding_run_anomalies(&engine).contains(&Anomaly::UnscentedCall)
+        });
+        // Let both closes land, then count the Anomaly's events: one.
+        std::thread::sleep(Duration::from_millis(500));
+        let mut raised = 0;
+        while let Ok(event) = events.try_recv() {
+            if let EngineEvent::Run(run) = event {
+                if run.change == RunEventKind::AnomaliesChanged
+                    && run.anomalies.contains(&Anomaly::UnscentedCall)
+                {
+                    raised += 1;
+                }
+            }
+        }
+        assert_eq!(raised, 1, "the Anomaly is raised once, not per call");
+
+        // `enforce`: the re-resolution clears the Anomaly, and an unscented
+        // call is refused before any dial — a GET too (no safe-method
+        // exemption).
+        facade
+            .change_policy(mode(ScentCheckMode::Enforce), false)
+            .unwrap();
+        wait_for("the Anomaly to clear", || {
+            !binding_run_anomalies(&engine).contains(&Anomaly::UnscentedCall)
+        });
+        for method in ["POST", "GET"] {
+            let (status, answer) = raw(port, method, "/gw/v1/chat", "");
+            assert_eq!(status, 401, "{method}: {answer}");
+            assert!(answer.contains("hekma_unscented_call"), "{answer}");
+            assert!(answer.contains("x-should-retry: false"), "{answer}");
+        }
+        assert_eq!(served.load(Ordering::SeqCst), 2, "nothing was forwarded");
+        // An unknown Run Key keeps its own answer under `enforce`.
+        let unknown = format!("x-hekma-run-key: hk_run_{}\r\n", "9".repeat(52));
+        let (status, answer) = raw(port, "POST", "/gw/v1/chat", &unknown);
+        assert_eq!(status, 401);
+        assert!(answer.contains("hekma_unknown_credential"), "{answer}");
+        // The refusals are recorded with disposition `enforce`.
+        wait_for("the enforce records", || {
+            facade
+                .list_calls(CallsQuery {
+                    disposition: Some("enforce".into()),
+                    ..CallsQuery::all()
+                })
+                .map(|page| page.items.len() == 2)
+                .unwrap_or(false)
+        });
+
+        // `off`: served again.
+        facade
+            .change_policy(mode(ScentCheckMode::Off), false)
+            .unwrap();
+        let (status, answer) = raw(port, "POST", "/gw/v1/chat", "");
+        assert_eq!(status, 200, "{answer}");
+        assert_eq!(served.load(Ordering::SeqCst), 3);
     }
 }

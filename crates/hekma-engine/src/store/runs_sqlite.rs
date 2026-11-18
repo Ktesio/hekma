@@ -695,6 +695,11 @@ const ACTION_SCOPE: &str = "run";
 /// step: the existing key `(run_id, dimension, scope)` holds both layers.
 const CALLER_PREFIX: &str = "caller.";
 
+/// The `run_limits` row a Caller's Scent-Check Mode is stored in (story
+/// 22-3).
+const SCENT_DIMENSION: &str = "scent";
+const SCENT_SCOPE: &str = "mode";
+
 /// The dimension a layer's row is stored under.
 fn slot_dimension(slot: crate::ports::LimitSlot, dimension: &str) -> String {
     match slot {
@@ -760,6 +765,20 @@ impl LimitsFold {
         match (dimension, scope) {
             (ACTION_DIMENSION, _) => {
                 layer.action_row = Some((value != 0).then_some(parsed));
+                return Ok(());
+            }
+            (SCENT_DIMENSION, SCENT_SCOPE) => {
+                use crate::domain::runs::policy::ScentCheckMode;
+                layer.limits.scent_check = Some(match value {
+                    0 => ScentCheckMode::Off,
+                    1 => ScentCheckMode::Shadow,
+                    2 => ScentCheckMode::Enforce,
+                    other => {
+                        return Err(corrupt(format!(
+                            "Run `{run_id}` has an unknown Scent-Check tightness `{other}`"
+                        )))
+                    }
+                });
                 return Ok(());
             }
             ("tokens", "per-run") => layer.limits.token_per_run = Some(value as u64),
@@ -1065,6 +1084,16 @@ impl RunRecords for SqliteStore {
                 limits.dollar_per_run_micros.map(|m| m.0.max(0)),
             ),
             ("tokens", "cumulative", limits.token_cumulative.map(clamp)),
+            // Story 22-3: a Caller's Scent-Check Mode, stored as its
+            // tightness (0 off, 1 shadow, 2 enforce) — data-only, no
+            // schema step.
+            (
+                SCENT_DIMENSION,
+                SCENT_SCOPE,
+                limits
+                    .scent_check
+                    .map(|mode| i64::from(crate::domain::runs::policy::scent_tightness(mode))),
+            ),
             (
                 "dollars",
                 "cumulative",

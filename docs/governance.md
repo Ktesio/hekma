@@ -56,7 +56,7 @@ without running the CLI.
 
 ## The document, schema version 1
 
-An excerpt (the full artifact carries 73 cases; the shape is identical
+An excerpt (the full artifact carries 76 cases; the shape is identical
 throughout):
 
 ```json
@@ -225,7 +225,7 @@ API — see [Embedding the engine](embedding.md).
   | 1.1.0 | 27-34 | the `decision-block-*` cases and the `fence-*` cases |
   | 1.2.0 | 35-39 | the `chain-*` cases |
   | 1.3.0 | 40-53 | the `policy-*` cases and two `decision-policy-*` cases |
-  | 1.4.0 | 54-73 | the `rearm-*` cases, then the `policy-caller-*` cases, then the `policy-wire-*` cases |
+  | 1.4.0 | 54-76 | the `rearm-*` cases, then the `policy-caller-*` cases, then the `policy-wire-*` cases, then the Scent-Check `policy-*` cases (a mode tie, a Caller tighten, a looser Caller mode ignored) |
 
   The provenance list grows with the generator functions the new cases come
   from (1.1.0 added `governance::fence_refusal`, 1.2.0

@@ -1023,6 +1023,10 @@ pub(crate) struct RunLimitsPatch {
     /// The Run's Breach Action (`warn`, `pause`, `stop`, `block`).
     #[serde(default)]
     pub breach_action: Option<String>,
+    /// Story 22-3: the Run's Scent-Check Mode (`off`, `shadow`, `enforce`)
+    /// — a Caller field, tighten-only; the Operator sets modes on Policies.
+    #[serde(default)]
+    pub scent_check: Option<String>,
     /// Limits to clear.
     #[serde(default)]
     pub clear: Vec<String>,
@@ -1053,6 +1057,10 @@ pub(crate) struct SetLimitsRequest {
     /// The Run's Breach Action (`warn`, `pause`, `stop`, `block`).
     #[serde(default)]
     pub breach_action: Option<String>,
+    /// Story 22-3: the Run's Scent-Check Mode (`off`, `shadow`, `enforce`)
+    /// — a Caller field, tighten-only; the Operator sets modes on Policies.
+    #[serde(default)]
+    pub scent_check: Option<String>,
     /// Limits to clear.
     #[serde(default)]
     pub clear: Vec<String>,
@@ -1069,6 +1077,7 @@ impl SetLimitsRequest {
                 dollars_per_run: self.dollars_per_run,
                 dollars_cumulative: self.dollars_cumulative,
                 breach_action: self.breach_action,
+                scent_check: self.scent_check,
                 clear: self.clear,
                 dry_run: false,
             },

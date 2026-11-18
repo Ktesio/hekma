@@ -4,6 +4,16 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — Scent-Check Modes act at the metering proxy (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **`shadow` and `enforce` are accepted.** `hekma policy create|change --scent-check <off|shadow|enforce>` and `POST/PATCH /v0/policies` store any mode; `--clear scent-check` removes it. **Breaking:** `scent-unavailable` is gone (`RunError::ScentUnavailable` and its exit and HTTP mappings are removed).
+> - **The proxy acts on the mode.** A call no valid Run Key identified (a binding's Run or split, the unattributed Run, a Run route reached without its key) is **unscented**. Under the strictest mode over its Run's ancestor chain: `off` serves it; `shadow` serves it and raises the new `unscented` Anomaly on the Run (once, one `anomalies-changed` event; cleared when a re-resolution moves the Run off `shadow`); `enforce` refuses it with the new `proxy-wire v1` row `401 hekma_unscented_call`, nothing forwarded, the per-call record's disposition `enforce`. Unknown and revoked Run Keys keep their own `401`s under every mode; a latched `block` still refuses first, and `enforce` has no safe-method exemption.
+> - **A Caller may tighten.** `PATCH /v0/runs/{id}/limits` takes `scent_check` from the Run's own Run Key, applied only where tighter (`403 raise-forbidden` for a lower value); the Operator sets modes on Policies (`400 invalid-request` on that route).
+> - **The default is `off`, everywhere.** The default Policy stays `off`; nothing is written at upgrade. There is no per-environment default.
+> - **Governance vectors stay 1.4.0** and gain three Scent-Check `policy` cases appended after every earlier case (76 in all; new checksum).
+> - **Engine surface within the unreleased `hekma-engine` 0.12.0** (no version bump): `Anomaly::UnscentedCall`, `CallDisposition::Enforce`, `RunLimits.scent_check`; `RunError::ScentUnavailable` removed. No schema step.
+
 > **Unreleased — key custody, a preview (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it. Key custody is a **preview, not yet supported**: it becomes supported when the pending security rulings are recorded and its test criteria pass in CI.
 >

@@ -127,6 +127,8 @@ fn change_from(args: &SetArgs) -> Result<RunLimitChange, Box<dyn std::error::Err
                 .map(|raw| dollars("dollars-cumulative", raw))
                 .transpose()?,
             breach_action,
+            // Story 22-3: the Operator sets Scent-Check Modes on Policies.
+            scent_check: None,
         },
         clear,
     };
@@ -706,6 +708,7 @@ mod tests {
                 token_cumulative: Some(9),
                 dollar_cumulative_micros: Some(Micros(1)),
                 breach_action: Some(BreachAction::Pause),
+                scent_check: None,
             },
             resolution: hekma_engine::PolicyResolution {
                 tokens: hekma_engine::TokenBudget::none(),

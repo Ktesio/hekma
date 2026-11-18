@@ -1078,6 +1078,9 @@ pub fn generate() -> VectorsDocument {
             // Story 23-1 (still 1.4.0, unreleased): `block` executes at
             // every depth with a wire path; `pause`/`stop` there fall back.
             .chain(wire_block_policy_cases())
+            // Story 22-3 (still 1.4.0, unreleased): the Scent-Check Mode's
+            // tie and the Caller's tighten-only rule.
+            .chain(scent_policy_cases())
             .collect(),
     }
 }
@@ -2375,6 +2378,55 @@ fn wire_block_policy_cases() -> Vec<Case> {
     ]
 }
 
+/// Story 22-3: the Scent-Check Mode as a resolved limit — a tie among
+/// maximal candidates takes the strictest mode; a Caller's mode applies
+/// only where it is tighter, and a looser one is ignored. Appended after
+/// every case.
+fn scent_policy_cases() -> Vec<Case> {
+    use crate::domain::runs::policy::ScentCheckMode as M;
+    use crate::domain::runs::{PolicyLimits, PolicyRecord};
+    let scent = |mode: M| PolicyLimits {
+        scent_check: Some(mode),
+        ..Default::default()
+    };
+    let core = |name: &str, selector: &str, limits: PolicyLimits| PolicyRecord {
+        name: name.to_string(),
+        selector: Some(selector.parse().unwrap()),
+        limits,
+        rates: Default::default(),
+    };
+    let caller_case = |id: &str, policy: M, caller: M| {
+        policy_case(
+            id,
+            crate::domain::runs::policy::ResolutionInput {
+                bound_labels: labels(&[("team", "core")]),
+                caller_limits: scent(caller),
+                policies: vec![
+                    PolicyRecord::default_policy(),
+                    core("p", "team=core", scent(policy)),
+                ],
+                ..Default::default()
+            },
+        )
+    };
+    vec![
+        policy_case(
+            "policy-scent-tie-takes-the-strictest",
+            crate::domain::runs::policy::ResolutionInput {
+                bound_labels: labels(&[("a", "1"), ("b", "2"), ("c", "3")]),
+                policies: vec![
+                    PolicyRecord::default_policy(),
+                    core("left", "a=1,b=2", scent(M::Off)),
+                    core("right", "a=1,c=3", scent(M::Enforce)),
+                ],
+                ..Default::default()
+            },
+        ),
+        caller_case("policy-caller-scent-tightens", M::Shadow, M::Enforce),
+        caller_case("policy-caller-looser-scent-is-ignored", M::Enforce, M::Off),
+    ]
+}
+
 fn policy_case(id: &str, input: crate::domain::runs::policy::ResolutionInput) -> Case {
     Case::Policy(PolicyCase {
         id: id.to_string(),
@@ -3325,9 +3377,10 @@ mod tests {
         let document = generate();
         assert_eq!(
             document.cases.len(),
-            SHIPPED.len() + 14 + 10 + 6 + 4,
+            SHIPPED.len() + 14 + 10 + 6 + 4 + 3,
             "39 shipped + the 14 cases 21-3 appends + the 10 cases 21-6 appends + the 6 \
-             Caller-layer cases 22-1 appends + the 4 wire-depth cases 23-1 appends"
+             Caller-layer cases 22-1 appends + the 4 wire-depth cases 23-1 appends + the 3 \
+             Scent-Check cases 22-3 appends"
         );
         for (index, id) in SHIPPED.iter().enumerate() {
             assert_eq!(
@@ -3385,11 +3438,12 @@ mod tests {
             .iter()
             .all(|case| matches!(case, Case::Rearm(_))));
         // Story 22-1 appends the 6 Caller-layer `policy` cases after them,
-        // and story 23-1 the 4 wire-depth `policy` cases after those.
+        // story 23-1 the 4 wire-depth `policy` cases after those, and story
+        // 22-3 the 3 Scent-Check `policy` cases after those.
         assert!(document.cases[63..]
             .iter()
             .all(|case| matches!(case, Case::Policy(_))));
-        assert_eq!(document.cases.len() - 53, 20);
+        assert_eq!(document.cases.len() - 53, 23);
     }
 
     /// The SHA-256 of the 1.3.0 artifact's 53 cases, pretty-printed as one
@@ -3576,11 +3630,24 @@ mod tests {
             ),
             "the Caller-layer cases follow the rearm cases"
         );
+        let first_scent = document
+            .cases
+            .iter()
+            .position(
+                |case| matches!(case, Case::Policy(case) if case.id.starts_with("policy-scent-")),
+            )
+            .expect("the Scent-Check cases exist");
+        assert!(first_scent > first_wire);
         assert!(
-            document.cases[first_wire..].iter().all(
+            document.cases[first_wire..first_scent].iter().all(
                 |case| matches!(case, Case::Policy(case) if case.id.starts_with("policy-wire-"))
             ),
-            "the wire-depth cases close the artifact"
+            "the wire-depth cases follow the Caller-layer cases"
+        );
+        assert_eq!(
+            document.cases.len() - first_scent,
+            3,
+            "the 3 Scent-Check cases close the artifact"
         );
         assert!(
             document.cases[first_rearm..first_caller]

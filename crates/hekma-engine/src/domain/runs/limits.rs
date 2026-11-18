@@ -454,6 +454,9 @@ impl RunLimitChange {
         if self.set.breach_action.is_some() {
             next.breach_action = self.set.breach_action;
         }
+        if self.set.scent_check.is_some() {
+            next.scent_check = self.set.scent_check;
+        }
         for field in &self.clear {
             field.clear_in(&mut next);
         }
@@ -860,6 +863,17 @@ pub(crate) fn plan_limits(
     // other layer, so a later Operator, Host or Policy tightening wins); an
     // Operator or Host writes the Run's layer. The other layer is read, so
     // both resolutions see the whole Run.
+    // Story 22-3: a Scent-Check Mode on a Run is the Caller's to TIGHTEN;
+    // the Operator and a Host set modes on Policies.
+    if change.set.scent_check.is_some() && actor != LimitActor::Caller {
+        return Err(RunError::Invalid {
+            field: "scent_check".to_string(),
+            reason: "a Run's Scent-Check Mode is set by Policies — use `hekma policy change \
+                     <name> --scent-check <mode>`; only the Run's own Caller (its Run Key) may \
+                     tighten it here"
+                .to_string(),
+        });
+    }
     let slot = if actor == LimitActor::Caller {
         crate::ports::LimitSlot::Caller
     } else {
@@ -898,6 +912,16 @@ pub(crate) fn plan_limits(
     // value above what applies now, no looser action, no clear of a limit
     // that applies, and no loosening of the effective limits.
     if actor == LimitActor::Caller {
+        // Story 22-3: a Caller cannot lower the Scent-Check Mode.
+        if change.set.scent_check.is_some_and(|mode| {
+            super::policy::scent_tightness(mode)
+                < super::policy::scent_tightness(prior_resolution.scent_check)
+        }) {
+            return Err(RunError::RaiseForbidden {
+                run_id: run_id.as_str().to_string(),
+                limit: "scent_check".to_string(),
+            });
+        }
         if let Some(limit) = caller_loosens(change, &prior_resolution).or(looser.first().copied()) {
             return Err(RunError::RaiseForbidden {
                 run_id: run_id.as_str().to_string(),

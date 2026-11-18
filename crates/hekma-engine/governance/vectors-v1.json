@@ -3600,6 +3600,217 @@
           "action": "stop"
         }
       }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-scent-tie-takes-the-strictest",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "observed",
+        "wire_path": false,
+        "bound_labels": [
+          [
+            "a",
+            "1"
+          ],
+          [
+            "b",
+            "2"
+          ],
+          [
+            "c",
+            "3"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "left",
+            "selector": "a=1,b=2",
+            "limits": {
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "right",
+            "selector": "a=1,c=3",
+            "limits": {
+              "scent_check": "enforce"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "warn",
+        "effective_action": "warn",
+        "scent_check": "enforce",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": "unset",
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": "default",
+          "scent_check": {
+            "policy": "right"
+          },
+          "rate": "unset"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-caller-scent-tightens",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "observed",
+        "wire_path": false,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "caller_limits": {
+          "scent_check": "enforce"
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "scent_check": "shadow"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "warn",
+        "effective_action": "warn",
+        "scent_check": "enforce",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": "unset",
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": "default",
+          "scent_check": "caller",
+          "rate": "unset"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-caller-looser-scent-is-ignored",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "observed",
+        "wire_path": false,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "caller_limits": {
+          "scent_check": "off"
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "scent_check": "enforce"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "warn",
+        "effective_action": "warn",
+        "scent_check": "enforce",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": "unset",
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": "default",
+          "scent_check": {
+            "policy": "p"
+          },
+          "rate": "unset"
+        }
+      }
     }
   ]
 }

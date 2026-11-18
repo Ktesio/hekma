@@ -613,13 +613,6 @@ impl Registry {
                     .to_string(),
             ));
         }
-        if let Some(mode) = change.set.scent_check {
-            if mode != policy::ScentCheckMode::Off {
-                return Err(RunError::ScentUnavailable {
-                    mode: mode.as_str().to_string(),
-                });
-            }
-        }
         if !change.rates.is_empty() && !is_default {
             return Err(invalid(
                 "rates",

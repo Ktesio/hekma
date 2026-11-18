@@ -54,6 +54,10 @@ pub(crate) struct RefusalCounters {
     pub bad_target: AtomicU64,
     pub bad_host: AtomicU64,
     pub path_not_allowed: AtomicU64,
+    /// Story 22-3: unscented calls served under `shadow` and refused under
+    /// `enforce`.
+    pub unscented_served: AtomicU64,
+    pub unscented_refused: AtomicU64,
     pub busy: AtomicU64,
     pub ignored_hints: AtomicU64,
     pub capped_hints: AtomicU64,
@@ -143,7 +147,8 @@ impl ProxyShared {
         (self.diagnostics)(format!(
             "metering proxy refusals so far: {} credential in URL, {} unknown credential, {} \
              revoked credential, {} Run Key in the API-key slot, {} out of scope, {} no route, \
-             {} bad target, {} bad host, {} path outside the held key's list, {} busy",
+             {} bad target, {} bad host, {} path outside the held key's list, {} busy, {} \
+             unscented served (shadow), {} unscented refused (enforce)",
             c.credential_in_url.load(Ordering::Relaxed),
             c.unknown_credential.load(Ordering::Relaxed),
             c.credential_revoked.load(Ordering::Relaxed),
@@ -154,6 +159,8 @@ impl ProxyShared {
             c.bad_host.load(Ordering::Relaxed),
             c.path_not_allowed.load(Ordering::Relaxed),
             c.busy.load(Ordering::Relaxed),
+            c.unscented_served.load(Ordering::Relaxed),
+            c.unscented_refused.load(Ordering::Relaxed),
         ));
     }
 
@@ -376,6 +383,9 @@ struct Pending {
     started: Instant,
     upstream_started: Option<Instant>,
     stopping: Arc<AtomicBool>,
+    /// Story 22-3: served unscented under `shadow` (the close raises the
+    /// Run's `unscented` Anomaly).
+    unscented: bool,
 }
 
 impl Pending {
@@ -434,7 +444,9 @@ impl CloseGuard {
         if let Some(mut pending) = self.0.take() {
             let record = pending.record(disposition, outcome, status, status_class, model, usage);
             let permit = pending.permit.take();
-            pending.pump.close_call(record, usage, permit);
+            pending
+                .pump
+                .close_call(record, usage, pending.unscented, permit);
         }
     }
 }
@@ -699,6 +711,7 @@ async fn serve_admitted(
         started,
         upstream_started: None,
         stopping: Arc::clone(&shared.stopping),
+        unscented: false,
     }));
 
     // The disposition over the whole ancestor chain.
@@ -722,6 +735,49 @@ async fn serve_admitted(
                 None,
             );
             return wire::block_response(&refusal);
+        }
+    }
+
+    // Story 22-3 — the Scent-Check Mode, after the fence (a fenced Run's
+    // 402 wins) and before the call-start record and any dial. A call is
+    // SCENTED when a valid Run Key identified it; everything else (a
+    // binding's Run, a split, the unattributed Run, a Run route reached
+    // with no key) is unscented. The effective mode is the strictest over
+    // the attribution Run's ancestor chain. No safe-method exemption:
+    // identity does not depend on the method.
+    if target.token_id.is_none() {
+        match snapshot.scent_over(&run_id) {
+            crate::domain::runs::policy::ScentCheckMode::Off => {}
+            crate::domain::runs::policy::ScentCheckMode::Shadow => {
+                guard.get().unscented = true;
+                shared
+                    .counters
+                    .unscented_served
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            crate::domain::runs::policy::ScentCheckMode::Enforce => {
+                let awaits_continue = req
+                    .headers()
+                    .get(hyper::header::EXPECT)
+                    .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"100-continue"));
+                if !awaits_continue {
+                    drain_request_body(req.into_body()).await;
+                }
+                guard.close(
+                    CallDisposition::Enforce,
+                    CallOutcome::Refused,
+                    Some(401),
+                    StatusClass::Refused,
+                    None,
+                    None,
+                );
+                shared
+                    .counters
+                    .unscented_refused
+                    .fetch_add(1, Ordering::Relaxed);
+                shared.note_refusals();
+                return WireError::UnscentedCall.response();
+            }
         }
     }
 

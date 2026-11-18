@@ -366,6 +366,25 @@ impl RunSnapshot {
         over
     }
 
+    /// The effective Scent-Check Mode for a call attributed to `run_id`
+    /// (story 22-3): the strictest stored mode over the Run's own and its
+    /// ancestors' resolutions — a Caller-opened child under an `enforce`
+    /// parent is `enforce`, whatever Policies its own labels select. An
+    /// entry with no stored resolution counts as `off`.
+    pub(crate) fn scent_over(&self, run_id: &RunId) -> super::policy::ScentCheckMode {
+        use super::policy::{scent_tightness, ScentCheckMode};
+        self.chain(run_id)
+            .iter()
+            .map(|entry| {
+                entry
+                    .policy
+                    .as_ref()
+                    .map_or(ScentCheckMode::Off, |resolution| resolution.scent_check)
+            })
+            .max_by_key(|mode| scent_tightness(*mode))
+            .unwrap_or(ScentCheckMode::Off)
+    }
+
     /// The upstream a Run route forwards to: the first recorded upstream up
     /// the Run's chain, else its pending route's (story 23-1).
     pub(crate) fn route_upstream(&self, run_id: &RunId) -> Option<Arc<str>> {
@@ -687,6 +706,48 @@ mod tests {
             identity: None,
             custody: None,
         }
+    }
+
+    #[test]
+    fn the_scent_mode_over_a_chain_is_the_strictest_of_its_entries() {
+        use crate::domain::runs::policy::{resolve, ResolutionInput, ScentCheckMode as M};
+        let with = |id: &str, parent: Option<&str>, mode: Option<M>| {
+            let mut e = entry(id, Some("a"), parent.is_none(), RunStatus::Active);
+            e.record.parent_run_id = parent.map(RunId::from_wire);
+            e.policy = mode.map(|mode| {
+                let mut resolution = resolve(&ResolutionInput::default());
+                resolution.scent_check = mode;
+                resolution
+            });
+            e
+        };
+        for (root, child, grandchild, expected) in [
+            (None, None, None, M::Off),
+            (Some(M::Enforce), Some(M::Off), Some(M::Off), M::Enforce),
+            (Some(M::Shadow), Some(M::Enforce), None, M::Enforce),
+            (Some(M::Off), None, Some(M::Shadow), M::Shadow),
+            (Some(M::Shadow), Some(M::Off), Some(M::Off), M::Shadow),
+        ] {
+            let publisher = SnapshotPublisher::default();
+            publisher.publish(vec![
+                with("root", None, root),
+                with("child", Some("root"), child),
+                with("grand", Some("child"), grandchild),
+            ]);
+            let snapshot = publisher.current();
+            assert_eq!(
+                snapshot.scent_over(&RunId::from_wire("grand")),
+                expected,
+                "{root:?} {child:?} {grandchild:?}"
+            );
+        }
+        // An unknown Run reads `off`.
+        assert_eq!(
+            SnapshotPublisher::default()
+                .current()
+                .scent_over(&RunId::from_wire("ghost")),
+            M::Off
+        );
     }
 
     #[test]
