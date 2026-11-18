@@ -427,6 +427,8 @@ fn event_instance(event: &EngineEvent) -> &str {
         EngineEvent::BudgetBreach(b) => &b.instance,
         EngineEvent::UsageUpdate(u) => &u.event.instance,
         EngineEvent::Run(r) => r.instance.as_deref().unwrap_or_default(),
+        // Policy-family events are fleet-wide: they name no instance.
+        EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => "",
     }
 }
 

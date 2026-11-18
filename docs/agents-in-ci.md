@@ -79,13 +79,15 @@ source = "self-reported"
 ```bash
 hekma agent register review-bot --manifest ./review-bot
 hekma agent config set review-bot budget.tokens.cumulative 2000000
-hekma agent config set review-bot budget.breach_action pause
+hekma agent config set review-bot budget.breach_action stop
 ```
 
 `budget.tokens.cumulative` is the spend cap for the whole job (per-run and
 dollar caps exist too — see the [unified config keys](commands.md#unified-config-keys)).
-`budget.breach_action` is what happens at the ceiling: `pause` (the default),
-`stop`, `warn` (record only), or `block` (engine-observed instances: the
+`budget.breach_action` is what happens at the ceiling: `warn` (the default —
+record only, nothing is stopped), `pause`, `stop` (set it explicitly in CI: a
+spend cap must end the job, not just record), or `block` (engine-observed
+instances: the
 metering listener refuses further model calls; see
 [the wire fence](hosting.md#the-wire-fence-block-refuses-further-model-calls)). The budget is re-read on every usage event,
 so a cap set before `start` is enforced from the first event.
@@ -224,8 +226,9 @@ esac
 **There is no dedicated breach exit code.** The stable surface is `0`–`6`, and
 none of them means "the budget was crossed" — a breach is not a command
 failure, it is a state the agent lands in. Prove a breach by reading the
-Fleet row: the state reads `paused` (or `stopped`, under `breach_action
-stop`) and the budget block carries the ceiling with `cumulative_remaining`
+Fleet row: the state reads `stopped` (this recipe sets `breach_action stop`;
+under `pause` it would read `paused`) and the budget block carries the
+ceiling with `cumulative_remaining`
 clamped at `0`. Spend checks — "did the bot stay under budget?" — read
 `usage --json` totals against your own ceiling instead.
 
@@ -233,28 +236,28 @@ The poll loop that proves the breach is bounded and fails loudly, naming the
 last read instead of just timing out:
 
 ```bash
-paused=""
+stopped=""
 for i in $(seq 1 60); do
   hekma agent show review-bot --json > show.json || { sleep 1; continue; }
   state=$(jq -r '.instance.state // empty' show.json) || { sleep 1; continue; }
   limit=$(jq -r '.instance.budget.cumulative_limit // empty' show.json)
   remaining=$(jq -r '.instance.budget.cumulative_remaining // empty' show.json)
-  if [ "$state" = "paused" ] && [ -n "$limit" ] && [ "$remaining" = "0" ]; then paused=1; break; fi
+  if [ "$state" = "stopped" ] && [ -n "$limit" ] && [ "$remaining" = "0" ]; then stopped=1; break; fi
   sleep 1
 done
-if [ -z "$paused" ]; then
-  echo "::error::the agent never reached a budget-paused row within the bound; last read:" >&2
+if [ -z "$stopped" ]; then
+  echo "::error::the agent never reached a budget-stopped row within the bound; last read:" >&2
   cat show.json >&2
   exit 1
 fi
 ```
 
-The `remaining = 0` conjunction matters: an agent paused for any OTHER reason
-(an operator pause, a crash-window state) still reads `paused`, but only a
+The `remaining = 0` conjunction matters: an agent stopped for any OTHER
+reason (a failed probe, an operator stop) still reads `stopped`, but only a
 budget breach clamps the remaining allowance to zero — the row proves the
-breach, not just the pause.
+breach, not just the stop.
 
-When the row proves the pause, name the breach in the summary — the same
+When the row proves the breach, name it in the summary — the same
 table as the success case, with the state column carrying the story:
 
 ```bash
@@ -262,7 +265,7 @@ table as the success case, with the state column carrying the story:
   echo "## Agent usage — BUDGET BREACH"
   echo ""
   echo "review-bot crossed its cumulative ceiling of ${limit} tokens and was"
-  echo "paused by the configured Breach Action. See the row below."
+  echo "stopped by the configured Breach Action. See the row below."
 } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 ```
 
@@ -306,7 +309,7 @@ request, with two deliberate differences from the copy-paste path above:
   5 usage events of 10 input + 20 output tokens — so both legs are
   deterministic: a **success leg** (ceiling far above the batch, exit 0,
   tokens and labeled dollars rendered) and a **breach leg** (ceiling 90, the
-  batch crosses it at event 3, the agent pauses, the poll proves the paused
+  batch crosses it at event 3, the agent stops, the poll proves the stopped
   row plus the budget fields, and the summary names the breach). Every wait
   polls for a known committed state — never a sleep.
 

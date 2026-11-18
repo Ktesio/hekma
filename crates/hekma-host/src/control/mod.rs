@@ -218,6 +218,18 @@ fn router(state: ApiState) -> Router {
             "/v0/runs/{id}/labels",
             get(routes::run_labels_get).patch(routes::run_labels_patch),
         )
+        // Policies (story 21-3): Operator-set limits for the Runs a
+        // Selector matches by bound label (this bearer is the Operator's).
+        .route(
+            "/v0/policies",
+            get(routes::policies_list).post(routes::policy_create),
+        )
+        .route(
+            "/v0/policies/{name}",
+            get(routes::policy_show)
+                .patch(routes::policy_change)
+                .delete(routes::policy_delete),
+        )
         // Live events (SSE).
         .route("/v0/events", get(sse::live_events))
         // The ephemeral-host export surface (story 17-4): the global outbox

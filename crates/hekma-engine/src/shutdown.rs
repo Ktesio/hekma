@@ -386,6 +386,7 @@ mod tests {
             usage_gap: None,
             supervision: None,
             recorded_state: None,
+            breach_default_upgraded: false,
             agent_home: "/tmp/test-home".to_string(),
         }
     }

@@ -23,9 +23,11 @@ against its implementation and assert byte-exact agreement.
 - Artifact id: `hekma-governance-vectors`
 - Canonical location: `crates/hekma-engine/governance/vectors-v1.json`
 - Checksum sidecar: `crates/hekma-engine/governance/vectors-v1.json.sha256`
-- Current version: **1.2.0** (schema version 1). 1.1.0 appended the `block`
+- Current version: **1.3.0** (schema version 1). 1.1.0 appended the `block`
   cases and the `fence` kind after the unchanged 1.0.0 set; 1.2.0 appended the
-  `chain` kind for ancestor ceilings after the unchanged 1.1.0 set.
+  `chain` kind for ancestor ceilings after the unchanged 1.1.0 set; 1.3.0
+  appended the `policy` kind for Policy resolution after the unchanged 1.2.0
+  set.
 
 ## Getting the artifact
 
@@ -56,7 +58,7 @@ throughout):
 {
   "artifact": "hekma-governance-vectors",
   "schema_version": 1,
-  "vectors_version": "1.2.0",
+  "vectors_version": "1.3.0",
   "provenance": {
     "generated_from": [
       "BudgetEvaluator",
@@ -125,8 +127,13 @@ Four case kinds exist:
   so a child's breach never suppresses its parent's, and a parent's ceiling
   binds its children's usage. A one-level chain is exactly a `decision`.
 
-A later minor version may add a case kind, as 1.1.0 added `fence` and 1.2.0
-added `chain`. See the
+- **`policy`** (from 1.3.0) — Policy resolution: the Run's depth, wire path
+  and bound labels, its explicit limits, the policy set and the model in, and
+  the exact resolution out — the effective ceilings and action with each
+  limit's source, the depth fallback, and the unpriced-cap signal.
+
+A later minor version may add a case kind, as 1.1.0 added `fence`, 1.2.0
+added `chain` and 1.3.0 added `policy`. See the
 versioning policy for how a consumer pinned to an older version handles it.
 
 Every case carries `covers` — the rule set it pins:
@@ -143,6 +150,7 @@ Every case carries `covers` — the rule set it pins:
 | `no-retro-repricing` | Each ledger row prices at the rate persisted with it; repricing history at the latest rate produces a different (wrong) value. |
 | `block-fence` | A `block` decision fires under the same threshold, latch and order rules as any action. A fenced Run refuses with status 402 and the `hekma_budget_block` class, reporting the first raised reason: tokens before dollars, per-run before cumulative. |
 | `ancestor-ceilings` | Over a Run's ancestor chain every level decides on its own subtree totals and its own latches; outcomes come deepest level first, token before dollar within a level. |
+| `policy-resolution` | Each limit resolves on its own: explicit limits on the Run, then on the agent, outrank every Policy; per limit the most specific Selector (a strict term-set superset) wins, incomparable Selectors tie to the tightest value, and the default Policy fills what is unset. A malformed action fails closed to `pause`; an action the depth cannot execute acts as `warn`; a Cost Cap with no Rate is loud, never silently inert. |
 
 ## How a Host pins it
 
@@ -154,7 +162,9 @@ Every case carries `covers` — the rule set it pins:
    latch state to `expected`. For each `derivation` case, run the named
    derivation on the inputs and compare the micro-dollar result to
    `expected_micros`. For each `chain` case, run every level through your
-   guard and compare the outcomes level by level.
+   guard and compare the outcomes level by level. For each `policy` case,
+   resolve the input with your own resolution and compare every field of the
+   expected resolution.
 3. **Fail on any difference.** A mismatch means your guard disagrees with the
    engine on a pinned rule — fix the guard (or file an issue if you believe
    the vector is wrong), never silently skip the case.
@@ -186,10 +196,11 @@ API — see [Embedding the engine](embedding.md).
   | 1.0.0 | 1-26 | the first 26 `decision` and `derivation` cases |
   | 1.1.0 | 27-34 | the `decision-block-*` cases and the `fence-*` cases |
   | 1.2.0 | 35-39 | the `chain-*` cases |
+  | 1.3.0 | 40-48 | the `policy-*` cases |
 
   The provenance list grows with the generator functions the new cases come
   from (1.1.0 added `governance::fence_refusal`, 1.2.0
-  `governance::decide_chain`).
+  `governance::decide_chain`, 1.3.0 `runs::policy::resolve`).
 - **Any change to a shipped case** (its expected output or its input), or to
   the shape of the header or of an existing kind, is a **major** bump and is announced ahead of the release in the release
   notes. A major bump means a pinned verdict must be re-established — it does
