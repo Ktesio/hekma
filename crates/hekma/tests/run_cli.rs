@@ -48,6 +48,21 @@ fn run_refusals_map_to_the_documented_exit_codes() {
 }
 
 #[test]
+fn a_write_whose_state_root_cannot_be_created_starts_no_host() {
+    let ctx = TestContext::new();
+    // The state root's parent is a regular file, so the directory a host
+    // would serve can never be created.
+    let blocker = ctx.project_dir.join("not-a-directory");
+    std::fs::write(&blocker, b"").unwrap();
+    let state_dir = blocker.join("state");
+    let run = run_hekma_agent(&["run", "close", "run_ghost"], &ctx.project_dir, &state_dir);
+    assert_eq!(run.code, Some(1), "stderr: {}", run.stderr);
+    assert!(run.stderr.contains("<state-dir>"), "{}", run.stderr);
+    assert!(run.stderr.contains("not-a-directory"), "{}", run.stderr);
+    assert!(!state_dir.exists());
+}
+
+#[test]
 fn a_child_run_opens_shows_and_closes_under_a_detached_agent_unix() {
     if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
         // A detached agent dies with the command's job on Windows; the

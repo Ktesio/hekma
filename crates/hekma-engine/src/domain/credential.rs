@@ -302,7 +302,7 @@ fn fill_random(bytes: &mut [u8]) -> Result<(), CredentialError> {
             detail: "test seam: the random source is failing".to_string(),
         });
     }
-    getrandom::getrandom(bytes).map_err(|err| CredentialError::RandomSourceFailed {
+    getrandom::fill(bytes).map_err(|err| CredentialError::RandomSourceFailed {
         detail: err.to_string(),
     })
 }

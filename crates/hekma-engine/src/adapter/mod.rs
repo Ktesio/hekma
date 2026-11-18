@@ -2754,4 +2754,75 @@ max_age_ms = 5000
             other => panic!("expected InvalidLifecyclePair, got {other}"),
         }
     }
+
+    #[test]
+    fn resolve_drain_plan_refuses_an_out_of_range_drain_bound() {
+        // A `[drain]` bound hand-edited to zero after registration: the verb
+        // refuses with InvalidDrain naming the adapter and the bound, never a
+        // drain that completes before it waited at all.
+        let tmp = TempDir::new().unwrap();
+        let body = DRAIN_PLAN_MANIFEST.replace("timeout_ms = 5_000", "timeout_ms = 0");
+        let path = write_manifest(tmp.path(), &body);
+        match resolve_drain_plan("demo", Some(&path)).unwrap_err() {
+            LaunchResolveError::InvalidDrain { adapter, detail } => {
+                assert_eq!(adapter, "demo");
+                assert!(detail.contains("timeout_ms"), "{detail}");
+                assert!(detail.contains("1..=600_000"), "{detail}");
+            }
+            other => panic!("expected InvalidDrain, got {other}"),
+        }
+    }
+
+    /// Every per-call manifest resolver, run against one manifest path, its
+    /// outcome reduced to the error (or `None` when it resolved).
+    fn every_resolver_error(path: &Path) -> Vec<(&'static str, Option<LaunchResolveError>)> {
+        vec![
+            (
+                "readiness",
+                resolve_readiness_probe("demo", Some(path)).err(),
+            ),
+            ("liveness", resolve_liveness_check("demo", Some(path)).err()),
+            ("exit codes", resolve_exit_codes("demo", Some(path)).err()),
+            ("drain plan", resolve_drain_plan("demo", Some(path)).err()),
+        ]
+    }
+
+    #[test]
+    fn every_manifest_resolver_reports_a_vanished_manifest_as_unreadable_naming_the_path() {
+        // The manifest was deleted after registration: each per-call resolver
+        // refuses with ManifestUnreadable naming the path it tried, never a
+        // silent "nothing declared" that would drop the declared section.
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("gone").join(MANIFEST_FILE);
+        for (what, err) in every_resolver_error(&missing) {
+            match err {
+                Some(LaunchResolveError::ManifestUnreadable { path, detail }) => {
+                    assert_eq!(path, missing.to_string_lossy(), "{what}");
+                    assert!(!detail.is_empty(), "{what}: the I/O cause is carried");
+                }
+                other => panic!("{what}: expected ManifestUnreadable, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_manifest_resolver_reports_a_corrupted_manifest_as_unreadable_naming_the_path() {
+        // The manifest was hand-edited into invalid TOML after registration:
+        // each per-call resolver refuses with ManifestUnreadable naming the
+        // path and the parse failure, never a launch from a guessed section.
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(tmp.path(), "contract_version = = \"1.1.0\"");
+        for (what, err) in every_resolver_error(&path) {
+            match err {
+                Some(LaunchResolveError::ManifestUnreadable {
+                    path: named,
+                    detail,
+                }) => {
+                    assert_eq!(named, path.to_string_lossy(), "{what}");
+                    assert!(!detail.is_empty(), "{what}: the parse cause is carried");
+                }
+                other => panic!("{what}: expected ManifestUnreadable, got {other:?}"),
+            }
+        }
+    }
 }
