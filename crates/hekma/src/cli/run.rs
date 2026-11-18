@@ -701,6 +701,8 @@ mod tests {
             usage: hekma_engine::RunUsage::default(),
             open_children: 0,
             custody: None,
+            last_activity_at: None,
+            lease_expires_at: None,
         }
     }
 
