@@ -10812,10 +10812,11 @@ fn a_restart_requested_cause_without_detail_renders_the_bare_code() {
 }
 
 #[test]
-fn a_relaunch_with_an_unreadable_config_re_applies_nothing_and_stays_quiet() {
-    // Without a readable configuration there is no configured action to
-    // match a latch against: nothing is re-applied (the next evaluation
-    // reads the config again), and nothing is announced.
+fn a_relaunch_with_an_unreadable_config_fails_closed_and_re_applies_a_latched_pause() {
+    // Without a readable configuration the resolved action fails closed to
+    // `pause` (story 21-3), so a latched `pause` is re-applied and
+    // announced. Nothing is held, so the pause cannot be honored, and that
+    // is surfaced too.
     let (_state, _manifest, registry) = setup_fake("latchcfg", &["--linger-ms", "600000"]);
     let name = InstanceName::new("latchcfg").unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
@@ -10833,10 +10834,17 @@ fn a_relaunch_with_an_unreadable_config_re_applies_nothing_and_stays_quiet() {
     std::fs::write(registry.paths().instance_config(&name), "[budget\nbroken").unwrap();
     let buffer = install_capture_sink(&mut sup);
     sup.reapply_latched_actions(&registry, &name, &run);
-    assert_eq!(
-        sink_text(&buffer),
-        "",
-        "an unreadable config re-applies nothing"
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains(
+            "latchcfg: the Restart Policy relaunched this instance into the same Run, whose \
+             tokens per-run ceiling had already fired `pause` — re-applying it"
+        ),
+        "an unreadable config fails closed to the latched pause:\n{text}"
+    );
+    assert!(
+        text.contains("budget breach pause could not be honored"),
+        "{text}"
     );
     assert_eq!(state_of(&registry, "latchcfg"), LifecycleState::Registered);
 }
@@ -10869,7 +10877,8 @@ fn a_relaunch_re_applies_a_latched_dollar_pause_with_its_cost_cause() {
     let name = InstanceName::new("latchusd").unwrap();
     std::fs::write(
         registry.paths().instance_config(&name),
-        "[cost.rate]\ninput = \"1000.00\"\noutput = \"1000.00\"\n\
+        "[budget]\nbreach_action = \"pause\"\n\
+         [cost.rate]\ninput = \"1000.00\"\noutput = \"1000.00\"\n\
          [budget.dollars]\nper_run = \"0.05\"\n",
     )
     .unwrap();
