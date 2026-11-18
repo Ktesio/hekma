@@ -89,7 +89,7 @@ pub fn host_key(state_dir: &Path) -> std::io::Result<[u8; 32]> {
         }),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let mut key = [0u8; 32];
-            getrandom::getrandom(&mut key).map_err(|err| std::io::Error::other(err.to_string()))?;
+            getrandom::fill(&mut key).map_err(|err| std::io::Error::other(err.to_string()))?;
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
