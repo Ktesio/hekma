@@ -11218,7 +11218,15 @@ fn a_transition_whose_run_projection_fails_still_commits_and_says_so() {
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let buffer = install_capture_sink(&mut sup);
     sup.start(&registry, "runproj").unwrap();
-    state_db_exec(state.path(), "ALTER TABLE runs RENAME TO runs_unavailable;");
+    // A trigger that refuses every Run status write fails only the
+    // projection: story 22-1's credential revocation reads the `runs` table
+    // inside the transition (and fails the whole transition when it cannot),
+    // so the fault must leave that table readable.
+    state_db_exec(
+        state.path(),
+        "CREATE TRIGGER runs_refuse_update BEFORE UPDATE ON runs \
+         BEGIN SELECT RAISE(ABORT, 'run status writes refused'); END;",
+    );
     sup.stop(&registry, "runproj", Some(Duration::from_secs(5)))
         .unwrap();
     assert_eq!(
