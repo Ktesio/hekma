@@ -118,7 +118,7 @@ pub fn supported() -> bool {
 /// A fresh one-time token: 32 random bytes, hex.
 pub fn new_token() -> Result<String, HandoffError> {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes)
+    getrandom::fill(&mut bytes)
         .map_err(|err| HandoffError::Io(std::io::Error::other(err.to_string())))?;
     Ok(crate::shim::secret::to_hex(&bytes))
 }
@@ -127,7 +127,7 @@ pub fn new_token() -> Result<String, HandoffError> {
 /// directory's owner-only `shims/` directory (socket paths are short).
 pub fn channel_path(state_base: &Path) -> Result<PathBuf, HandoffError> {
     let mut bytes = [0u8; 4];
-    getrandom::getrandom(&mut bytes)
+    getrandom::fill(&mut bytes)
         .map_err(|err| HandoffError::Io(std::io::Error::other(err.to_string())))?;
     Ok(state_base
         .join("shims")
