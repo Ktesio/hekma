@@ -4690,4 +4690,145 @@ mod tests {
             "the reads wrote nothing"
         );
     }
+
+    #[test]
+    fn failed_cause_detail_names_a_detail_less_unresponsive_or_restart_requested_cause() {
+        // A hand-built (or pre-detail) event carries no verdict text: `show`
+        // still names the check and its streak, or the declared code, from
+        // the cause's own fields instead of falling back to nothing.
+        assert_eq!(
+            failed_cause_detail(&TransitionCause::Unresponsive {
+                check: "liveness check heartbeat-file hb.marker".to_string(),
+                failing_for_ms: 6_000,
+                detail: None,
+            })
+            .as_deref(),
+            Some("liveness check heartbeat-file hb.marker failing for 6000ms")
+        );
+        assert_eq!(
+            failed_cause_detail(&TransitionCause::RestartRequested {
+                code: 75,
+                detail: None,
+            })
+            .as_deref(),
+            Some("exit code 75 requested a restart (declared `restart_requested`)")
+        );
+    }
+
+    #[test]
+    fn the_blocking_facade_reads_the_capture_posture_and_live_capture_answers() {
+        // The sync twins of the capture reads: the default posture is Full,
+        // and nothing is held live for an unknown, a malformed or a
+        // never-started name.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        assert_eq!(facade.log_capture_mode(), LogCaptureMode::Full);
+        facade.register("demo", "mock").unwrap();
+        assert!(!facade.has_live_capture("demo"), "never started");
+        assert!(!facade.has_live_capture("ghost"), "unknown");
+        assert!(!facade.has_live_capture("Bad Name"), "malformed");
+    }
+
+    #[test]
+    fn the_fleet_degrades_an_unreadable_spawn_record_to_defaults_row_by_row() {
+        // One instance's runtime row is corrupt, so the batched spawn-record
+        // read fails: the Fleet still lists every instance, and the corrupt
+        // one's runtime fields read at their defaults (never a failed Fleet,
+        // never a dropped row).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let engine = Engine::open(Some(base.clone())).unwrap();
+        let facade = engine.blocking();
+        facade.register("good", "mock").unwrap();
+        facade.register("bad", "mock").unwrap();
+        {
+            let conn = rusqlite::Connection::open(base.join(crate::paths::STATE_DB_FILE)).unwrap();
+            conn.execute(
+                "INSERT INTO agent_runtime (instance_id, pid, start_time, restart_policy, \
+                 restart_count) SELECT id, 0, 0, 'sideways', 4 FROM agent_instances \
+                 WHERE name = 'bad'",
+                [],
+            )
+            .unwrap();
+        }
+        let fleet = facade.fleet().unwrap();
+        let names: Vec<&str> = fleet.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names.contains(&"good") && names.contains(&"bad"),
+            "{names:?}"
+        );
+        let bad = fleet.iter().find(|e| e.name.as_str() == "bad").unwrap();
+        assert_eq!(bad.restart_count, 0, "the unreadable record is not read");
+        assert_eq!(bad.supervision, None);
+        assert_eq!(bad.state, LifecycleState::Registered);
+    }
+
+    #[test]
+    fn the_fleet_reads_an_acp_instance_with_a_malformed_config_as_unknown_source() {
+        // A hand-broken config.toml for an `acp` instance: the Fleet row
+        // stays listed with no Rate, no budget, and the honest "unknown"
+        // metering source rather than a guess or a failed Fleet.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        facade.register("talker", "acp").unwrap();
+        let config = crate::paths::EnginePaths::new(Some(tmp.path().to_path_buf()))
+            .unwrap()
+            .instance_config(&InstanceName::new("talker").unwrap());
+        std::fs::write(&config, "this is = = not valid toml").unwrap();
+        let entry = facade.fleet_entry("talker").unwrap();
+        assert_eq!(entry.kind, "acp");
+        assert_eq!(entry.metering_source, "unknown");
+        assert!(entry.budget.is_none(), "{entry:?}");
+    }
+
+    #[test]
+    fn an_open_surfaces_an_unreadable_legacy_log_line_on_the_diagnostic_sink() {
+        // The one-time v12 upgrade skips a torn legacy log line and says so:
+        // the engine carries that note to its diagnostic surface on open,
+        // before supervision starts, rather than dropping it.
+        #[derive(Clone)]
+        struct Shared(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = crate::paths::EnginePaths::new(Some(tmp.path().to_path_buf())).unwrap();
+        std::fs::create_dir_all(paths.state_base()).unwrap();
+        let name = InstanceName::new("legacy").unwrap();
+        let home = paths.agent_home(&name);
+        let conn = crate::store::create_v11_for_test(&paths.state_db());
+        conn.execute(
+            "INSERT INTO agent_instances (name, kind, state, agent_home, created_at, updated_at) \
+             VALUES ('legacy', 'mock', 'stopped', ?1, '2026-10-30T00:00:00Z', \
+             '2026-10-30T00:00:00Z')",
+            [home.to_string_lossy()],
+        )
+        .unwrap();
+        drop(conn);
+        std::fs::create_dir_all(home.join("logs")).unwrap();
+        std::fs::write(
+            home.join("logs").join("instance.log"),
+            "{\"schema_version\":1,\"inst\n",
+        )
+        .unwrap();
+        let shared = Shared(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let sink: crate::DiagnosticSink = Arc::new(std::sync::Mutex::new(Box::new(shared.clone())));
+        let engine = Engine::open_with_diagnostics(Some(tmp.path().to_path_buf()), sink).unwrap();
+        let text = String::from_utf8(shared.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains("[hekma] ") && text.contains("skipped 1 unreadable line(s)"),
+            "{text}"
+        );
+        assert!(text.contains("instance.log"), "{text}");
+        drop(engine);
+    }
 }

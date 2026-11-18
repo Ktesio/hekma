@@ -302,6 +302,9 @@ fn invalid(message: String) -> Box<dyn std::error::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::agent::RoutedError;
+    use crate::cli::fanout::reclassed;
+    use crate::cli::host_client::CallError;
     use crate::error::{RunInvalidState, RunNotFound};
     use hekma_engine::RunError;
 
@@ -397,6 +400,55 @@ mod tests {
         assert!(render_result(&refused).is_none());
         assert_eq!(words(LabelVerb::Remove).question, "Unlabel");
         assert_eq!(words(LabelVerb::Set).verb, "label");
+    }
+
+    #[test]
+    fn remove_without_a_key_names_what_is_missing() {
+        let err = parse(&args(LabelVerb::Remove, None, &["my-agent"])).unwrap_err();
+        assert!(err.is::<RunInvalid>());
+        assert_eq!(err.to_string(), "name at least one label key to remove");
+    }
+
+    #[test]
+    fn a_refusal_carries_the_engine_code_or_the_host_class() {
+        // Planned locally: the engine's own code, message and exit class.
+        let ended = Refusal::from_run_error(RunError::RunEnded {
+            run_id: "run_A".into(),
+        });
+        assert_eq!(ended.code, "run-ended");
+        assert!(ended.message.contains("run_A"), "{}", ended.message);
+        assert!(ended.diagnostic.is::<RunInvalidState>());
+        assert_eq!(ended.diagnostic.to_string(), ended.message);
+        // A host that cannot be reached: the service-host code, exit class 1.
+        let gone = Refusal::from_routed(RoutedError::Call(CallError::Unavailable(
+            "the local Service Host stopped answering".into(),
+        )));
+        assert_eq!(gone.code, "service-host");
+        assert_eq!(gone.message, "the local Service Host stopped answering");
+        assert!(gone.diagnostic.is::<crate::error::ServiceHostUnavailable>());
+    }
+
+    #[test]
+    fn a_partial_host_failure_keeps_the_host_class_with_the_count() {
+        use crate::error::{ServiceHostRefused, ServiceHostUnavailable};
+        let refused = reclassed(
+            ServiceHostRefused {
+                message: "bad body".into(),
+            }
+            .into(),
+            "2 of 3 Runs were not labeled".into(),
+        );
+        assert!(refused.is::<ServiceHostRefused>());
+        assert_eq!(refused.to_string(), "2 of 3 Runs were not labeled");
+        let unavailable = reclassed(
+            ServiceHostUnavailable {
+                message: "gone".into(),
+            }
+            .into(),
+            "1 of 2 Runs were not labeled".into(),
+        );
+        assert!(unavailable.is::<ServiceHostUnavailable>());
+        assert_eq!(unavailable.to_string(), "1 of 2 Runs were not labeled");
     }
 
     #[test]

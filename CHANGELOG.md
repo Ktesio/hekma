@@ -54,6 +54,16 @@ Release automation updates this file with a pull request after each `vMAJOR.MINO
 > - **One-way upgrade.** The first open migrates `state.db` to schema 15. An older engine refuses the migrated state dir.
 > - **Breaking engine surface within the unreleased `hekma-engine` 0.12.0:** `EngineEvent` gains `Policy` and `BreachDefaultUpgraded`, `Anomaly` gains `UnpricedModel` and `RunError` gains `PolicyNotFound` and `PolicyExists` (exhaustive public enums). Additive: `Engine::policies`, `policy`, `create_policy`, `change_policy`, `delete_policy` (async and blocking), `PolicyChange`, `PolicyOutcome`, `PolicyRecord`, `PolicyLimits`, `PolicyEvent`, `ScentCheckMode` and the resolution types.
 
+> **Unreleased — honest release diagnostics for a signal-killed paused agent (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **A signal-killed paused detached agent is no longer recorded as an adopted process when the engine releases it.** At shutdown the engine reconciles a paused detached agent that had already exited to `failed`; when that agent was spawned by this engine and died by a signal, the recorded cause now says "terminated by signal". Only an agent adopted from a previous engine — whose exit code this engine structurally cannot read — keeps the "exit code unavailable — adopted process is not this engine's child" wording. The `paused → failed` transition, the record settlement, and the coded-exit wording are unchanged.
+
+> **Unreleased — Control API body shapes.**
+> Announced ahead of the release that ships it:
+>
+> - **`start`, `stop` and `drain` bodies must be JSON objects.** A present body that is not the JSON object shape is refused `400 invalid_body` before anything runs, naming the expected shape: the bare sequence forms serde's derived reader used to accept (`[true]` a detached start, `[30]` a stop window, `[1500]` a drain bound) are refusals now. A body with a duplicate key (`{"timeout_ms":1,"timeout_ms":null}`) stays a `400 invalid_body`, as before — the derived visitor has always rejected repeated keys; only the sequence forms change behaviour. A truly absent body still means each verb's own default — the manifest drain tier or the engine's stop window.
+
 > **Unreleased — bound labels: `hekma label` (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >
