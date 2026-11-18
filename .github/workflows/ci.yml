@@ -571,10 +571,16 @@ jobs:
     # serve runs; not ratcheted — the canonical baseline carries no serve
     # metrics). Its report file rides the SAME artifact as the default
     # report (two files, one artifact).
+    # Story 21-5: the job ALSO runs the Run-scale listing scenario
+    # (--ps-seed 10000, its own step below) — the listing's first page plus
+    # counts over 10 000 seeded Runs, gated strict at p99 < 1 s (bound only
+    # on ps runs; not ratcheted — the canonical baseline carries no ps
+    # metric). Its report file rides the same artifact.
     runs-on: ubuntu-latest
     # Story 17-1: the job now runs the harness TWICE (default + --serve-shape,
-    # ~2 min more on a warm cache) — the ceiling grows with it.
-    timeout-minutes: 25
+    # ~2 min more on a warm cache) — the ceiling grows with it. Story 21-5:
+    # a THIRD run (--ps-seed 10000) grows it again.
+    timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -665,12 +671,34 @@ jobs:
             exit 1
           }
           target/release/examples/perf-budgets --serve-shape
+      - name: Run the Run-scale listing scenario (story 21-5; regressions fail this job)
+        # The THIRD explicit run (story 21-5): gated budgets CI never runs
+        # are not gates, so the listing scenario is its own blocking step.
+        # It seeds 10 000 Runs straight into the harness's store (no extra
+        # processes) and gates the first exceptions page plus its counts at
+        # p99 < 1 s strict (the CI once-retry re-measures the whole set
+        # once). WITHOUT --baseline — the canonical baseline carries no ps
+        # metric and the ps gate binds only on ps runs. Same contract as the
+        # steps above: no redirection, no `|| true`, the bare binary
+        # invocation (+ its flags) as the last line.
+        timeout-minutes: 10
+        env:
+          PERF_BUDGETS_REPORT_PATH: perf-budgets-ps-report.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/release/examples/perf-budgets || {
+            echo "::error::perf-budgets binary not found at target/release/examples/perf-budgets — the build step above failed or the output path moved."
+            exit 1
+          }
+          target/release/examples/perf-budgets --ps-seed 10000
       - name: Upload the measured report (artifact)
         # The measured record of record also lives in this job's log; the
         # artifact makes it downloadable for trend inspection. `if: always()`
         # so a red (regression) run's numbers are preserved too — that is
         # exactly when the record matters most. Story 17-1: ONE artifact
-        # carries BOTH report files (the default run's and the serve run's).
+        # carries BOTH report files (the default run's and the serve run's);
+        # story 21-5 adds the ps run's as the third.
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -678,6 +706,7 @@ jobs:
           path: |
             perf-budgets-report.json
             perf-budgets-serve-report.json
+            perf-budgets-ps-report.json
           if-no-files-found: warn
 
   agents-in-ci:

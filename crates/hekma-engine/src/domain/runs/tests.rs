@@ -1160,3 +1160,129 @@ fn every_bound_label_path_calls_the_policy_hook_inside_the_writer_job() {
     let entry = snapshot.run(&run).unwrap();
     assert!(entry.labels.contains(&Label::verb("env", "prod")));
 }
+
+// ---------------------------------------------------------------------------
+// The listing's per-row assembly (story 21-5): labels, the STORED
+// resolution's headroom, subtree and cumulative usage, latches.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_listing_assembles_each_row_from_its_stored_facts() {
+    use crate::domain::budget::{BreachAction, BreachScope};
+    use crate::domain::cost::Rate;
+    use crate::domain::event::BreachDimension;
+    use crate::domain::runs::listing::{self, ListingView};
+    use crate::domain::usage::UsageEvent;
+    use crate::ports::{PolicyRecords as _, RunRecords as _, RunStore as _};
+
+    let (_tmp, store) = store();
+    let owner = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&owner, true, true), AT).unwrap();
+    let child_id = child(&store, RunParent::Run(owner.clone())).unwrap();
+
+    // A Policy that arms the owner's level: a per-run token ceiling, a
+    // per-run dollar cap, and a Rate — then a re-resolve stores it.
+    store
+        .put_policy(&super::PolicyRecord {
+            name: "tight".to_string(),
+            selector: Some("team=payments".parse().unwrap()),
+            limits: super::PolicyLimits {
+                tokens_per_run: Some(1_000),
+                dollars_per_run_micros: Some(500_000),
+                rate: Some(Rate::new(1_000_000, 2_000_000)),
+                ..Default::default()
+            },
+            rates: Default::default(),
+        })
+        .unwrap();
+    ops::mark_breach(&store, &owner, AT).unwrap();
+    super::policy::resolve_run(&store, &owner, None, AT).unwrap();
+
+    // Usage on the owner's Run folds into its subtree rollup AND the
+    // instance's cumulative rollup (10k in / 20k out at $1/$2 per 1M).
+    let event = UsageEvent {
+        instance: "a".to_string(),
+        run_id: owner.clone(),
+        input_tokens: 10_000,
+        output_tokens: 20_000,
+        cached_tokens: None,
+        metering_source: "engine-observed".to_string(),
+        sequence: 0,
+        occurred_at: AT.to_string(),
+    };
+    store
+        .insert_usage(&event, Some(Rate::new(1_000_000, 2_000_000)), 0)
+        .unwrap();
+    // A latched `block` from an earlier breach (the fence-visibility slice).
+    store
+        .latch(
+            &owner,
+            crate::domain::LatchKey {
+                dimension: BreachDimension::Tokens,
+                scope: BreachScope::PerRun,
+            },
+            BreachAction::Block,
+            AT,
+        )
+        .unwrap();
+
+    let (rows, _) = store
+        .list_runs(
+            ListingView::Exceptions,
+            None,
+            None,
+            50,
+            "2026-11-02T00:00:00Z",
+        )
+        .unwrap();
+    let items = listing::assemble(&store, rows).unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "the breached owner; the healthy child is counted"
+    );
+    let row = &items[0];
+    assert_eq!(row.record.run_id, owner);
+    assert_eq!(row.record.anomalies, vec![Anomaly::Breach]);
+    assert!(row.labels.contains(&Label::bound("team", "payments")));
+    // Subtree usage: 30k tokens and the derived cost at the stored Rate
+    // ($10 per 1M in + $20 per 1M out over 10k/20k = $0.50).
+    assert_eq!(row.usage.input_tokens, 10_000);
+    assert_eq!(row.usage.output_tokens, 20_000);
+    // The derived cost at the stored Rate: 10k in at $1/1M ($0.01) + 20k
+    // out at $2/1M ($0.04) = $0.05.
+    assert_eq!(row.usage.cost_micros.0, 50_000);
+    // The owner carries the instance cumulative usage; the budget block
+    // computes headroom against the POLICY-sourced ceilings.
+    let cumulative = row.cumulative_usage.as_ref().expect("owner carries it");
+    assert_eq!(cumulative.input_tokens, 10_000);
+    let budget = row.budget.as_ref().expect("the policy arms the level");
+    assert_eq!(budget.view.per_run_limit, Some(1_000));
+    // The subtree (30k tokens) already exceeds the 1000-token ceiling: the
+    // remaining saturates at zero, never negative. The dollar headroom:
+    // $0.50 cap − $0.05 spent.
+    assert_eq!(budget.view.per_run_remaining, Some(0));
+    assert_eq!(
+        budget.view.per_run_dollars_remaining,
+        Some(crate::domain::cost::Micros(450_000))
+    );
+    assert!(budget.view.policies.contains(&"tight".to_string()));
+    assert_eq!(row.latched.len(), 1);
+    assert_eq!(row.latched[0].action, BreachAction::Block);
+    assert_eq!(row.latched[0].dimension, BreachDimension::Tokens);
+
+    // The child row: cumulative usage ABSENT (not zero), no breach, and a
+    // budget block from the default policy (nothing set) — an honest None.
+    let (rows, _) = store
+        .list_runs(ListingView::All, None, None, 50, "2026-11-02T00:00:00Z")
+        .unwrap();
+    let items = listing::assemble(&store, rows).unwrap();
+    let child_row = items
+        .iter()
+        .find(|row| row.record.run_id == child_id)
+        .expect("the child lists in the all view");
+    assert!(child_row.cumulative_usage.is_none());
+    assert!(child_row.budget.is_none());
+    assert_eq!(child_row.usage.input_tokens, 0);
+    assert!(child_row.latched.is_empty());
+}

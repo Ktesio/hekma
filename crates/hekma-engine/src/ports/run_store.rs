@@ -311,6 +311,14 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// The instance's open process-owning Run.
     fn open_process_run(&self, instance: &InstanceName) -> Result<Option<RunRecord>, StoreError>;
 
+    /// The instance's NEWEST process-owning Run, ended or not (story 21-5):
+    /// the subject of a transition published after its owner Run's end
+    /// committed (a `stopped` or `failed` transition), so a Selector-
+    /// filtered event stream still sees it. ULID ids sort by creation, and
+    /// at most one owner is open, so the open owner is the newest when it
+    /// exists.
+    fn latest_process_run(&self, instance: &InstanceName) -> Result<Option<RunRecord>, StoreError>;
+
     /// The non-ended descendants of a Run hosted in the same process (same
     /// instance, not process owners), oldest first.
     fn open_in_process_descendants(&self, run_id: &RunId) -> Result<Vec<RunRecord>, StoreError>;
@@ -339,6 +347,29 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// The non-ended Runs carrying every `key=value` term of `selector`
     /// (bound or Caller), ordered by run id, at most `limit` (story 21-9).
     fn select_runs(&self, selector: &Selector, limit: usize) -> Result<Vec<RunRecord>, StoreError>;
+
+    /// One keyset page of the Run listing (story 21-5): the view's rows
+    /// after `after` (the decoded cursor's run id, `None` = the first
+    /// page), newest run id first, plus the run id the next page resumes
+    /// after (`None` when the read is exhausted). Reads the v16 partial
+    /// indexes — no `SCAN` on `runs` (pinned by tests).
+    fn list_runs(
+        &self,
+        view: crate::domain::runs::ListingView,
+        selector: Option<&Selector>,
+        after: Option<&str>,
+        limit: usize,
+        cutoff: &str,
+    ) -> Result<(Vec<RunRecord>, Option<String>), StoreError>;
+
+    /// The listing's counts (story 21-5): how many Runs the view lists and
+    /// how many are healthy and open, both subject to `selector`.
+    fn listing_counts(
+        &self,
+        view: crate::domain::runs::ListingView,
+        selector: Option<&Selector>,
+        cutoff: &str,
+    ) -> Result<crate::domain::runs::ListingCounts, StoreError>;
 
     /// The Run an external id maps to under a binding.
     fn identity_run(&self, binding: &str, external_id: &str) -> Result<Option<RunId>, StoreError>;

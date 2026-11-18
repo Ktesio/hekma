@@ -148,6 +148,37 @@ Examples:
   hekma label set --selector team=core,env=prod tier=gold --dry-run
   hekma label remove --selector team=core tier --yes";
 
+const PS_AFTER_HELP: &str = "\
+Details:
+  The Runs that need you, newest first. The default view lists a Run iff it
+  carries an Anomaly (an ended Run only inside the 7-day ended-Run window)
+  or a held, silent or stale status; healthy open Runs are counted in the
+  footer, not listed. --all lists every Run inside the window. The CONTROL
+  column shows the Control Depth (supervised (no wire) for an agent whose
+  model calls skip the metering listener); the RUN column shows the agent's
+  name on process-owning rows and the run id on child Runs. ANOMALIES shows
+  the breach Anomaly with each latched Breach Action (breach[block]) beside
+  the others; LABELS marks caller labels. USAGE is the Run's subtree tokens
+  and derived dollars (an estimate); HEADROOM is what remains against the
+  Run's resolved ceilings, naming the Policy that set them and, on
+  process-owning rows, the cumulative token headroom. Both dollar figures
+  are estimates and appear only where a Rate prices them.
+
+  --selector key=value[,key=value...] filters by label (bound or caller
+  alike) in either view. --limit N pages (default 50, at most 1000; 0 means
+  the maximum); when another page exists the footer prints the exact
+  --cursor value that continues the listing. The table follows the
+  terminal width; --json carries every figure whole. A read-only read: no
+  host is started and nothing is written. Exit codes: 2 an invalid
+  selector, cursor or limit; 1 a store failure; 0 otherwise — an empty
+  listing included.
+
+Examples:
+  hekma ps
+  hekma ps --selector team=core,env=prod
+  hekma ps --all --limit 100
+  hekma ps --cursor dnVuXzFfMDEx --json";
+
 #[derive(Parser)]
 #[command(
     name = "hekma",
@@ -195,6 +226,29 @@ enum Commands {
     Policy {
         #[command(subcommand)]
         command: PolicyCommands,
+    },
+    /// List the Runs that need you, newest first
+    #[command(
+        about = "List the Runs that need you, newest first",
+        after_help = PS_AFTER_HELP
+    )]
+    Ps {
+        /// Only Runs carrying all these labels (key=value[,key=value...])
+        #[arg(long, value_name = "SELECTOR")]
+        selector: Option<String>,
+        /// List every Run inside the ended-Run window, not just the
+        /// exceptions
+        #[arg(long)]
+        all: bool,
+        /// Page size (default 50, at most 1000; 0 means the maximum)
+        #[arg(long, value_name = "N")]
+        limit: Option<u64>,
+        /// Continue after a previous page's cursor
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
+        /// Print the listing as one JSON document
+        #[arg(long)]
+        json: bool,
     },
     /// Serve a state directory as a long-running host
     #[command(
@@ -867,6 +921,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 json,
             } => cli::policy::delete(&name, dry_run, json),
         },
+        Some(Commands::Ps {
+            selector,
+            all,
+            limit,
+            cursor,
+            json,
+        }) => cli::ps::run(cli::ps::PsArgs {
+            selector,
+            all,
+            limit,
+            cursor,
+            json,
+        }),
         Some(Commands::Label { command }) => {
             let (verb, args, selector, dry_run, yes, json) = match command {
                 LabelCommands::Set {

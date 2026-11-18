@@ -1001,7 +1001,7 @@ impl Supervisor {
                     return Ok(None);
                 };
                 self.note_outbox_append(&append);
-                self.publish(EngineEvent::UsageUpdate(update.clone()));
+                self.publish(append.seq, EngineEvent::UsageUpdate(update.clone()));
                 self.apply_evaluation(registry, name, commit.evaluation);
                 Ok(Some(update))
             }
@@ -1174,7 +1174,10 @@ impl Supervisor {
         for committed in &evaluation.breaches {
             self.mirror_breach(registry, name, &committed.event);
             self.note_outbox_append(&committed.outbox);
-            self.publish(EngineEvent::BudgetBreach(committed.event.clone()));
+            self.publish(
+                committed.outbox.seq,
+                EngineEvent::BudgetBreach(committed.event.clone()),
+            );
         }
         // Story 21-2: the `breach` Anomalies those breaches raised, committed
         // after them.
@@ -1599,7 +1602,7 @@ impl Supervisor {
             Ok(append) => {
                 self.mirror_breach(registry, name, event);
                 self.note_outbox_append(&append);
-                self.publish(EngineEvent::BudgetBreach(event.clone()));
+                self.publish(append.seq, EngineEvent::BudgetBreach(event.clone()));
             }
             Err(e) => {
                 self.log_enforcement_diagnostic(

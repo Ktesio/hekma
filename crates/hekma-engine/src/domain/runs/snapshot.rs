@@ -102,6 +102,42 @@ impl RunSnapshot {
     }
 }
 
+/// What the published snapshot alone answers about an event's subject Run
+/// (story 21-5, the SSE Selector filter's lock-free fast path).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SubjectLabels {
+    /// The subject Run is in the snapshot: its CURRENT labels.
+    Found(Vec<Label>),
+    /// The event names no Run (`policy`, `breach_default_upgraded`).
+    NoSubject,
+    /// The event names a Run (or an instance) the snapshot does not hold —
+    /// an ended Run, or a transition with no open owner: the store answers.
+    NotInSnapshot,
+}
+
+/// The subject Run's labels as far as `snapshot` knows them: Run, usage
+/// and breach events by their run id, a transition by its instance's open
+/// process-owning Run.
+pub(crate) fn subject_labels(
+    snapshot: &RunSnapshot,
+    event: &crate::domain::EngineEvent,
+) -> SubjectLabels {
+    use crate::domain::EngineEvent;
+    let entry = match event {
+        EngineEvent::Run(event) => snapshot.run(&event.run_id),
+        EngineEvent::UsageUpdate(update) => snapshot.run(&update.event.run_id),
+        EngineEvent::BudgetBreach(breach) => snapshot.run(&RunId::from_wire(breach.run_id.clone())),
+        EngineEvent::Transition(transition) => snapshot.owner_of(&transition.instance),
+        EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => {
+            return SubjectLabels::NoSubject
+        }
+    };
+    match entry {
+        Some(entry) => SubjectLabels::Found(entry.labels.clone()),
+        None => SubjectLabels::NotInSnapshot,
+    }
+}
+
 /// Holds the current snapshot; only store-writer post-commit hooks publish.
 #[derive(Debug, Default)]
 pub(crate) struct SnapshotPublisher {

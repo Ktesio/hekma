@@ -91,7 +91,11 @@ use crate::ports::{
 /// see [`super::runs_sqlite`].
 /// v14 (story 21-9): `run_labels.origin`, each bound label's origin —
 /// see [`super::runs_sqlite`].
-pub(crate) const SCHEMA_VERSION: i64 = 15;
+/// v15 (story 21-3): Policies, the per-Run resolutions, and the FR-21
+/// upgrade marker — see [`super::runs_sqlite`].
+/// v16 (story 21-5): the Run listing's three partial indexes —
+/// see [`super::runs_sqlite`].
+pub(crate) const SCHEMA_VERSION: i64 = 16;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -722,6 +726,11 @@ fn migrate(
     // opens — see the registry's finish pass).
     if version < 15 {
         super::runs_sqlite::migrate_v15(conn, breach)?;
+    }
+    // Story 21-5: v16 adds the Run listing's three partial indexes (one
+    // crash-atomic step, additive DDL only).
+    if version < 16 {
+        super::runs_sqlite::migrate_v16(conn)?;
     }
     Ok(notes)
 }
