@@ -5343,4 +5343,92 @@ source = "self-reported"
         assert!(reg.breach_events(&name).unwrap().is_empty());
         assert_eq!(reg.transition_events(&name).unwrap().len(), 2);
     }
+
+    #[test]
+    fn the_legacy_reader_skips_blank_lines_and_ignores_an_unnamable_instance() {
+        use crate::domain::{TransitionCause, TransitionEvent};
+        let tmp = TempDir::new().unwrap();
+        let paths = EnginePaths::new(Some(tmp.path().to_path_buf())).unwrap();
+        let legacy = LegacyFiles { paths: &paths };
+        // A name that is not an instance name has no Agent Home to read.
+        let none = legacy.transitions("Not A Name");
+        assert!(none.records.is_empty() && none.notes.is_empty());
+        // Blank framing lines between records are skipped, not counted as
+        // unreadable.
+        let name = InstanceName::new("legacy").unwrap();
+        let logs = paths.agent_home(&name).join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let event = TransitionEvent::new(
+            "legacy",
+            LifecycleState::Registered,
+            LifecycleState::Starting,
+            TransitionCause::AdapterReady,
+            "2026-10-30T00:00:01Z",
+        );
+        let line = serde_json::to_string(&event).unwrap();
+        std::fs::write(
+            logs.join("instance.log"),
+            format!("\n{line}\n   \n{line}\n"),
+        )
+        .unwrap();
+        let read = legacy.transitions("legacy");
+        assert_eq!(read.records.len(), 2);
+        assert!(read.notes.is_empty(), "{:?}", read.notes);
+    }
+
+    #[test]
+    fn breach_events_read_past_one_page_in_commit_order() {
+        use crate::domain::{BreachScope, BudgetBreachEvent};
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let total = crate::ports::PAGE_MAX + 2;
+        reg.writer()
+            .call(move |ctx| {
+                for index in 0..total {
+                    ctx.store().append_breach(&BudgetBreachEvent::new(
+                        "demo",
+                        format!("run-{index}"),
+                        BreachScope::PerRun,
+                        100,
+                        120,
+                        BreachAction::Warn,
+                        "self-reported",
+                        "2026-10-30T00:00:03Z",
+                    ))?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let events = reg
+            .breach_events(&InstanceName::new("demo").unwrap())
+            .unwrap();
+        assert_eq!(events.len(), total, "every page is read");
+        assert_eq!(events[0].run_id, "run-0");
+        assert_eq!(events[total - 1].run_id, format!("run-{}", total - 1));
+    }
+
+    #[test]
+    fn an_unreadable_open_run_starts_the_run_snapshot_empty_with_a_note() {
+        // A corrupt Run row cannot be read into the published Run snapshot:
+        // the open still succeeds (graceful degradation), and a note says the
+        // snapshot starts empty and fills as Runs change.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        drop(Registry::open(Some(base.clone())).unwrap());
+        let db = EnginePaths::new(Some(base.clone())).unwrap().state_db();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO runs (run_id, control_depth, status, created_at, updated_at) \
+                 VALUES ('run_bad', 'wire', 'sideways', 't', 't');",
+            )
+            .unwrap();
+        let reg = Registry::open(Some(base)).unwrap();
+        let notes = reg.take_open_notes();
+        assert!(
+            notes.iter().any(|n| n.contains("published Run snapshot")
+                && n.contains("starts empty and fills as Runs change")),
+            "{notes:?}"
+        );
+    }
 }
