@@ -653,6 +653,87 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_agent_code_names_the_listing_and_a_host_failure_keeps_exit_one() {
+        let missing = map_run_code("instance-not-found", "no agent `ghost`".into());
+        assert!(missing.is::<AgentNotFound>());
+        assert!(
+            missing.to_string().contains("hekma agent list"),
+            "{missing}"
+        );
+        // A failure that is not a Run code (the host went away) is the host
+        // diagnostic, never a Run refusal.
+        let gone = routed_run(Err(RoutedError::Call(CallError::Unavailable(
+            "the local Service Host stopped answering".into(),
+        ))))
+        .unwrap_err();
+        assert!(gone.is::<crate::error::ServiceHostUnavailable>(), "{gone}");
+        assert!(gone.to_string().contains("stopped answering"), "{gone}");
+    }
+
+    fn sample_view() -> RunView {
+        RunView {
+            record: hekma_engine::RunRecord {
+                run_id: hekma_engine::RunId::from_wire("run_01JZ6Q9G3S8V2X7K4M1N5P0R2T"),
+                control_depth: hekma_engine::ControlDepth::Supervised,
+                wire_path: false,
+                status: hekma_engine::RunStatus::Active,
+                anomalies: Vec::new(),
+                parent_run_id: None,
+                instance: Some("worker".to_string()),
+                process_owner: true,
+                end_cause: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                ended_at: None,
+            },
+            labels: Vec::new(),
+            limits: RunLimits::default(),
+            policy: None,
+            usage: hekma_engine::RunUsage::default(),
+            open_children: 0,
+        }
+    }
+
+    #[test]
+    fn a_run_with_anomalies_and_a_dollar_cap_shows_both() {
+        let mut view = sample_view();
+        view.record.anomalies = vec![
+            hekma_engine::Anomaly::Breach,
+            hekma_engine::Anomaly::DepthFallback,
+        ];
+        view.limits = RunLimits {
+            token_per_run: Some(500),
+            dollar_per_run_micros: Some(hekma_engine::Micros(1_500_000)),
+            breach_action: Some(BreachAction::Warn),
+            ..Default::default()
+        };
+        let text = render_text(&view, "opened");
+        assert!(
+            text.contains("ANOMALIES    breach, depth-fallback"),
+            "{text}"
+        );
+        assert!(
+            text.contains("LIMITS       500 tokens per run, $1.50 per run (warn)"),
+            "{text}"
+        );
+        // A dollar cap alone still names the action, its figure rendered by
+        // the one currency module.
+        let cap = hekma_engine::Micros(250_000);
+        assert_eq!(
+            render_limits(&RunLimits {
+                token_per_run: None,
+                dollar_per_run_micros: Some(cap),
+                breach_action: None,
+                ..Default::default()
+            }),
+            format!("{} per run (warn)", hekma_engine::render_dollars_bare(cap))
+        );
+        // No anomaly is the dash.
+        let calm = render_text(&sample_view(), "");
+        assert!(calm.contains("ANOMALIES    —"), "{calm}");
+    }
+
+    #[test]
     fn run_errors_map_to_the_documented_exit_classes() {
         let not_found = map_run_error(RunError::NotFound {
             run_id: "run_X".into(),
