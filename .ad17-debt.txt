@@ -1,0 +1,3 @@
+# The AD-17 lock debt: bare `.lock()` sites left in
+# crates/hekma-engine/src/engine.rs, per symbol. Checked by
+# scripts/check_ad17_debt.py; it may only go down.

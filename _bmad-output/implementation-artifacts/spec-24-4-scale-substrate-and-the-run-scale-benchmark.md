@@ -210,4 +210,41 @@ Each is a public-contract or product choice; the recommendation is the spec's cu
   - **What the instrument shows:** the stuck send holds BOTH the registry and the supervisor lock for its 5 s bound. That is the cross-instance coupling Steps 3–4 split, and the test now pins it by site.
   - **Drift:** the spec's adversarial 25-instance fixture is narrowed to this two-instance pathological pair, the existing isolation test now instrumented. A 25-instance fleet with an armed Stop budget and a `--follow` reader needs the fixture work of Steps 2–4 and is recorded there.
   - **Not built:** Steps 2–4.
+- 2026-11-14 — **phase 4c (built): AD-18 Step 2** (stacked on 24-3 phase 9, #434).
+  - **The scopes:** `domain/bounded.rs`. `RegistryCell::critical()` takes the registry. `SupervisorCell::after(&RegistryGuard)` is the only ordered way to the supervisor, so the R→S order is enforced by the compiler; `after_recovering`/`critical_recovering` serve the best-effort `Drop`. `SupervisorCell::alone()` is the listed exception. `cell_scope` (and `cell_scope_recovering` for the credential reader) lock a small cell for one closure. All keep `#[track_caller]`, so Step 1's per-site stats still name the engine.rs line.
+  - **engine.rs:** all 157 lock sites are converted: 93 registry, 46 ordered supervisor, 1 more ordered by restructuring `binding_write`, 9 cells, and 2 recovering locks in `Drop`. No bare `.lock()` is left. Six supervisor-only reads take `alone()`: `with_diagnostics`, `has_live_capture`, `log_capture_mode`, `refresh_bypass_hosts`, and two test seams.
+  - **The ratchet:** `.ad17-debt.txt` lists those six by symbol (`Type::function`, never a line number). `scripts/check_ad17_debt.py` fails on a new site, on a second site in a listed function, and on a paid-down site still listed. Its `--self-test` mutation-tests each of those, plus symbol stability under line shifts. Both run in the CI docs job, and `scripts/test_automation.py` pins them.
+  - **Drift from the spec:**
+    - The spec named closure-shaped `critical()`/`cell_scope()` scopes. The big locks use guard-returning named scopes instead: converting 140 multi-statement sites into closures would rewrite every body for no gain, since `after(&guard)` already makes `&mut Supervisor` unobtainable without a live registry guard.
+    - The small cells do use closures.
+  - **Not built:** Steps 3 and 4.
+- 2026-11-14 — **phase 4d (built): AD-18 Step 3, first slice** (stacked on phase 4c, #435): the `remove` split, the slice the spec names as the wedge risk.
+  - **The split:** `Registry::remove` becomes `remove_row`, which runs under the gate (name validation, the running-guard, the row and its cascading credentials), plus the free `delete_home(&EnginePaths, &InstanceName)`. `Engine::remove` drops both guards before `delete_home`, using `EngineInner.paths` from Step 0. The public `Registry::remove` keeps its signature and composes the two.
+  - **The abort gate, measured:** `tests/lock_scopes.rs` removes an agent with a 4,000-file home under lock timing and asserts the registry's max hold is under half the remove's wall time. Mutation-checked: with the delete moved back under the lock, it fails, with the registry held 185.0 ms of a 185.1 ms remove. So the histogram shows the max gate hold falling.
+  - **Not built:**
+    - the `StoreGate` forwarding type;
+    - the other mixed DB+FS splits (`effective_config`, `register_with_adapter`, `set_config`, `resolve_secrets`, `write_effective_config_snapshot`). Each is a single-file read or write under the lock, not a recursive tree walk, so none is a wedge on the scale of `remove`;
+    - Step 4.
 
+- 2026-11-14 — **phase 4e (built): the lock debt paid to zero** (stacked on 24-2 phase 6, #439), the first `SupervisorShared`-shaped slice of Step 4.
+  - **Moved onto `EngineInner`:** the log-capture posture (fixed at open) and, for the test seam, the custody cache. `Engine::log_capture_mode` takes no lock; a test holds both engine locks on another thread and gets its answer in under a second.
+  - **Now ordered:** `refresh_bypass_hosts`, `with_diagnostics`, `has_live_capture` and the stop-fault test seam take the registry first and the supervisor through `after`. None runs with the registry already held, and each already waited behind any start, which holds both locks.
+  - **Removed:** `SupervisorCell::alone()`, so the supervisor is reachable only beside a registry guard. `.ad17-debt.txt` is empty, and the ratchet still fails CI on any bare `.lock()` or `alone()` that comes back.
+- 2026-11-14 — **phase 4f (built): the store gate, and Step 3 re-scoped** (stacked on phase 4e, #440).
+  - **The gate:** `RegistryCell::gate(|registry| …)` runs one registry call and releases the lock before returning; the guard never reaches the caller. All 19 single-call registry sites in `engine.rs` go through it. This replaces the spec's one-forwarding-method-per-Registry-method shape: the closure gives the same guarantee without 19 hand-written forwards.
+  - **Step 3 re-scoped:** the named single-file splits are **not taken**, per the plan's own abort rule ("stop and re-scope, record it here").
+    - `set_config`, `register_with_adapter`, `effective_config`, `resolve_secrets` and `write_effective_config_snapshot` each read, modify and write the Agent Home's `config.toml` or snapshot under the registry lock. That lock is what serializes two concurrent writers of the same file. Moving the file half off it would turn the lost-update window into a real race, unlike `remove`'s delete, which nothing else writes.
+    - These sites shrink only with a per-instance lock, which is Step 5, explicitly not taken.
+    - The histogram's falling max hold is shown for `remove` (phase 4d), which was the wedge the spec named.
+
+- 2026-11-14 — **phase 4g (built): AD-18 Step 4a, `SupervisorShared`** (stacked on phase 4f, #441).
+  - **The move:** the supervisor's shared, `&self`-shaped state moves into `SupervisorShared`, held as `Supervisor.shared`. That is the process backend, the restart schedule, the event bus, the usage source, the proxy's evaluation inbox, and the stable-run and pause-command windows. 103 accesses across the supervisor files now read `self.shared.…`.
+  - **Behaviour:** no change, and the supervisor mutex is unchanged.
+  - **Not built (Step 4b):**
+    - the per-instance `InstanceState`;
+    - receivers taking `(&SupervisorShared, &StoreGate, &mut InstanceState)`, so shared state can be handed out without the supervisor lock.
+    - The mutable configuration fields (diagnostics, proxy URL, env allowlist, log capture) stay on `Supervisor`, since they are set after construction.
+- 2026-11-14 — **phase 4h (built): AD-18 Step 4b, first half: `InstanceState`** (stacked on phase 4g, #442).
+  - **The move:** the per-instance state moves into `InstanceState`, held as `Supervisor.instances`. That is the held processes (`running`), the poll-error and requested-restart streaks, the last poll errors, and the liveness lookup-error memory. 190 accesses now read `self.instances.…`.
+  - **Behaviour:** no change, and the supervisor mutex is unchanged.
+  - **Still to do (Step 4b, second half):** the receiver change itself. Supervisor methods would take `(&SupervisorShared, &RegistryGuard, &mut InstanceState)` instead of `&mut self`, so one instance's slice can be handed out without the whole supervisor. Methods touch both halves freely today, so it is a per-method rewrite that needs review, not a mechanical pass.

@@ -169,24 +169,25 @@ impl Supervisor {
             #[cfg(test)]
             let injected = {
                 let pid = self
+                    .instances
                     .running
                     .get(&name)
-                    .map(|supervised| self.backend.pid(&supervised.handle));
+                    .map(|supervised| self.shared.backend.pid(&supervised.handle));
                 pid.and_then(|pid| self.injected_poll_fault(pid))
             };
             #[cfg(not(test))]
             let injected = None;
-            let stuck = match self.running.get_mut(&name) {
+            let stuck = match self.instances.running.get_mut(&name) {
                 Some(supervised) if supervised.stop_unconfirmed => {
                     let status = match injected {
                         Some(source) => Err(source),
-                        None => self.backend.poll(&mut supervised.handle),
+                        None => self.shared.backend.poll(&mut supervised.handle),
                     }
                     .map_err(|source| EngineError::Backend {
                         name: name.as_str().to_string(),
                         source,
                     })?;
-                    let log_capture = self.backend.log_capture(&supervised.handle);
+                    let log_capture = self.shared.backend.log_capture(&supervised.handle);
                     Some((status, log_capture))
                 }
                 _ => None,
@@ -207,8 +208,8 @@ impl Supervisor {
                 // 18-3 review: a stop ends any requested-recycle chain —
                 // drop its streak too (no leak; the next start paces
                 // from the base).
-                self.requested_restart_streaks.remove(&name);
-                self.running.remove(&name);
+                self.instances.requested_restart_streaks.remove(&name);
+                self.instances.running.remove(&name);
                 // Story 14-2: the settle retains an acp session id (see the
                 // ordinary stop path); identical to a clear otherwise.
                 registry
@@ -249,7 +250,7 @@ impl Supervisor {
         // confirmed death before then anyway). Benign commands never reach
         // here: only the explicit stop path does. A record whose process is
         // GONE adopts nothing — the honest no-process stop below stands.
-        if !self.running.contains_key(&name) {
+        if !self.instances.running.contains_key(&name) {
             let record = registry
                 .spawn_record(&name)
                 .ok()
@@ -260,14 +261,16 @@ impl Supervisor {
                 // otherwise by the child's fingerprint (an explicit stop
                 // acts even when another engine holds the Shim).
                 let adopted = match self
+                    .shared
                     .backend
                     .reacquire_shim(&record, registry.paths.state_base())
                     .0
                 {
                     proc::ShimReacquire::Held(handle) => Ok(Some(handle)),
-                    proc::ShimReacquire::Busy | proc::ShimReacquire::None => {
-                        self.backend.adopt(&record.fingerprint, record.detach)
-                    }
+                    proc::ShimReacquire::Busy | proc::ShimReacquire::None => self
+                        .shared
+                        .backend
+                        .adopt(&record.fingerprint, record.detach),
                 };
                 match adopted {
                     Ok(Some(handle)) => {
@@ -291,7 +294,7 @@ impl Supervisor {
                             .lookup(&name)
                             .map(|instance| crate::acp::is_acp_kind(&instance.kind))
                             .unwrap_or(false);
-                        self.running.insert(
+                        self.instances.running.insert(
                             name.clone(),
                             Supervised {
                                 handle,
@@ -405,6 +408,7 @@ impl Supervisor {
         // signal — the pre-18-4 silence stands.
         if instance.state == LifecycleState::Paused {
             let cooperatively_paused = self
+                .instances
                 .running
                 .get(&name)
                 .map(|supervised| supervised.cooperatively_paused)
@@ -417,7 +421,7 @@ impl Supervisor {
                     name.as_str(),
                 ));
             } else {
-                let resume_outcome = self.running.get_mut(&name).map(|supervised| {
+                let resume_outcome = self.instances.running.get_mut(&name).map(|supervised| {
                     // Story 20-1 review — the cfg(test) fault-injection
                     // seam extended to THIS direct backend.resume (the
                     // stop ladder's own pre-flight resume, NOT the
@@ -436,7 +440,7 @@ impl Supervisor {
                                 .to_string(),
                         });
                     }
-                    self.backend.resume(&mut supervised.handle)
+                    self.shared.backend.resume(&mut supervised.handle)
                 });
                 match resume_outcome {
                     Some(Ok(())) => {
@@ -494,7 +498,7 @@ impl Supervisor {
         // cross-restart stop now really terminates it.
         // Story 4-2, Task 4 (fix pass, review of #80): capture the
         // log_capture HERE, before `running.remove` drops the handle below
-        // — the default `self.transition(...)` lookup (via `self.running`)
+        // — the default `self.transition(...)` lookup (via `self.instances.running`)
         // would find NOTHING by the time the terminal transition below
         // runs. By the time `backend.stop` (below) returns, the process is
         // provably dead (its raw capture files can never grow again), and
@@ -503,9 +507,9 @@ impl Supervisor {
         // line still lands correctly ordered after it, regardless of
         // whether the process handle's `Drop` (which also signals the
         // background tailer thread to stop) has run yet.
-        let (outcome, log_capture) = match self.running.get_mut(&name) {
+        let (outcome, log_capture) = match self.instances.running.get_mut(&name) {
             Some(supervised) => {
-                let log_capture = self.backend.log_capture(&supervised.handle);
+                let log_capture = self.shared.backend.log_capture(&supervised.handle);
                 // Epic 20-1 coverage seam (cfg(test) only — the established
                 // fault-injection idiom, see the `stop_fault_pids` field
                 // docs): an armed fault ALSO fronts the LADDER's windowed
@@ -515,14 +519,14 @@ impl Supervisor {
                 // arms pin exactly that scenario; production is unchanged).
                 #[cfg(test)]
                 let raw_stop = {
-                    let pid = self.backend.pid(&supervised.handle);
+                    let pid = self.shared.backend.pid(&supervised.handle);
                     match Self::injected_zero_stop(&self.stop_fault_pids, pid) {
                         Some(faulted) => faulted,
-                        None => self.backend.stop(&mut supervised.handle, window),
+                        None => self.shared.backend.stop(&mut supervised.handle, window),
                     }
                 };
                 #[cfg(not(test))]
-                let raw_stop = self.backend.stop(&mut supervised.handle, window);
+                let raw_stop = self.shared.backend.stop(&mut supervised.handle, window);
                 let outcome = raw_stop.map_err(|source| match source {
                     // Fix pass (review of #80 follow-up — the CRITICAL
                     // finding): mark the handle so a RETRY `stop` (or the
@@ -532,7 +536,7 @@ impl Supervisor {
                     // bounded SIGTERM/SIGKILL/confirm sequence (see
                     // `stop_inner`'s retry-branch docs above and
                     // `poll_once`'s docs). This `?` skips
-                    // `self.running.remove` below, so the handle is
+                    // `self.instances.running.remove` below, so the handle is
                     // RETAINED, never silently dropped — the instance
                     // stays `stopping` (the terminal transition below is
                     // never reached), an honest, non-terminal state.
@@ -554,7 +558,7 @@ impl Supervisor {
         };
         // AI-63 follow-on (billing under-count at STOP, owner-approved): a FINAL
         // TERMINAL rescue drain AFTER `backend.stop` has CONFIRMED the process
-        // dead and BEFORE `self.running.remove` below drops the handle + cursor.
+        // dead and BEFORE `self.instances.running.remove` below drops the handle + cursor.
         //
         // The pre-kill drain (above, before `backend.stop`) runs while the agent is
         // still ALIVE, so a usage line the agent flushes in the window between that
@@ -573,8 +577,8 @@ impl Supervisor {
         // advanced `usage_cursor` to what it consumed, so this pass ingests ONLY
         // bytes that arrived AFTER it (the two drains are disjoint by cursor; the DB
         // dedup is a backstop, not the primary guard). The `Supervised` entry MUST
-        // still be in `self.running` for its cursor/run_id/metering_source to be
-        // read — hence strictly BEFORE `self.running.remove`. This mirrors the crash
+        // still be in `self.instances.running` for its cursor/run_id/metering_source to be
+        // read — hence strictly BEFORE `self.instances.running.remove`. This mirrors the crash
         // reaper's proven drain-AFTER-observed-exit (see `poll_once`). Best-effort,
         // like the pre-kill drain — a drain hiccup never blocks the stop. The acp
         // stderr sentinel channel (story 14-3, T3) rides the same rescue: its
@@ -596,8 +600,8 @@ impl Supervisor {
         self.clear_poll_error_streak(&name);
         // 18-3 review: a stop ends any requested-recycle chain — drop its
         // streak too (no leak; the next start paces from the base).
-        self.requested_restart_streaks.remove(&name);
-        self.running.remove(&name);
+        self.instances.requested_restart_streaks.remove(&name);
+        self.instances.running.remove(&name);
 
         // Settle the write-ahead spawn record (AD-5): a cleanly-stopped instance
         // must NOT be later adopted or reconciled-to-failed as an orphan. Settled
@@ -865,7 +869,7 @@ impl Supervisor {
             // otherwise (the durable state leads, exactly like stop).
             SupportLevel::Guaranteed => {
                 self.ensure_log_dir(registry, &name)?;
-                let has_handle = self.running.contains_key(&name);
+                let has_handle = self.instances.running.contains_key(&name);
                 let cause = match (cause_override.clone(), has_handle) {
                     // The handle is held: a story-3-2 budget pause overrides the
                     // cause with BudgetExceeded; a plain command keeps its plain
@@ -1062,7 +1066,7 @@ impl Supervisor {
         let outcome = run_bounded_command(
             &registry.agent_home(name),
             &launch,
-            self.pause_command_cap,
+            self.shared.pause_command_cap,
             BOUNDED_COMMAND_POLL,
         );
         match outcome {
@@ -1089,7 +1093,7 @@ impl Supervisor {
                     detail: format!(
                         "the command outlived its {}s standalone bound and was killed; \
                          the lifecycle change was not applied",
-                        self.pause_command_cap.as_secs(),
+                        self.shared.pause_command_cap.as_secs(),
                     ),
                 });
             }
@@ -1126,7 +1130,7 @@ impl Supervisor {
         }
         match command {
             LifecycleCommand::Pause => {
-                if let Some(supervised) = self.running.get_mut(name) {
+                if let Some(supervised) = self.instances.running.get_mut(name) {
                     supervised.cooperatively_paused = true;
                 }
             }
@@ -1168,7 +1172,7 @@ impl Supervisor {
     /// Best-effort: no handle held → nothing to do (an adopted/no-handle
     /// resume has no in-memory state at all).
     fn note_committed_resume_edge(&mut self, name: &InstanceName) {
-        if let Some(supervised) = self.running.get_mut(name) {
+        if let Some(supervised) = self.instances.running.get_mut(name) {
             supervised.liveness_failing_since = None;
             supervised.running_since = std::time::Instant::now();
             supervised.cooperatively_paused = false;
@@ -1176,7 +1180,7 @@ impl Supervisor {
     }
 
     /// Signal the running process for a GUARANTEED pause/resume, via the in-memory
-    /// handle map (same `self.running.get_mut(&name)` pattern as `stop`).
+    /// handle map (same `self.instances.running.get_mut(&name)` pattern as `stop`).
     ///
     /// Cross-lifetime honesty (AD-5, story 1-6: adoption re-holds handles): with
     /// orphan adoption, a still-live process started by a PRIOR engine is
@@ -1197,7 +1201,7 @@ impl Supervisor {
         name: &InstanceName,
         command: LifecycleCommand,
     ) -> Result<(), EngineError> {
-        let Some(supervised) = self.running.get_mut(name) else {
+        let Some(supervised) = self.instances.running.get_mut(name) else {
             return Ok(());
         };
         // AI-9 (loop 2) wiring seam (cfg(test)): the armed instance's signal
@@ -1220,8 +1224,8 @@ impl Supervisor {
             });
         }
         let result = match command {
-            LifecycleCommand::Pause => self.backend.pause(&mut supervised.handle),
-            _ => self.backend.resume(&mut supervised.handle),
+            LifecycleCommand::Pause => self.shared.backend.pause(&mut supervised.handle),
+            _ => self.shared.backend.resume(&mut supervised.handle),
         };
         result.map_err(|source| EngineError::Backend {
             name: name.as_str().to_string(),
@@ -1240,7 +1244,7 @@ impl Supervisor {
     /// to run `resume`. This pass closes that: for every held handle whose
     /// spawn record is DETACHED and whose row reads `paused` for an
     /// OPERATOR pause, RESUME the child BEFORE the handle is released (the
-    /// caller runs this at engine close, while `self.running` still holds
+    /// caller runs this at engine close, while `self.instances.running` still holds
     /// the handles) and record the honest `paused → running` edge with the
     /// [`TransitionCause::DetachedResumed`] cause — never a plain `resume`
     /// command, which would claim an operator action that never happened.
@@ -1276,6 +1280,7 @@ impl Supervisor {
         // reads degrade to "not a candidate" (an unreadable record/state never
         // blocks teardown — the handle then simply drops as before).
         let candidates: Vec<InstanceName> = self
+            .instances
             .running
             .keys()
             .filter(|name| {
@@ -1295,7 +1300,7 @@ impl Supervisor {
         // Pass 2: classify, probe, then resume-or-freeze-or-reconcile, one
         // instance at a time.
         for name in candidates {
-            let Some(supervised) = self.running.get_mut(&name) else {
+            let Some(supervised) = self.instances.running.get_mut(&name) else {
                 continue;
             };
             // REVIEW ROUND 1, the ALREADY-DEAD probe: the row may read
@@ -1307,7 +1312,9 @@ impl Supervisor {
             // degrades to the resume attempt below (a single un-pollable
             // read is not crash evidence — that is poll_once's corroboration
             // discipline, AI-12 — and teardown must not invent a crash).
-            if let Ok(ProcessStatus::Exited { code }) = self.backend.poll(&mut supervised.handle) {
+            if let Ok(ProcessStatus::Exited { code }) =
+                self.shared.backend.poll(&mut supervised.handle)
+            {
                 // AI-13: read the adopted flag BEFORE the reconcile — a
                 // code-less `None` has the same TWO shapes the reaper draws
                 // (an adopted handle's code is unrecoverable by structure;
@@ -1370,7 +1377,8 @@ impl Supervisor {
                     },
                 })
             } else {
-                self.backend
+                self.shared
+                    .backend
                     .resume(&mut supervised.handle)
                     .map_err(|source| EngineError::Backend {
                         name: name.as_str().to_string(),
@@ -1379,6 +1387,7 @@ impl Supervisor {
             };
             #[cfg(not(test))]
             let resume = self
+                .shared
                 .backend
                 .resume(&mut supervised.handle)
                 .map_err(|source| EngineError::Backend {

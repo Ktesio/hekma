@@ -16,6 +16,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 python3 scripts/check_docs.py
+python3 scripts/check_ad17_debt.py
 python3 scripts/generate_release_docs.py v0.0.0 --output-dir target/release-docs-test
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
 ```
