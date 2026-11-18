@@ -6395,7 +6395,9 @@ mod tests {
         struct Shared(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Shared {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
+                crate::domain::bounded::cell_scope(&self.0, "test capture", |captured| {
+                    captured.extend_from_slice(buf)
+                });
                 Ok(buf.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
@@ -6425,7 +6427,10 @@ mod tests {
         let shared = Shared(Arc::new(std::sync::Mutex::new(Vec::new())));
         let sink: crate::DiagnosticSink = Arc::new(std::sync::Mutex::new(Box::new(shared.clone())));
         let engine = Engine::open_with_diagnostics(Some(tmp.path().to_path_buf()), sink).unwrap();
-        let text = String::from_utf8(shared.0.lock().unwrap().clone()).unwrap();
+        let captured = crate::domain::bounded::cell_scope(&shared.0, "test capture", |captured| {
+            captured.clone()
+        });
+        let text = String::from_utf8(captured).unwrap();
         assert!(
             text.contains("[hekma] ") && text.contains("skipped 1 unreadable line(s)"),
             "{text}"
