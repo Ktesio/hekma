@@ -3638,6 +3638,116 @@ fn an_auto_started_host_leaves_when_its_state_root_disappears() {
     );
 }
 
+#[test]
+fn a_drain_body_that_is_not_json_is_a_bad_request_and_an_empty_object_means_the_manifest_tier() {
+    // The body is parsed BEFORE the engine is asked anything: a malformed
+    // body is a rejected REQUEST naming the expected shape, while `{}` (no
+    // `timeout_ms`) is the manifest tier and reaches the engine — which
+    // answers for the unknown instance.
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let drain = format!("http://{}/v0/instances/ghost/drain", server.addr);
+
+    let mut response = client
+        .post(&drain)
+        .header("Authorization", &auth)
+        .header("Content-Type", "application/json")
+        .send("timeout_ms=1500")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = json_body(&mut response);
+    assert_eq!(json["error"]["kind"], "invalid_body");
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("the drain body must be a JSON object like")
+            && message.contains("no body at all for the manifest tier"),
+        "the refusal names both accepted shapes: {message}"
+    );
+
+    let mut response = client
+        .post(&drain)
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({}))
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "an empty object passes the body rule and the engine answers for the instance"
+    );
+    assert_eq!(json_body(&mut response)["error"]["kind"], "not_found");
+
+    server.stop().unwrap();
+}
+
+#[test]
+fn a_memory_attach_whose_read_back_fails_still_answers_ok_and_names_the_failure() {
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        // The manifest fake agent is the POSIX shape (see the lifecycle test).
+        return;
+    }
+    // The attach commits without reading the adapter's manifest; the
+    // read-back does read it (does the config mapping target the memory
+    // key?). With the manifest gone, the attach stands and the answer
+    // carries the read-back failure instead of a fabricated status.
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let manifest = registered_fake_agent(&base, "orphan");
+    drop(manifest);
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let mut response = client
+        .put(format!("http://{}/v0/instances/orphan/memory", server.addr))
+        .header("Authorization", format!("Bearer {BEARER_VALUE}"))
+        .send_json(serde_json::json!({"kind": "filesystem"}))
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["instance"], "orphan");
+    assert!(
+        Path::new(json["dir"].as_str().unwrap()).is_dir(),
+        "the attach committed and made its directory: {json}"
+    );
+    assert!(
+        json["kind"].is_null() && json["guarantee"].is_null() && json["declared"].is_null(),
+        "no status is invented when the read-back failed: {json}"
+    );
+    assert!(
+        !json["readback_error"].as_str().unwrap_or("").is_empty(),
+        "the read-back failure is named: {json}"
+    );
+
+    server.stop().unwrap();
+}
+
+#[test]
+fn a_child_run_under_an_unknown_parent_run_is_refused_by_the_engine_not_the_body_rule() {
+    // `parent_run_id` alone is a well-formed parent: the route hands it to
+    // the engine, which refuses the Run id it does not know.
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
+    let client = client();
+    let mut response = client
+        .post(format!("http://{}/v0/runs", server.addr))
+        .header("Authorization", format!("Bearer {BEARER_VALUE}"))
+        .send_json(serde_json::json!({"parent_run_id": "run_ghost"}))
+        .unwrap();
+    let status = response.status();
+    let json = json_body(&mut response);
+    assert_ne!(
+        json["error"]["kind"], "invalid_body",
+        "a single parent passes the body rule: {json}"
+    );
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+    assert_eq!(json["error"]["kind"], "not_found", "{json}");
+
+    server.stop().unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Story 21-3: the /v0/policies routes — CRUD, the reserved default, the
 // matched/fallback counts, and the typed refusals.
