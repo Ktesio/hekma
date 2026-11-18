@@ -573,6 +573,158 @@ fn the_v14_step_records_config_as_the_origin_of_every_bound_label() {
 }
 
 #[test]
+fn an_instance_less_run_round_trips_and_an_unnamable_instance_is_a_corrupt_row() {
+    let (_tmp, store) = store();
+    let mut free = record("run_free", None, "a", false);
+    free.instance = None;
+    insert(&store, free, vec![], RunLimits::default());
+    let read = store
+        .run_record(&RunId::from_wire("run_free"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.instance, None, "a Run need not belong to an instance");
+
+    let mut bad = record("run_bad", None, "a", false);
+    bad.instance = Some("Not A Name".to_string());
+    match store.insert_run(&NewRun {
+        record: bad,
+        labels: vec![],
+        limits: RunLimits::default(),
+        identity: None,
+    }) {
+        Err(StoreError::CorruptRow { name, detail }) => {
+            assert_eq!(name, "Not A Name");
+            assert!(
+                detail.contains("invalid instance name on a Run"),
+                "{detail}"
+            );
+        }
+        other => panic!("expected CorruptRow, got {other:?}"),
+    }
+    assert!(store
+        .run_record(&RunId::from_wire("run_bad"))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_run_column_of_the_wrong_storage_type_is_a_backend_error_not_a_vocabulary_refusal() {
+    // An unknown depth/status word is a typed CorruptRow; a column whose
+    // stored value cannot be read as its type at all is the backend's own
+    // error, passed through rather than relabelled.
+    let (_tmp, store) = store();
+    store
+        .conn()
+        .execute_batch(
+            "INSERT INTO runs (run_id, control_depth, wire_path, status, created_at, \
+             updated_at) VALUES ('typed', 'wire', 'not a number', 'active', 't', 't');",
+        )
+        .unwrap();
+    match store.run_record(&RunId::from_wire("typed")) {
+        Err(StoreError::Backend(detail)) => assert!(!detail.is_empty()),
+        other => panic!("expected a backend error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_bound_label_row_without_an_origin_reads_as_configuration() {
+    // Bound rows written before origins existed carry NULL: configuration
+    // was the only bound source then, so that is what they read as.
+    let (_tmp, store) = store();
+    insert(
+        &store,
+        record("run_old", None, "a", true),
+        vec![Label::bound("team", "core")],
+        RunLimits::default(),
+    );
+    store
+        .conn()
+        .execute_batch("UPDATE run_labels SET origin = NULL WHERE run_id = 'run_old';")
+        .unwrap();
+    assert_eq!(
+        store.run_labels(&RunId::from_wire("run_old")).unwrap(),
+        vec![Label::bound("team", "core")]
+    );
+}
+
+#[test]
+fn a_parent_cycle_is_cut_at_twice_the_nesting_limit() {
+    // The engine never re-parents, so a cycle cannot arise through it; a
+    // hand-edited one must still end the upward walk instead of looping.
+    let (_tmp, store) = store();
+    insert(
+        &store,
+        record("run_x", None, "a", false),
+        vec![],
+        RunLimits::default(),
+    );
+    insert(
+        &store,
+        record("run_y", Some("run_x"), "a", false),
+        vec![],
+        RunLimits::default(),
+    );
+    store
+        .conn()
+        .execute_batch("UPDATE runs SET parent_run_id = 'run_y' WHERE run_id = 'run_x';")
+        .unwrap();
+    let chain = store.run_chain(&RunId::from_wire("run_x")).unwrap();
+    assert_eq!(chain.len(), 2 * crate::domain::MAX_RUN_NESTING);
+    assert_eq!(chain[0].run_id, RunId::from_wire("run_x"));
+    assert_eq!(chain[1].run_id, RunId::from_wire("run_y"));
+}
+
+fn user_version(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn a_v13_step_that_fails_rolls_back_and_leaves_the_database_at_v12() {
+    let tmp = TempDir::new().unwrap();
+    let conn = crate::store::create_v11_for_test(&tmp.path().join("state.db"));
+    migrate_v12(&conn, &NoLegacy).unwrap();
+    // A stray table under the step's own name makes its DDL fail.
+    conn.execute_batch("CREATE TABLE runs (stray INTEGER);")
+        .unwrap();
+    assert!(matches!(migrate_v13(&conn), Err(StoreError::Backend(_))));
+    assert_eq!(user_version(&conn), 12, "nothing of the v13 step committed");
+    assert!(
+        conn.is_autocommit(),
+        "the failed step's transaction is rolled back, not left open"
+    );
+}
+
+#[test]
+fn a_v14_step_that_fails_rolls_back_and_leaves_the_database_at_v13() {
+    let tmp = TempDir::new().unwrap();
+    let conn = crate::store::create_v11_for_test(&tmp.path().join("state.db"));
+    migrate_v12(&conn, &NoLegacy).unwrap();
+    migrate_v13(&conn).unwrap();
+    // The column the step adds already exists, so its DDL fails.
+    conn.execute_batch("ALTER TABLE run_labels ADD COLUMN origin TEXT;")
+        .unwrap();
+    assert!(matches!(migrate_v14(&conn), Err(StoreError::Backend(_))));
+    assert_eq!(user_version(&conn), 13, "nothing of the v14 step committed");
+    assert!(conn.is_autocommit());
+}
+
+#[test]
+fn a_v12_step_that_fails_rolls_back_and_leaves_the_database_at_v11() {
+    let tmp = TempDir::new().unwrap();
+    let conn = crate::store::create_v11_for_test(&tmp.path().join("state.db"));
+    // A stray table under one of the step's own names makes its DDL fail.
+    conn.execute_batch("CREATE TABLE transition_events (stray INTEGER);")
+        .unwrap();
+    assert!(matches!(
+        migrate_v12(&conn, &NoLegacy),
+        Err(StoreError::Backend(_))
+    ));
+    assert_eq!(user_version(&conn), 11, "nothing of the v12 step committed");
+    assert!(conn.is_autocommit());
+}
+
+#[test]
 fn corrupt_policy_rows_are_typed_and_fail_the_read_closed() {
     // Money code never silently drops a standing limit: every corrupt
     // Policy row shape answers a typed CorruptRow, and the whole `policies`

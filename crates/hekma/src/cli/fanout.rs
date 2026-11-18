@@ -551,10 +551,22 @@ pub(crate) fn reclassed(
     message: String,
 ) -> Box<dyn std::error::Error> {
     use crate::error::{
-        AgentCapabilityUnsupported, AgentInteractionTimedOut, AgentStore, RunInvalidState,
-        RunNotFound,
+        AgentCapabilityUnsupported, AgentInteractionTimedOut, AgentNotFound, AgentStore,
+        RunInvalidState, RunNotFound, ServiceHostRefused, ServiceHostUnavailable,
     };
     use crate::exit_code::ExitCode;
+    // The host-level classes and the agent-not-found class share an exit
+    // code with a broader family; keep their own class so the summary still
+    // names a silent or refusing Service Host.
+    if diagnostic.is::<ServiceHostRefused>() {
+        return ServiceHostRefused { message }.into();
+    }
+    if diagnostic.is::<ServiceHostUnavailable>() {
+        return ServiceHostUnavailable { message }.into();
+    }
+    if diagnostic.is::<AgentNotFound>() {
+        return AgentNotFound { message }.into();
+    }
     match crate::exit_code::classify(&*diagnostic) {
         ExitCode::NotFound => RunNotFound { message }.into(),
         ExitCode::Usage => RunInvalid { message }.into(),
