@@ -1207,7 +1207,9 @@ fn limit_change(patch: &dto::RunLimitsPatch) -> ApiResult<hekma_engine::RunLimit
         .map(str::parse::<BreachAction>)
         .transpose()
         .map_err(|err| ApiError::invalid_body(format!("breach_action: {err}")))?;
-    let mut clear = Vec::with_capacity(patch.clear.len());
+    // Sized by what it can hold (five distinct fields), never by the
+    // request's list length, which a caller controls.
+    let mut clear = Vec::new();
     for raw in &patch.clear {
         let field = hekma_engine::RunLimitField::from_wire(raw).ok_or_else(|| {
             ApiError::invalid_body(format!(
