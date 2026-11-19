@@ -659,7 +659,7 @@ subject Run currently carries every term (bound or caller labels alike)
 are delivered: Run events by their run id, usage and breach events by
 theirs, a transition by its instance's process-owning Run (the newest
 one, so the `stopped` transition that follows a Run's end still matches). Events
-that name no Run (`policy`, `breach-default-upgraded`) are delivered only
+that name no Run (`policy`, `breach_default_upgraded`) are delivered only
 without a Selector. The filter reads the subject Run's CURRENT labels —
 the in-memory snapshot first, one read-only store read when the Run has
 ended (ended Runs keep matching until compaction). Honest limitation, by

@@ -256,9 +256,11 @@ integer losslessly — in JavaScript, use a BigInt-aware JSON parser (or
 `JSON.parse` with a reviver over the numeric fields). The fields that carry
 extremes:
 
-- `input_tokens` / `output_tokens` — `u64::MAX` in the saturation cases
-  (`derivation-saturation-max-tokens-max-rate`,
-  `derivation-saturation-cached-derivation-saturates`).
+- `input_tokens` / `output_tokens` / `cached_tokens` — `u64::MAX` in the
+  saturation cases (`derivation-saturation-max-tokens-max-rate`,
+  `derivation-saturation-cached-derivation-saturates`). `cached_tokens` is
+  present only on `cost-micros-with-cached` derivation cases (the cached
+  subset of `input_tokens`) and is absent from the others.
 - `rate.input_micros_per_1m` / `rate.output_micros_per_1m` /
   `rate.cached_micros_per_1m` — `u64::MAX` in the same cases.
 - `expected_micros` — `i64::MAX` (the saturation pin itself).

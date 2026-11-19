@@ -94,11 +94,12 @@ so a cap set before `start` is enforced from the first event.
 Agents that speak the Agent Client Protocol — most coding agents — can skip
 the manifest: register with `--kind acp` and set `acp.command` (and optionally
 `acp.args`) instead. Lifecycle, budgets, and usage work the same way — with
-ONE CI-shaped exception: `start --detach` is refused for `acp` instances
-(exit 5 — the protocol transport lives in the engine that spawned it, the
-local Service Host the CLI starts, and would die with it), so an ACP agent in
-CI starts without `--detach` — it still outlives the step's command, under the
-host — or runs behind a manifest adapter that detaches cleanly.
+ONE CI-shaped exception: `start --detach` does not work for `acp` instances.
+The protocol transport needs the child's stdin and stdout pipes, which a
+detached start does not hold, so the launch fails (exit 1), the instance lands
+in `failed`, and stderr says no stdin pipe is held for the child. So an ACP
+agent in CI starts without `--detach` — it still outlives the step's command,
+under the host — or runs behind a manifest adapter that detaches cleanly.
 
 Optionally set prices so the ledger derives dollars:
 
@@ -216,9 +217,9 @@ set -e
 case $code in
   0) echo "agent started (detached)" ;;
   2|3) echo "invocation or name error (exit $code) — fix the workflow" >&2; exit 1 ;;
-  4|5) echo "state or capability refusal (exit $code) — see stderr (note: --detach is refused for --kind acp)" >&2; exit 1 ;;
+  4|5) echo "state or capability refusal (exit $code) — see stderr" >&2; exit 1 ;;
   6) echo "a bounded operation timed out (exit 6)" >&2; exit 1 ;;
-  *) echo "unexpected failure (exit $code)" >&2; exit 1 ;;
+  *) echo "unexpected failure (exit $code; 1 includes a failed launch, e.g. --detach with --kind acp)" >&2; exit 1 ;;
 esac
 ```
 
