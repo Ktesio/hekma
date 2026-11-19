@@ -2571,8 +2571,8 @@ impl NoRatchetReason {
 ///
 /// | family (gate) | ε | justification |
 /// |---|---|---|
-/// | read p99 (`read_p99_lt_1s`) | 0.5 ms | sub-3 ms p99s jitter by scheduler quanta, not percents; 0.5 ms is ~20% of the committed 2.52 ms seed and 0.05% of the 1 s budget |
-/// | CPU (`cpu_per_instance_le_2pct`) | 0.05 pct-pts | sysinfo's two-refresh CPU% resolution over an 11-sample window; 1/40 of the strict 2% budget |
+/// | read p99 (`read_p99_lt_1s`) | 1.0 ms | sub-3 ms p99s jitter by scheduler quanta, not percents; shared CI runners measured a 1.08 ms baseline at 1.45–1.80 ms with no code change (2026-11-18), so 0.5 ms failed unchanged code; 1.0 ms is 0.1% of the 1 s budget |
+/// | CPU (`cpu_per_instance_le_2pct`) | 0.25 pct-pts | sysinfo's two-refresh CPU% resolution over an 11-sample window, plus co-tenant noise: main's own pushes measured a 0.073% baseline at 0.073–0.27% (2026-11-18), so 0.05 pts failed unchanged code; 1/8 of the strict 2% budget |
 /// | RSS mean + spike (both `rss_*` gates) | 0.25 MiB | page-granular retention moves in fractions of a MiB; 1/200 of the 50 MiB budget |
 /// | subscriber CPU Δ | 0.05 pct-pts | a difference of two single-window means, each with the 0.05-pts resolution above; 1/5 of the 0.25-pt budget |
 /// | subscriber RSS Δ | 0.25 MiB | same page-granularity argument; 1/8 of the 2 MiB budget |
@@ -2582,10 +2582,10 @@ impl NoRatchetReason {
 /// handed) floors at 0.0 — the strict pure-×1.15 rule, never a guess.
 fn ratchet_noise_floor(gate: &str) -> f64 {
     match gate {
-        "read_p99_lt_1s" | "serve_read_p99_lt_1s" => 0.5,
-        "cpu_per_instance_le_2pct"
-        | "subscriber_cpu_delta_le_budget"
-        | "serve_cpu_per_instance_le_2pct" => 0.05,
+        "read_p99_lt_1s" => 1.0,
+        "serve_read_p99_lt_1s" => 0.5,
+        "cpu_per_instance_le_2pct" => 0.25,
+        "subscriber_cpu_delta_le_budget" | "serve_cpu_per_instance_le_2pct" => 0.05,
         "rss_per_instance_le_50mib"
         | "rss_max_spike_le_2x_budget"
         | "subscriber_rss_delta_le_budget"
@@ -5430,7 +5430,10 @@ mod tests {
         let entry = &trend.entries[0];
         assert!((entry.delta - (-1.0)).abs() < 1e-9);
         assert!((entry.delta_pct.unwrap() - (-20.0)).abs() < 1e-9);
-        assert!((entry.limit.unwrap() - 5.0 * RATCHET_TOLERANCE).abs() < 1e-9);
+        assert!(
+            (entry.limit.unwrap() - 6.0).abs() < 1e-9,
+            "a 5 ms read baseline limits at baseline + the 1 ms floor"
+        );
         assert_eq!(trend.verdict_str(), "pass");
     }
 
@@ -5458,14 +5461,14 @@ mod tests {
 
     #[test]
     fn ratchet_beyond_tolerance_fails_naming_all_four_figures() {
-        // +20% on every metric: the four ×1.15-dominated metrics (read p99,
-        // RSS mean/max, CPU — baselines well above their floors) go Beyond
-        // and the gated run fails, while the three subscriber deltas land
-        // INSIDE their noise floors (0.1→limit 0.15, 0.5→0.75, 10→35 — the
-        // floor engaging, exactly its purpose). Each entry carries the
-        // baseline, the current, the delta, and the tolerance's limit (the
-        // four figures every verdict must name).
-        let drifted: [f64; 7] = SEVEN.map(|value| value * 1.20);
+        // +30% on every metric: the four gated metrics (read p99 past its
+        // 6.0 floored limit, RSS mean/max past ×1.15, CPU past its 1.25
+        // floored limit) go Beyond and the gated run fails, while the three
+        // subscriber deltas land INSIDE their noise floors (0.1→limit 0.15,
+        // 0.5→0.75, 10→35 — the floor engaging, exactly its purpose). Each
+        // entry carries the baseline, the current, the delta, and the
+        // tolerance's limit (the four figures every verdict must name).
+        let drifted: [f64; 7] = SEVEN.map(|value| value * 1.30);
         let trend = trend_for(&baseline_json_with(&SEVEN), &drifted, true).unwrap();
         assert!(!trend.passed && trend.fails_run(), "{trend:?}");
         assert_eq!(trend.verdict_str(), "fail");
@@ -5487,17 +5490,17 @@ mod tests {
         }
         let entry = &trend.entries[0];
         assert!((entry.baseline - 5.0).abs() < 1e-9);
-        assert!((entry.current - 6.0).abs() < 1e-9);
-        assert!((entry.delta - 1.0).abs() < 1e-9);
+        assert!((entry.current - 6.5).abs() < 1e-9);
+        assert!((entry.delta - 1.5).abs() < 1e-9);
         assert!(
-            (entry.limit.unwrap() - 5.75).abs() < 1e-9,
+            (entry.limit.unwrap() - 6.0).abs() < 1e-9,
             "limit = max(baseline x 1.15, baseline + floor)"
         );
-        assert!((entry.delta_pct.unwrap() - 20.0).abs() < 1e-9);
+        assert!((entry.delta_pct.unwrap() - 30.0).abs() < 1e-9);
         // One drifted metric alone fails the whole ratchet (the additive
         // gate is per-metric, like the absolute gates).
         let mut one = SEVEN;
-        one[3] *= 1.20;
+        one[3] *= 1.30;
         let trend = trend_for(&baseline_json_with(&SEVEN), &one, true).unwrap();
         assert!(!trend.passed, "{trend:?}");
         assert_eq!(trend.entries[3].verdict, RatchetVerdict::Beyond);
@@ -5537,12 +5540,12 @@ mod tests {
 
     #[test]
     fn non_gate_platforms_report_without_gating() {
-        // The same +20% drift on a NON-gate platform (local/other-OS run):
-        // the trend names every Beyond verdict (the four ×1.15-dominated
-        // metrics; the three subscriber deltas ride their noise floors),
+        // The same +30% drift on a NON-gate platform (local/other-OS run):
+        // the trend names every Beyond verdict (the four gated metrics;
+        // the three subscriber deltas ride their noise floors),
         // but the run does not gate — verdict_str is report-only and
         // fails_run is false.
-        let drifted: [f64; 7] = SEVEN.map(|value| value * 1.20);
+        let drifted: [f64; 7] = SEVEN.map(|value| value * 1.30);
         let trend = trend_for(&baseline_json_with(&SEVEN), &drifted, false).unwrap();
         assert!(!trend.passed, "the math verdict still names the drift");
         assert!(
@@ -5677,8 +5680,8 @@ mod tests {
         // The per-family ε table itself (a change is a documented
         // re-ratification — the table's doc comment carries each value's
         // justification).
-        assert_eq!(ratchet_noise_floor("read_p99_lt_1s"), 0.5);
-        assert_eq!(ratchet_noise_floor("cpu_per_instance_le_2pct"), 0.05);
+        assert_eq!(ratchet_noise_floor("read_p99_lt_1s"), 1.0);
+        assert_eq!(ratchet_noise_floor("cpu_per_instance_le_2pct"), 0.25);
         assert_eq!(ratchet_noise_floor("rss_per_instance_le_50mib"), 0.25);
         assert_eq!(ratchet_noise_floor("rss_max_spike_le_2x_budget"), 0.25);
         assert_eq!(ratchet_noise_floor("subscriber_cpu_delta_le_budget"), 0.05);
@@ -5705,16 +5708,16 @@ mod tests {
         // Exactly at the floored limit is within (the inclusive boundary).
         let entry = ratchet_entry("subscriber_cpu_delta_le_budget", 0.009, 0.059);
         assert_eq!(entry.verdict, RatchetVerdict::Within, "{entry:?}");
-        // The floor is IRRELEVANT wherever the baseline is meaningfully
-        // positive: ×1.15 dominates (a 5 ms read baseline limits at 5.75,
-        // not 5.5).
-        let entry = ratchet_entry("read_p99_lt_1s", 5.0, 5.6);
-        assert!((entry.limit.unwrap() - 5.75).abs() < 1e-12);
+        // The floor is IRRELEVANT wherever the baseline is large enough:
+        // ×1.15 dominates (a 10 ms read baseline limits at 11.5, not 11.0).
+        let entry = ratchet_entry("read_p99_lt_1s", 10.0, 11.2);
+        assert!((entry.limit.unwrap() - 11.5).abs() < 1e-12);
         assert_eq!(entry.verdict, RatchetVerdict::Within, "{entry:?}");
-        // …but it DOES engage on the committed seed's real read figure
-        // (2.523 ms: 2.90 from ×1.15 vs 3.02 from +0.5 — the floor wins).
-        let entry = ratchet_entry("read_p99_lt_1s", 2.523, 2.95);
-        assert!((entry.limit.unwrap() - 3.023).abs() < 1e-12);
+        // …but it DOES engage on the committed baseline's real read figure
+        // (1.075 ms: 1.24 from ×1.15 vs 2.08 from +1.0 — the floor wins, so
+        // the 1.45–1.80 ms shared-runner jitter stays within).
+        let entry = ratchet_entry("read_p99_lt_1s", 1.075, 1.80);
+        assert!((entry.limit.unwrap() - 2.075).abs() < 1e-12);
         assert_eq!(entry.verdict, RatchetVerdict::Within, "{entry:?}");
         // Block-level: a +400% drift on a 0.009-pt subscriber-CPU baseline
         // (0.045 current) stays within ONLY because of the floor — and the
@@ -6321,9 +6324,9 @@ mod tests {
     #[test]
     fn trend_note_lines_carry_the_fail_and_report_only_summaries() {
         // The FAIL summary (gated + beyond) — the line the CI job log leads
-        // with on a ratchet red. At +20% the four ×1.15-dominated metrics
-        // are Beyond and the three subscriber deltas ride their floors.
-        let drifted: [f64; 7] = SEVEN.map(|value| value * 1.20);
+        // with on a ratchet red. At +30% the four gated metrics are Beyond
+        // and the three subscriber deltas ride their floors.
+        let drifted: [f64; 7] = SEVEN.map(|value| value * 1.30);
         let trend = trend_for(&baseline_json_with(&SEVEN), &drifted, true).unwrap();
         let lines = trend_note_lines(&trend);
         assert_eq!(lines.len(), 7 + 1, "seven metric rows + one summary");
