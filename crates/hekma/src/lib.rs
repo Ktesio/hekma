@@ -290,6 +290,12 @@ enum Commands {
         #[command(subcommand)]
         command: BindingCommands,
     },
+    /// Read the metering proxy's per-call records
+    #[command(about = "Read the metering proxy's per-call records")]
+    Calls {
+        #[command(subcommand)]
+        command: CallsCommands,
+    },
     /// List the Runs that need you, newest first
     #[command(
         about = "List the Runs that need you, newest first",
@@ -537,6 +543,70 @@ impl From<PolicyLimitArgs> for cli::policy::LimitFlags {
             rate_cached: args.rate_cached,
         }
     }
+}
+
+// `list` carries every filter flag and `show` only an id; the enum lives
+// once per invocation, so the size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+enum CallsCommands {
+    /// List per-call records, newest first
+    List {
+        /// Only this Run's calls (never its child Runs')
+        #[arg(long, value_name = "RUN_ID")]
+        run: Option<String>,
+        /// Only calls that presented this Run Key (its 12-hex token id)
+        #[arg(long, value_name = "TOKEN_ID")]
+        token_id: Option<String>,
+        /// Only calls with this outcome (completed, refused, upstream-error,
+        /// client-disconnect, shutdown, crash, recovered)
+        #[arg(long, value_name = "OUTCOME")]
+        outcome: Option<String>,
+        /// Only calls with this disposition (pass, block, hold, reroute,
+        /// reject)
+        #[arg(long, value_name = "DISPOSITION")]
+        disposition: Option<String>,
+        /// Only calls with this status class (2xx, 3xx, 4xx, 5xx, refused,
+        /// transport-error)
+        #[arg(long, value_name = "CLASS")]
+        status_class: Option<String>,
+        /// Only calls that named this model
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Only calls at this Control Depth (observed, wire, announced,
+        /// supervised)
+        #[arg(long, value_name = "DEPTH")]
+        depth: Option<String>,
+        /// Only calls made through this binding
+        #[arg(long, value_name = "NAME")]
+        binding: Option<String>,
+        /// Only calls that started at or after this time (RFC 3339)
+        #[arg(long, value_name = "TIME")]
+        from: Option<String>,
+        /// Only calls that started before this time (RFC 3339)
+        #[arg(long, value_name = "TIME")]
+        to: Option<String>,
+        /// Only the calls that did not complete cleanly
+        #[arg(long)]
+        problems: bool,
+        /// Page size (default 50, at most 1000; 0 means the maximum)
+        #[arg(long, value_name = "N")]
+        limit: Option<u64>,
+        /// Continue after a previous page's cursor
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
+        /// Print the listing as one JSON document
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one per-call record
+    Show {
+        /// The call's id (call_ plus 26 characters)
+        call_id: String,
+        /// Print the record as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1263,6 +1333,40 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 no_cascade,
                 json,
             } => cli::run::revoke_keys(&run_id, !no_cascade, json),
+        },
+        Some(Commands::Calls { command }) => match command {
+            CallsCommands::List {
+                run,
+                token_id,
+                outcome,
+                disposition,
+                status_class,
+                model,
+                depth,
+                binding,
+                from,
+                to,
+                problems,
+                limit,
+                cursor,
+                json,
+            } => cli::calls::list(cli::calls::ListArgs {
+                run,
+                token_id,
+                outcome,
+                disposition,
+                status_class,
+                model,
+                depth,
+                binding,
+                from,
+                to,
+                problems,
+                limit,
+                cursor,
+                json,
+            }),
+            CallsCommands::Show { call_id, json } => cli::calls::show(&call_id, json),
         },
         Some(Commands::Binding { command }) => match command {
             BindingCommands::List { after, limit, json } => {

@@ -667,6 +667,17 @@ pub(crate) struct RunDocument {
     pub run: hekma_engine::RunView,
 }
 
+/// `GET /v0/calls/{call_id}`: one per-call record under the Control API
+/// schema version. The item itself is the engine's own record shape, so
+/// `hekma calls show --json` is byte-equal to this document's `call`.
+#[derive(Serialize)]
+pub(crate) struct CallDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The record.
+    pub call: hekma_engine::CallRecord,
+}
+
 /// `POST /v0/instances/{name}/start` (story 21-4) — the optional start body.
 /// ABSENT (an empty request body) or `{"detach": false}` is a supervised
 /// start; `{"detach": true}` disarms the child's handle at spawn, so the

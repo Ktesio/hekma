@@ -294,6 +294,11 @@ struct EngineInner {
     /// supervisor mutexes, and never a writer job: only a credential that
     /// resolves here goes on to take those locks or the store writer.
     credential_reader: Mutex<crate::store::SqliteStore>,
+    /// The calls store's directory: the per-call read surface opens its own
+    /// read-only segment connections under this path, taking NO registry or
+    /// supervisor lock and sending nothing to the writer — the read cannot
+    /// slow supervision or the proxy's hot path.
+    calls_dir: std::path::PathBuf,
 }
 
 /// Open-time options for the long-running Host (story 17-2) — the additive,
@@ -573,6 +578,7 @@ impl Engine {
         let events = supervisor.event_bus();
         let run_snapshot = Arc::clone(registry.run_publisher());
         let credential_reader = Mutex::new(registry.open_credential_reader(false)?);
+        let calls_dir = registry.calls_dir();
         let inner = Arc::new(EngineInner {
             metering_proxy: Mutex::new(proxy),
             metering_proxy_error: proxy_error,
@@ -582,6 +588,7 @@ impl Engine {
             events,
             run_snapshot,
             credential_reader,
+            calls_dir,
         });
 
         // (1) Orphan adoption on open (AC-B / AI-7 / AI-8). Reconcile BEFORE the
@@ -637,6 +644,7 @@ impl Engine {
         let events = supervisor.event_bus();
         let run_snapshot = Arc::clone(registry.run_publisher());
         let credential_reader = Mutex::new(registry.open_credential_reader(true)?);
+        let calls_dir = registry.calls_dir();
         let inner = Arc::new(EngineInner {
             metering_proxy: Mutex::new(None),
             metering_proxy_error: None,
@@ -646,6 +654,7 @@ impl Engine {
             events,
             run_snapshot,
             credential_reader,
+            calls_dir,
         });
         Ok(Self {
             rt: Arc::new(rt),
@@ -2736,6 +2745,46 @@ impl Engine {
         .await
     }
 
+    /// The per-call records listing (the calls store's read surface): one
+    /// keyset page over the `calls/` segment files, newest call id first,
+    /// filtered by Run, token id, outcome, disposition, status class,
+    /// model, Control Depth, binding and a half-open call-start window,
+    /// with a `problems` view that lists only calls that were not a clean
+    /// pass. Every page is bounded: at most [`CALLS_MAX_LIMIT`] items and
+    /// at most [`CALLS_SCAN_BUDGET`] rows examined — a sparse filter stops
+    /// there and says so (`scan_limited`, the continuing cursor, how far
+    /// back the page looked). Works on a read-only engine and on an engine
+    /// whose proxy is disabled; a missing calls directory is an empty
+    /// listing. Takes NO registry or supervisor lock and sends nothing to
+    /// the writer: the reader opens its own read-only connection per
+    /// segment and closes it on return, so it cannot slow supervision or
+    /// the proxy's hot path. A cursor that is not the codec's form, or one
+    /// naming anything but a call id, is the typed `invalid-cursor`
+    /// refusal.
+    pub async fn list_calls(
+        &self,
+        query: crate::domain::calls::CallsQuery,
+    ) -> Result<crate::domain::calls::CallListing, crate::domain::calls::CallError> {
+        let dir = self.inner.calls_dir.clone();
+        self.run_blocking(move || crate::store::calls_read::read_page(&dir, &query))
+            .await
+    }
+
+    /// One per-call record by its id (the calls store's read surface): the
+    /// newest segment that holds the id serves it. The same lock-free,
+    /// read-only discipline as [`Engine::list_calls`]. A malformed id is
+    /// the typed `invalid-call-id` refusal; an unknown one is
+    /// [`CallError::NotFound`](crate::domain::calls::CallError::NotFound).
+    pub async fn call(
+        &self,
+        call_id: &str,
+    ) -> Result<crate::domain::calls::CallRecord, crate::domain::calls::CallError> {
+        let dir = self.inner.calls_dir.clone();
+        let call_id = call_id.to_string();
+        self.run_blocking(move || crate::store::calls_read::read_call(&dir, &call_id))
+            .await
+    }
+
     /// Seed bench Run rows under one instance (story 21-5's perf harness,
     /// `#[doc(hidden)]`): written directly through the store writer — no
     /// events, no snapshot publish, no processes. NOT a supported
@@ -3903,6 +3952,22 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.change_policy(change, dry_run))
+    }
+
+    /// Blocking twin of [`Engine::list_calls`].
+    pub fn list_calls(
+        &self,
+        query: crate::domain::calls::CallsQuery,
+    ) -> Result<crate::domain::calls::CallListing, crate::domain::calls::CallError> {
+        self.engine.rt.block_on(self.engine.list_calls(query))
+    }
+
+    /// Blocking twin of [`Engine::call`].
+    pub fn call(
+        &self,
+        call_id: &str,
+    ) -> Result<crate::domain::calls::CallRecord, crate::domain::calls::CallError> {
+        self.engine.rt.block_on(self.engine.call(call_id))
     }
 
     /// Blocking twin of [`Engine::delete_policy`].

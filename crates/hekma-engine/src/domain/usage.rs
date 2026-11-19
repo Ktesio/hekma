@@ -125,6 +125,15 @@ fn encode_ulid(millis: u64, random: &[u8; 10]) -> String {
         .collect()
 }
 
+/// The lexicographically smallest ULID whose embedded time is `unix_millis`
+/// (the random half all zero). A call-id window bound: because a call id is
+/// `call_` + a ULID and the Crockford rendering of a fixed length is
+/// order-preserving, `call_id >= "call_" + ulid_floor(t)` holds exactly when
+/// the call's embedded time is `t` or later.
+pub(crate) fn ulid_floor(unix_millis: u64) -> String {
+    encode_ulid(unix_millis, &[0u8; 10])
+}
+
 impl std::fmt::Display for RunId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)

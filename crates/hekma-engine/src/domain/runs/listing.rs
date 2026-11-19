@@ -123,12 +123,29 @@ impl ListRunsQuery {
     /// The keyset bound this page resumes after (the decoded cursor), or
     /// `None` for the first page. A cursor that is not the codec's form
     /// (a bad base64url body, a foreign version prefix, an empty id) is a
-    /// typed refusal — never a silently ignored key.
+    /// typed refusal — never a silently ignored key. So is a cursor whose
+    /// id is a CALL id (the calls listing's kind): the two listings share
+    /// one codec, so each refuses the other's cursors and a calls cursor
+    /// can never silently page the Run listing.
     pub fn after_key(&self) -> Result<Option<String>, super::RunError> {
         self.after
             .as_deref()
             .map(decode_cursor)
             .transpose()
+            .and_then(|decoded| match decoded {
+                Some((run_id, raw)) => {
+                    if crate::domain::calls::is_call_id(&run_id) {
+                        Err(super::RunError::InvalidCursor {
+                            detail: "the cursor names an id of another kind — it is not one this \
+                                     listing printed (start again from the first page)"
+                                .to_string(),
+                        })
+                    } else {
+                        Ok(Some((run_id, raw)))
+                    }
+                }
+                None => Ok(None),
+            })
             .map(|option| option.map(|(run_id, _raw)| run_id))
     }
 }
@@ -855,6 +872,30 @@ mod tests {
             query.after_key().unwrap_err().code(),
             "invalid-cursor",
             "a bad cursor refuses at the query, never mispages"
+        );
+    }
+
+    #[test]
+    fn a_calls_cursor_never_pages_the_run_listing() {
+        // The two listings share one codec, so the Run listing refuses a
+        // cursor whose id is a call id — the cross-kind hole closed in both
+        // directions.
+        let call_id = format!("call_{}", crate::domain::mint_ulid());
+        let query = ListRunsQuery {
+            after: Some(encode_cursor(&call_id)),
+            ..ListRunsQuery::exceptions()
+        };
+        let err = query.after_key().unwrap_err();
+        assert_eq!(err.code(), "invalid-cursor");
+        assert!(err.to_string().contains("another kind"), "{err}");
+        // A legacy run id still passes (only the call-id shape refuses).
+        let legacy = ListRunsQuery {
+            after: Some(encode_cursor("run-1730000000000000000-7")),
+            ..ListRunsQuery::exceptions()
+        };
+        assert_eq!(
+            legacy.after_key().unwrap().as_deref(),
+            Some("run-1730000000000000000-7")
         );
     }
 

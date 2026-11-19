@@ -224,6 +224,11 @@ fn router(state: ApiState) -> Router {
         .route("/v0/runs", get(routes::runs_list).post(routes::run_open))
         .route("/v0/runs/{id}", get(routes::run_show))
         .route("/v0/runs/{id}/close", post(routes::run_close))
+        // The per-call read surface over the calls store: the listing and
+        // the by-id record, both in the Operator route family (the auth
+        // layer's matrix — every other credential class answers 403).
+        .route("/v0/calls", get(routes::calls_list))
+        .route("/v0/calls/{call_id}", get(routes::call_show))
         // Story 22-1: Run Keys — trade a refresh credential (no id in the
         // path: the credential names its Run), revoke a Run's keys, list
         // a Run's key metadata.
