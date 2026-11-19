@@ -55,7 +55,7 @@ pub const GOVERNANCE_VECTORS_ARTIFACT_PATH: &str = "crates/hekma-engine/governan
 /// release notes (the pinning contract, docs/governance.md). Mirrored inside
 /// the artifact's `vectors_version` field by the generator — they cannot
 /// drift.
-pub const GOVERNANCE_VECTORS_VERSION: &str = "1.3.0";
+pub const GOVERNANCE_VECTORS_VERSION: &str = "1.4.0";
 
 /// The artifact's schema version — `1` until the DOCUMENT shape itself
 /// changes (a breaking schema change is a major `vectors_version` bump).
@@ -63,7 +63,7 @@ pub const GOVERNANCE_VECTORS_SCHEMA_VERSION: u32 = 1;
 
 /// The provenance list — the engine symbols every case is generated from and
 /// verified against (fixed order; the byte-compare pins it).
-const GENERATED_FROM: [&str; 8] = [
+const GENERATED_FROM: [&str; 9] = [
     "BudgetEvaluator",
     "CostEvaluator",
     "cost_micros",
@@ -72,6 +72,7 @@ const GENERATED_FROM: [&str; 8] = [
     "governance::fence_refusal",
     "governance::decide_chain",
     "runs::policy::resolve",
+    "governance::rearm",
 ];
 
 // ---------------------------------------------------------------------------
@@ -424,6 +425,224 @@ pub fn fence_refusal(reasons: &[LatchKey]) -> Option<FenceRefusal> {
 }
 
 // ---------------------------------------------------------------------------
+// The within-Run re-arm (story 21-6, vectors 1.4.0)
+// ---------------------------------------------------------------------------
+
+/// The ceilings ONE level enforces after a limit change, per
+/// `(dimension, scope)`, in the evaluators' units (tokens; integer
+/// micro-dollars). `None` = the level enforces no ceiling there (unset, or
+/// one this level never arms — a child level carries no cumulative scope).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LevelArms {
+    /// The per-run token ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_run: Option<u64>,
+    /// The cumulative token ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_cumulative: Option<u64>,
+    /// The per-run dollar cap, micro-dollars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dollars_per_run_micros: Option<u64>,
+    /// The cumulative dollar cap, micro-dollars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dollars_cumulative_micros: Option<u64>,
+}
+
+impl LevelArms {
+    /// The ceiling for one `(dimension, scope)`.
+    pub fn ceiling(&self, key: LatchKey) -> Option<u64> {
+        match (key.dimension, key.scope) {
+            (BreachDimension::Tokens, BreachScope::PerRun) => self.tokens_per_run,
+            (BreachDimension::Tokens, BreachScope::Cumulative) => self.tokens_cumulative,
+            (BreachDimension::Dollars, BreachScope::PerRun) => self.dollars_per_run_micros,
+            (BreachDimension::Dollars, BreachScope::Cumulative) => self.dollars_cumulative_micros,
+        }
+    }
+}
+
+/// The committed totals a re-arm compares against: per-run scopes against
+/// the RUN's subtree totals, cumulative scopes against the hosting
+/// instance's lifetime totals (every Run).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LevelTotals {
+    /// The Run's subtree token total.
+    pub run_tokens: u64,
+    /// The instance's lifetime token total.
+    pub cumulative_tokens: u64,
+    /// The Run's subtree cost, micro-dollars.
+    pub run_cost_micros: u64,
+    /// The instance's lifetime cost, micro-dollars.
+    pub cumulative_cost_micros: u64,
+}
+
+impl LevelTotals {
+    /// The total one `(dimension, scope)` compares against.
+    pub fn total(&self, key: LatchKey) -> u64 {
+        match (key.dimension, key.scope) {
+            (BreachDimension::Tokens, BreachScope::PerRun) => self.run_tokens,
+            (BreachDimension::Tokens, BreachScope::Cumulative) => self.cumulative_tokens,
+            (BreachDimension::Dollars, BreachScope::PerRun) => self.run_cost_micros,
+            (BreachDimension::Dollars, BreachScope::Cumulative) => self.cumulative_cost_micros,
+        }
+    }
+}
+
+/// The RE-ARM rule (story 21-3's raise half, promoted and shared by every
+/// raise trigger in story 21-6): the `(dimension, scope)` pairs whose latch
+/// re-arms after a limit change — every pair whose ceiling is now ABOVE its
+/// total, or no longer set at this level (a cleared or deleted ceiling is
+/// limit-free, so a latch under it would otherwise hold forever). In
+/// [`FENCE_REASON_ORDER`]. A ceiling AT or below the total keeps its latch
+/// (the `>=` threshold: it would fire again at once).
+pub fn re_armed_keys(arms: &LevelArms, totals: &LevelTotals) -> Vec<LatchKey> {
+    FENCE_REASON_ORDER
+        .into_iter()
+        .filter(|key| {
+            arms.ceiling(*key)
+                .is_none_or(|ceiling| ceiling > totals.total(*key))
+        })
+        .collect()
+}
+
+/// One latched pair with the Breach Action that recorded it (the latch is
+/// keyed by action: a pair spent under `warn` re-fires once under `pause`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatchedReason {
+    /// The `(dimension, scope)`.
+    pub reason: LatchKey,
+    /// The action it latched under.
+    pub action: BreachAction,
+}
+
+/// A `rearm` input (vectors 1.4.0): one level's ceilings and action after
+/// a limit change, its totals, and its latches before the change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RearmInput {
+    /// The level's ceilings AFTER the change.
+    pub arms: LevelArms,
+    /// The level's effective Breach Action after the change.
+    pub action: BreachAction,
+    /// Whether a Rate resolves (an unpriced dollar cap re-arms like any
+    /// ceiling but cannot fire).
+    pub priced: bool,
+    /// The committed totals.
+    pub totals: LevelTotals,
+    /// The latches before the change, in latch order.
+    #[serde(default)]
+    pub latched: Vec<LatchedReason>,
+}
+
+/// What a `rearm` does (vectors 1.4.0).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RearmOutcome {
+    /// The latches the change released (re-armed), in latch order.
+    pub unlatched: Vec<LatchedReason>,
+    /// The `block` fence reasons that lift — PER REASON: only the released
+    /// `block` latches; any other latched `block` reason keeps the fence up.
+    pub fence_cleared: Vec<LatchKey>,
+    /// The breaches the change fires AT ONCE (a ceiling now at or below
+    /// its total), token before dollar — [`decide`] over the new arms.
+    pub fired: Vec<GovernanceDecision>,
+    /// The latches after: the kept ones, then the newly fired.
+    pub latched_after: Vec<LatchedReason>,
+    /// The fence reasons raised after, in [`FENCE_REASON_ORDER`] (every
+    /// `block` latch left or fired).
+    pub fence_after: Vec<LatchKey>,
+    /// Whether the Run's `breach` Anomaly holds after (it mirrors the
+    /// latches: cleared once every latch re-armed, raised by a firing).
+    pub breach_anomaly: bool,
+}
+
+/// The within-Run re-arm, whole (story 21-6, vectors 1.4.0): release the
+/// latches [`re_armed_keys`] names, lift their `block` fence reasons per
+/// reason, then [`decide`] over the new arms with the kept latches (only
+/// those under the current action count — the action-keyed latch) so a
+/// ceiling lowered to at-or-below its total fires now. The outcome is the
+/// same whatever raised or lowered the ceiling — a Policy change, a
+/// Run-level limit, or an instance configuration write. This is exactly
+/// the composition the store-side pass runs (`runs::limits::re_arm`, then
+/// the pipeline's evaluation), for one level.
+pub fn rearm(input: &RearmInput) -> RearmOutcome {
+    let keys = re_armed_keys(&input.arms, &input.totals);
+    let mut outcome = RearmOutcome::default();
+    let mut kept: Vec<LatchedReason> = Vec::new();
+    for latched in &input.latched {
+        if kept
+            .iter()
+            .chain(outcome.unlatched.iter())
+            .any(|seen| seen == latched)
+        {
+            continue;
+        }
+        if keys.contains(&latched.reason) {
+            outcome.unlatched.push(*latched);
+            if latched.action == BreachAction::Block
+                && !outcome.fence_cleared.contains(&latched.reason)
+            {
+                outcome.fence_cleared.push(latched.reason);
+            }
+        } else {
+            kept.push(*latched);
+        }
+    }
+    let token_budget = TokenBudget {
+        per_run: input.arms.tokens_per_run,
+        cumulative: input.arms.tokens_cumulative,
+    };
+    let cost_cap = CostCap {
+        per_run: input
+            .arms
+            .dollars_per_run_micros
+            .map(|v| Micros(v.min(i64::MAX as u64) as i64)),
+        cumulative: input
+            .arms
+            .dollars_cumulative_micros
+            .map(|v| Micros(v.min(i64::MAX as u64) as i64)),
+    };
+    let decision = decide(&GovernanceInput {
+        token: token_budget.is_set().then_some(TokenArm {
+            run_total: input.totals.run_tokens,
+            cumulative_total: input.totals.cumulative_tokens,
+            budget: token_budget,
+            action: input.action,
+        }),
+        dollar:
+            (input.priced && cost_cap.is_set()).then_some(DollarArm {
+                run_cost: Micros(input.totals.run_cost_micros.min(i64::MAX as u64) as i64),
+                cumulative_cost: Micros(
+                    input.totals.cumulative_cost_micros.min(i64::MAX as u64) as i64
+                ),
+                cap: cost_cap,
+                action: input.action,
+            }),
+        latched: kept
+            .iter()
+            .filter(|latched| latched.action == input.action)
+            .map(|latched| latched.reason)
+            .collect(),
+    });
+    outcome.latched_after = kept;
+    for fired in &decision.decisions {
+        outcome.latched_after.push(LatchedReason {
+            reason: LatchKey::new(fired.dimension, fired.scope),
+            action: fired.action,
+        });
+    }
+    outcome.fired = decision.decisions;
+    outcome.fence_after = FENCE_REASON_ORDER
+        .into_iter()
+        .filter(|key| {
+            outcome
+                .latched_after
+                .iter()
+                .any(|latched| latched.reason == *key && latched.action == BreachAction::Block)
+        })
+        .collect();
+    outcome.breach_anomaly = !outcome.latched_after.is_empty();
+    outcome
+}
+
+// ---------------------------------------------------------------------------
 // The vectors artifact (schema + generator)
 // ---------------------------------------------------------------------------
 
@@ -479,6 +698,14 @@ pub enum CoverTag {
     /// fail-closed, the upgrade marker's `pause`, the depth fallback to
     /// `warn`, the Rate chain, and the unpriced cap made loud.
     PolicyResolution,
+    /// The within-Run re-arm (story 21-6, vectors 1.4.0): after a limit
+    /// change, a ceiling now ABOVE its total (or no longer set) releases
+    /// its latch and lifts its `block` fence reason PER REASON (a fence
+    /// holding another latched `block` reason stays up); a ceiling at or
+    /// below its total keeps its latch, and one lowered to at or below the
+    /// total fires at once — the same outcome whether a Policy change, a
+    /// Run-level limit or an instance configuration write moved it.
+    ReArm,
 }
 
 impl CoverTag {
@@ -496,6 +723,7 @@ impl CoverTag {
             CoverTag::BlockFence => "block-fence",
             CoverTag::AncestorCeilings => "ancestor-ceilings",
             CoverTag::PolicyResolution => "policy-resolution",
+            CoverTag::ReArm => "re-arm",
         }
     }
 }
@@ -515,6 +743,7 @@ pub const ALL_COVERS: &[CoverTag] = &[
     CoverTag::BlockFence,
     CoverTag::AncestorCeilings,
     CoverTag::PolicyResolution,
+    CoverTag::ReArm,
 ];
 
 /// A `decision` case (story 19-1): a [`GovernanceInput`] (ledger state,
@@ -656,6 +885,44 @@ pub enum Case {
     /// A Policy resolution: input → expected resolution (story 21-3,
     /// vectors 1.3.0).
     Policy(PolicyCase),
+    /// A within-Run re-arm after a limit change: arms, totals and latches
+    /// in → released latches, lifted fence reasons and fired breaches out
+    /// (story 21-6, vectors 1.4.0).
+    Rearm(RearmCase),
+}
+
+/// What moved the ceiling a `rearm` case re-arms against (story 21-6):
+/// context, not an input — the rule never reads it, so the expected
+/// outcome never depends on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RearmTrigger {
+    /// A Policy was created, changed or deleted.
+    PolicyChange,
+    /// A limit was set on the Run itself (`hekma budget set`).
+    RunLimits,
+    /// The instance's `budget.*` / `cost.rate.*` configuration was written.
+    ConfigWrite,
+}
+
+/// A `rearm` case (story 21-6, vectors 1.4.0): the level's ceilings before
+/// (context only — the rule reads the AFTER arms) and the [`RearmInput`],
+/// and the EXACT expected [`RearmOutcome`] — generated from [`rearm`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RearmCase {
+    /// The case's unique, stable id.
+    pub id: String,
+    /// Which rules this case pins.
+    pub covers: Vec<CoverTag>,
+    /// What moved the ceiling.
+    pub trigger: RearmTrigger,
+    /// The level's ceilings BEFORE the change (context: the outcome reads
+    /// only the arms after).
+    pub arms_before: LevelArms,
+    /// The input.
+    pub input: RearmInput,
+    /// The expected outcome.
+    pub expected: RearmOutcome,
 }
 
 /// A `chain` case (story 21-2, vectors 1.2.0): the decision inputs of each
@@ -737,6 +1004,7 @@ impl VectorsDocument {
                 Case::Fence(fence) => &fence.covers,
                 Case::Chain(chain) => &chain.covers,
                 Case::Policy(policy) => &policy.covers,
+                Case::Rearm(rearm) => &rearm.covers,
             };
             for tag in covers {
                 if !seen.contains(tag) {
@@ -802,6 +1070,8 @@ pub fn generate() -> VectorsDocument {
             // AFTER every shipped case, so the 1.2.0 sequence keeps its
             // original indices byte-for-byte.
             .chain(policy_decision_cases())
+            // Story 21-6 (1.4.0): the `rearm` cases, after every 1.3.0 case.
+            .chain(rearm_cases())
             .collect(),
     }
 }
@@ -1729,6 +1999,206 @@ fn policy_decision_cases() -> Vec<Case> {
     ]
 }
 
+/// The `rearm` cases (story 21-6, vectors 1.4.0), in fixed canonical
+/// order. Each case's `expected` is computed by [`rearm`] itself.
+fn rearm_cases() -> Vec<Case> {
+    let tokens_per_run = LatchKey::new(BreachDimension::Tokens, BreachScope::PerRun);
+    let tokens_cumulative = LatchKey::new(BreachDimension::Tokens, BreachScope::Cumulative);
+    let dollars_cumulative = LatchKey::new(BreachDimension::Dollars, BreachScope::Cumulative);
+    let latched = |reason: LatchKey, action: BreachAction| LatchedReason { reason, action };
+    let totals = LevelTotals {
+        run_tokens: 1_500,
+        cumulative_tokens: 4_000,
+        run_cost_micros: 900_000,
+        cumulative_cost_micros: 1_500_000,
+    };
+    // The per-reason fence: a token per-run and a dollar cumulative `block`,
+    // the token ceiling raised above its total.
+    let one_of_two = RearmInput {
+        arms: LevelArms {
+            tokens_per_run: Some(2_000),
+            dollars_cumulative_micros: Some(1_000_000),
+            ..LevelArms::default()
+        },
+        action: BreachAction::Block,
+        priced: true,
+        totals,
+        latched: vec![
+            latched(tokens_per_run, BreachAction::Block),
+            latched(dollars_cumulative, BreachAction::Block),
+        ],
+    };
+    let one_of_two_before = LevelArms {
+        tokens_per_run: Some(1_000),
+        dollars_cumulative_micros: Some(1_000_000),
+        ..LevelArms::default()
+    };
+    vec![
+        rearm_case(
+            "rearm-raise-above-the-total-releases-the-latch",
+            RearmTrigger::RunLimits,
+            LevelArms {
+                tokens_per_run: Some(1_000),
+                ..LevelArms::default()
+            },
+            RearmInput {
+                arms: LevelArms {
+                    tokens_per_run: Some(2_000),
+                    ..LevelArms::default()
+                },
+                action: BreachAction::Pause,
+                priced: false,
+                totals,
+                latched: vec![latched(tokens_per_run, BreachAction::Pause)],
+            },
+        ),
+        rearm_case(
+            "rearm-raise-to-exactly-the-total-keeps-the-latch",
+            RearmTrigger::RunLimits,
+            LevelArms {
+                tokens_per_run: Some(1_000),
+                ..LevelArms::default()
+            },
+            RearmInput {
+                arms: LevelArms {
+                    tokens_per_run: Some(1_500),
+                    ..LevelArms::default()
+                },
+                action: BreachAction::Pause,
+                priced: false,
+                totals,
+                latched: vec![latched(tokens_per_run, BreachAction::Pause)],
+            },
+        ),
+        rearm_case(
+            "rearm-per-reason-one-of-two-stays-fenced",
+            RearmTrigger::RunLimits,
+            one_of_two_before,
+            one_of_two.clone(),
+        ),
+        rearm_case(
+            "rearm-per-reason-both-raised-unfences",
+            RearmTrigger::RunLimits,
+            one_of_two_before,
+            RearmInput {
+                arms: LevelArms {
+                    tokens_per_run: Some(2_000),
+                    dollars_cumulative_micros: Some(2_000_000),
+                    ..LevelArms::default()
+                },
+                ..one_of_two.clone()
+            },
+        ),
+        rearm_case(
+            "rearm-lowered-to-at-or-below-the-total-fires-now",
+            RearmTrigger::RunLimits,
+            LevelArms::default(),
+            RearmInput {
+                arms: LevelArms {
+                    tokens_per_run: Some(1_500),
+                    tokens_cumulative: Some(3_000),
+                    ..LevelArms::default()
+                },
+                action: BreachAction::Pause,
+                priced: false,
+                totals,
+                latched: Vec::new(),
+            },
+        ),
+        rearm_case(
+            "rearm-cleared-ceiling-releases-its-latch",
+            RearmTrigger::RunLimits,
+            LevelArms {
+                tokens_cumulative: Some(3_000),
+                ..LevelArms::default()
+            },
+            RearmInput {
+                arms: LevelArms::default(),
+                action: BreachAction::Warn,
+                priced: false,
+                totals,
+                latched: vec![latched(tokens_cumulative, BreachAction::Warn)],
+            },
+        ),
+        rearm_case(
+            "rearm-a-new-action-refires-a-kept-pair-once",
+            RearmTrigger::RunLimits,
+            LevelArms {
+                tokens_per_run: Some(1_000),
+                ..LevelArms::default()
+            },
+            RearmInput {
+                arms: LevelArms {
+                    tokens_per_run: Some(1_000),
+                    ..LevelArms::default()
+                },
+                action: BreachAction::Pause,
+                priced: false,
+                totals,
+                latched: vec![latched(tokens_per_run, BreachAction::Warn)],
+            },
+        ),
+        // Unpriced: the cumulative cap latched earlier (when a Rate still
+        // priced it) is raised above its total and re-arms; the per-run
+        // cap lowered below its total cannot fire — no Rate prices it.
+        rearm_case(
+            "rearm-unpriced-dollar-cap-re-arms-but-cannot-fire",
+            RearmTrigger::RunLimits,
+            LevelArms {
+                dollars_cumulative_micros: Some(1_000_000),
+                ..LevelArms::default()
+            },
+            RearmInput {
+                arms: LevelArms {
+                    dollars_per_run_micros: Some(500_000),
+                    dollars_cumulative_micros: Some(2_000_000),
+                    ..LevelArms::default()
+                },
+                action: BreachAction::Pause,
+                priced: false,
+                totals,
+                latched: vec![latched(dollars_cumulative, BreachAction::Pause)],
+            },
+        ),
+        // The trigger is context, not an input: a consumer re-deriving
+        // these cases must not branch on it (the SAME input under all
+        // three triggers carries the SAME expected outcome). That the
+        // engine's three store paths feed the rule the same input is pinned
+        // by the engine's own tests, not by these cases.
+        rearm_case(
+            "rearm-same-outcome-from-a-policy-change",
+            RearmTrigger::PolicyChange,
+            one_of_two_before,
+            one_of_two.clone(),
+        ),
+        rearm_case(
+            "rearm-same-outcome-from-a-config-write",
+            RearmTrigger::ConfigWrite,
+            one_of_two_before,
+            one_of_two,
+        ),
+    ]
+}
+
+fn rearm_case(id: &str, trigger: RearmTrigger, arms_before: LevelArms, input: RearmInput) -> Case {
+    let mut covers = vec![CoverTag::ReArm];
+    if input
+        .latched
+        .iter()
+        .any(|latched| latched.action == BreachAction::Block)
+    {
+        covers.push(CoverTag::BlockFence);
+    }
+    Case::Rearm(RearmCase {
+        id: id.to_string(),
+        covers,
+        trigger,
+        arms_before,
+        expected: rearm(&input),
+        input,
+    })
+}
+
 /// The bound-label pairs of a resolution input.
 fn labels(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
@@ -2339,6 +2809,7 @@ mod tests {
             CoverTag::BlockFence => (8, "block-fence"),
             CoverTag::AncestorCeilings => (9, "ancestor-ceilings"),
             CoverTag::PolicyResolution => (10, "policy-resolution"),
+            CoverTag::ReArm => (11, "re-arm"),
         }
     }
 
@@ -2538,6 +3009,14 @@ mod tests {
                         case.id
                     );
                 }
+                Case::Rearm(case) => {
+                    assert_eq!(
+                        rearm(&case.input),
+                        case.expected,
+                        "case `{}`: the committed outcome does not match rearm()",
+                        case.id
+                    );
+                }
             }
         }
     }
@@ -2555,6 +3034,7 @@ mod tests {
                 Case::Fence(case) => (&case.id, &case.covers),
                 Case::Chain(case) => (&case.id, &case.covers),
                 Case::Policy(case) => (&case.id, &case.covers),
+                Case::Rearm(case) => (&case.id, &case.covers),
             };
             assert!(!ids.contains(&id), "duplicate case id `{id}`");
             assert!(!covers.is_empty(), "case `{id}` carries no covers tags");
@@ -2592,6 +3072,7 @@ mod tests {
                 "governance::fence_refusal",
                 "governance::decide_chain",
                 "runs::policy::resolve",
+                "governance::rearm",
             ]
         );
     }
@@ -2611,7 +3092,7 @@ mod tests {
             .iter()
             .position(|case| match case {
                 Case::Decision(case) => case.id.starts_with("decision-block-"),
-                Case::Fence(_) | Case::Chain(_) | Case::Policy(_) => true,
+                Case::Fence(_) | Case::Chain(_) | Case::Policy(_) | Case::Rearm(_) => true,
                 Case::Derivation(_) => false,
             })
             .expect("the 1.1.0 cases exist");
@@ -2624,7 +3105,7 @@ mod tests {
                     policy_tagged
                         || case.input.token.map(|arm| arm.action) == Some(BreachAction::Block)
                 }
-                Case::Fence(_) | Case::Chain(_) | Case::Policy(_) => true,
+                Case::Fence(_) | Case::Chain(_) | Case::Policy(_) | Case::Rearm(_) => true,
                 Case::Derivation(_) => false,
             }));
     }
@@ -2678,18 +3159,177 @@ mod tests {
         let document = generate();
         assert_eq!(
             document.cases.len(),
-            SHIPPED.len() + 14,
-            "39 shipped + the 14 cases 21-3 appends"
+            SHIPPED.len() + 14 + 10,
+            "39 shipped + the 14 cases 21-3 appends + the 10 cases 21-6 appends"
         );
         for (index, id) in SHIPPED.iter().enumerate() {
-            let actual = match &document.cases[index] {
-                Case::Decision(case) => &case.id,
-                Case::Derivation(case) => &case.id,
-                Case::Fence(case) => &case.id,
-                Case::Chain(case) => &case.id,
-                Case::Policy(case) => &case.id,
-            };
-            assert_eq!(actual, id, "index {index}: the shipped order is frozen");
+            assert_eq!(
+                case_id(&document.cases[index]),
+                *id,
+                "index {index}: the shipped order is frozen"
+            );
+        }
+    }
+
+    fn case_id(case: &Case) -> &str {
+        match case {
+            Case::Decision(case) => &case.id,
+            Case::Derivation(case) => &case.id,
+            Case::Fence(case) => &case.id,
+            Case::Chain(case) => &case.id,
+            Case::Policy(case) => &case.id,
+            Case::Rearm(case) => &case.id,
+        }
+    }
+
+    #[test]
+    fn the_shipped_1_3_0_cases_keep_their_indices_and_bytes() {
+        // Story 21-6: 1.4.0 only APPENDS. Every case 1.3.0 shipped sits at
+        // its original index with its original bytes (the 1.3.0 artifact's
+        // per-case canonical JSON, pinned by the SHA-256 of the 53-case
+        // array), and the `rearm` cases follow all of them.
+        const SHIPPED_1_3_0_TAIL: &[&str] = &[
+            "policy-explicit-run-instance-policy",
+            "policy-most-specific-per-limit",
+            "policy-tie-takes-the-tightest",
+            "policy-default-fills-the-action",
+            "policy-fail-closed-malformed-and-marker",
+            "policy-upgrade-marker-holds-pause",
+            "policy-depth-fallback-and-wire-path",
+            "policy-rate-chain",
+            "policy-unpriced-cap-is-loud",
+            "policy-no-bound-term-no-match",
+            "policy-malformed-keeps-explicit-ceilings",
+            "policy-malformed-outranks-the-run-action",
+            "decision-policy-lowered-per-run-fires-while-cumulative-latched",
+            "decision-policy-raised-then-recrossed-refires",
+        ];
+        let document = generate();
+        for (offset, id) in SHIPPED_1_3_0_TAIL.iter().enumerate() {
+            assert_eq!(case_id(&document.cases[39 + offset]), *id);
+        }
+        let shipped = serde_json::to_string_pretty(&document.cases[..53]).unwrap();
+        assert_eq!(
+            crate::sha256::to_hex(&crate::sha256::digest(shipped.as_bytes())),
+            SHIPPED_1_3_0_CASES_SHA256,
+            "a 1.3.0 case changed its bytes — 1.4.0 is additive only"
+        );
+        assert!(document.cases[53..]
+            .iter()
+            .all(|case| matches!(case, Case::Rearm(_))));
+        assert_eq!(document.cases.len() - 53, 10);
+    }
+
+    /// The SHA-256 of the 1.3.0 artifact's 53 cases, pretty-printed as one
+    /// JSON array (computed from the committed 1.3.0 file).
+    const SHIPPED_1_3_0_CASES_SHA256: &str =
+        "3cf9db041daad12139f2f01dc4814deda2c3aabe768e044d16245f510a6b3442";
+
+    #[test]
+    fn the_rearm_rule_is_the_same_for_every_trigger() {
+        let document = generate();
+        let mut outcomes: Vec<(RearmInput, RearmOutcome, RearmTrigger)> = Vec::new();
+        for case in &document.cases {
+            if let Case::Rearm(case) = case {
+                outcomes.push((case.input.clone(), case.expected.clone(), case.trigger));
+            }
+        }
+        let shared: Vec<_> = outcomes
+            .iter()
+            .filter(|(input, _, _)| {
+                outcomes
+                    .iter()
+                    .filter(|(other, _, _)| other == input)
+                    .count()
+                    == 3
+            })
+            .collect();
+        assert_eq!(shared.len(), 3, "one input under all three triggers");
+        assert!(shared.windows(2).all(|pair| pair[0].1 == pair[1].1));
+        let triggers: Vec<RearmTrigger> = shared.iter().map(|(_, _, trigger)| *trigger).collect();
+        for trigger in [
+            RearmTrigger::PolicyChange,
+            RearmTrigger::RunLimits,
+            RearmTrigger::ConfigWrite,
+        ] {
+            assert!(triggers.contains(&trigger));
+        }
+        // The per-reason pin: one of two `block` reasons lifts, the fence
+        // stays up on the other, and the breach Anomaly holds.
+        let (_, outcome, _) = shared[0];
+        assert_eq!(outcome.fence_cleared, vec![FENCE_REASON_ORDER[0]]);
+        assert_eq!(outcome.fence_after, vec![FENCE_REASON_ORDER[3]]);
+        assert!(outcome.breach_anomaly);
+        assert!(outcome.fired.is_empty());
+    }
+
+    #[test]
+    fn rearm_releases_raised_keeps_reached_and_fires_lowered() {
+        let tokens = FENCE_REASON_ORDER[0];
+        let totals = LevelTotals {
+            run_tokens: 100,
+            ..LevelTotals::default()
+        };
+        // Raised above: released, the anomaly clears.
+        let out = rearm(&RearmInput {
+            arms: LevelArms {
+                tokens_per_run: Some(101),
+                ..LevelArms::default()
+            },
+            action: BreachAction::Pause,
+            priced: false,
+            totals,
+            latched: vec![
+                LatchedReason {
+                    reason: tokens,
+                    action: BreachAction::Pause,
+                },
+                LatchedReason {
+                    reason: tokens,
+                    action: BreachAction::Pause,
+                },
+            ],
+        });
+        assert_eq!(out.unlatched.len(), 1, "a doubled latch row is one");
+        assert!(!out.breach_anomaly && out.fired.is_empty());
+        // Exactly at: kept, and the same action does not re-fire.
+        let out = rearm(&RearmInput {
+            arms: LevelArms {
+                tokens_per_run: Some(100),
+                ..LevelArms::default()
+            },
+            action: BreachAction::Block,
+            priced: false,
+            totals,
+            latched: vec![LatchedReason {
+                reason: tokens,
+                action: BreachAction::Block,
+            }],
+        });
+        assert!(out.unlatched.is_empty() && out.fired.is_empty());
+        assert_eq!(out.fence_after, vec![tokens]);
+        // Lowered below: fires now, latched after.
+        let out = rearm(&RearmInput {
+            arms: LevelArms {
+                tokens_per_run: Some(50),
+                dollars_per_run_micros: Some(1),
+                ..LevelArms::default()
+            },
+            action: BreachAction::Block,
+            priced: true,
+            totals: LevelTotals {
+                run_tokens: 100,
+                run_cost_micros: 5,
+                ..LevelTotals::default()
+            },
+            latched: Vec::new(),
+        });
+        assert_eq!(out.fired.len(), 2, "token then dollar");
+        assert_eq!(out.fence_after, vec![tokens, FENCE_REASON_ORDER[2]]);
+        assert!(out.breach_anomaly);
+        for key in FENCE_REASON_ORDER {
+            assert_eq!(LevelArms::default().ceiling(key), None);
+            assert_eq!(LevelTotals::default().total(key), 0);
         }
     }
 
@@ -2716,6 +3356,12 @@ mod tests {
                 _ => false,
             })
             .expect("the 1.3.0 cases exist");
+        // Story 21-6 (1.4.0): the `rearm` cases close the artifact now.
+        let first_rearm = document
+            .cases
+            .iter()
+            .position(|case| matches!(case, Case::Rearm(_)))
+            .expect("the 1.4.0 cases exist");
         assert!(document.cases[..first_chain]
             .iter()
             .all(|case| !matches!(case, Case::Chain(_) | Case::Policy(_))));
@@ -2723,14 +3369,20 @@ mod tests {
             .iter()
             .all(|case| matches!(case, Case::Chain(_))));
         assert!(
-            document.cases[first_appended..]
+            document.cases[first_appended..first_rearm]
                 .iter()
                 .all(|case| match case {
                     Case::Policy(_) => true,
                     Case::Decision(case) => case.covers.contains(&CoverTag::PolicyResolution),
                     _ => false,
                 }),
-            "the 1.3.0 cases close the artifact"
+            "the 1.3.0 cases follow the chain era"
+        );
+        assert!(
+            document.cases[first_rearm..]
+                .iter()
+                .all(|case| matches!(case, Case::Rearm(_))),
+            "the 1.4.0 cases close the artifact"
         );
     }
 

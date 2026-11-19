@@ -72,8 +72,9 @@ use crate::domain::{
     TransitionEvent,
 };
 use crate::domain::{
-    ChildRunRequest, Label, LabelChange, LabelOutcome, ListRunsQuery, PolicyChange, PolicyOutcome,
-    PolicyRecord, RunError, RunId, RunListing, RunRecord, RunView, Selector,
+    ChildRunRequest, Label, LabelChange, LabelOutcome, LimitActor, ListRunsQuery, PolicyChange,
+    PolicyOutcome, PolicyRecord, RunError, RunId, RunLifecycleVerb, RunLimitChange, RunLimitsView,
+    RunListing, RunRecord, RunSummary, RunVerbError, RunView, Selector,
 };
 use crate::ports::{LogCaptureMode, SpawnRecord};
 use crate::shutdown::DrainOutcome;
@@ -1893,6 +1894,192 @@ impl Engine {
         .await
     }
 
+    /// [`Engine::select_runs`] with each matched Run assembled as its
+    /// listing row ([`RunSummary`]: labels, subtree usage, latches and
+    /// headroom) — the act set `POST /v0/runs/select` answers (story 21-6).
+    /// The same cap ([`RunError::TooManyRuns`]); reads only.
+    pub async fn select_run_summaries(
+        &self,
+        selector: &Selector,
+    ) -> Result<Vec<RunSummary>, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let selector = selector.clone();
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .select_run_summaries(&selector)
+        })
+        .await
+    }
+
+    /// Whether `verb` would act on Run `run_id` (story 21-6): the Run's
+    /// row when the verb maps to its instance's verb, else the per-Run
+    /// refusal ([`RunError::RunEnded`], [`RunError::VerbUnavailable`]) the
+    /// act would answer. Reads only — the `--dry-run` planner; an act can
+    /// still meet the instance verb's own refusals (capability, state).
+    pub async fn plan_run_verb(
+        &self,
+        run_id: &str,
+        verb: RunLifecycleVerb,
+    ) -> Result<RunRecord, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let record = registry
+                .run_record(&run_id)?
+                .ok_or_else(|| RunError::NotFound {
+                    run_id: run_id.as_str().to_string(),
+                })?;
+            crate::domain::runs::verbs::run_verb_target(verb, &record)?;
+            Ok(record)
+        })
+        .await
+    }
+
+    /// The instance a Run-grain verb acts on, checked and acted under the
+    /// SAME locks (so a Run that ends — and a fresh start that replaces it
+    /// — between the check and the act cannot redirect the verb onto
+    /// another Run).
+    async fn act_on_run<T: Send + 'static>(
+        &self,
+        run_id: &str,
+        verb: RunLifecycleVerb,
+        act: impl FnOnce(&Registry, &mut Supervisor, &str) -> Result<T, EngineError> + Send + 'static,
+    ) -> Result<T, RunVerbError> {
+        self.refuse_if_read_only()
+            .map_err(|err| RunVerbError::Run(RunError::Store(err)))?;
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let record = registry
+                .run_record(&run_id)?
+                .ok_or_else(|| RunError::NotFound {
+                    run_id: run_id.as_str().to_string(),
+                })?;
+            let instance = crate::domain::runs::verbs::run_verb_target(verb, &record)?;
+            act(&registry, &mut supervisor, &instance).map_err(RunVerbError::Engine)
+        })
+        .await
+    }
+
+    /// Stop the instance whose supervised process Run `run_id` owns (story
+    /// 21-6, PRD FR-50): exactly [`Engine::stop`] on that instance. A child
+    /// Run, an ended Run, and any depth the verb × depth table does not
+    /// serve yet are refused per Run ([`RunVerbError::Run`]).
+    pub async fn stop_run(
+        &self,
+        run_id: &str,
+        window: Option<Duration>,
+    ) -> Result<AgentInstance, RunVerbError> {
+        self.act_on_run(
+            run_id,
+            RunLifecycleVerb::Stop,
+            move |registry, supervisor, name| supervisor.stop(registry, name, window),
+        )
+        .await
+    }
+
+    /// Pause the instance whose process Run `run_id` owns (story 21-6):
+    /// exactly [`Engine::pause`] on it (the Run goes `held`). Other Runs
+    /// are refused per Run.
+    pub async fn pause_run(&self, run_id: &str) -> Result<AgentInstance, RunVerbError> {
+        self.act_on_run(
+            run_id,
+            RunLifecycleVerb::Pause,
+            |registry, supervisor, name| supervisor.pause(registry, name),
+        )
+        .await
+    }
+
+    /// Resume the instance whose process Run `run_id` owns (story 21-6):
+    /// exactly [`Engine::resume`] on it. A child held because its parent is
+    /// paused is refused, naming the parent.
+    pub async fn resume_run(&self, run_id: &str) -> Result<AgentInstance, RunVerbError> {
+        self.act_on_run(
+            run_id,
+            RunLifecycleVerb::Resume,
+            |registry, supervisor, name| supervisor.resume(registry, name),
+        )
+        .await
+    }
+
+    /// Drain the instance whose process Run `run_id` owns (story 21-6):
+    /// exactly [`Engine::drain`] on it, with its own bound. Other Runs are
+    /// refused per Run.
+    pub async fn drain_run(
+        &self,
+        run_id: &str,
+        timeout_override: Option<Duration>,
+    ) -> Result<DrainReport, RunVerbError> {
+        self.act_on_run(
+            run_id,
+            RunLifecycleVerb::Drain,
+            move |registry, supervisor, name| {
+                supervisor
+                    .drain(registry, name, timeout_override)
+                    .map(|(instance, outcome)| DrainReport { instance, outcome })
+            },
+        )
+        .await
+    }
+
+    /// Set limits on Runs as `actor` (story 21-6, PRD FR-50 / FR-60): the
+    /// budget job behind `hekma budget set` and `PATCH /v0/runs/{id}/limits`.
+    /// Each Run is one writer job and answers on its own (a refusal on one
+    /// never stops the others): `scope-unavailable` (a cumulative ceiling on
+    /// a child Run), `action-unavailable` (an action its depth cannot
+    /// execute, naming the Metering Source), `raise-forbidden` (a Caller
+    /// loosening a limit), `run-ended`, `run-not-found`. A committed change
+    /// writes the Run's `run_limits`, re-resolves it, commits one
+    /// `limits-changed` event and runs the shared re-arm pass: a ceiling
+    /// raised above the totals re-arms its latch and lifts the matching
+    /// `block` fence reason per reason; one lowered to at or below the usage
+    /// breaches at once, its Breach Action applied before this returns. A
+    /// limit set here belongs to the Run — it ends with the Run. `dry_run`
+    /// plans each Run and writes nothing. A malformed change is refused
+    /// whole.
+    pub async fn set_run_limits(
+        &self,
+        run_ids: Vec<String>,
+        change: RunLimitChange,
+        actor: LimitActor,
+        dry_run: bool,
+    ) -> Result<crate::domain::RunLimitsResults, RunError> {
+        if !dry_run {
+            self.refuse_if_read_only().map_err(RunError::Store)?;
+        }
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let ids: Vec<RunId> = run_ids.into_iter().map(RunId::from_wire).collect();
+            supervisor.set_run_limits(&registry, &ids, &change, actor, dry_run)
+        })
+        .await
+    }
+
+    /// The budget read of one Run (story 21-6, `hekma budget show`): the
+    /// limits set on the Run, the resolved limits with each source, its
+    /// subtree and cumulative usage, the headroom and the latches. Reads
+    /// only.
+    pub async fn run_limits_view(&self, run_id: &str) -> Result<RunLimitsView, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .run_limits_view(&run_id)
+        })
+        .await
+    }
+
     /// The Run listing (story 21-5, PRD FR-50): one exception-first (or
     /// `--all`, inside-the-ended-Run-window) keyset page, newest run id
     /// first, with each row's CONTROL depth, Run Status, Anomalies with
@@ -2849,6 +3036,74 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.select_runs(selector))
     }
 
+    /// Blocking twin of [`Engine::select_run_summaries`].
+    pub fn select_run_summaries(&self, selector: &Selector) -> Result<Vec<RunSummary>, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.select_run_summaries(selector))
+    }
+
+    /// Blocking twin of [`Engine::plan_run_verb`].
+    pub fn plan_run_verb(
+        &self,
+        run_id: &str,
+        verb: RunLifecycleVerb,
+    ) -> Result<RunRecord, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.plan_run_verb(run_id, verb))
+    }
+
+    /// Blocking twin of [`Engine::stop_run`].
+    pub fn stop_run(
+        &self,
+        run_id: &str,
+        window: Option<Duration>,
+    ) -> Result<AgentInstance, RunVerbError> {
+        self.engine
+            .rt
+            .block_on(self.engine.stop_run(run_id, window))
+    }
+
+    /// Blocking twin of [`Engine::pause_run`].
+    pub fn pause_run(&self, run_id: &str) -> Result<AgentInstance, RunVerbError> {
+        self.engine.rt.block_on(self.engine.pause_run(run_id))
+    }
+
+    /// Blocking twin of [`Engine::resume_run`].
+    pub fn resume_run(&self, run_id: &str) -> Result<AgentInstance, RunVerbError> {
+        self.engine.rt.block_on(self.engine.resume_run(run_id))
+    }
+
+    /// Blocking twin of [`Engine::drain_run`].
+    pub fn drain_run(
+        &self,
+        run_id: &str,
+        timeout_override: Option<Duration>,
+    ) -> Result<DrainReport, RunVerbError> {
+        self.engine
+            .rt
+            .block_on(self.engine.drain_run(run_id, timeout_override))
+    }
+
+    /// Blocking twin of [`Engine::set_run_limits`].
+    pub fn set_run_limits(
+        &self,
+        run_ids: Vec<String>,
+        change: RunLimitChange,
+        actor: LimitActor,
+        dry_run: bool,
+    ) -> Result<crate::domain::RunLimitsResults, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.set_run_limits(run_ids, change, actor, dry_run))
+    }
+
+    /// Blocking twin of [`Engine::run_limits_view`].
+    pub fn run_limits_view(&self, run_id: &str) -> Result<RunLimitsView, RunError> {
+        self.engine.rt.block_on(self.engine.run_limits_view(run_id))
+    }
+
     /// Blocking twin of [`Engine::seed_runs_for_perf`] (the perf harness's
     /// `#[doc(hidden)]` seeding seam).
     #[doc(hidden)]
@@ -3310,6 +3565,176 @@ mod tests {
         assert!(matches!(
             facade.run("run_none"),
             Err(RunError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn the_run_verb_and_limit_facades_map_refuse_and_plan_per_run() {
+        // Story 21-6: the Run-grain verbs and the budget job through the
+        // async + blocking facade, over a supervised Run seeded through the
+        // registry (the builtin `mock` cannot start a process).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        facade.register("demo", "mock").unwrap();
+        let owner = RunId::mint();
+        {
+            let registry = engine.inner.registry.lock().unwrap();
+            registry
+                .ensure_supervised_run(crate::domain::runs::ops::SupervisedRun {
+                    instance: InstanceName::new("demo").unwrap(),
+                    run_id: owner.clone(),
+                    wire_path: false,
+                    labels: Vec::new(),
+                    fresh: true,
+                    inputs: None,
+                })
+                .unwrap();
+        }
+        let child = facade
+            .open_child_run(ChildRunRequest::under(crate::domain::RunParent::Run(
+                owner.clone(),
+            )))
+            .unwrap()
+            .record
+            .run_id;
+        // The owner maps to the instance's verb (which refuses here: the
+        // registered mock is not running — an ENGINE error, decoded as such).
+        assert_eq!(
+            facade
+                .plan_run_verb(owner.as_str(), RunLifecycleVerb::Stop)
+                .unwrap()
+                .instance
+                .as_deref(),
+            Some("demo")
+        );
+        for result in [
+            facade.stop_run(owner.as_str(), None).map(|_| ()),
+            facade.pause_run(owner.as_str()).map(|_| ()),
+            facade.resume_run(owner.as_str()).map(|_| ()),
+            facade.drain_run(owner.as_str(), None).map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(RunVerbError::Engine(_))), "{result:?}");
+        }
+        // The child is refused per Run, naming its depth.
+        for result in [
+            facade.stop_run(child.as_str(), None).map(|_| ()),
+            facade.pause_run(child.as_str()).map(|_| ()),
+            facade.resume_run(child.as_str()).map(|_| ()),
+            facade.drain_run(child.as_str(), None).map(|_| ()),
+        ] {
+            match result {
+                Err(RunVerbError::Run(err)) => assert_eq!(err.code(), "verb-unavailable"),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(
+            facade
+                .plan_run_verb(child.as_str(), RunLifecycleVerb::Pause)
+                .unwrap_err()
+                .code(),
+            "verb-unavailable"
+        );
+        assert_eq!(
+            facade
+                .plan_run_verb("run_none", RunLifecycleVerb::Pause)
+                .unwrap_err()
+                .code(),
+            "run-not-found"
+        );
+        assert!(matches!(
+            facade.stop_run("run_none", None),
+            Err(RunVerbError::Run(RunError::NotFound { .. }))
+        ));
+        // The budget job: a dry run plans, a write commits, a child's
+        // cumulative ceiling is that Run's refusal.
+        let change = RunLimitChange {
+            set: crate::domain::RunLimits {
+                token_per_run: Some(5_000),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+        };
+        let planned = facade
+            .set_run_limits(
+                vec![owner.to_string()],
+                change.clone(),
+                LimitActor::Operator,
+                true,
+            )
+            .unwrap();
+        assert!(planned[0].1.as_ref().unwrap().dry_run);
+        assert_eq!(
+            facade.run_limits_view(owner.as_str()).unwrap().limits,
+            crate::domain::RunLimits::default()
+        );
+        let results = facade
+            .set_run_limits(
+                vec![owner.to_string(), child.to_string()],
+                RunLimitChange {
+                    set: crate::domain::RunLimits {
+                        token_per_run: Some(5_000),
+                        token_cumulative: Some(9_000),
+                        ..Default::default()
+                    },
+                    clear: Vec::new(),
+                },
+                LimitActor::Operator,
+                false,
+            )
+            .unwrap();
+        assert!(results[0].1.is_ok());
+        assert_eq!(
+            results[1].1.as_ref().unwrap_err().code(),
+            "scope-unavailable"
+        );
+        let view = facade.run_limits_view(owner.as_str()).unwrap();
+        assert_eq!(view.limits.token_cumulative, Some(9_000));
+        assert_eq!(
+            view.resolution.sources.tokens_cumulative,
+            crate::domain::LimitSource::Run
+        );
+        // A config write runs the re-arm pass (nothing latched here) and
+        // leaves the Run-level limit on top.
+        facade
+            .set_config("demo", "budget.tokens.per_run", "100")
+            .unwrap();
+        assert_eq!(
+            facade
+                .run_limits_view(owner.as_str())
+                .unwrap()
+                .resolution
+                .tokens
+                .per_run,
+            Some(5_000)
+        );
+        // A malformed change is refused whole.
+        assert!(facade
+            .set_run_limits(
+                vec![owner.to_string()],
+                RunLimitChange::default(),
+                LimitActor::Operator,
+                false
+            )
+            .is_err());
+        // A read-only engine plans but refuses every write.
+        drop(engine);
+        let read_only = Engine::open_read_only(Some(tmp.path().to_path_buf())).unwrap();
+        let ro = read_only.blocking();
+        assert!(ro
+            .set_run_limits(
+                vec![owner.to_string()],
+                change.clone(),
+                LimitActor::Operator,
+                true
+            )
+            .is_ok());
+        assert!(ro
+            .set_run_limits(vec![owner.to_string()], change, LimitActor::Operator, false)
+            .is_err());
+        assert!(matches!(
+            ro.stop_run(owner.as_str(), None),
+            Err(RunVerbError::Run(RunError::Store(_)))
         ));
     }
 

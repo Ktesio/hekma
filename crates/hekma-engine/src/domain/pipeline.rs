@@ -273,6 +273,9 @@ struct ResolvedArms {
     /// fallback already applied); `None` when the action is set directly
     /// (the 21-2 loud-degrade contract keeps the configured action).
     policy_action: Option<BreachAction>,
+    /// A Caller's tighter action (story 21-6): set directly, so it keeps
+    /// the depth check below like the Run's own action.
+    caller_action: Option<BreachAction>,
 }
 
 impl Level {
@@ -328,11 +331,14 @@ fn levels_for<S: RunRecords + ?Sized>(
         // the process level alone (the owner's resolution, in the
         // EvalInput) — a child level enforcing them too would fire the
         // instance ceiling once per level.
+        // A Caller's tighter limit (story 21-6) also arms from the stored
+        // resolution: it is not in the Run's own (Operator/Host) row.
         let policy_sourced = |source: &crate::domain::runs::LimitSource| {
             matches!(
                 source,
                 crate::domain::runs::LimitSource::Policy(_)
                     | crate::domain::runs::LimitSource::Default
+                    | crate::domain::runs::LimitSource::Caller
             )
         };
         let resolution = store.run_policy(&record.run_id)?.map(|row| {
@@ -350,18 +356,22 @@ fn levels_for<S: RunRecords + ?Sized>(
             let rate = policy_sourced(&row.resolution.sources.rate)
                 .then_some(row.resolution.rate)
                 .flatten();
-            let policy_action = policy_sourced(&row.resolution.sources.breach_action)
+            let action_source = &row.resolution.sources.breach_action;
+            let caller_action = (*action_source == crate::domain::runs::LimitSource::Caller)
+                .then_some(row.resolution.action);
+            let policy_action = (caller_action.is_none() && policy_sourced(action_source))
                 .then_some(row.resolution.effective_action);
             ResolvedArms {
                 token_per_run,
                 dollar_per_run_micros,
                 rate,
                 policy_action,
+                caller_action,
             }
         });
         let action = resolution
             .as_ref()
-            .and_then(|arms| arms.policy_action)
+            .and_then(|arms| arms.policy_action.or(arms.caller_action))
             .unwrap_or_else(|| limits.action());
         let child_action = if resolution
             .as_ref()

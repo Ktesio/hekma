@@ -1598,6 +1598,9 @@ jobs:
         # `fence` kind, whose refusals a Host re-derives below. Story 21-2
         # (vectors 1.2.0) adds the `ancestor-ceilings` rule and the `chain`
         # kind (one outcome per level, never a latched pair re-firing).
+        # Story 21-6 (vectors 1.4.0) adds the `re-arm` rule and the `rearm`
+        # kind, whose released latches and lifted fence reasons a Host
+        # re-derives below.
         run: |
           python3 - <<'PY'
           import json
@@ -1629,6 +1632,7 @@ jobs:
               "block-fence",
               "ancestor-ceilings",
               "policy-resolution",
+              "re-arm",
           }
           missing = expected - tags
           assert not missing, f"uncovered rules: {sorted(missing)}"
@@ -1637,6 +1641,7 @@ jobs:
           assert kinds.get("fence"), f"no fence cases: {kinds}"
           assert kinds.get("chain"), f"no chain cases: {kinds}"
           assert kinds.get("policy"), f"no policy cases: {kinds}"
+          assert kinds.get("rearm"), f"no rearm cases: {kinds}"
           for case in document["cases"]:
               if case["kind"] != "chain":
                   continue
@@ -1668,6 +1673,32 @@ jobs:
               assert (expected["dimension"], expected["scope"]) == first, case["id"]
               code = f"{first[0]}_{first[1].replace('-', '_')}"
               assert expected["code"] == code, case["id"]
+          # The re-arm rule (vectors 1.4.0), re-implemented as a Host
+          # would: a latch re-arms when its ceiling is now above its total
+          # or unset; its `block` fence reason lifts per reason.
+          totals_key = {
+              ("tokens", "per-run"): ("tokens_per_run", "run_tokens"),
+              ("tokens", "cumulative"): ("tokens_cumulative", "cumulative_tokens"),
+              ("dollars", "per-run"): ("dollars_per_run_micros", "run_cost_micros"),
+              ("dollars", "cumulative"): ("dollars_cumulative_micros", "cumulative_cost_micros"),
+          }
+          for case in document["cases"]:
+              if case["kind"] != "rearm":
+                  continue
+              arms = case["input"]["arms"]
+              totals = case["input"]["totals"]
+              released = []
+              lifted = []
+              for latched in case["input"]["latched"]:
+                  key = (latched["reason"]["dimension"], latched["reason"]["scope"])
+                  arm, total = totals_key[key]
+                  ceiling = arms.get(arm)
+                  if (ceiling is None or ceiling > totals[total]) and latched not in released:
+                      released.append(latched)
+                      if latched["action"] == "block" and latched["reason"] not in lifted:
+                          lifted.append(latched["reason"])
+              assert case["expected"]["unlatched"] == released, case["id"]
+              assert case["expected"]["fence_cleared"] == lifted, case["id"]
           print(
               "governance vectors ok:"
               f" {len(document['cases'])} cases {kinds},"

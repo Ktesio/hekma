@@ -114,6 +114,10 @@ fn note<S: RunRecords + ?Sized>(
         anomalies: record.anomalies.clone(),
         labels: bound_only(&labels),
         prior_labels: prior.labels,
+        limits: prior
+            .limits
+            .map(|_| Box::new(prior.after_limits.unwrap_or(limits))),
+        prior_limits: prior.limits.map(Box::new),
         cause,
         policies: resolution
             .as_ref()
@@ -136,6 +140,12 @@ struct Prior {
     depth: Option<ControlDepth>,
     wire_path: Option<bool>,
     labels: Option<Vec<Label>>,
+    /// The Run's own limits before, on `limits-changed` (the event then
+    /// carries the limits after too).
+    limits: Option<super::RunLimits>,
+    /// The changed layer after, on `limits-changed` (else the Run's
+    /// Operator/Host layer as read back).
+    after_limits: Option<super::RunLimits>,
 }
 
 /// The bound subset of `labels` (what a Run event carries).
@@ -572,6 +582,37 @@ fn write_labels<S: RunRecords + ?Sized>(
     )?;
     changes.extend(resolved);
     Ok(())
+}
+
+/// Note a `limits-changed` event for `record` (story 21-6): the changed
+/// layer of the Run's own limits before (`prior`) and after (`after`), with
+/// the actor as the cause. The change is the Run's latest update: the row
+/// is saved here with `updated_at = at`, and the event carries that `at`
+/// (the audit time of a money change, not the Run's last earlier write).
+pub(crate) fn note_limits_changed<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    record: &RunRecord,
+    prior: super::RunLimits,
+    after: super::RunLimits,
+    actor: &str,
+    at: &str,
+) -> Result<(), StoreError> {
+    let mut record = record.clone();
+    record.updated_at = at.to_string();
+    store.save_run(&record)?;
+    note(
+        store,
+        changes,
+        &record,
+        RunEventKind::LimitsChanged,
+        Prior {
+            limits: Some(prior),
+            after_limits: Some(after),
+            ..Prior::default()
+        },
+        Some(actor.to_string()),
+    )
 }
 
 /// Note an `anomalies-changed` event for `record` (already saved with its

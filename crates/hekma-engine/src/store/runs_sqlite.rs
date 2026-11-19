@@ -619,31 +619,112 @@ fn decode_label(
     })
 }
 
-/// Fold one per-run `run_limits` row into `limits` (shared by the one-Run
-/// read and the Fleet's batched read).
-fn apply_run_limit(
-    limits: &mut RunLimits,
-    run_id: &str,
-    dimension: &str,
-    limit: i64,
-    action: &str,
-) -> Result<(), StoreError> {
-    let action: BreachAction = action.parse().map_err(|_| StoreError::CorruptRow {
-        name: "run_limits".to_string(),
-        detail: format!("Run `{run_id}` has an unknown Breach Action `{action}`"),
-    })?;
-    limits.breach_action = Some(action);
-    match dimension {
-        "tokens" => limits.token_per_run = Some(limit.max(0) as u64),
-        "dollars" => limits.dollar_per_run_micros = Some(Micros(limit.max(0))),
-        other => {
-            return Err(StoreError::CorruptRow {
-                name: "run_limits".to_string(),
-                detail: format!("Run `{run_id}` has an unknown dimension `{other}`"),
-            })
-        }
+/// The `run_limits` dimension of the Run-level Breach Action row (story
+/// 21-6): `limit_value` 1 = the action column is the Run's action, 0 = the
+/// Run sets no action of its own (the action column is a placeholder).
+/// When the row exists it decides the Run's action; a Run without it (a
+/// child opened by 21-2, which stores the action on every ceiling row)
+/// keeps the ceiling rows' action.
+const ACTION_DIMENSION: &str = "action";
+
+/// The scope column of the action row.
+const ACTION_SCOPE: &str = "run";
+
+/// The dimension prefix of the Caller layer's rows (story 21-6): a Caller's
+/// limits are their own rows (`caller.tokens` / `per-run`, …,
+/// `caller.action` / `run`) beside the Operator/Host rows on the same Run,
+/// so a Caller write never replaces — or re-labels — an Operator's limit,
+/// and the resolver applies the Caller's only where tighter. No schema
+/// step: the existing key `(run_id, dimension, scope)` holds both layers.
+const CALLER_PREFIX: &str = "caller.";
+
+/// The dimension a layer's row is stored under.
+fn slot_dimension(slot: crate::ports::LimitSlot, dimension: &str) -> String {
+    match slot {
+        crate::ports::LimitSlot::Run => dimension.to_string(),
+        crate::ports::LimitSlot::Caller => format!("{CALLER_PREFIX}{dimension}"),
     }
-    Ok(())
+}
+
+/// Folds one layer of a Run's `run_limits` rows into its [`RunLimits`].
+#[derive(Default)]
+struct LayerFold {
+    limits: RunLimits,
+    /// The action carried on the ceiling rows (the 21-2 child-open shape).
+    ceiling_action: Option<BreachAction>,
+    /// The action row's verdict, when the layer has one.
+    action_row: Option<Option<BreachAction>>,
+}
+
+impl LayerFold {
+    fn finish(self) -> RunLimits {
+        let mut limits = self.limits;
+        limits.breach_action = match self.action_row {
+            Some(action) => action,
+            None => self.ceiling_action,
+        };
+        limits
+    }
+}
+
+/// Folds one Run's `run_limits` rows into its two layers (shared by the
+/// one-Run reads and the Fleet's batched read).
+#[derive(Default)]
+struct LimitsFold {
+    /// The Operator/Host layer.
+    run: LayerFold,
+    /// The Caller layer.
+    caller: LayerFold,
+}
+
+impl LimitsFold {
+    fn row(
+        &mut self,
+        run_id: &str,
+        dimension: &str,
+        scope: &str,
+        limit: i64,
+        action: &str,
+    ) -> Result<(), StoreError> {
+        let corrupt = |detail: String| StoreError::CorruptRow {
+            name: "run_limits".to_string(),
+            detail,
+        };
+        let parsed: BreachAction = action.parse().map_err(|_| {
+            corrupt(format!(
+                "Run `{run_id}` has an unknown Breach Action `{action}`"
+            ))
+        })?;
+        let (layer, dimension) = match dimension.strip_prefix(CALLER_PREFIX) {
+            Some(dimension) => (&mut self.caller, dimension),
+            None => (&mut self.run, dimension),
+        };
+        let value = limit.max(0);
+        match (dimension, scope) {
+            (ACTION_DIMENSION, _) => {
+                layer.action_row = Some((value != 0).then_some(parsed));
+                return Ok(());
+            }
+            ("tokens", "per-run") => layer.limits.token_per_run = Some(value as u64),
+            ("dollars", "per-run") => layer.limits.dollar_per_run_micros = Some(Micros(value)),
+            ("tokens", "cumulative") => layer.limits.token_cumulative = Some(value as u64),
+            ("dollars", "cumulative") => {
+                layer.limits.dollar_cumulative_micros = Some(Micros(value))
+            }
+            (other, scope) => {
+                return Err(corrupt(format!(
+                    "Run `{run_id}` has an unknown limit `{other}` / `{scope}`"
+                )))
+            }
+        }
+        layer.ceiling_action = Some(parsed);
+        Ok(())
+    }
+
+    /// The Operator/Host layer and the Caller layer.
+    fn finish(self) -> (RunLimits, RunLimits) {
+        (self.run.finish(), self.caller.finish())
+    }
 }
 
 fn read_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
@@ -690,6 +771,14 @@ impl SqliteStore {
     #[cfg(test)]
     pub(crate) fn execute_batch_for_test(&self, sql: &str) {
         self.conn().execute_batch(sql).expect("test fixture SQL");
+    }
+
+    /// Test-only: one text column of one row.
+    #[cfg(test)]
+    pub(crate) fn query_string_for_test(&self, sql: &str) -> String {
+        self.conn()
+            .query_row(sql, [], |row| row.get::<_, String>(0))
+            .expect("test fixture query")
     }
 
     /// Run `body` in a named SAVEPOINT of the open batch transaction: its
@@ -894,28 +983,114 @@ impl RunRecords for SqliteStore {
     }
 
     fn run_limits(&self, run_id: &RunId) -> Result<RunLimits, StoreError> {
-        let mut stmt = self
-            .conn()
-            .prepare(
-                "SELECT dimension, limit_value, action FROM run_limits \
-                 WHERE run_id = ?1 AND scope = 'per-run'",
-            )
-            .map_err(backend)?;
-        let rows = stmt
-            .query_map([run_id.as_str()], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(backend)?;
-        let mut limits = RunLimits::default();
-        for row in rows {
-            let (dimension, limit, action) = row.map_err(backend)?;
-            apply_run_limit(&mut limits, run_id.as_str(), &dimension, limit, &action)?;
+        Ok(self.run_limit_layers(run_id)?.0)
+    }
+
+    fn run_caller_limits(&self, run_id: &RunId) -> Result<RunLimits, StoreError> {
+        Ok(self.run_limit_layers(run_id)?.1)
+    }
+
+    fn replace_run_limits(
+        &self,
+        run_id: &RunId,
+        slot: crate::ports::LimitSlot,
+        limits: &RunLimits,
+        source: &str,
+        at: &str,
+    ) -> Result<(), StoreError> {
+        let action = limits.action();
+        let clamp = |value: u64| value.min(i64::MAX as u64) as i64;
+        let wanted = [
+            ("tokens", "per-run", limits.token_per_run.map(clamp)),
+            (
+                "dollars",
+                "per-run",
+                limits.dollar_per_run_micros.map(|m| m.0.max(0)),
+            ),
+            ("tokens", "cumulative", limits.token_cumulative.map(clamp)),
+            (
+                "dollars",
+                "cumulative",
+                limits.dollar_cumulative_micros.map(|m| m.0.max(0)),
+            ),
+            (
+                ACTION_DIMENSION,
+                ACTION_SCOPE,
+                limits
+                    .is_set()
+                    .then_some(i64::from(limits.breach_action.is_some())),
+            ),
+        ];
+        for (dimension, scope, value) in wanted {
+            let dimension = slot_dimension(slot, dimension);
+            let existing: Option<(i64, String)> = self
+                .conn()
+                .query_row(
+                    "SELECT limit_value, action FROM run_limits \
+                     WHERE run_id = ?1 AND dimension = ?2 AND scope = ?3",
+                    rusqlite::params![run_id.as_str(), dimension, scope],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(backend)?;
+            match (value, existing) {
+                (None, None) => {}
+                (None, Some(_)) => {
+                    self.conn()
+                        .execute(
+                            "DELETE FROM run_limits \
+                             WHERE run_id = ?1 AND dimension = ?2 AND scope = ?3",
+                            rusqlite::params![run_id.as_str(), dimension, scope],
+                        )
+                        .map_err(backend)?;
+                }
+                // Provenance: a row whose value holds keeps who set it and
+                // when. The action column a ceiling row carries (the 21-2
+                // shape's fallback) follows the layer's action in place;
+                // the action row's own value is its action, so a change of
+                // action is a change of that row.
+                (Some(value), Some((stored, stored_action)))
+                    if stored == value
+                        && (scope != ACTION_SCOPE || stored_action == action.as_str()) =>
+                {
+                    if stored_action != action.as_str() {
+                        self.conn()
+                            .execute(
+                                "UPDATE run_limits SET action = ?4 \
+                                 WHERE run_id = ?1 AND dimension = ?2 AND scope = ?3",
+                                rusqlite::params![
+                                    run_id.as_str(),
+                                    dimension,
+                                    scope,
+                                    action.as_str()
+                                ],
+                            )
+                            .map_err(backend)?;
+                    }
+                }
+                (Some(value), _) => {
+                    self.conn()
+                        .execute(
+                            "INSERT INTO run_limits (run_id, dimension, scope, limit_value, \
+                             action, source, set_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                             ON CONFLICT (run_id, dimension, scope) DO UPDATE SET \
+                             limit_value = excluded.limit_value, action = excluded.action, \
+                             source = excluded.source, set_at = excluded.set_at",
+                            rusqlite::params![
+                                run_id.as_str(),
+                                dimension,
+                                scope,
+                                value,
+                                action.as_str(),
+                                source,
+                                at
+                            ],
+                        )
+                        .map_err(backend)?;
+                }
+            }
         }
-        Ok(limits)
+        Ok(())
     }
 
     fn run_chain(&self, run_id: &RunId) -> Result<Vec<RunRecord>, StoreError> {
@@ -1451,7 +1626,7 @@ impl PolicyRecords for SqliteStore {
             return Ok(None);
         };
         let labels = self.run_labels(run_id)?;
-        let limits = self.run_limits(run_id)?;
+        let (limits, caller_limits) = self.run_limit_layers(run_id)?;
         let kept_on_pause = match &record.instance {
             Some(instance) => self.breach_default_kept(instance)?,
             None => false,
@@ -1460,6 +1635,7 @@ impl PolicyRecords for SqliteStore {
             record,
             labels,
             limits,
+            caller_limits,
             kept_on_pause,
         }))
     }
@@ -1501,15 +1677,14 @@ impl PolicyRecords for SqliteStore {
                 labels.entry(run_id).or_default().push(label);
             }
         }
-        let mut limits: HashMap<String, RunLimits> = HashMap::new();
+        let mut limits: HashMap<String, (RunLimits, RunLimits)> = HashMap::new();
         {
             let mut stmt = self
                 .conn()
                 .prepare(&format!(
-                    "SELECT l.run_id, l.dimension, l.limit_value, l.action FROM run_limits l \
-                     JOIN runs r ON r.run_id = l.run_id \
-                     WHERE {OPEN_OWNER} AND l.scope = 'per-run' \
-                     ORDER BY l.run_id, l.dimension"
+                    "SELECT l.run_id, l.dimension, l.scope, l.limit_value, l.action \
+                     FROM run_limits l JOIN runs r ON r.run_id = l.run_id \
+                     WHERE {OPEN_OWNER} ORDER BY l.run_id, l.dimension, l.scope"
                 ))
                 .map_err(backend)?;
             let rows = stmt
@@ -1517,15 +1692,22 @@ impl PolicyRecords for SqliteStore {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })
                 .map_err(backend)?;
+            let mut folds: HashMap<String, LimitsFold> = HashMap::new();
             for row in rows {
-                let (run_id, dimension, limit, action) = row.map_err(backend)?;
-                let entry = limits.entry(run_id.clone()).or_default();
-                apply_run_limit(entry, &run_id, &dimension, limit, &action)?;
+                let (run_id, dimension, scope, limit, action) = row.map_err(backend)?;
+                folds
+                    .entry(run_id.clone())
+                    .or_default()
+                    .row(&run_id, &dimension, &scope, limit, &action)?;
+            }
+            for (run_id, fold) in folds {
+                limits.insert(run_id, fold.finish());
             }
         }
         let kept: HashSet<String> = {
@@ -1551,9 +1733,11 @@ impl PolicyRecords for SqliteStore {
                     .instance
                     .as_deref()
                     .is_some_and(|instance| kept.contains(instance));
+                let (run_limits, caller_limits) = limits.remove(run_id).unwrap_or_default();
                 crate::ports::ResolutionFacts {
                     labels: labels.remove(run_id).unwrap_or_default(),
-                    limits: limits.remove(run_id).unwrap_or_default(),
+                    limits: run_limits,
+                    caller_limits,
                     kept_on_pause,
                     record,
                 }
@@ -1725,3 +1909,33 @@ fn decode_run_policy(
 
 #[cfg(test)]
 mod tests;
+
+impl SqliteStore {
+    /// One Run's two limit layers (the Operator/Host layer, the Caller
+    /// layer) in one read.
+    fn run_limit_layers(&self, run_id: &RunId) -> Result<(RunLimits, RunLimits), StoreError> {
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT dimension, scope, limit_value, action FROM run_limits \
+                 WHERE run_id = ?1",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([run_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(backend)?;
+        let mut fold = LimitsFold::default();
+        for row in rows {
+            let (dimension, scope, limit, action) = row.map_err(backend)?;
+            fold.row(run_id.as_str(), &dimension, &scope, limit, &action)?;
+        }
+        Ok(fold.finish())
+    }
+}

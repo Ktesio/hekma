@@ -270,6 +270,9 @@ pub enum LimitSource {
     Policy(String),
     /// Supplied by the `default` Policy.
     Default,
+    /// Set on the Run by a Caller, and tighter than every other layer
+    /// (story 21-6: a Caller's limit applies only while it is tighter).
+    Caller,
     /// Not set anywhere.
     Unset,
 }
@@ -304,7 +307,9 @@ impl LimitSources {
         .filter_map(|source| match source {
             LimitSource::Policy(name) => Some(name.clone()),
             LimitSource::Default => Some(DEFAULT_POLICY_NAME.to_string()),
-            LimitSource::Run | LimitSource::Instance | LimitSource::Unset => None,
+            LimitSource::Run | LimitSource::Caller | LimitSource::Instance | LimitSource::Unset => {
+                None
+            }
         })
         .collect();
         names.sort();
@@ -329,7 +334,9 @@ impl LimitSources {
         .filter_map(|source| match source {
             LimitSource::Policy(name) => Some(name.clone()),
             LimitSource::Default => Some(DEFAULT_POLICY_NAME.to_string()),
-            LimitSource::Run | LimitSource::Instance | LimitSource::Unset => None,
+            LimitSource::Run | LimitSource::Caller | LimitSource::Instance | LimitSource::Unset => {
+                None
+            }
         })
         .collect();
         names.sort();
@@ -543,6 +550,29 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
             *source = LimitSource::Default;
         }
     }
+    // ---- A Caller's ceilings (FR-53/FR-60): each applies only where it
+    // is tighter than the value every other layer resolved — so a later
+    // Operator, Host or Policy tightening below it wins again.
+    for kind in [
+        LimitKind::TokensPerRun,
+        LimitKind::TokensCumulative,
+        LimitKind::DollarsPerRun,
+        LimitKind::DollarsCumulative,
+    ] {
+        let Some(value) = input.caller_limits.ceiling(kind) else {
+            continue;
+        };
+        let (slot, source) = match kind {
+            LimitKind::TokensPerRun => (&mut tokens.per_run, &mut sources.tokens_per_run),
+            LimitKind::TokensCumulative => (&mut tokens.cumulative, &mut sources.tokens_cumulative),
+            LimitKind::DollarsPerRun => (&mut dollar_scope[0], &mut sources.dollars_per_run),
+            LimitKind::DollarsCumulative => (&mut dollar_scope[1], &mut sources.dollars_cumulative),
+        };
+        if slot.is_none_or(|resolved| value < resolved) {
+            *slot = Some(value);
+            *source = LimitSource::Caller;
+        }
+    }
     dollars.per_run = dollar_scope[0].map(|micros| crate::domain::cost::Micros(micros as i64));
     dollars.cumulative = dollar_scope[1].map(|micros| crate::domain::cost::Micros(micros as i64));
 
@@ -579,6 +609,15 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
             .limits
             .breach_action
             .unwrap_or(BreachAction::Warn)
+    };
+
+    // A Caller's Breach Action applies only where it is tighter.
+    let action = match input.caller_limits.breach_action {
+        Some(caller) if action_tightness(caller) > action_tightness(action) => {
+            sources.breach_action = LimitSource::Caller;
+            caller
+        }
+        _ => action,
     };
 
     // ---- The Scent-Check Mode: instance > the most specific matching
@@ -633,7 +672,7 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
     let action_source = match &sources.breach_action {
         LimitSource::Policy(name) => Some(name.clone()),
         LimitSource::Default => Some(DEFAULT_POLICY_NAME.to_string()),
-        LimitSource::Run | LimitSource::Instance | LimitSource::Unset => None,
+        LimitSource::Run | LimitSource::Caller | LimitSource::Instance | LimitSource::Unset => None,
     };
     let fallback = if action != BreachAction::Warn
         && action_source.is_some()
@@ -689,15 +728,32 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
     }
 }
 
-/// The Run-level ceiling for `kind` (`run_limits`), if set. Only per-run
-/// scopes exist at the Run level today (21-2).
+/// The Run-level ceiling for `kind` (`run_limits`), if set. Story 21-6
+/// adds the cumulative scopes (set through `hekma budget` on a
+/// process-owning Run; a child Run never carries one).
 fn run_ceiling(limits: &RunLimits, kind: LimitKind) -> Option<u64> {
     match kind {
         LimitKind::TokensPerRun => limits.token_per_run,
         LimitKind::DollarsPerRun => limits
             .dollar_per_run_micros
-            .map(|micros| micros.get() as u64),
-        LimitKind::TokensCumulative | LimitKind::DollarsCumulative => None,
+            .map(|micros| micros.get().max(0) as u64),
+        LimitKind::TokensCumulative => limits.token_cumulative,
+        LimitKind::DollarsCumulative => limits
+            .dollar_cumulative_micros
+            .map(|micros| micros.get().max(0) as u64),
+    }
+}
+
+/// A Run's Caller layer as the resolver's `caller_limits` input.
+pub(crate) fn caller_policy_limits(limits: &RunLimits) -> PolicyLimits {
+    let micros = |value: crate::domain::cost::Micros| value.get().max(0) as u64;
+    PolicyLimits {
+        tokens_per_run: limits.token_per_run,
+        tokens_cumulative: limits.token_cumulative,
+        dollars_per_run_micros: limits.dollar_per_run_micros.map(micros),
+        dollars_cumulative_micros: limits.dollar_cumulative_micros.map(micros),
+        breach_action: limits.breach_action,
+        ..PolicyLimits::default()
     }
 }
 
@@ -978,6 +1034,7 @@ fn resolve_for<S: RunRecords + ?Sized>(
 ) -> Result<PolicyResolution, StoreError> {
     let labels = store.run_labels(&record.run_id)?;
     let run_limits = store.run_limits(&record.run_id)?;
+    let caller = store.run_caller_limits(&record.run_id)?;
     let kept = record
         .instance
         .as_deref()
@@ -994,7 +1051,7 @@ fn resolve_for<S: RunRecords + ?Sized>(
             .collect(),
         run_limits,
         inputs: inputs.clone(),
-        caller_limits: PolicyLimits::default(),
+        caller_limits: caller_policy_limits(&caller),
         kept_on_pause: kept,
         policies: store.policies()?,
     }))
@@ -1243,6 +1300,7 @@ mod tests {
             token_per_run: Some(100),
             dollar_per_run_micros: None,
             breach_action: Some(BreachAction::Warn),
+            ..RunLimits::default()
         };
         let resolution = resolve(&with_run);
         assert_eq!(limits_of(&resolution), Some(100));

@@ -74,6 +74,7 @@ fn a_run_round_trips_with_its_labels_limits_and_identity() {
                 token_per_run: Some(100),
                 dollar_per_run_micros: Some(Micros(5)),
                 breach_action: Some(BreachAction::Warn),
+                ..RunLimits::default()
             },
             identity: Some(("host".to_string(), "job-1".to_string())),
         })
