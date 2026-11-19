@@ -122,6 +122,10 @@ fn engine_parts(err: &EngineError) -> (&'static str, Value) {
         EngineError::LaunchFailed { name, detail } => {
             ("LaunchFailed", json!({ "name": name, "detail": detail }))
         }
+        EngineError::CredentialUnavailable { name, detail } => (
+            "CredentialUnavailable",
+            json!({ "name": name, "detail": detail }),
+        ),
         EngineError::AdapterUnresolved { name, detail } => (
             "AdapterUnresolved",
             json!({ "name": name, "detail": detail }),
@@ -549,6 +553,10 @@ fn decode_engine(variant: &str, f: &Fields) -> Option<EngineError> {
             level: text(f, "level")?,
         },
         "LaunchFailed" => EngineError::LaunchFailed {
+            name: text(f, "name")?,
+            detail: text(f, "detail")?,
+        },
+        "CredentialUnavailable" => EngineError::CredentialUnavailable {
             name: text(f, "name")?,
             detail: text(f, "detail")?,
         },

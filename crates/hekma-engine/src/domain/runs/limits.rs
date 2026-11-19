@@ -597,6 +597,9 @@ pub(crate) struct LimitsPlan {
     pub record: RunRecord,
     /// The layer the actor writes (a Caller's own; else the Run's).
     pub slot: crate::ports::LimitSlot,
+    /// The Caller's layer after an Operator/Host clear reached it (story
+    /// 22-1: the Operator outranks); `None` when the Caller layer is kept.
+    pub caller_cleared: Option<RunLimits>,
     /// That layer before and after.
     pub prior_limits: RunLimits,
     pub limits: RunLimits,
@@ -658,10 +661,13 @@ fn movement(
 
 /// The first limit a Caller's `change` asks to loosen against what applies
 /// now (`before`, the effective resolution): a ceiling set above the
-/// effective one, an action looser than the
-/// effective one, or a clear of a limit that applies. A Caller's limit
-/// lives in its own layer, so the effective movement alone cannot see a
-/// request that the other layers happen to outrank.
+/// effective one, or an action looser than the effective one. A Caller's
+/// limit lives in its own layer, so the effective movement alone cannot see
+/// a request that the other layers happen to outrank. A CLEAR is judged by
+/// the effective movement alone (story 22-1, the 21-6 review's N5): a
+/// Caller may clear its own dormant row — one the other layers outrank, so
+/// clearing it loosens nothing — and is refused only when the clear would
+/// loosen what applies.
 fn caller_loosens(change: &RunLimitChange, before: &PolicyResolution) -> Option<&'static str> {
     let (ceilings, action) = effective(before);
     let micros = |value: Micros| value.get().max(0) as u64;
@@ -685,17 +691,13 @@ fn caller_loosens(change: &RunLimitChange, before: &PolicyResolution) -> Option<
     {
         return Some("breach-action");
     }
-    for field in &change.clear {
-        let applies = match field {
-            RunLimitField::TokensPerRun => ceilings[0].is_some(),
-            RunLimitField::TokensCumulative => ceilings[1].is_some(),
-            RunLimitField::DollarsPerRun => ceilings[2].is_some(),
-            RunLimitField::DollarsCumulative => ceilings[3].is_some(),
-            RunLimitField::BreachAction => action > policy::action_tightness(BreachAction::Warn),
-        };
-        if applies {
-            return Some(field.as_str());
-        }
+    // Story 22-1 (the 21-6 review's L2): a Caller may not trade `pause` or
+    // `stop` for the cooperative `block`.
+    if change.set.breach_action == Some(BreachAction::Block)
+        && !policy::caller_action_tightens(BreachAction::Block, before.effective_action)
+        && before.effective_action != BreachAction::Block
+    {
+        return Some("breach-action");
     }
     None
 }
@@ -871,10 +873,24 @@ pub(crate) fn plan_limits(
         crate::ports::LimitSlot::Caller => caller_layer,
     };
     let limits = change.merged_over(&prior_limits);
+    // The Operator outranks (story 22-1, the 21-6 open question): an
+    // Operator or Host CLEAR of a limit clears it in the Caller's layer
+    // too — otherwise a Caller's self-imposed row could never be lifted.
+    // A set never touches the Caller's layer (the Caller's row still
+    // applies only where it is tighter).
     let (run_after, caller_after) = match slot {
-        crate::ports::LimitSlot::Run => (limits, caller_layer),
+        crate::ports::LimitSlot::Run => (
+            limits,
+            RunLimitChange {
+                set: RunLimits::default(),
+                clear: change.clear.clone(),
+            }
+            .merged_over(&caller_layer),
+        ),
         crate::ports::LimitSlot::Caller => (run_layer, limits),
     };
+    let caller_cleared = (slot == crate::ports::LimitSlot::Run && caller_after != caller_layer)
+        .then_some(caller_after);
     let inputs = inputs_for(store, &record, context)?;
     let prior_resolution = resolve_with(store, &record, &run_layer, &caller_layer, &inputs)?;
     let resolution = resolve_with(store, &record, &run_after, &caller_after, &inputs)?;
@@ -890,7 +906,7 @@ pub(crate) fn plan_limits(
             });
         }
     }
-    let direction = if limits == prior_limits {
+    let direction = if limits == prior_limits && caller_cleared.is_none() {
         LimitsDirection::Unchanged
     } else if change.only_clears() {
         LimitsDirection::Cleared
@@ -924,6 +940,7 @@ pub(crate) fn plan_limits(
     Ok(LimitsPlan {
         record,
         slot,
+        caller_cleared,
         prior_limits,
         limits,
         resolution,
@@ -1010,6 +1027,15 @@ pub(crate) fn apply_limits(
         return Ok((outcome, changes, breaches));
     }
     store.replace_run_limits(run_id, plan.slot, &plan.limits, actor.as_str(), at)?;
+    if let Some(caller_after) = &plan.caller_cleared {
+        store.replace_run_limits(
+            run_id,
+            crate::ports::LimitSlot::Caller,
+            caller_after,
+            actor.as_str(),
+            at,
+        )?;
+    }
     changes.extend(policy::resolve_and_store(
         store,
         &plan.record,
@@ -1027,6 +1053,10 @@ pub(crate) fn apply_limits(
         plan.prior_limits,
         plan.limits,
         actor.as_str(),
+        match plan.slot {
+            crate::ports::LimitSlot::Run => "run",
+            crate::ports::LimitSlot::Caller => "caller",
+        },
         at,
     )?;
     if let Some(instance) = record.instance.as_deref() {

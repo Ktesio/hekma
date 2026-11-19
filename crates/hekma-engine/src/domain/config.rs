@@ -158,6 +158,35 @@ pub const METERING_BASE_URL_KEY: &str = "metering.base_url";
 /// snapshot (3-4's honest-provenance split, extended by 5-1's CORRECTION).
 pub const MEMORY_DIR_KEY: &str = "memory.dir";
 
+/// The RESERVED key the engine delivers a supervised launch's Run Key at
+/// (story 22-1). The engine injects it as an invocation-override leaf whose
+/// stored value is only the marker [`RUN_KEY_MARKER_PREFIX`]`<token id>`;
+/// the cleartext reaches the adapter's mapping only through the per-launch
+/// secrets map. Every agent receives it in [`RUN_KEY_ENV`]; an Adapter may
+/// also map it to its own environment variable — `env` targets only (a
+/// `flag` or `file` target is refused at registration). Writes are refused
+/// at every layer, and a hand-set value is stripped at start. Never written
+/// to `effective-config.json`.
+pub const RUN_KEY_KEY: &str = "run.key";
+
+/// The RESERVED key a supervised launch's refresh credential is delivered at
+/// (story 22-1): minted only when the Adapter maps this key to an `env`
+/// target (none does today). Same rules as [`RUN_KEY_KEY`].
+pub const RUN_REFRESH_KEY_KEY: &str = "run.refresh_key";
+
+/// The environment variable every supervised agent receives its Run Key in
+/// (story 22-1). Its children inherit it.
+pub const RUN_KEY_ENV: &str = "HEKMA_RUN_KEY";
+
+/// The marker a reserved credential leaf carries in place of its value
+/// (`run-key:<token id>`) wherever the config renders at all.
+pub const RUN_KEY_MARKER_PREFIX: &str = "run-key:";
+
+/// Whether `key` is one of the reserved credential keys.
+pub fn is_reserved_credential_key(key: &str) -> bool {
+    key == RUN_KEY_KEY || key == RUN_REFRESH_KEY_KEY
+}
+
 /// The engine-namespace config key for the builtin `acp` kind's launch
 /// executable (story 14-1, spine AD-19). REQUIRED at start: an `acp`
 /// instance whose `acp.command` is unset refuses honestly, naming both this
@@ -634,6 +663,10 @@ const KNOWN_KEYS: &[&str] = &[
     // CONTRACT_VERSION bump). The operator never sets it — it is a delivery
     // mechanism, not operator configuration, and is never persisted into the snapshot.
     MEMORY_DIR_KEY,
+    // Story 22-1: the engine-injected credential leaves. KNOWN so an
+    // Adapter's mapping can target them; every write is refused below.
+    RUN_KEY_KEY,
+    RUN_REFRESH_KEY_KEY,
     // Story 14-1 (spine AD-19, the builtin `acp` kind): the operator-set
     // ACP launch keys. `acp.command` (REQUIRED at start — the executable)
     // and `acp.args` (optional). Engine-namespace keys (NOT `agent.*`
@@ -739,6 +772,17 @@ pub fn validate_write(key: &str, value: &str) -> Result<(), ConfigError> {
         return Err(ConfigError::UnknownKey {
             key: key.to_string(),
             suggestion: None,
+        });
+    }
+    // Story 22-1: the credential leaves are engine-injected, never
+    // configuration — refused at every layer, and the value is never echoed.
+    if is_reserved_credential_key(key) {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_string(),
+            value: "(not shown)".to_string(),
+            reason: "this key is reserved: the engine delivers each launch's Run Key itself, so \
+                     it cannot be set in configuration"
+                .to_string(),
         });
     }
     // Story 21-2 (D3): `labels.<key>` binds a label on the instance's
@@ -1923,6 +1967,8 @@ mod tests {
                 "metering.upstream_base_url",
                 "metering.base_url",
                 "memory.dir",
+                "run.key",
+                "run.refresh_key",
                 "acp.command",
                 "acp.args",
             ]

@@ -240,8 +240,50 @@ impl Supervisor {
         // masquerade as engine-delivered memory. Only the invocation-override
         // layer built further below may supply this key.
         let _ = effective.remove(super::config::MEMORY_DIR_KEY);
+        // Story 22-1: the reserved credential leaves are delivery mechanisms
+        // too — a hand-set value never reaches the mapping or the snapshot.
+        let _ = effective.remove(super::config::RUN_KEY_KEY);
+        let _ = effective.remove(super::config::RUN_REFRESH_KEY_KEY);
         let mapping = adapter::resolve_config_mapping(&kind, manifest_path.as_deref())
             .map_err(|e| launch_to_engine(&name, e))?;
+
+        // (2b-run-key) Story 22-1 (P1): THIS launch's Run Key, minted from
+        // the OS random source BEFORE any state change — an RNG failure
+        // refuses the start with nothing spawned and nothing written (no
+        // fallback). A refresh credential is minted only when the Adapter
+        // maps `run.refresh_key` to an `env` target (none does today: a
+        // CLI cannot swap its own key mid-process, so its rotation is the
+        // relaunch). The cleartext lives in `SecretString`s until the
+        // mapping places it in the spawn environment; only the hashes are
+        // committed, with the launch record (step 6).
+        let launch_key =
+            crate::domain::credential::mint(crate::domain::credential::TokenClass::RunKey)
+                .map_err(|e| credential_to_engine(&name, e))?;
+        let launch_refresh = match mapping.target(super::config::RUN_REFRESH_KEY_KEY) {
+            Some(hekma_adapter_api::ConfigTarget::Env { .. }) => Some(
+                crate::domain::credential::mint(crate::domain::credential::TokenClass::Refresh)
+                    .map_err(|e| credential_to_engine(&name, e))?,
+            ),
+            _ => None,
+        };
+        let mut run_key_markers = vec![(
+            super::config::RUN_KEY_KEY,
+            format!(
+                "{}{}",
+                super::config::RUN_KEY_MARKER_PREFIX,
+                launch_key.token_id()
+            ),
+        )];
+        if let Some(refresh) = &launch_refresh {
+            run_key_markers.push((
+                super::config::RUN_REFRESH_KEY_KEY,
+                format!(
+                    "{}{}",
+                    super::config::RUN_KEY_MARKER_PREFIX,
+                    refresh.token_id()
+                ),
+            ));
+        }
 
         // (2b-readiness) Resolve the adapter's optional declared readiness gate
         // (contract `1.1.0`): the `[readiness]` section's ONE probe + its
@@ -380,9 +422,10 @@ impl Supervisor {
         // so NEITHER injected value is persisted as "what applied" — honest
         // provenance (3-4's rule; 5-1's CORRECTION extends it: `memory.dir` is a
         // delivery mechanism, not operator configuration).
-        let mut mapping_effective = match invocation_overrides(
+        let mut mapping_effective = match invocation_overrides_with_keys(
             observed_listener.as_ref().map(ObservedListener::base_url),
             memory_dir.as_deref(),
+            &run_key_markers,
         ) {
             Some(layer) => registry
                 .effective_config(&name, layer)
@@ -438,9 +481,21 @@ impl Supervisor {
         // persisted state change, so an unresolved/ill-permissioned secret REJECTS
         // the start cleanly (no half-launch, mirroring the config-apply + snapshot
         // failures) — a typed `EngineError::Secret` that NEVER echoes a value.
-        let secrets = registry
+        let mut secrets = registry
             .resolve_secrets(&mapping_effective)
             .map_err(|e| secret_to_engine(&name, e))?;
+        // Story 22-1: the launch's credentials join the per-launch secrets
+        // map — the ONLY way their cleartext reaches the mapping.
+        secrets.insert(
+            super::config::RUN_KEY_KEY.to_string(),
+            crate::domain::SecretString::new(launch_key.secret().expose_secret()),
+        );
+        if let Some(refresh) = &launch_refresh {
+            secrets.insert(
+                super::config::RUN_REFRESH_KEY_KEY.to_string(),
+                crate::domain::SecretString::new(refresh.secret().expose_secret()),
+            );
+        }
         // (AI-27 shadow capture) The pre-apply launch env, snapshotted BEFORE
         // the mapping application mutates `launch.env` (whatever the persisted
         // registration snapshot carried): an env-targeted mapping whose name
@@ -766,47 +821,53 @@ impl Supervisor {
             // fail-closes the action to `pause`, never to nothing-set.
             inputs: Some(registry.resolve_inputs_fail_closed(&name)),
         };
-        let launch_generation =
-            match registry.write_spawn_record_new_launch(&record, supervised_run) {
-                Ok((generation, run_events)) => {
-                    // The Run's `created` (or a kept Run's re-sync) precedes the
-                    // `running` transition on the bus.
-                    self.publish_run_events(run_events);
-                    generation
+        let launch_generation = match registry.write_spawn_record_new_launch(
+            &record,
+            supervised_run,
+            Some(crate::domain::runs::ops::LaunchCredentials {
+                key: launch_key.stub(),
+                refresh: launch_refresh.as_ref().map(|refresh| refresh.stub()),
+            }),
+        ) {
+            Ok((generation, run_events)) => {
+                // The Run's `created` (or a kept Run's re-sync) precedes the
+                // `running` transition on the bus.
+                self.publish_run_events(run_events);
+                generation
+            }
+            Err(e) => {
+                // Persisting the record failed: kill the just-spawned process and
+                // land the instance in `failed` so we never leave an unrecorded
+                // process behind (AD-5 safety).
+                //
+                // Review round 2: `drop(handle)` alone only tears the process down
+                // when the handle is ATTACHED (drop = group/job kill). A DETACHED
+                // handle is DISARMED — its Drop deliberately kills nothing — so a
+                // detached start whose record commit fails would LEAK a live,
+                // unrecorded process. The teardown is therefore explicit on the
+                // detach path: a short graceful window through the backend stop
+                // (which still works on a detached handle — the pgid/job is
+                // unchanged), then the drop releases whatever remains.
+                //
+                // AUDIT of the other post-spawn error paths in this function (why
+                // this is the ONLY fix site): between `spawn` and this commit the
+                // sole fallible step is `watch_startup`, whose failure branch runs
+                // only when the process ALREADY exited (reaped by the poll —
+                // nothing survives, detached or not); every `?` after the commit
+                // happens once the record is DURABLE, so a dropped detached
+                // handle there leaves a recorded (adoptable) process, not an
+                // unrecorded one.
+                if detach {
+                    let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
                 }
-                Err(e) => {
-                    // Persisting the record failed: kill the just-spawned process and
-                    // land the instance in `failed` so we never leave an unrecorded
-                    // process behind (AD-5 safety).
-                    //
-                    // Review round 2: `drop(handle)` alone only tears the process down
-                    // when the handle is ATTACHED (drop = group/job kill). A DETACHED
-                    // handle is DISARMED — its Drop deliberately kills nothing — so a
-                    // detached start whose record commit fails would LEAK a live,
-                    // unrecorded process. The teardown is therefore explicit on the
-                    // detach path: a short graceful window through the backend stop
-                    // (which still works on a detached handle — the pgid/job is
-                    // unchanged), then the drop releases whatever remains.
-                    //
-                    // AUDIT of the other post-spawn error paths in this function (why
-                    // this is the ONLY fix site): between `spawn` and this commit the
-                    // sole fallible step is `watch_startup`, whose failure branch runs
-                    // only when the process ALREADY exited (reaped by the poll —
-                    // nothing survives, detached or not); every `?` after the commit
-                    // happens once the record is DURABLE, so a dropped detached
-                    // handle there leaves a recorded (adoptable) process, not an
-                    // unrecorded one.
-                    if detach {
-                        let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
-                    }
-                    drop(handle);
-                    return Err(self.fail_launch_detail(
-                        registry,
-                        &name,
-                        format!("could not commit the write-ahead spawn record: {e}"),
-                    ));
-                }
-            };
+                drop(handle);
+                return Err(self.fail_launch_detail(
+                    registry,
+                    &name,
+                    format!("could not commit the write-ahead spawn record: {e}"),
+                ));
+            }
+        };
 
         // (6b) ACP HANDSHAKE (story 14-1, spine AD-19) — for an `acp` instance,
         // take ownership of the child's pipe halves, start the connection

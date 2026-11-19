@@ -387,7 +387,8 @@ fn the_usage_and_breach_hooks_write_the_journal_too() {
                 }
             }
             // Story 21-2: the Run events each transition and breach cause.
-            "run" => {}
+            // Story 22-1: the launch's Run Key events.
+            "run" | "credential" => {}
             other => panic!("an unknown family in the journal: {other}"),
         }
     }

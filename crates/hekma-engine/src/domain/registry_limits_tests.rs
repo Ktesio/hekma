@@ -540,20 +540,24 @@ fn a_caller_may_only_tighten_and_an_operator_or_host_may_raise() {
             context(None, PolicyLimits::default()),
         )
     };
-    // Raising a ceiling, clearing one (unlimited), loosening the action: refused.
+    // Raising a ceiling, loosening the action: refused. (Story 22-1, the
+    // 21-6 review's N5: a Caller's CLEAR is judged by the effective
+    // movement — clearing a limit the Caller holds no row of loosens
+    // nothing, so it is an unchanged no-op, not a refusal; a clear that
+    // would loosen what applies is refused in
+    // `n5_a_caller_may_clear_its_own_dormant_row_but_not_one_that_applies`.)
+    let noop = caller(RunLimitChange {
+        set: RunLimits::default(),
+        clear: vec![RunLimitField::TokensPerRun],
+    })
+    .unwrap();
+    assert_eq!(noop.direction, LimitsDirection::Unchanged);
     for (change, limit) in [
         (
             limits(RunLimits {
                 token_per_run: Some(2_000),
                 ..RunLimits::default()
             }),
-            "tokens-per-run",
-        ),
-        (
-            RunLimitChange {
-                set: RunLimits::default(),
-                clear: vec![RunLimitField::TokensPerRun],
-            },
             "tokens-per-run",
         ),
         (
@@ -1522,4 +1526,392 @@ fn the_budget_jobs_edges_mixed_moves_stored_inputs_and_runs_without_an_agent() {
     assert!(planned.fired.is_empty());
     let view = wired.registry.run_limits_view(&orphan).unwrap();
     assert!(view.cumulative_usage.is_none());
+}
+
+// ---- Story 22-1: the 21-6 second review's latent Caller findings, made
+// reachable by the Run Key (each test fails with its fix reverted).
+
+/// Create or change the `cap` Policy over `team=core` with `set`.
+fn cap_policy(seeded: &Seeded, set: PolicyLimits, ctx: InstanceContext) {
+    let existing = seeded.registry.policy("cap").unwrap();
+    seeded
+        .registry
+        .apply_policy_change(
+            existing,
+            PolicyChange {
+                name: "cap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set,
+                clear: Vec::new(),
+                rates: BTreeMap::new(),
+            },
+            std::collections::HashMap::from([(INSTANCE.to_string(), ctx)]),
+        )
+        .unwrap();
+}
+
+fn stored_resolution(seeded: &Seeded, run: &RunId) -> crate::domain::PolicyResolution {
+    seeded.registry.run_view(run).unwrap().policy.unwrap()
+}
+
+#[test]
+fn n1_a_caller_action_over_a_depth_fallen_back_policy_action_is_effective() {
+    // No wire path: a Policy `block` cannot execute and falls back to
+    // `warn`. A Caller `pause` is tighter than the EFFECTIVE `warn`, so it
+    // is accepted — and it must then apply, never a silent no-op.
+    let seeded = seed_with(50, 50, false);
+    cap_policy(
+        &seeded,
+        PolicyLimits {
+            tokens_per_run: Some(1_000),
+            breach_action: Some(BreachAction::Block),
+            ..PolicyLimits::default()
+        },
+        context(None, PolicyLimits::default()),
+    );
+    let before = stored_resolution(&seeded, &seeded.run);
+    assert_eq!(before.effective_action, BreachAction::Warn);
+    assert!(before.fallback.is_some());
+    let outcome = set(
+        &seeded.registry,
+        &seeded.run,
+        limits(RunLimits {
+            breach_action: Some(BreachAction::Pause),
+            ..RunLimits::default()
+        }),
+        LimitActor::Caller,
+        context(None, PolicyLimits::default()),
+    )
+    .unwrap();
+    assert_eq!(outcome.resolution.effective_action, BreachAction::Pause);
+    assert_eq!(
+        outcome.resolution.sources.breach_action,
+        LimitSource::Caller
+    );
+    assert!(outcome.resolution.fallback.is_none());
+    let after = stored_resolution(&seeded, &seeded.run);
+    assert_eq!(after.effective_action, BreachAction::Pause);
+}
+
+#[test]
+fn n2_a_caller_undercutting_an_unpriced_policy_cap_keeps_the_unpriced_anomaly() {
+    let seeded = seed_with(50, 50, true);
+    let unpriced = InstanceContext {
+        inputs: Some(Ok(ResolveInputs::default())),
+        ..context(None, PolicyLimits::default())
+    };
+    cap_policy(
+        &seeded,
+        PolicyLimits {
+            dollars_per_run_micros: Some(10_000_000),
+            ..PolicyLimits::default()
+        },
+        unpriced.clone(),
+    );
+    assert!(anomalies(&seeded.registry, &seeded.run).contains(&Anomaly::UnpricedModel));
+    let outcome = set(
+        &seeded.registry,
+        &seeded.run,
+        limits(RunLimits {
+            dollar_per_run_micros: Some(Micros(5_000_000)),
+            ..RunLimits::default()
+        }),
+        LimitActor::Caller,
+        unpriced,
+    )
+    .unwrap();
+    assert_eq!(
+        outcome.resolution.sources.dollars_per_run,
+        LimitSource::Caller
+    );
+    assert_eq!(
+        outcome
+            .resolution
+            .unpriced
+            .as_ref()
+            .map(|u| u.policy.as_str()),
+        Some("cap"),
+        "the undercut Policy is still named"
+    );
+    assert!(anomalies(&seeded.registry, &seeded.run).contains(&Anomaly::UnpricedModel));
+}
+
+#[test]
+fn n3_a_limits_changed_event_names_the_layer_it_describes() {
+    let seeded = seed_with(50, 50, true);
+    for (actor, tokens) in [(LimitActor::Operator, 1_000), (LimitActor::Caller, 900)] {
+        set(
+            &seeded.registry,
+            &seeded.run,
+            limits(RunLimits {
+                token_per_run: Some(tokens),
+                ..RunLimits::default()
+            }),
+            actor,
+            context(None, PolicyLimits::default()),
+        )
+        .unwrap();
+    }
+    let layers: Vec<(Option<String>, Option<String>)> =
+        crate::domain::export_core(&seeded.registry, None, 1_000)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                crate::domain::EngineEvent::Run(event)
+                    if event.change == RunEventKind::LimitsChanged =>
+                {
+                    Some((event.cause, event.limits_layer))
+                }
+                _ => None,
+            })
+            .collect();
+    assert_eq!(
+        layers,
+        vec![
+            (Some("operator".to_string()), Some("run".to_string())),
+            (Some("caller".to_string()), Some("caller".to_string())),
+        ]
+    );
+}
+
+#[test]
+fn n4_a_child_open_action_keeps_its_provenance_when_another_limit_is_written() {
+    let seeded = seed_with(50, 50, true);
+    // The 21-2 child-open shape: a Host's ceiling rows carry the action,
+    // no action row.
+    let child = RunId::mint();
+    let row = record(&child, false, true, Some(&seeded.run));
+    seeded
+        .registry
+        .writer
+        .call(move |ctx| {
+            ctx.store().insert_run(&crate::ports::NewRun {
+                record: row,
+                labels: Vec::new(),
+                limits: RunLimits {
+                    token_per_run: Some(100),
+                    breach_action: Some(BreachAction::Warn),
+                    ..RunLimits::default()
+                },
+                identity: None,
+            })
+        })
+        .unwrap();
+    let row = |dimension: &str| -> String {
+        seeded.registry.reader().query_string_for_test(&format!(
+            "SELECT source || ' ' || set_at FROM run_limits WHERE run_id = '{child}' \
+             AND dimension = '{dimension}'"
+        ))
+    };
+    let tokens = row("tokens");
+    // The Operator writes a different limit; the action is unchanged.
+    set(
+        &seeded.registry,
+        &child,
+        limits(RunLimits {
+            dollar_per_run_micros: Some(Micros(2_000_000)),
+            ..RunLimits::default()
+        }),
+        LimitActor::Operator,
+        context(None, PolicyLimits::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        row("action"),
+        tokens,
+        "the action row keeps the opener's provenance"
+    );
+    assert!(row("dollars").starts_with("operator "));
+}
+
+#[test]
+fn n5_a_caller_may_clear_its_own_dormant_row_but_not_one_that_applies() {
+    let seeded = seed_with(50, 50, true);
+    let ctx = || context(None, PolicyLimits::default());
+    cap_policy(
+        &seeded,
+        PolicyLimits {
+            tokens_per_run: Some(1_000),
+            ..PolicyLimits::default()
+        },
+        ctx(),
+    );
+    let tighten = limits(RunLimits {
+        token_per_run: Some(900),
+        ..RunLimits::default()
+    });
+    set(
+        &seeded.registry,
+        &seeded.run,
+        tighten,
+        LimitActor::Caller,
+        ctx(),
+    )
+    .unwrap();
+    let clear = RunLimitChange {
+        set: RunLimits::default(),
+        clear: vec![RunLimitField::TokensPerRun],
+    };
+    // While it applies, its clear would loosen: refused.
+    let refused = set(
+        &seeded.registry,
+        &seeded.run,
+        clear.clone(),
+        LimitActor::Caller,
+        ctx(),
+    )
+    .unwrap_err();
+    assert_eq!(refused.code(), "raise-forbidden");
+    // The Policy is lowered below it: the Caller's row is dormant, and its
+    // clear loosens nothing — accepted.
+    cap_policy(
+        &seeded,
+        PolicyLimits {
+            tokens_per_run: Some(500),
+            ..PolicyLimits::default()
+        },
+        ctx(),
+    );
+    let outcome = set(
+        &seeded.registry,
+        &seeded.run,
+        clear,
+        LimitActor::Caller,
+        ctx(),
+    )
+    .unwrap();
+    assert_eq!(outcome.direction, LimitsDirection::Cleared);
+    assert_eq!(
+        seeded
+            .registry
+            .reader()
+            .run_caller_limits(&seeded.run)
+            .unwrap(),
+        RunLimits::default()
+    );
+}
+
+#[test]
+fn an_operator_clear_lifts_a_callers_row_too_the_operator_outranks() {
+    let seeded = seed_with(50, 50, true);
+    let ctx = || context(None, PolicyLimits::default());
+    cap_policy(
+        &seeded,
+        PolicyLimits {
+            tokens_per_run: Some(1_000),
+            ..PolicyLimits::default()
+        },
+        ctx(),
+    );
+    set(
+        &seeded.registry,
+        &seeded.run,
+        limits(RunLimits {
+            token_per_run: Some(900),
+            ..RunLimits::default()
+        }),
+        LimitActor::Caller,
+        ctx(),
+    )
+    .unwrap();
+    // The Operator holds no row of its own here: the clear still lifts the
+    // Caller's self-imposed 900, handing back to the Policy's 1000.
+    let outcome = set(
+        &seeded.registry,
+        &seeded.run,
+        RunLimitChange {
+            set: RunLimits::default(),
+            clear: vec![RunLimitField::TokensPerRun],
+        },
+        LimitActor::Operator,
+        ctx(),
+    )
+    .unwrap();
+    assert_ne!(outcome.direction, LimitsDirection::Unchanged);
+    assert_eq!(
+        seeded
+            .registry
+            .reader()
+            .run_caller_limits(&seeded.run)
+            .unwrap(),
+        RunLimits::default()
+    );
+    let resolution = stored_resolution(&seeded, &seeded.run);
+    assert_eq!(resolution.tokens.per_run, Some(1_000));
+    assert_eq!(
+        resolution.sources.tokens_per_run,
+        LimitSource::Policy("cap".to_string())
+    );
+    // An Operator SET never touches the Caller's layer.
+    set(
+        &seeded.registry,
+        &seeded.run,
+        limits(RunLimits {
+            token_per_run: Some(800),
+            ..RunLimits::default()
+        }),
+        LimitActor::Caller,
+        ctx(),
+    )
+    .unwrap();
+    set(
+        &seeded.registry,
+        &seeded.run,
+        limits(RunLimits {
+            token_per_run: Some(2_000),
+            ..RunLimits::default()
+        }),
+        LimitActor::Operator,
+        ctx(),
+    )
+    .unwrap();
+    assert_eq!(
+        seeded
+            .registry
+            .reader()
+            .run_caller_limits(&seeded.run)
+            .unwrap()
+            .token_per_run,
+        Some(800)
+    );
+}
+
+#[test]
+fn l2_a_caller_may_not_trade_pause_or_stop_for_the_cooperative_block() {
+    let seeded = seed_with(50, 50, true);
+    let ctx = || context(Some(WireFence::default()), PolicyLimits::default());
+    cap_policy(
+        &seeded,
+        PolicyLimits {
+            tokens_per_run: Some(1_000),
+            breach_action: Some(BreachAction::Stop),
+            ..PolicyLimits::default()
+        },
+        ctx(),
+    );
+    let block = limits(RunLimits {
+        breach_action: Some(BreachAction::Block),
+        ..RunLimits::default()
+    });
+    let refused = set(
+        &seeded.registry,
+        &seeded.run,
+        block.clone(),
+        LimitActor::Caller,
+        ctx(),
+    )
+    .unwrap_err();
+    assert_eq!(refused.code(), "raise-forbidden");
+    assert!(refused.to_string().contains("breach-action"), "{refused}");
+    // The Operator may set it.
+    let outcome = set(
+        &seeded.registry,
+        &seeded.run,
+        block,
+        LimitActor::Operator,
+        ctx(),
+    )
+    .unwrap();
+    assert_eq!(outcome.resolution.effective_action, BreachAction::Block);
 }

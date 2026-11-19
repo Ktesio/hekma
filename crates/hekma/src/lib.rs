@@ -116,13 +116,19 @@ Details:
   counts on every ancestor and every ancestor's ceilings apply; its own
   ceilings (--token-budget, --dollar-cap) take the warn Breach Action.
   --label key=value adds caller labels; --external-id makes a retried open
-  return the same Run. close ends a child Run; show prints any Run. All
-  three accept --json.
+  return the same Run. close ends a child Run; show prints any Run.
+  open --print-key also issues the child's Run Key and refresh credential
+  and prints them once: they are not stored and cannot be shown again.
+  keys lists a Run's credentials (token ids and states, never a key);
+  revoke-keys revokes them, and by default every credential issued under
+  them (--no-cascade keeps the child Runs' keys). Every verb accepts --json.
 
 Examples:
   hekma run open --parent my-agent --label task=review --token-budget 20000
   hekma run show run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
-  hekma run close run_01JZ6Q9G3S8V2X7K4M1N5P0R2T --json";
+  hekma run close run_01JZ6Q9G3S8V2X7K4M1N5P0R2T --json
+  hekma run keys run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
+  hekma run revoke-keys run_01JZ6Q9G3S8V2X7K4M1N5P0R2T";
 
 const LABEL_AFTER_HELP: &str = "\
 Details:
@@ -421,6 +427,10 @@ enum RunCommands {
         /// An id under which a retried open returns the same Run
         #[arg(long, value_name = "ID")]
         external_id: Option<String>,
+        /// Issue the child's Run Key and refresh credential and print them
+        /// (once — they are not stored and cannot be shown again)
+        #[arg(long)]
+        print_key: bool,
         /// Print the Run as JSON
         #[arg(long)]
         json: bool,
@@ -449,6 +459,26 @@ enum RunCommands {
         /// The run id
         run_id: String,
         /// Print the Run as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List a Run's credentials: token ids, classes and states, never a key
+    Keys {
+        /// The run id
+        run_id: String,
+        /// Print the list as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke a Run's credentials, and those issued under them
+    RevokeKeys {
+        /// The run id
+        run_id: String,
+        /// Revoke only the Run's own credentials, not those of the child
+        /// Runs opened with them
+        #[arg(long)]
+        no_cascade: bool,
+        /// Print what was revoked as JSON
         #[arg(long)]
         json: bool,
     },
@@ -1038,6 +1068,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 dollar_cap,
                 breach_action,
                 external_id,
+                print_key,
                 json,
             } => cli::run::open(cli::run::OpenArgs {
                 parent,
@@ -1046,6 +1077,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 dollar_cap,
                 breach_action,
                 external_id,
+                print_key,
                 json,
             }),
             RunCommands::Close {
@@ -1064,6 +1096,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 timeout_ms: None,
             }),
             RunCommands::Show { run_id, json } => cli::run::show(&run_id, json),
+            RunCommands::Keys { run_id, json } => cli::run::keys(&run_id, json),
+            RunCommands::RevokeKeys {
+                run_id,
+                no_cascade,
+                json,
+            } => cli::run::revoke_keys(&run_id, !no_cascade, json),
         },
         Some(Commands::Policy { command }) => match command {
             PolicyCommands::List { json } => cli::policy::list(json),

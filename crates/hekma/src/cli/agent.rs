@@ -3275,6 +3275,16 @@ pub(crate) fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // Story 22-1: no Run Key could be issued (the OS random source
+        // failed): nothing was spawned and nothing changed.
+        EngineError::CredentialUnavailable { name, .. } => AgentLaunchFailed {
+            message: format!(
+                "The operating system's random source failed, so no Run Key was issued and the \
+                 agent '{name}' was not started. Nothing changed; check the system's random \
+                 source and try again."
+            ),
+        }
+        .into(),
         // AC3: pause is UNSUPPORTED on this OS — fail fast QUOTING the declaration
         // (the level + OS) and pointing at `hekma agent show`. No state changed.
         EngineError::CapabilityUnsupported {
@@ -6185,6 +6195,7 @@ mod tests {
             dollar_cap: Some("1.50".to_string()),
             breach_action: Some("warn".to_string()),
             external_id: Some("job-7".to_string()),
+            print_key: false,
             json: false,
         };
         // No host serves the root (and a unit test never starts one): the
@@ -6323,6 +6334,7 @@ mod tests {
             ],
             limits: Default::default(),
             external_id: None,
+            issue_credentials: false,
         });
         // A planned removal of a Caller label the verb never bound.
         let planned = label(label_args(

@@ -1072,6 +1072,9 @@ pub fn generate() -> VectorsDocument {
             .chain(policy_decision_cases())
             // Story 21-6 (1.4.0): the `rearm` cases, after every 1.3.0 case.
             .chain(rearm_cases())
+            // Story 22-1 (still 1.4.0, unreleased; the 21-6 review's N7):
+            // the resolver's Caller layer, appended after every case.
+            .chain(caller_policy_cases())
             .collect(),
     }
 }
@@ -2209,6 +2212,112 @@ fn labels(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 
 /// Author ONE policy case: the input as written, the expected resolution
 /// computed by [`crate::domain::runs::policy::resolve`].
+/// Story 22-1: `policy` cases for the resolver's Caller layer (a Run
+/// Key's tighten-only limits): a Caller ceiling below a Policy value
+/// applies (source `caller`), one above it is ignored, a tighter Caller
+/// action applies, a Caller `block` never replaces a `stop` (the
+/// cooperative fence is not tighter for the workload), a Caller action over
+/// a Policy action that fell back for
+/// depth applies against the EFFECTIVE action, and a Caller undercutting an
+/// unpriced Policy cap still names the Policy.
+fn caller_policy_cases() -> Vec<Case> {
+    use crate::domain::runs::{ControlDepth, PolicyLimits, PolicyRecord, ResolveInputs};
+    let core = |limits: PolicyLimits| PolicyRecord {
+        name: "p".to_string(),
+        selector: Some("team=core".parse().unwrap()),
+        limits,
+        rates: Default::default(),
+    };
+    let input =
+        |policy: PolicyLimits, caller: PolicyLimits| crate::domain::runs::policy::ResolutionInput {
+            depth: ControlDepth::Supervised,
+            wire_path: true,
+            bound_labels: labels(&[("team", "core")]),
+            inputs: ResolveInputs {
+                explicit: PolicyLimits {
+                    rate: Some(Rate::new(1_000_000, 1_000_000)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            caller_limits: caller,
+            policies: vec![PolicyRecord::default_policy(), core(policy)],
+            ..Default::default()
+        };
+    let tokens = |value: u64| PolicyLimits {
+        tokens_per_run: Some(value),
+        ..Default::default()
+    };
+    vec![
+        policy_case(
+            "policy-caller-below-the-policy-applies",
+            input(tokens(1_000), tokens(900)),
+        ),
+        policy_case(
+            "policy-caller-above-the-policy-is-ignored",
+            input(tokens(1_000), tokens(5_000)),
+        ),
+        policy_case(
+            "policy-caller-tighter-action-applies",
+            input(
+                PolicyLimits {
+                    breach_action: Some(BreachAction::Pause),
+                    ..tokens(1_000)
+                },
+                PolicyLimits {
+                    breach_action: Some(BreachAction::Stop),
+                    ..Default::default()
+                },
+            ),
+        ),
+        policy_case(
+            "policy-caller-block-never-replaces-stop",
+            input(
+                PolicyLimits {
+                    breach_action: Some(BreachAction::Stop),
+                    ..tokens(1_000)
+                },
+                PolicyLimits {
+                    breach_action: Some(BreachAction::Block),
+                    ..Default::default()
+                },
+            ),
+        ),
+        policy_case(
+            "policy-caller-action-over-a-depth-fallback",
+            crate::domain::runs::policy::ResolutionInput {
+                wire_path: false,
+                ..input(
+                    PolicyLimits {
+                        breach_action: Some(BreachAction::Block),
+                        ..tokens(1_000)
+                    },
+                    PolicyLimits {
+                        breach_action: Some(BreachAction::Pause),
+                        ..Default::default()
+                    },
+                )
+            },
+        ),
+        policy_case(
+            "policy-caller-under-an-unpriced-policy-cap-keeps-it-named",
+            crate::domain::runs::policy::ResolutionInput {
+                inputs: ResolveInputs::default(),
+                ..input(
+                    PolicyLimits {
+                        dollars_per_run_micros: Some(10_000_000),
+                        ..Default::default()
+                    },
+                    PolicyLimits {
+                        dollars_per_run_micros: Some(5_000_000),
+                        ..Default::default()
+                    },
+                )
+            },
+        ),
+    ]
+}
+
 fn policy_case(id: &str, input: crate::domain::runs::policy::ResolutionInput) -> Case {
     Case::Policy(PolicyCase {
         id: id.to_string(),
@@ -3159,8 +3268,9 @@ mod tests {
         let document = generate();
         assert_eq!(
             document.cases.len(),
-            SHIPPED.len() + 14 + 10,
-            "39 shipped + the 14 cases 21-3 appends + the 10 cases 21-6 appends"
+            SHIPPED.len() + 14 + 10 + 6,
+            "39 shipped + the 14 cases 21-3 appends + the 10 cases 21-6 appends + the 6 \
+             Caller-layer cases 22-1 appends"
         );
         for (index, id) in SHIPPED.iter().enumerate() {
             assert_eq!(
@@ -3214,10 +3324,14 @@ mod tests {
             SHIPPED_1_3_0_CASES_SHA256,
             "a 1.3.0 case changed its bytes — 1.4.0 is additive only"
         );
-        assert!(document.cases[53..]
+        assert!(document.cases[53..63]
             .iter()
             .all(|case| matches!(case, Case::Rearm(_))));
-        assert_eq!(document.cases.len() - 53, 10);
+        // Story 22-1 appends the 6 Caller-layer `policy` cases after them.
+        assert!(document.cases[63..]
+            .iter()
+            .all(|case| matches!(case, Case::Policy(_))));
+        assert_eq!(document.cases.len() - 53, 16);
     }
 
     /// The SHA-256 of the 1.3.0 artifact's 53 cases, pretty-printed as one
@@ -3378,11 +3492,27 @@ mod tests {
                 }),
             "the 1.3.0 cases follow the chain era"
         );
+        // Story 22-1 (still 1.4.0): the Caller-layer `policy` cases close
+        // the artifact after the `rearm` cases.
+        let first_caller = document
+            .cases
+            .iter()
+            .position(
+                |case| matches!(case, Case::Policy(case) if case.id.starts_with("policy-caller-")),
+            )
+            .expect("the Caller-layer cases exist");
+        assert!(first_caller > first_rearm);
         assert!(
-            document.cases[first_rearm..]
+            document.cases[first_caller..].iter().all(
+                |case| matches!(case, Case::Policy(case) if case.id.starts_with("policy-caller-"))
+            ),
+            "the Caller-layer cases close the artifact"
+        );
+        assert!(
+            document.cases[first_rearm..first_caller]
                 .iter()
                 .all(|case| matches!(case, Case::Rearm(_))),
-            "the 1.4.0 cases close the artifact"
+            "the rearm cases follow the 1.3.0 set"
         );
     }
 

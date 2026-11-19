@@ -2877,6 +2877,453 @@
         ],
         "breach_anomaly": true
       }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-caller-below-the-policy-applies",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "supervised",
+        "wire_path": true,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {
+            "rate": {
+              "input_micros_per_1m": 1000000,
+              "output_micros_per_1m": 1000000
+            }
+          }
+        },
+        "caller_limits": {
+          "tokens_per_run": 900
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "tokens_per_run": 1000
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 900,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "warn",
+        "effective_action": "warn",
+        "scent_check": "off",
+        "rate": {
+          "input_micros_per_1m": 1000000,
+          "output_micros_per_1m": 1000000
+        },
+        "sources": {
+          "tokens_per_run": "caller",
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": "default",
+          "scent_check": "default",
+          "rate": "instance"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-caller-above-the-policy-is-ignored",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "supervised",
+        "wire_path": true,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {
+            "rate": {
+              "input_micros_per_1m": 1000000,
+              "output_micros_per_1m": 1000000
+            }
+          }
+        },
+        "caller_limits": {
+          "tokens_per_run": 5000
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "tokens_per_run": 1000
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 1000,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "warn",
+        "effective_action": "warn",
+        "scent_check": "off",
+        "rate": {
+          "input_micros_per_1m": 1000000,
+          "output_micros_per_1m": 1000000
+        },
+        "sources": {
+          "tokens_per_run": {
+            "policy": "p"
+          },
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": "default",
+          "scent_check": "default",
+          "rate": "instance"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-caller-tighter-action-applies",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "supervised",
+        "wire_path": true,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {
+            "rate": {
+              "input_micros_per_1m": 1000000,
+              "output_micros_per_1m": 1000000
+            }
+          }
+        },
+        "caller_limits": {
+          "breach_action": "stop"
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "tokens_per_run": 1000,
+              "breach_action": "pause"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 1000,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "stop",
+        "effective_action": "stop",
+        "scent_check": "off",
+        "rate": {
+          "input_micros_per_1m": 1000000,
+          "output_micros_per_1m": 1000000
+        },
+        "sources": {
+          "tokens_per_run": {
+            "policy": "p"
+          },
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": "caller",
+          "scent_check": "default",
+          "rate": "instance"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-caller-block-never-replaces-stop",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "supervised",
+        "wire_path": true,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {
+            "rate": {
+              "input_micros_per_1m": 1000000,
+              "output_micros_per_1m": 1000000
+            }
+          }
+        },
+        "caller_limits": {
+          "breach_action": "block"
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "tokens_per_run": 1000,
+              "breach_action": "stop"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 1000,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "stop",
+        "effective_action": "stop",
+        "scent_check": "off",
+        "rate": {
+          "input_micros_per_1m": 1000000,
+          "output_micros_per_1m": 1000000
+        },
+        "sources": {
+          "tokens_per_run": {
+            "policy": "p"
+          },
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": {
+            "policy": "p"
+          },
+          "scent_check": "default",
+          "rate": "instance"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-caller-action-over-a-depth-fallback",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "supervised",
+        "wire_path": false,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {
+            "rate": {
+              "input_micros_per_1m": 1000000,
+              "output_micros_per_1m": 1000000
+            }
+          }
+        },
+        "caller_limits": {
+          "breach_action": "pause"
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "tokens_per_run": 1000,
+              "breach_action": "block"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 1000,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "pause",
+        "effective_action": "pause",
+        "scent_check": "off",
+        "rate": {
+          "input_micros_per_1m": 1000000,
+          "output_micros_per_1m": 1000000
+        },
+        "sources": {
+          "tokens_per_run": {
+            "policy": "p"
+          },
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": "caller",
+          "scent_check": "default",
+          "rate": "instance"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-caller-under-an-unpriced-policy-cap-keeps-it-named",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "supervised",
+        "wire_path": true,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "caller_limits": {
+          "dollars_per_run_micros": 5000000
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "dollars_per_run_micros": 10000000
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": 5000000,
+          "cumulative": null
+        },
+        "action": "warn",
+        "effective_action": "warn",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": "unset",
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "caller",
+          "dollars_cumulative": "unset",
+          "breach_action": "default",
+          "scent_check": "default",
+          "rate": "unset"
+        },
+        "unpriced": {
+          "model": "no model configured",
+          "policy": "p"
+        }
+      }
     }
   ]
 }

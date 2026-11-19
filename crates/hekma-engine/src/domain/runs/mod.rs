@@ -30,6 +30,7 @@ use super::lifecycle::LifecycleState;
 use super::usage::RunId;
 use crate::ports::StoreError;
 
+pub(crate) mod keys;
 pub(crate) mod labels;
 pub(crate) mod limits;
 pub(crate) mod listing;
@@ -64,6 +65,51 @@ pub const RUN_EVENT_SCHEMA_VERSION: u32 = 1;
 
 /// The deepest a Run tree may nest: the root is level 1 (PRD FR-49).
 pub const MAX_RUN_NESTING: usize = 8;
+
+/// The most open children one parent may have when a Caller opens them with
+/// a Run Key (story 22-1, threat T1.9: a Run Key can create Runs). The
+/// Operator and Host are not capped.
+pub const MAX_CALLER_OPEN_CHILDREN: u64 = 1000;
+
+/// Who acts on a Run (story 22-1, spine AD-20): the Operator, a Host, or a
+/// Run's own Caller presenting its Run Key. A Caller may open, close and
+/// tighten only within its own Run's subtree; every Caller-authorized job
+/// re-validates the presenting token inside its transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunActor {
+    /// The Operator (the CLI, the Control API's operator bearer).
+    Operator,
+    /// A Host acting on its own Runs.
+    Host,
+    /// A Run's Caller, authenticated by the Run Key with this hash.
+    Caller {
+        /// The Run the presented key belongs to.
+        run_id: RunId,
+        /// The presented key's hash (re-validated in the job).
+        token_hash: crate::domain::credential::TokenHash,
+    },
+}
+
+impl RunActor {
+    /// The limits actor this actor writes as (21-6's [`LimitActor`]).
+    pub fn limit_actor(&self) -> LimitActor {
+        match self {
+            RunActor::Operator => LimitActor::Operator,
+            RunActor::Host => LimitActor::Host,
+            RunActor::Caller { .. } => LimitActor::Caller,
+        }
+    }
+
+    /// Who issued a credential this actor asked for (`operator`, `host`, or
+    /// the presenting key's token id).
+    pub(crate) fn issuer(&self) -> String {
+        match self {
+            RunActor::Operator => "operator".to_string(),
+            RunActor::Host => "host".to_string(),
+            RunActor::Caller { token_hash, .. } => token_hash.token_id(),
+        }
+    }
+}
 
 /// The identity binding a Host-supplied external id resolves under
 /// (`run_identities`, AD-25). Later stories add identity-header and announce
@@ -203,14 +249,18 @@ pub enum Anomaly {
     /// an unpriced model), so the cap cannot fire; cleared when a Rate
     /// resolves (story 21-3 — never silently inert).
     UnpricedModel,
+    /// A used refresh credential was presented again (story 22-1): the Run's
+    /// credentials were revoked. Cleared by an Operator `revoke-keys`.
+    CredentialReuse,
 }
 
 impl Anomaly {
-    const ALL: [Anomaly; 4] = [
+    const ALL: [Anomaly; 5] = [
         Anomaly::Breach,
         Anomaly::Failed,
         Anomaly::DepthFallback,
         Anomaly::UnpricedModel,
+        Anomaly::CredentialReuse,
     ];
 
     /// The stable wire form.
@@ -220,6 +270,7 @@ impl Anomaly {
             Anomaly::Failed => "failed",
             Anomaly::DepthFallback => "depth-fallback",
             Anomaly::UnpricedModel => "unpriced-model",
+            Anomaly::CredentialReuse => "credential-reuse",
         }
     }
 
@@ -526,6 +577,10 @@ pub struct ChildRunRequest {
     pub limits: RunLimits,
     /// An external id under which a retried open returns the same Run.
     pub external_id: Option<String>,
+    /// Whether to issue the child's Run Key and refresh credential (story
+    /// 22-1): returned once by [`crate::Engine::open_child_run_as`].
+    /// [`crate::Engine::open_child_run`] never issues them.
+    pub issue_credentials: bool,
 }
 
 impl ChildRunRequest {
@@ -536,8 +591,19 @@ impl ChildRunRequest {
             labels: Vec::new(),
             limits: RunLimits::default(),
             external_id: None,
+            issue_credentials: false,
         }
     }
+}
+
+/// What a child open returns (story 22-1): the Run, and — when the request
+/// asked — its credentials, shown once.
+#[derive(Debug)]
+pub struct OpenedRun {
+    /// The opened (or, on a retried external id, the existing) Run.
+    pub view: RunView,
+    /// Its Run Key and refresh credential, when issued.
+    pub credentials: Option<crate::domain::credential::IssuedCredentials>,
 }
 
 /// What happened to a Run (the `change` of a [`RunEvent`]).
@@ -622,6 +688,13 @@ pub struct RunEvent {
     /// Its own limits before the change, on `limits-changed` (story 21-6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_limits: Option<Box<RunLimits>>,
+    /// Which layer `limits` and `prior_limits` describe, on
+    /// `limits-changed` (story 22-1, the 21-6 review's N3): `run` (the
+    /// Operator/Host layer) or `caller` (the Caller's own layer, applied
+    /// only where tighter). Neither is the effective limit — the Run's
+    /// resolution (`hekma budget show`) is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits_layer: Option<String>,
     /// Why (a transition cause, `parent-paused`, `closed`, `label-verb`,
     /// `config`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -840,9 +913,56 @@ pub enum RunError {
         /// Why.
         reason: String,
     },
+    /// A Caller acted outside its own Run's subtree (story 22-1).
+    #[error(
+        "Run `{run_id}` is outside the presenting Run Key's own Run and its children, so the \
+         key cannot act on it"
+    )]
+    RunOutOfScope {
+        /// The Run asked for.
+        run_id: String,
+    },
+    /// The presented credential is no longer honoured (story 22-1).
+    #[error("the presented credential has been revoked")]
+    CredentialRevoked,
+    /// The presented credential is not one Hekma issued (story 22-1).
+    #[error("the presented credential is not recognised")]
+    CredentialUnknown,
+    /// A credential could not be issued (story 22-1): the operating system's
+    /// random source failed. There is no fallback.
+    #[error(
+        "the operating system's random source failed, so no credential was issued and nothing \
+         was changed ({detail})"
+    )]
+    CredentialUnavailable {
+        /// The source's own error text.
+        detail: String,
+    },
+    /// A Caller opened more open children under one parent than
+    /// [`MAX_CALLER_OPEN_CHILDREN`] (story 22-1).
+    #[error(
+        "Run `{parent}` already has {max} open children opened with a Run Key — close some \
+         before opening more"
+    )]
+    TooManyChildren {
+        /// The parent.
+        parent: String,
+        /// [`MAX_CALLER_OPEN_CHILDREN`].
+        max: u64,
+    },
     /// The store refused or failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+impl From<crate::domain::credential::CredentialError> for RunError {
+    fn from(err: crate::domain::credential::CredentialError) -> Self {
+        match err {
+            crate::domain::credential::CredentialError::RandomSourceFailed { detail } => {
+                RunError::CredentialUnavailable { detail }
+            }
+        }
+    }
 }
 
 impl RunError {
@@ -870,6 +990,11 @@ impl RunError {
             RunError::ScentUnavailable { .. } => "scent-unavailable",
             RunError::InvalidCursor { .. } => "invalid-cursor",
             RunError::Invalid { .. } => "invalid-request",
+            RunError::RunOutOfScope { .. } => "run-out-of-scope",
+            RunError::CredentialRevoked => "credential-revoked",
+            RunError::CredentialUnknown => "unauthorized",
+            RunError::CredentialUnavailable { .. } => "credential-unavailable",
+            RunError::TooManyChildren { .. } => "too-many-children",
             RunError::Store(_) => "store",
         }
     }
@@ -888,5 +1013,7 @@ pub enum RunVerbError {
     Engine(#[from] crate::domain::EngineError),
 }
 
+#[cfg(test)]
+mod keys_tests;
 #[cfg(test)]
 mod tests;

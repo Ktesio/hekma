@@ -12,8 +12,25 @@ use crate::domain::pipeline::CommittedBreach;
 use crate::domain::runs::limits::{self, InstanceContext};
 use crate::domain::runs::ops::{self, CommittedRunEvent, RunChanges};
 use crate::domain::runs::{
-    LimitActor, ResolveInputs, RunError, RunLimitChange, RunLimitsOutcome, RunLimitsView,
+    LimitActor, ResolveInputs, RunActor, RunError, RunLimitChange, RunLimitsOutcome, RunLimitsView,
 };
+
+/// A Caller's gate on a limits write (story 22-1): the target must exist
+/// (its own not-found first), then the presenting key must be active and
+/// the target within its subtree.
+fn caller_gate<S: RunRecords + ?Sized>(
+    store: &S,
+    guard: &RunActor,
+    run_id: &RunId,
+) -> Result<(), RunError> {
+    if store.run_record(run_id)?.is_none() {
+        return Err(RunError::NotFound {
+            run_id: run_id.as_str().to_string(),
+        });
+    }
+    crate::domain::runs::keys::caller_check(store, guard, run_id)?;
+    Ok(())
+}
 use crate::domain::usage::RunId;
 use crate::domain::Registry;
 use crate::ports::RunRecords;
@@ -36,6 +53,7 @@ pub(crate) struct LimitsApplied {
 impl Registry {
     /// Plan a Run-level limit change (the dry run): every refusal and the
     /// planned outcome, read-only (works on a read-only engine).
+    #[cfg(test)]
     pub(crate) fn plan_run_limits(
         &self,
         run_id: &RunId,
@@ -43,14 +61,33 @@ impl Registry {
         actor: LimitActor,
         context: Option<&InstanceContext>,
     ) -> Result<RunLimitsOutcome, RunError> {
-        let plan = self
-            .store
-            .snapshot(|store| Ok(limits::plan_limits(store, run_id, change, actor, context)))??;
+        self.plan_run_limits_guarded(run_id, change, actor, context, None)
+    }
+
+    /// [`Self::plan_run_limits`] with a Caller's key check (story 22-1): the
+    /// presenting Run Key must be active and the Run within its subtree.
+    pub(crate) fn plan_run_limits_guarded(
+        &self,
+        run_id: &RunId,
+        change: &RunLimitChange,
+        actor: LimitActor,
+        context: Option<&InstanceContext>,
+        guard: Option<&RunActor>,
+    ) -> Result<RunLimitsOutcome, RunError> {
+        let plan = self.store.snapshot(|store| {
+            Ok((|| {
+                if let Some(guard) = guard {
+                    caller_gate(store, guard, run_id)?;
+                }
+                limits::plan_limits(store, run_id, change, actor, context)
+            })())
+        })??;
         Ok(plan.dry_outcome())
     }
 
     /// Commit a Run-level limit change (one writer job): the budget job of
     /// [`limits::apply_limits`], its Run events committed in the same job.
+    #[cfg(test)]
     pub(crate) fn apply_run_limits(
         &self,
         run_id: &RunId,
@@ -58,12 +95,33 @@ impl Registry {
         actor: LimitActor,
         context: Option<InstanceContext>,
     ) -> Result<LimitsApplied, RunError> {
+        self.apply_run_limits_guarded(run_id, change, actor, context, None)
+    }
+
+    /// [`Self::apply_run_limits`] with a Caller's key check INSIDE the job
+    /// (story 22-1): a request authenticated before a revocation and run
+    /// after it is refused with no effect.
+    pub(crate) fn apply_run_limits_guarded(
+        &self,
+        run_id: &RunId,
+        change: &RunLimitChange,
+        actor: LimitActor,
+        context: Option<InstanceContext>,
+        guard: Option<RunActor>,
+    ) -> Result<LimitsApplied, RunError> {
         let publisher = Arc::clone(&self.run_snapshot);
         let run_id = run_id.clone();
         let change = change.clone();
         let result = self.writer.call(move |ctx| {
             let store = ctx.store();
             let at = now_rfc3339();
+            if let Some(guard) = &guard {
+                match caller_gate(store, guard, &run_id) {
+                    Ok(()) => {}
+                    Err(RunError::Store(err)) => return Err(err),
+                    Err(refusal) => return Ok(Err(refusal)),
+                }
+            }
             match limits::apply_limits(store, ctx, &run_id, &change, actor, context.as_ref(), &at) {
                 Ok((outcome, changes, breaches)) => {
                     let notes = outcome.notes.clone();

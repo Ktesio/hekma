@@ -76,6 +76,30 @@ impl Target {
             (Some(raw), None) => Ok(Target::Instance(raw.to_string())),
         }
     }
+
+    /// A target in the LEGACY run-id shape (`run-<digits>-<digits>`) is also
+    /// a valid agent name: when an agent of that name is registered, it is
+    /// the agent, so its verb keeps its agent route. A ULID run id is never
+    /// an agent name (names are lowercase), so it is never looked up. Story
+    /// 22-1 (the 21-6 review's N6): shared by every verb that takes a Run or
+    /// an agent — the lifecycle verbs, `budget` and `label`.
+    pub(crate) fn prefer_agent(self) -> Self {
+        match self {
+            Target::Run(raw)
+                if !hekma_engine::RunId::from_wire(&raw).is_ulid() && is_registered_agent(&raw) =>
+            {
+                Target::Instance(raw)
+            }
+            other => other,
+        }
+    }
+}
+
+/// Whether an agent named `name` is registered (a read-only look; no
+/// state directory or no such agent is `false`).
+fn is_registered_agent(name: &str) -> bool {
+    super::agent::open_read_only_engine()
+        .is_ok_and(|engine| engine.blocking().fleet_entry(name).is_ok())
 }
 
 /// One Run's error in a result row.

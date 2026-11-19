@@ -249,7 +249,7 @@ fn parse(args: &LabelArgs) -> Result<(Target, LabelChange), Box<dyn std::error::
                 ));
             };
             let target = if looks_like_run_id(first) {
-                Target::Run(first.clone())
+                Target::Run(first.clone()).prefer_agent()
             } else {
                 Target::Instance(first.clone())
             };
