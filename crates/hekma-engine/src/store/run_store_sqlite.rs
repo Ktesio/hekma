@@ -684,6 +684,56 @@ impl SqliteStore {
         result
     }
 
+    /// The policy table's change fingerprint (the cross-process staleness
+    /// check, story 21-3): every POLICY COLUMN plus the whole Rate table,
+    /// concatenated in name order — not just the update timestamps,
+    /// because `updated_at` has whole-second resolution and two changes
+    /// to the same Policy within one second would otherwise leave the
+    /// fingerprint unchanged (a second engine then never reloaded; the
+    /// 21-3 review round 3 finding L1). ANY committed change to the
+    /// table's CONTENT — this engine's own (the writer is a different
+    /// connection, so its commits move the read-only connection's change
+    /// counters too) or another engine's — changes the string however
+    /// fast it happens; an unchanged table leaves it byte-identical, so
+    /// one tiny aggregate read per tick decides whether a reload is
+    /// needed. (A `PRAGMA data_version` check would fire on EVERY commit
+    /// by this engine's own writer — usage rows included — and reload the
+    /// set from SQL on almost every tick.)
+    pub(crate) fn policies_fingerprint(&self) -> Result<String, StoreError> {
+        // Two aggregate reads concatenated in Rust (a correlated subquery
+        // over the derived table has no name to correlate against).
+        let policies = self.conn().query_row(
+            "SELECT coalesce(group_concat( \
+                 name || ':' || coalesce(selector, '') \
+                 || ':' || coalesce(tokens_per_run, '') \
+                 || ':' || coalesce(tokens_cumulative, '') \
+                 || ':' || coalesce(dollars_per_run_micros, '') \
+                 || ':' || coalesce(dollars_cumulative_micros, '') \
+                 || ':' || coalesce(breach_action, '') \
+                 || ':' || coalesce(scent_check, '') \
+                 || ':' || coalesce(rate_input_micros, '') \
+                 || ':' || coalesce(rate_output_micros, '') \
+                 || ':' || coalesce(rate_cached_micros, '') \
+               , '|'), '') \
+             FROM (SELECT * FROM policies ORDER BY name)",
+            [],
+            |row| row.get::<_, String>(0),
+        );
+        let rates = self.conn().query_row(
+            "SELECT coalesce(group_concat( \
+                 policy || ':' || model || '=' || input_micros_per_1m || '/' \
+                 || output_micros_per_1m || '/' || coalesce(cached_micros_per_1m, '') \
+               , '|'), '') \
+             FROM (SELECT * FROM policy_rates ORDER BY policy, model)",
+            [],
+            |row| row.get::<_, String>(0),
+        );
+        match (policies, rates) {
+            (Ok(policies), Ok(rates)) => Ok(format!("{policies}||{rates}")),
+            (Err(err), _) | (_, Err(err)) => Err(backend(err)),
+        }
+    }
+
     /// The instance's current launch generation (`NotFound` when absent).
     pub(crate) fn launch_generation(&self, name: &InstanceName) -> Result<u64, StoreError> {
         self.conn()
@@ -933,6 +983,27 @@ impl RunStore for SqliteStore {
                     key.scope.as_str(),
                     action.as_str(),
                     at,
+                ],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn unlatch(
+        &self,
+        run_id: &RunId,
+        key: LatchKey,
+        action: BreachAction,
+    ) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "DELETE FROM run_latches WHERE run_id = ?1 AND dimension = ?2 AND scope = ?3 \
+                 AND action = ?4",
+                rusqlite::params![
+                    run_id.as_str(),
+                    key.dimension.as_str(),
+                    key.scope.as_str(),
+                    action.as_str(),
                 ],
             )
             .map_err(backend)?;
@@ -1273,8 +1344,12 @@ mod tests {
         // An ack file survived an empty journal: the ack is the seq floor, so
         // the first new entry is 42, never a reused range below it.
         let dir = tempfile::TempDir::new().unwrap();
-        let (store, notes) =
-            SqliteStore::open_with_legacy(&dir.path().join("state.db"), &AckOnly).unwrap();
+        let (store, notes) = SqliteStore::open_with_legacy(
+            &dir.path().join("state.db"),
+            &AckOnly,
+            &crate::store::runs_sqlite::NoBreachDefault,
+        )
+        .unwrap();
         assert!(notes.is_empty());
         let event = EngineEvent::Transition(TransitionEvent::new(
             "x",

@@ -15,6 +15,31 @@
 use serde::{Deserialize, Serialize};
 
 use super::ControlDepth;
+use crate::domain::budget::BreachAction;
+
+/// Whether a Run at `(depth, wire_path)` can EXECUTE `action` today
+/// (story 21-3, one source of truth with the verb × depth table):
+///
+/// * `warn` always executes (it only signals);
+/// * `pause` / `stop` are process actions — the supervised depth only
+///   (below it they need wire hold/reject, story 23.4);
+/// * `block` fences the metering listener — supervised with a wire path
+///   only (`supervised (no wire)` cannot; FR-49).
+///
+/// A resolved action that cannot execute falls back to `warn` with the
+/// `depth-fallback` Anomaly (FR-60); it takes effect when the Run's depth
+/// allows it again.
+pub(crate) fn action_executable(
+    depth: ControlDepth,
+    wire_path: bool,
+    action: BreachAction,
+) -> bool {
+    match action {
+        BreachAction::Warn => true,
+        BreachAction::Pause | BreachAction::Stop => depth == ControlDepth::Supervised,
+        BreachAction::Block => depth == ControlDepth::Supervised && wire_path,
+    }
+}
 
 /// A verb row of the FR-49 table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

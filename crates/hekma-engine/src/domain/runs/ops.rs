@@ -27,19 +27,23 @@ use crate::ports::{NewRun, OutboxAppend, RunRecords, RunStore, StoreError};
 use crate::store::WriterCtx;
 
 /// What one operation changed.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RunChanges {
     pub events: Vec<RunEvent>,
     pub entries: Vec<RunEntry>,
+    /// Diagnostics the operation surfaced (a fail-closed resolution note):
+    /// the caller emits them on the engine's diagnostic surface.
+    pub notes: Vec<String>,
     /// Test-only: the Runs whose Policy hook ran in this operation.
     #[cfg(test)]
     pub policy_resolved: Vec<RunId>,
 }
 
 impl RunChanges {
-    fn extend(&mut self, other: RunChanges) {
+    pub(crate) fn extend(&mut self, other: RunChanges) {
         self.events.extend(other.events);
         self.entries.extend(other.entries);
+        self.notes.extend(other.notes);
         #[cfg(test)]
         self.policy_resolved.extend(other.policy_resolved);
     }
@@ -82,7 +86,8 @@ pub(crate) fn commit(
 }
 
 /// Record one change of `record` (already saved) as an event plus its
-/// snapshot entry.
+/// snapshot entry. The event names the Policies that supplied the Run's
+/// limits and the entry carries its stored resolution (AD-14, story 21-3).
 fn note<S: RunRecords + ?Sized>(
     store: &S,
     changes: &mut RunChanges,
@@ -93,6 +98,7 @@ fn note<S: RunRecords + ?Sized>(
 ) -> Result<(), StoreError> {
     let labels = store.run_labels(&record.run_id)?;
     let limits = store.run_limits(&record.run_id)?;
+    let resolution = store.run_policy(&record.run_id)?.map(|row| row.resolution);
     changes.events.push(RunEvent {
         schema_version: RUN_EVENT_SCHEMA_VERSION,
         change: kind,
@@ -109,13 +115,18 @@ fn note<S: RunRecords + ?Sized>(
         labels: bound_only(&labels),
         prior_labels: prior.labels,
         cause,
+        policies: resolution
+            .as_ref()
+            .map(|resolution| resolution.sources.policy_names())
+            .unwrap_or_default(),
         at: record.updated_at.clone(),
     });
-    changes.entries.push(RunEntry {
-        record: record.clone(),
-        labels,
+    changes.entries.push(super::snapshot::entry_of(
+        record,
+        &labels,
         limits,
-    });
+        resolution.as_ref(),
+    ));
     Ok(())
 }
 
@@ -306,6 +317,12 @@ pub(crate) struct SupervisedRun {
     /// instance ends as `replaced`); `false` for a relaunch or adoption,
     /// which keep the Run.
     pub fresh: bool,
+    /// The caller-resolved instance facts (story 21-3): the created or
+    /// kept Run resolves against the Policies in the SAME job (the 21-9
+    /// deferral, filled). `None` reuses the Run's stored inputs (a kept
+    /// Run); a fresh Run with `None` resolves with no explicit instance
+    /// limits.
+    pub inputs: Option<super::policy::ResolveInputs>,
 }
 
 /// Create the supervised Run (fresh start), or keep it (relaunch, adoption):
@@ -376,7 +393,24 @@ pub(crate) fn ensure_supervised<S: RunRecords + ?Sized>(
                 run.wire_path,
                 at,
             )?);
-            changes.extend(sync_bound_labels(store, &run.run_id, &run.labels, at)?);
+            let label_changes =
+                sync_bound_labels(store, &run.run_id, &run.labels, run.inputs.clone(), at)?;
+            let labels_changed = !label_changes.entries.is_empty();
+            changes.extend(label_changes);
+            // Story 21-3: the kept Run's label sync resolves with the
+            // caller's FRESH inputs when it has them (an adoption re-syncs
+            // labels against a config it just read — the stored inputs
+            // would be one read stale); the stored inputs otherwise. A
+            // label change already resolved inside its own hook — never
+            // resolve twice for one job.
+            if !labels_changed {
+                changes.extend(policy::resolve_run(
+                    store,
+                    &run.run_id,
+                    run.inputs.clone(),
+                    at,
+                )?);
+            }
         }
         _ => {
             let record = RunRecord {
@@ -407,6 +441,16 @@ pub(crate) fn ensure_supervised<S: RunRecords + ?Sized>(
                 Prior::default(),
                 None,
             )?;
+            // Story 21-3: the Run resolves at creation — the 21-9 deferral
+            // (a Policy created while this engine was off, a hand-edited
+            // config) cannot leave a fresh Run unpriced/unresolved until
+            // its first label change.
+            changes.extend(policy::resolve_run(
+                store,
+                &run.run_id,
+                run.inputs.clone(),
+                at,
+            )?);
         }
     }
     Ok(changes)
@@ -414,8 +458,12 @@ pub(crate) fn ensure_supervised<S: RunRecords + ?Sized>(
 
 /// Re-derive a Run's depth and wire path; a change keeps the id and emits
 /// `depth-changed` (FR-49). Latches are keyed by run id, so they survive.
-/// A directly set non-`warn` Breach Action the new depth cannot execute
-/// raises `depth-fallback`; one it can execute clears it.
+/// The Run's Policies re-resolve in the same job (a depth change moves the
+/// fallback rule, so a Policy-sourced `depth-fallback` Anomaly sets or
+/// clears here); a directly set non-`warn` Breach Action the new depth
+/// cannot execute raises `depth-fallback` after it (the 21-2 loud signal
+/// for directly set actions, which the resolution deliberately leaves to
+/// the executor).
 pub(crate) fn sync_depth<S: RunRecords + ?Sized>(
     store: &S,
     mut record: RunRecord,
@@ -435,15 +483,6 @@ pub(crate) fn sync_depth<S: RunRecords + ?Sized>(
     record.control_depth = depth;
     record.wire_path = wire_path;
     record.updated_at = at.to_string();
-    let limits = store.run_limits(&record.run_id)?;
-    if limits.is_armed() && limits.action() != BreachAction::Warn && !record.process_owner {
-        let unexecutable = action_refusal(limits.action(), depth, wire_path).is_some();
-        record.anomalies.retain(|a| *a != Anomaly::DepthFallback);
-        if unexecutable {
-            record.anomalies.push(Anomaly::DepthFallback);
-            record.anomalies.sort();
-        }
-    }
     store.save_run(&record)?;
     note(
         store,
@@ -453,6 +492,13 @@ pub(crate) fn sync_depth<S: RunRecords + ?Sized>(
         prior,
         None,
     )?;
+    // The resolution's own `store_changes` raises the `depth-fallback`
+    // Anomaly for BOTH sources — a POLICY-sourced action per the
+    // resolver, a directly set one per the 21-2 rule (round 3: the
+    // duplicate re-raise that used to live here was dead code once
+    // store_changes owned the directly set arm; removed, not tested
+    // around).
+    changes.extend(policy::resolve_run(store, &record.run_id, None, at)?);
     Ok(changes)
 }
 
@@ -466,6 +512,7 @@ pub(crate) fn sync_bound_labels<S: RunRecords + ?Sized>(
     store: &S,
     run_id: &RunId,
     config: &[Label],
+    inputs: Option<super::policy::ResolveInputs>,
     at: &str,
 ) -> Result<RunChanges, StoreError> {
     let mut changes = RunChanges::default();
@@ -477,7 +524,16 @@ pub(crate) fn sync_bound_labels<S: RunRecords + ?Sized>(
     if next == current {
         return Ok(changes);
     }
-    write_labels(store, &mut changes, record, &current, &next, "config", at)?;
+    write_labels(
+        store,
+        &mut changes,
+        record,
+        &current,
+        &next,
+        "config",
+        inputs,
+        at,
+    )?;
     Ok(changes)
 }
 
@@ -485,6 +541,7 @@ pub(crate) fn sync_bound_labels<S: RunRecords + ?Sized>(
 /// Policy hook inside the same job, then note the `labels-changed` event
 /// (bound labels before and after) and the snapshot entry — so a Policy
 /// re-resolution commits and publishes with the label change (AD-25).
+#[allow(clippy::too_many_arguments)]
 fn write_labels<S: RunRecords + ?Sized>(
     store: &S,
     changes: &mut RunChanges,
@@ -492,12 +549,13 @@ fn write_labels<S: RunRecords + ?Sized>(
     current: &[Label],
     next: &[Label],
     cause: &str,
+    inputs: Option<super::policy::ResolveInputs>,
     at: &str,
 ) -> Result<(), StoreError> {
     store.set_run_labels(&record.run_id, next)?;
     record.updated_at = at.to_string();
     store.save_run(&record)?;
-    let resolved = policy::labels_changed(store, &record.run_id, at)?;
+    let resolved = policy::labels_changed(store, &record.run_id, inputs, at)?;
     // Both planners only ever change bound rows (a verb write, a config
     // row, a bound key replacing a Caller's), so a changed set is a changed
     // bound set.
@@ -514,6 +572,25 @@ fn write_labels<S: RunRecords + ?Sized>(
     )?;
     changes.extend(resolved);
     Ok(())
+}
+
+/// Note an `anomalies-changed` event for `record` (already saved with its
+/// new Anomalies) plus its snapshot entry. Story 21-3's public entry point
+/// for the resolution-owned Anomalies (`depth-fallback`, `unpriced-model`).
+pub(crate) fn note_anomalies_changed<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    record: &RunRecord,
+    _at: &str,
+) -> Result<(), StoreError> {
+    note(
+        store,
+        changes,
+        record,
+        RunEventKind::AnomaliesChanged,
+        Prior::default(),
+        None,
+    )
 }
 
 /// The label verb (story 21-9, FR-49): bind and unbind labels on one
@@ -565,6 +642,7 @@ pub(crate) fn label<S: RunRecords + ?Sized>(
             &current,
             &next,
             "label-verb",
+            None,
             at,
         )?;
     }
@@ -619,6 +697,37 @@ pub(crate) fn mark_breach<S: RunRecords + ?Sized>(
     Ok(changes)
 }
 
+/// Clear the `breach` Anomaly from a Run whose every latch re-armed
+/// (story 21-3's raise path; the Anomaly stays while any latch holds).
+/// Nothing when it is not raised or the Run has no row. Returns the
+/// `anomalies-changed` event and snapshot entry (committed by the caller's
+/// own `commit`, so the clearing publishes — the pre-fix silent save left
+/// surfaces stale, 21-3 review round 1).
+pub(crate) fn clear_breach_anomaly<S: RunRecords + ?Sized>(
+    store: &S,
+    run_id: &RunId,
+    at: &str,
+) -> Result<RunChanges, StoreError> {
+    let mut changes = RunChanges::default();
+    let Some(record) = store.run_record(run_id)? else {
+        return Ok(changes);
+    };
+    if !record.anomalies.contains(&Anomaly::Breach) {
+        return Ok(changes);
+    }
+    let mut anomalies: Vec<Anomaly> = record
+        .anomalies
+        .iter()
+        .copied()
+        .filter(|anomaly| *anomaly != Anomaly::Breach)
+        .collect();
+    anomalies.sort();
+    anomalies.dedup();
+    let status = record.status;
+    move_to(store, &mut changes, record, status, anomalies, None, at)?;
+    Ok(changes)
+}
+
 /// Why a directly set Breach Action cannot execute on a child Run at this
 /// depth, if it cannot (the verb × depth table's Breach Action row).
 pub(crate) fn action_refusal(
@@ -649,11 +758,14 @@ pub(crate) fn action_refusal(
 
 /// Open a child Run (FR-43, FR-49) under an existing, non-ended parent.
 /// A request whose external id already maps to a Run returns that Run with
-/// no change.
+/// no change. The child resolves against the Policies in the same job
+/// (story 21-3: creation resolves — `inputs` is the caller-resolved
+/// instance facts; `None` resolves with no explicit instance limits).
 pub(crate) fn open_child<S: RunRecords + RunStore + ?Sized>(
     store: &S,
     request: &ChildRunRequest,
     run_id: RunId,
+    inputs: Option<super::policy::ResolveInputs>,
     at: &str,
 ) -> Result<(RunId, RunChanges), RunError> {
     let mut changes = RunChanges::default();
@@ -766,6 +878,9 @@ pub(crate) fn open_child<S: RunRecords + RunStore + ?Sized>(
         Prior::default(),
         held.then(|| "parent-paused".to_string()),
     )?;
+    // Story 21-3: the child resolves at creation (a bound label it carries
+    // can select a Policy whose ceilings arm its own level from the start).
+    changes.extend(policy::resolve_run(store, &run_id, inputs, at)?);
     Ok((run_id, changes))
 }
 
@@ -838,6 +953,7 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
     Ok(RunView {
         labels: store.run_labels(run_id)?,
         limits: store.run_limits(run_id)?,
+        policy: store.run_policy(run_id)?.map(|row| row.resolution),
         open_children: store.open_children(run_id)?,
         usage,
         record,
@@ -850,11 +966,15 @@ pub(crate) fn open_entries<S: RunRecords + ?Sized>(store: &S) -> Result<Vec<RunE
         .open_runs()?
         .into_iter()
         .map(|record| {
-            Ok(RunEntry {
-                labels: store.run_labels(&record.run_id)?,
-                limits: store.run_limits(&record.run_id)?,
-                record,
-            })
+            let labels = store.run_labels(&record.run_id)?;
+            let limits = store.run_limits(&record.run_id)?;
+            let resolution = store.run_policy(&record.run_id)?.map(|row| row.resolution);
+            Ok(super::snapshot::entry_of(
+                &record,
+                &labels,
+                limits,
+                resolution.as_ref(),
+            ))
         })
         .collect()
 }

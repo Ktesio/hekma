@@ -148,6 +148,37 @@ Examples:
   hekma label set --selector team=core,env=prod tier=gold --dry-run
   hekma label remove --selector team=core tier --yes";
 
+const PS_AFTER_HELP: &str = "\
+Details:
+  The Runs that need you, newest first. The default view lists a Run iff it
+  carries an Anomaly (an ended Run only inside the 7-day ended-Run window)
+  or a held, silent or stale status; healthy open Runs are counted in the
+  footer, not listed. --all lists every Run inside the window. The CONTROL
+  column shows the Control Depth (supervised (no wire) for an agent whose
+  model calls skip the metering listener); the RUN column shows the agent's
+  name on process-owning rows and the run id on child Runs. ANOMALIES shows
+  the breach Anomaly with each latched Breach Action (breach[block]) beside
+  the others; LABELS marks caller labels. USAGE is the Run's subtree tokens
+  and derived dollars (an estimate); HEADROOM is what remains against the
+  Run's resolved ceilings, naming the Policy that set them and, on
+  process-owning rows, the cumulative token headroom. Both dollar figures
+  are estimates and appear only where a Rate prices them.
+
+  --selector key=value[,key=value...] filters by label (bound or caller
+  alike) in either view. --limit N pages (default 50, at most 1000; 0 means
+  the maximum); when another page exists the footer prints the exact
+  --cursor value that continues the listing. The table follows the
+  terminal width; --json carries every figure whole. A read-only read: no
+  host is started and nothing is written. Exit codes: 2 an invalid
+  selector, cursor or limit; 1 a store failure; 0 otherwise — an empty
+  listing included.
+
+Examples:
+  hekma ps
+  hekma ps --selector team=core,env=prod
+  hekma ps --all --limit 100
+  hekma ps --cursor dnVuXzFfMDEx --json";
+
 #[derive(Parser)]
 #[command(
     name = "hekma",
@@ -189,6 +220,35 @@ enum Commands {
     Label {
         #[command(subcommand)]
         command: LabelCommands,
+    },
+    /// Set limits for the Runs a Selector matches
+    #[command(about = "Set limits for the Runs a Selector matches")]
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommands,
+    },
+    /// List the Runs that need you, newest first
+    #[command(
+        about = "List the Runs that need you, newest first",
+        after_help = PS_AFTER_HELP
+    )]
+    Ps {
+        /// Only Runs carrying all these labels (key=value[,key=value...])
+        #[arg(long, value_name = "SELECTOR")]
+        selector: Option<String>,
+        /// List every Run inside the ended-Run window, not just the
+        /// exceptions
+        #[arg(long)]
+        all: bool,
+        /// Page size (default 50, at most 1000; 0 means the maximum)
+        #[arg(long, value_name = "N")]
+        limit: Option<u64>,
+        /// Continue after a previous page's cursor
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
+        /// Print the listing as one JSON document
+        #[arg(long)]
+        json: bool,
     },
     /// Serve a state directory as a long-running host
     #[command(
@@ -327,6 +387,118 @@ enum RunCommands {
         /// The run id
         run_id: String,
         /// Print the Run as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// The limit flags `hekma policy create` and `change` share.
+#[derive(clap::Args, Clone, Debug, Default)]
+struct PolicyLimitArgs {
+    /// Per-run token ceiling
+    #[arg(long, value_name = "N")]
+    tokens_per_run: Option<u64>,
+    /// Cumulative token ceiling (over the agent's life)
+    #[arg(long, value_name = "N")]
+    tokens_cumulative: Option<u64>,
+    /// Per-run Cost Cap in dollars (an estimate from Rates you set)
+    #[arg(long, value_name = "DOLLARS")]
+    dollars_per_run: Option<String>,
+    /// Cumulative Cost Cap in dollars (an estimate from Rates you set)
+    #[arg(long, value_name = "DOLLARS")]
+    dollars_cumulative: Option<String>,
+    /// What a breach does: warn, pause, stop or block
+    #[arg(long, value_name = "ACTION")]
+    breach_action: Option<String>,
+    /// Input price in dollars per 1M tokens
+    #[arg(long, value_name = "DOLLARS")]
+    rate_input: Option<String>,
+    /// Output price in dollars per 1M tokens
+    #[arg(long, value_name = "DOLLARS")]
+    rate_output: Option<String>,
+    /// Cached-input price in dollars per 1M tokens (defaults to the input price)
+    #[arg(long, value_name = "DOLLARS")]
+    rate_cached: Option<String>,
+}
+
+impl From<PolicyLimitArgs> for cli::policy::LimitFlags {
+    fn from(args: PolicyLimitArgs) -> Self {
+        Self {
+            tokens_per_run: args.tokens_per_run,
+            tokens_cumulative: args.tokens_cumulative,
+            dollars_per_run: args.dollars_per_run,
+            dollars_cumulative: args.dollars_cumulative,
+            breach_action: args.breach_action,
+            rate_input: args.rate_input,
+            rate_output: args.rate_output,
+            rate_cached: args.rate_cached,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum PolicyCommands {
+    /// List every Policy, the default Policy included
+    List {
+        /// Print the Policies as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one Policy
+    Show {
+        /// The Policy's name
+        name: String,
+        /// Print the Policy as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a Policy for the Runs a Selector matches by bound label
+    Create {
+        /// The Policy's name (lowercase letters, digits, - and _)
+        name: String,
+        /// The bound labels of the Runs it governs (key=value[,key=value...])
+        #[arg(long, value_name = "SELECTOR")]
+        selector: String,
+        #[command(flatten)]
+        limits: PolicyLimitArgs,
+        /// Show what it would match and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a Policy, the default Policy included
+    Change {
+        /// The Policy's name (`default` for the default Policy)
+        name: String,
+        /// A new Selector (not on the default Policy)
+        #[arg(long, value_name = "SELECTOR")]
+        selector: Option<String>,
+        #[command(flatten)]
+        limits: PolicyLimitArgs,
+        /// Limits to clear: tokens-per-run, tokens-cumulative, dollars-per-run,
+        /// dollars-cumulative, breach-action, rate, or rate:<model>
+        #[arg(long, value_name = "LIMIT", value_delimiter = ',')]
+        clear: Vec<String>,
+        /// On the default Policy: the model the --rate-* flags price
+        #[arg(long, value_name = "MODEL")]
+        rate_for: Option<String>,
+        /// Show what it would change and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a Policy (the default Policy cannot be deleted)
+    Delete {
+        /// The Policy's name
+        name: String,
+        /// Show what it would re-resolve and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as JSON
         #[arg(long)]
         json: bool,
     },
@@ -708,6 +880,60 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             RunCommands::Close { run_id, json } => cli::run::close(&run_id, json),
             RunCommands::Show { run_id, json } => cli::run::show(&run_id, json),
         },
+        Some(Commands::Policy { command }) => match command {
+            PolicyCommands::List { json } => cli::policy::list(json),
+            PolicyCommands::Show { name, json } => cli::policy::show(&name, json),
+            PolicyCommands::Create {
+                name,
+                selector,
+                limits,
+                dry_run,
+                json,
+            } => cli::policy::create(cli::policy::WriteArgs {
+                name,
+                selector: Some(selector),
+                limits: limits.into(),
+                clear: Vec::new(),
+                rate_for: None,
+                dry_run,
+                json,
+            }),
+            PolicyCommands::Change {
+                name,
+                selector,
+                limits,
+                clear,
+                rate_for,
+                dry_run,
+                json,
+            } => cli::policy::change(cli::policy::WriteArgs {
+                name,
+                selector,
+                limits: limits.into(),
+                clear,
+                rate_for,
+                dry_run,
+                json,
+            }),
+            PolicyCommands::Delete {
+                name,
+                dry_run,
+                json,
+            } => cli::policy::delete(&name, dry_run, json),
+        },
+        Some(Commands::Ps {
+            selector,
+            all,
+            limit,
+            cursor,
+            json,
+        }) => cli::ps::run(cli::ps::PsArgs {
+            selector,
+            all,
+            limit,
+            cursor,
+            json,
+        }),
         Some(Commands::Label { command }) => {
             let (verb, args, selector, dry_run, yes, json) = match command {
                 LabelCommands::Set {

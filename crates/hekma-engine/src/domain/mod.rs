@@ -11,7 +11,7 @@
 
 mod budget;
 mod bus;
-mod config;
+pub(crate) mod config;
 mod cost;
 mod error;
 mod event;
@@ -35,6 +35,9 @@ pub(crate) mod probe_kinds;
 /// supervisor's start path is the only caller.
 pub(crate) mod readiness;
 mod registry;
+pub(crate) mod registry_policy;
+#[cfg(test)]
+mod registry_policy_tests;
 mod restart;
 mod resync;
 pub(crate) mod runs;
@@ -88,13 +91,24 @@ pub use outbox::{
     EXPORT_BATCH_MAX_CAP, OUTBOX_MAX_BYTES, OUTBOX_SCHEMA_VERSION, PAST_TAIL_SENTENCE,
 };
 pub use registry::{Registry, RemoveDisposition};
+pub use registry_policy::{PolicyChange, PolicyOutcome};
 pub use resync::{ResyncBatch, ResyncCursor};
+pub use runs::{
+    decode_cursor, encode_cursor, ended_run_cutoff, LatchedBreach, ListRunsQuery, ListingCounts,
+    ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument, RunSummary,
+    ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
+};
 pub use runs::{
     validate_label_key, validate_label_value, verb_cell, Anomaly, CellBehavior, ChildRunRequest,
     ControlDepth, Label, LabelChange, LabelOrigin, LabelOutcome, LabelSource, RunError, RunEvent,
     RunEventKind, RunLimits, RunParent, RunRecord, RunStatus, RunUsage, RunVerb, RunView, Selector,
     SelectorScope, VerbCell, HOST_IDENTITY_BINDING, MAX_RUN_NESTING, MAX_SELECTED_RUNS,
     RUN_EVENT_SCHEMA_VERSION, RUN_VERBS,
+};
+pub use runs::{
+    BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyEvent, PolicyEventKind,
+    PolicyLimits, PolicyRecord, PolicyResolution, RunPolicy, ScentCheckMode, UpgradedInstance,
+    DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
 };
 // The resync core is engine-internal glue the facade calls (the story-10-3
 // helper); only the cursor/batch TYPES are public surface.
