@@ -188,7 +188,9 @@ fn run(id: &str) -> Attribution {
 fn a_credential_in_the_url_is_refused_before_anything_else() {
     let w = world();
     let encoded = w.child_key.replace('_', "%5F");
-    for (path, query) in [
+    // The messages name the case, never the key: a test log must not
+    // carry a credential (CodeQL rust/cleartext-logging).
+    for (case, (path, query)) in [
         (format!("/openai/{}", w.child_key), None),
         (
             "/openai/v1".to_string(),
@@ -198,7 +200,10 @@ fn a_credential_in_the_url_is_refused_before_anything_else() {
         (format!("/_hekma/runs/run_P/{}", w.refresh), None),
         // Even an unknown token, and even on a path that would not route.
         (format!("/nowhere/{}", w.unknown_key), None),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let f = CallFacts {
             path: &path,
             query: query.as_deref(),
@@ -209,7 +214,7 @@ fn a_credential_in_the_url_is_refused_before_anything_else() {
         assert_eq!(
             refused(&identify(&w.snapshot, &f)),
             Some(Refusal::CredentialInUrl),
-            "{path} {query:?}"
+            "URL case {case}"
         );
     }
 }
@@ -220,7 +225,7 @@ fn a_token_in_the_api_key_slot_is_never_forwarded() {
     let bearer_child = format!("Bearer {}", w.child_key);
     let bearer_unknown = format!("bearer {}", w.unknown_key);
     let bearer_revoked = format!("BEARER {}", w.revoked_key);
-    for (authorization, api_key, expected) in [
+    for (case, (authorization, api_key, expected)) in [
         // A live Run Key: it names the Run, but custody is not here yet.
         (
             Some(bearer_child.as_str()),
@@ -245,7 +250,10 @@ fn a_token_in_the_api_key_slot_is_never_forwarded() {
         (None, Some(w.refresh.as_str()), Refusal::UnknownCredential),
         // A malformed `hk_` value is unknown, not a provider key.
         (None, Some("hk_run_short"), Refusal::UnknownCredential),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let f = CallFacts {
             path: "/openai/v1/chat",
             authorization,
@@ -255,7 +263,7 @@ fn a_token_in_the_api_key_slot_is_never_forwarded() {
         assert_eq!(
             refused(&identify(&w.snapshot, &f)),
             Some(expected),
-            "{authorization:?} {api_key:?}"
+            "slot case {case}"
         );
     }
     // A provider key in the slot is not a Hekma credential at all.
