@@ -95,7 +95,9 @@ use crate::ports::{
 /// upgrade marker — see [`super::runs_sqlite`].
 /// v16 (story 21-5): the Run listing's three partial indexes —
 /// see [`super::runs_sqlite`].
-pub(crate) const SCHEMA_VERSION: i64 = 16;
+/// v17 (story 22-1): `tokens`, the credential hashes and their metadata —
+/// see [`super::tokens_sqlite`].
+pub(crate) const SCHEMA_VERSION: i64 = 17;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -731,6 +733,11 @@ fn migrate(
     // crash-atomic step, additive DDL only).
     if version < 16 {
         super::runs_sqlite::migrate_v16(conn)?;
+    }
+    // Story 22-1: v17 adds `tokens` and its three indexes (one crash-atomic
+    // step, additive DDL only, no backfill).
+    if version < 17 {
+        super::tokens_sqlite::migrate_v17(conn)?;
     }
     Ok(notes)
 }

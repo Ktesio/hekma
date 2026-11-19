@@ -394,6 +394,7 @@ fn a_depth_change_raises_and_clears_depth_fallback_for_a_set_action() {
                 token_per_run: Some(5),
                 dollar_per_run_micros: None,
                 breach_action: Some(BreachAction::Pause),
+                ..RunLimits::default()
             },
             identity: None,
         })
