@@ -1422,11 +1422,11 @@ mod tests {
     }
 
     #[test]
-    fn an_instance_less_usage_row_advances_the_fold_without_touching_any_rollup() {
+    fn an_instance_less_usage_row_folds_only_into_its_own_run_rollup() {
         // A usage row with no instance has no per-instance rollup to fold
-        // into: the fold passes over it for the instances (the watermark
-        // still moves past it, so it is never re-read) and every instance's
-        // rollup stays zero.
+        // into: the fold moves the watermark past it (so it is never
+        // re-read), every instance's rollup stays zero, and the row lands
+        // only in its own Run's rollup.
         let store = store_with("known");
         store
             .conn()
