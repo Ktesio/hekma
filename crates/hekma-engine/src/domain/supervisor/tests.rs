@@ -1510,97 +1510,6 @@ fn adopt_orphans_adopts_a_dead_owner_record() {
 }
 
 #[test]
-fn a_degraded_run_breaches_read_surfaces_and_adopts_without_the_resumed_fence() {
-    // The resumed Run's breach records are the reasons its `block` wire
-    // fence gets re-raised on adoption (story 19-2). A read that FAILS must
-    // be surfaced (AI-18) and degrade to NO fence reasons — the next breach
-    // evaluation re-raises what it needs — while the adoption itself still
-    // completes (the fence read never blocks the handle re-take). Driven
-    // through the cfg(test) `run_breaches_fault_names` seam: a real store
-    // outage mid-adoption cannot be staged in-process.
-    let (_state, _manifest, registry) = setup_fake("fencer", &["--linger-ms", "600000"]);
-    let mut sup1 = Supervisor::with_backoff(fast_backoff());
-    let mut record = crash_engine_leaving_record(&mut sup1, &registry, "fencer");
-    let name = InstanceName::new("fencer").unwrap();
-    record.detach = false; // the attached crash shape
-    record.owner = Some(crate::ports::ProcessFingerprint::new(999_999_998, 1)); // dead
-    registry.write_spawn_record(&record).unwrap();
-
-    let mut sup2 = Supervisor::with_backoff(fast_backoff());
-    let buffer = install_capture_sink(&mut sup2);
-    sup2.run_breaches_fault_names.insert(name.clone());
-    assert_eq!(
-        sup2.adopt_orphans(&registry),
-        1,
-        "the faulted fence read must not block the adoption itself"
-    );
-    assert!(
-        sup2.running.contains_key(&name),
-        "the handle is re-held despite the degraded fence read"
-    );
-    let captured = sink_text(&buffer);
-    assert!(
-        captured.contains("fencer") && captured.contains("breach records could not be read"),
-        "the degraded read is surfaced, naming the instance: {captured}"
-    );
-    assert!(
-        captured.contains("a `block` fence it carried is not re-raised"),
-        "the diagnostic states the honest consequence: {captured}"
-    );
-    sup2.stop(&registry, "fencer", Some(Duration::from_secs(5)))
-        .unwrap();
-}
-
-#[test]
-fn a_failed_launch_generation_bump_surfaces_and_keeps_the_stored_generation() {
-    // Story 21-1: the adoption's launch-generation bump keeps a restarted
-    // observation sequence from colliding with the previous attach's rows.
-    // A bump that FAILS must be surfaced (the dedupe-honesty note — observed
-    // usage may be deduplicated against the previous attach's rows) and fall
-    // back to the STORED generation, while the adoption still completes and
-    // the stored value is left untouched (the fault wrote nothing). Driven
-    // through the cfg(test) `launch_bump_fault_names` seam.
-    let (_state, _manifest, registry) = setup_fake("genfail", &["--linger-ms", "600000"]);
-    let mut sup1 = Supervisor::with_backoff(fast_backoff());
-    let mut record = crash_engine_leaving_record(&mut sup1, &registry, "genfail");
-    let name = InstanceName::new("genfail").unwrap();
-    record.detach = false; // the attached crash shape
-    record.owner = Some(crate::ports::ProcessFingerprint::new(999_999_998, 1)); // dead
-    registry.write_spawn_record(&record).unwrap();
-    let generation_before = registry.launch_generation(&name).unwrap();
-
-    let mut sup2 = Supervisor::with_backoff(fast_backoff());
-    let buffer = install_capture_sink(&mut sup2);
-    sup2.launch_bump_fault_names.insert(name.clone());
-    assert_eq!(
-        sup2.adopt_orphans(&registry),
-        1,
-        "the faulted bump must not block the adoption itself"
-    );
-    assert!(
-        sup2.running.contains_key(&name),
-        "the handle is re-held despite the failed bump"
-    );
-    let captured = sink_text(&buffer);
-    assert!(
-        captured.contains("genfail")
-            && captured.contains("launch generation could not be advanced"),
-        "the failed bump is surfaced, naming the instance: {captured}"
-    );
-    assert!(
-        captured.contains("may be deduplicated against the previous attach's rows"),
-        "the diagnostic states the dedupe-honesty consequence: {captured}"
-    );
-    assert_eq!(
-        registry.launch_generation(&name).unwrap(),
-        generation_before,
-        "the failed bump wrote nothing — the stored generation is the fallback value"
-    );
-    sup2.stop(&registry, "genfail", Some(Duration::from_secs(5)))
-        .unwrap();
-}
-
-#[test]
 fn adopt_orphans_skips_a_record_whose_lease_is_held_by_a_live_engine_elsewhere() {
     // The lease-side twin of the live-owner boundary (issue #328): a record
     // whose ADOPTION LEASE names a LIVE engine that is not this one has
@@ -11784,6 +11693,10 @@ fn an_adoption_surfaces_unreadable_breach_records_and_a_stuck_launch_generation(
         text.contains("adoptfault: the adopted instance's launch generation could not be advanced")
             && text.contains("injected launch-generation fault"),
         "the stuck generation is named with its cause:\n{text}"
+    );
+    assert!(
+        text.contains("may be deduplicated against the previous attach's rows"),
+        "the diagnostic states the dedupe-honesty consequence"
     );
     assert_eq!(
         sup2.running.get(&name).unwrap().launch_generation,
