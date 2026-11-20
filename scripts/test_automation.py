@@ -1252,6 +1252,100 @@ class ReleaseDocsTests(unittest.TestCase):
             "gates its ratchet against it)",
         )
 
+    def _assert_upload_rider_discipline(self, ci: str) -> None:
+        """Job-aware checker over ci.yml text (review on #458): every
+        continue-on-error key — wherever it sits: a step key, a
+        dash-first key on the step's own line, or a job-level key
+        directly under a job header — is attributed to its owning step
+        WITHIN its owning job, and step slices never cross a job
+        boundary. Raises AssertionError on any violation."""
+        import re as _re
+
+        uploads = {
+            "test/Upload wedge post-mortem artifact",
+            "perf-budgets/Upload the measured report (artifact)",
+            "coverage/Upload the coverage measurement (diagnostics)",
+        }
+        enforcement = [
+            "test/Run tests (nextest)",
+            "test/Run doctests",
+            "perf-budgets/Run the perf harness (NFR-4 budgets; regressions fail this job)",
+            "perf-budgets/Run the serve-shape scenario (story 17-1; regressions fail this job)",
+            "perf-budgets/Run the Run-scale listing scenario (story 21-5; regressions fail this job)",
+            "coverage/Enforce coverage (per-crate split + merged aggregate gate, #101)",
+        ]
+        jobs_anchor = _re.search(r"^jobs:$", ci, _re.MULTILINE)
+        if jobs_anchor is None:
+            self.fail("ci.yml must carry a top-level jobs: block")
+        region = ci[jobs_anchor.end() :]
+        headers = list(
+            _re.finditer(r"^  ([A-Za-z0-9_-]+):$", region, _re.MULTILINE)
+        )
+        self.assertNotEqual(headers, [], "ci.yml must define at least one job")
+
+        # A real continue-on-error KEY: at least one space of indent,
+        # optionally the dash-first form on the step's own list line.
+        # Comment lines (a `#` before the key) never match, so prose in
+        # comments cannot trip or dodge the guard.
+        coe_key = _re.compile(r"^[ \t]+(?:- )?continue-on-error:", _re.MULTILINE)
+        step_start = _re.compile(r"^      - ", _re.MULTILINE)
+        dash_name = _re.compile(r"^      - name: (.+)$", _re.MULTILINE)
+        # The name key on its own line (the dash-first key order) sits at
+        # step-key indent; deeper `with:` inputs (10+ spaces) must not be
+        # mistaken for the step's name.
+        key_name = _re.compile(r"^        name: (.+)$", _re.MULTILINE)
+
+        carriers = []
+        job_level_hits = []
+        steps_by_name = {}
+        for idx, header in enumerate(headers):
+            job = header.group(1)
+            section_end = (
+                headers[idx + 1].start() if idx + 1 < len(headers) else len(region)
+            )
+            section = region[header.end() : section_end]
+            starts = list(step_start.finditer(section))
+            # Job-key area: the job header through its first step — a
+            # continue-on-error key here is a JOB-level continuation that
+            # masks every failure in the job (the #458 review shape).
+            job_key_area = section[: starts[0].start()] if starts else section
+            if coe_key.search(job_key_area):
+                job_level_hits.append(job)
+            for pos, start in enumerate(starts):
+                step_end = starts[pos + 1].start() if pos + 1 < len(starts) else len(section)
+                step_text = section[start.start() : step_end]
+                nm = dash_name.search(step_text) or key_name.search(step_text)
+                name = nm.group(1).strip() if nm else "<unnamed step>"
+                handle = f"{job}/{name}"
+                steps_by_name.setdefault(handle, step_text)
+                if coe_key.search(step_text):
+                    carriers.append(handle)
+
+        for job in job_level_hits:
+            self.fail(
+                f"job-level continue-on-error in job '{job}' masks every "
+                "failure in that job; only the diagnostics uploads may ride"
+            )
+        self.assertEqual(
+            sorted(carriers),
+            sorted(uploads),
+            "continue-on-error must stay diagnostics-uploads-only; found on: "
+            f"{sorted(carriers)}",
+        )
+        for handle in sorted(uploads):
+            self.assertIn(
+                handle, steps_by_name, f"upload step missing or renamed: {handle}"
+            )
+            block = steps_by_name[handle]
+            self.assertIn("continue-on-error: true", block, handle)
+            self.assertIn("if: always()", block, handle)
+            self.assertIn("actions/upload-artifact@", block, handle)
+        for handle in enforcement:
+            self.assertIn(
+                handle, steps_by_name, f"enforcement step missing or renamed: {handle}"
+            )
+            self.assertNotIn("continue-on-error", steps_by_name[handle], handle)
+
     def test_diagnostic_artifact_uploads_carry_continue_on_error_enforcement_does_not(
         self,
     ) -> None:
@@ -1259,65 +1353,71 @@ class ReleaseDocsTests(unittest.TestCase):
         riders — nothing downstream gates on them — so an artifact-service
         failure (2026-11-11: HTML error pages after 5 retries) must not
         red an otherwise-green job. Every ENFORCEMENT step still fails
-        the job. Pinned three ways: (1) step-level continue-on-error
-        appears on EXACTLY the three known upload steps across the whole
-        file (the spread guard — silently relaxing an enforcement step,
-        or adding a job-level continuation, fails here); (2) each upload
-        step keeps if: always() and the pinned upload-artifact action;
-        (3) the named enforcement steps carry NO continue-on-error."""
+        the job. The spread guard is JOB-AWARE (#458 review): ci.yml is
+        split into job sections at `^  <job>:` headers under `jobs:`, and
+        each continue-on-error key — step-key indent, dash-first on the
+        step line, or job-level under a job header — is attributed to its
+        owning step inside its own job, so neither fool-shape passes (the
+        review reproduced both against the old nearest-`- name:`
+        attribution). Pinned: (1) carriers are EXACTLY the three uploads
+        and NO job carries a job-level key; (2) each upload keeps
+        if: always() and the pinned upload-artifact action; (3) the named
+        enforcement steps — including the story 21-5 ps scenario — carry
+        NO continue-on-error. The two fool-shapes are negative-pinned in
+        test_upload_rider_guard_rejects_job_level_and_dash_first_continuations."""
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
-        import re as _re
+        self._assert_upload_rider_discipline(ci)
 
-        uploads = [
-            "Upload wedge post-mortem artifact",
-            "Upload the measured report (artifact)",
-            "Upload the coverage measurement (diagnostics)",
-        ]
-        enforcement = [
-            "Run tests (nextest)",
-            "Run doctests",
-            "Run the perf harness",
-            "Run the serve-shape scenario",
-            "Enforce coverage",
-        ]
-
-        def step_slice(title: str) -> str:
-            rest = ci[ci.index(f"- name: {title}") + 1 :]
-            nxt = _re.search(r"\n      - name: ", rest)
-            return rest[: nxt.start()] if nxt else rest
-
-        # (1) The spread guard: every continue-on-error key in the file
-        # must belong to one of the three diagnostics uploads. Each hit
-        # is attributed to its nearest preceding step name; a job-level
-        # hit lands on an unrelated (or absent) step name and mismatches
-        # the exact set — flagged here instead of silently allowed.
-        attributed = []
-        for hit in _re.finditer(r"^[ \t]+continue-on-error:", ci, _re.MULTILINE):
-            owner = None
-            for nm in _re.finditer(
-                r"^      - name: (.+)$", ci[: hit.start()], _re.MULTILINE
-            ):
-                owner = nm.group(1).strip()
-            attributed.append(owner if owner else "<no preceding step name>")
-        self.assertEqual(
-            sorted(attributed),
-            sorted(uploads),
-            "continue-on-error must stay diagnostics-uploads-only; found on: "
-            f"{attributed}",
+    def test_upload_rider_guard_rejects_job_level_and_dash_first_continuations(
+        self,
+    ) -> None:
+        """Negative pins for the #458 review shapes — a checker that
+        cannot fail vouches for nothing. Both mutations are the review's
+        own reproductions, applied to the real ci.yml text and fed
+        through the SAME checker the green test uses."""
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
         )
-        # (2) Each upload rides along on both axes: continue-on-error
-        # (its own failure is not the job's) and always() (a red run's
-        # evidence still ships while the service is healthy).
-        for title in uploads:
-            block = step_slice(title)
-            self.assertIn("continue-on-error: true", block, title)
-            self.assertIn("if: always()", block, title)
-            self.assertIn("actions/upload-artifact@", block, title)
-        # (3) Enforcement must keep failing the job.
-        for title in enforcement:
-            self.assertNotIn("continue-on-error", step_slice(title), title)
+
+        # Shape 1: delete the perf upload's own key, add a job-level
+        # continue-on-error directly under `  agents-in-ci:`. The old
+        # guard credited the job-level hit to the nearest preceding
+        # `- name:` line (the perf upload) and passed; step slices also
+        # ran across the job boundary. The job-aware checker must fail
+        # it by NAME.
+        upload_marker = "      - name: Upload the measured report (artifact)"
+        at = ci.index(upload_marker)
+        key_line = "        continue-on-error: true\n"
+        key_at = ci.index(key_line, at)
+        moved = ci[:key_at] + ci[key_at + len(key_line) :]
+        self.assertIn("  agents-in-ci:\n", moved)
+        moved = moved.replace(
+            "  agents-in-ci:\n",
+            "  agents-in-ci:\n    continue-on-error: true\n",
+            1,
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self._assert_upload_rider_discipline(moved)
+        self.assertIn("job-level", str(caught.exception))
+
+        # Shape 2: an enforcement step rewritten with a dash-first key —
+        # `- continue-on-error: true` with `name:` on the following
+        # line. The old hit regex (whitespace, then the key) never
+        # matched the dash-first form, so the step silently ignored its
+        # own failures. The checker must now flag the step by name.
+        scenario = "      - name: Run the serve-shape scenario (story 17-1; regressions fail this job)"
+        self.assertEqual(ci.count(scenario), 1)
+        dashed = ci.replace(
+            scenario,
+            "      - continue-on-error: true\n"
+            "        name: Run the serve-shape scenario (story 17-1; regressions fail this job)",
+            1,
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self._assert_upload_rider_discipline(dashed)
+        self.assertIn("serve-shape", str(caught.exception))
 
     def test_publish_flags_match_the_post_v070_release_state(self) -> None:
         """Publish-day state (go recorded 2026-09-09, release issue #176):
