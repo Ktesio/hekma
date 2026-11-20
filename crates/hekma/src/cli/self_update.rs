@@ -1488,6 +1488,46 @@ mod tests {
     }
 
     #[test]
+    fn test_a_zip_entry_whose_local_header_is_damaged_fails_before_extract() {
+        // The central directory still lists the entry, but the local header
+        // it points at no longer starts with its signature: the entry cannot
+        // even be opened, so extraction names the unreadable entry.
+        let target = ReleaseTarget {
+            triple: "x86_64-pc-windows-msvc",
+            extension: "zip",
+            binary_names: &["hekma.exe", "hkm.exe"],
+        };
+        let mut archive = zip_with_binaries(&[("hekma.exe", b"hekma"), ("hkm.exe", b"hkm")]);
+        assert_eq!(&archive[..4], b"PK\x03\x04", "the first local header");
+        archive[0] ^= 0xFF;
+
+        let error = extract_binaries(&archive, &target).unwrap_err();
+
+        assert!(
+            error
+                .message
+                .starts_with("Could not read release archive entry:"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn test_make_executable_names_a_replacement_that_vanished() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("hekma.new");
+        let result = make_executable(&missing);
+        if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+            // No permission bits to set, so nothing is read.
+            assert_eq!(result, Ok(()));
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.starts_with("Could not read permissions"), "{error}");
+            assert!(error.contains("hekma.new"), "{error}");
+        }
+    }
+
+    #[test]
     fn test_a_failed_checksum_never_reaches_the_installer() {
         // The ordering IS the security property: verify_checksum runs BEFORE
         // extract_binary and before replace_current_exe, so a tampered or

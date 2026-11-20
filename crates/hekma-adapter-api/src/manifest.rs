@@ -2907,6 +2907,30 @@ channel = "stdio"
     }
 
     #[test]
+    fn readiness_unbracketed_ipv6_host_is_refused_asking_for_brackets() {
+        // A bare IPv6 literal's colons are ambiguous against the port
+        // separator: the parser refuses it and names the bracketed form,
+        // never guessing which colon starts the port.
+        let toml = with_readiness(
+            "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+             \"http://::1:8080/health\"\nexpected_status = 200",
+        );
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. } if field.contains("`url`")),
+            "got {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("'http://::1:8080/health' is a bare IPv6 literal — bracket it: [::1]"),
+            "got {err}"
+        );
+    }
+
+    #[test]
     fn readiness_missing_kind_fields_are_rejected_naming_the_field() {
         // http-get without expected_status.
         let toml = with_readiness(

@@ -106,6 +106,10 @@ pub(crate) struct HostClient {
     /// The hekma build that wrote `control.json`.
     hekma_version: String,
     state_root: PathBuf,
+    /// The overall bound on each call (story 21-6: a set act's bounded
+    /// wait); `None` = unbounded (a single `stop` may hold its request for
+    /// the whole ladder).
+    bound: Option<Duration>,
 }
 
 /// The `ureq` agent every call uses: status codes are answers (never
@@ -256,7 +260,17 @@ impl HostClient {
             pid: discovery.pid,
             hekma_version: discovery.hekma_version,
             state_root: state_root.to_path_buf(),
+            bound: None,
         })
+    }
+
+    /// The same client with every call bounded by `bound` overall (story
+    /// 21-6: a set act waits at most this long, then reports that it lost
+    /// patience — never a hang).
+    pub(crate) fn bounded(mut self, bound: Duration) -> Self {
+        self.agent = agent(Some(bound));
+        self.bound = Some(bound);
+        self
     }
 
     /// One Control API call. `Ok(Some(json))` for a 2xx with a body,
@@ -340,6 +354,15 @@ impl HostClient {
     }
 
     fn transport_error(&self, err: ureq::Error) -> CallError {
+        if let (ureq::Error::Timeout(ureq::Timeout::Global), Some(bound)) = (&err, self.bound) {
+            return CallError::Unavailable(format!(
+                "the local Service Host (pid {}) did not answer within {}s, so this command \
+                 stopped waiting; the acts may still be committing — check the Runs with: \
+                 hekma ps --all",
+                self.pid,
+                bound.as_secs()
+            ));
+        }
         let not_sent = never_sent(&err);
         let message = format!(
             "the local Service Host (pid {}) stopped answering: {err}; see {}",
@@ -627,6 +650,83 @@ mod tests {
         match stale.call("POST", "/v0/instances/w/start", None) {
             Err(CallError::NotSent(message)) => {
                 assert!(message.contains("serve.log"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A loopback "host" that writes RAW bytes: each request gets the bytes
+    /// the script picks from its method and path, verbatim, and then the
+    /// connection closes (`None`: close without answering at all).
+    fn raw_host(script: fn(&str, &str) -> Option<&'static str>) -> std::net::SocketAddr {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    let _ = reader.read_line(&mut request_line);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let mut parts = request_line.split_whitespace();
+                    let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                    if let Some(raw) = script(method, path) {
+                        let _ = stream.write_all(raw.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        addr
+    }
+
+    /// The probe's answer from a real Control API.
+    const VERSION_ANSWER: &str = "HTTP/1.1 200 OK\r\nContent-Length: 27\r\nConnection: close\r\n\r\n{\"api\":\"hekma-control-api\"}";
+
+    #[test]
+    fn a_probe_answered_with_something_that_is_not_http_reads_as_an_absent_host() {
+        let garbage = raw_host(|_, _| Some("this is not an HTTP answer\r\n\r\n"));
+        let root = discovery_at(garbage, env!("CARGO_PKG_VERSION"));
+        assert!(
+            HostClient::find(root.path()).is_none(),
+            "a broken answer is an absent host, never a live one"
+        );
+    }
+
+    #[test]
+    fn a_host_that_drops_a_call_after_accepting_it_is_unavailable_not_retryable() {
+        let host = raw_host(|method, path| match (method, path) {
+            ("GET", "/v0/version") => Some(VERSION_ANSWER),
+            // Promises a 64-byte body and sends five.
+            ("GET", "/v0/short-body") => {
+                Some("HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\nshort")
+            }
+            // Reads the request, then hangs up without a word.
+            _ => None,
+        });
+        let root = discovery_at(host, env!("CARGO_PKG_VERSION"));
+        let client = HostClient::find(root.path()).expect("the probe was answered");
+        // The request reached the host, so it may have acted: never NotSent.
+        match client.call("GET", "/v0/instances/w/status", None) {
+            Err(CallError::Unavailable(message)) => {
+                assert!(message.contains("pid 4242"), "{message}");
+                assert!(message.contains("stopped answering"), "{message}");
+                assert!(message.contains("serve.log"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A body cut short mid-read is the same transport failure.
+        match client.call("GET", "/v0/short-body", None) {
+            Err(CallError::Unavailable(message)) => {
+                assert!(message.contains("stopped answering"), "{message}")
             }
             other => panic!("{other:?}"),
         }

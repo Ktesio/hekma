@@ -11,8 +11,9 @@
 
 mod budget;
 mod bus;
-mod config;
+pub(crate) mod config;
 mod cost;
+pub(crate) mod credential;
 mod error;
 mod event;
 mod fleet;
@@ -35,6 +36,13 @@ pub(crate) mod probe_kinds;
 /// supervisor's start path is the only caller.
 pub(crate) mod readiness;
 mod registry;
+pub(crate) mod registry_keys;
+pub(crate) mod registry_limits;
+#[cfg(test)]
+mod registry_limits_tests;
+pub(crate) mod registry_policy;
+#[cfg(test)]
+mod registry_policy_tests;
 mod restart;
 mod resync;
 pub(crate) mod runs;
@@ -55,11 +63,18 @@ pub use config::{
     BUDGET_BREACH_ACTION_KEY, BUDGET_DOLLARS_CUMULATIVE_KEY, BUDGET_DOLLARS_PER_RUN_KEY,
     BUDGET_TOKENS_CUMULATIVE_KEY, BUDGET_TOKENS_PER_RUN_KEY, COST_RATE_INPUT_KEY,
     COST_RATE_OUTPUT_KEY, MEMORY_DIR_KEY, METERING_BASE_URL_KEY, METERING_UPSTREAM_BASE_URL_KEY,
-    PASS_THROUGH_PREFIX, SECRET_MASK, SECRET_PREFIX,
+    PASS_THROUGH_PREFIX, RUN_KEY_ENV, RUN_KEY_KEY, RUN_KEY_MARKER_PREFIX, RUN_REFRESH_KEY_KEY,
+    SECRET_MASK, SECRET_PREFIX,
 };
 pub use cost::{
     cost_micros, cost_micros_with_cached, render_dollars, render_dollars_bare, CostCap,
     CostEvaluator, EstimateLabel, Micros, Rate, MICROS_PER_DOLLAR,
+};
+pub use credential::{
+    parse_presented, CredentialChange, CredentialError, CredentialEvent, CredentialMatch,
+    CredentialSummary, IssuedCredentials, MintedToken, PresentedState, RevokeOutcome,
+    RevokedCredential, TokenClass, TokenHash, TokenState, ANNOUNCE_PREFIX,
+    CREDENTIAL_EVENT_SCHEMA_VERSION, REFRESH_PREFIX, RUN_KEY_PREFIX, TOKEN_BODY_LEN, TOKEN_ID_LEN,
 };
 pub use error::{EngineError, RegistryError};
 pub use event::{
@@ -72,11 +87,12 @@ pub use fleet::{
 };
 pub use governance::{
     canonical_json, checksum_file_content, decide, decide_chain, fence_code, fence_refusal,
-    generate, governance_vectors_checksum, run_derivation, Case, ChainCase, CoverTag, DecisionCase,
-    DerivationCase, DerivationSpec, DollarArm, FenceCase, FenceRefusal, GovernanceDecision,
-    GovernanceInput, GovernanceOutcome, LatchKey, Provenance, RowPricing, TokenArm,
-    VectorsDocument, ALL_COVERS, FENCE_ERROR_TYPE, FENCE_REASON_ORDER, FENCE_REFUSAL_STATUS,
-    GOVERNANCE_VECTORS_ARTIFACT_ID, GOVERNANCE_VECTORS_ARTIFACT_PATH,
+    generate, governance_vectors_checksum, re_armed_keys, rearm, run_derivation, Case, ChainCase,
+    CoverTag, DecisionCase, DerivationCase, DerivationSpec, DollarArm, FenceCase, FenceRefusal,
+    GovernanceDecision, GovernanceInput, GovernanceOutcome, LatchKey, LatchedReason, LevelArms,
+    LevelTotals, Provenance, RearmCase, RearmInput, RearmOutcome, RearmTrigger, RowPricing,
+    TokenArm, VectorsDocument, ALL_COVERS, FENCE_ERROR_TYPE, FENCE_REASON_ORDER,
+    FENCE_REFUSAL_STATUS, GOVERNANCE_VECTORS_ARTIFACT_ID, GOVERNANCE_VECTORS_ARTIFACT_PATH,
     GOVERNANCE_VECTORS_SCHEMA_VERSION, GOVERNANCE_VECTORS_VERSION, PROXY_WIRE_VERSION,
 };
 pub use instance::AgentInstance;
@@ -88,7 +104,13 @@ pub use outbox::{
     EXPORT_BATCH_MAX_CAP, OUTBOX_MAX_BYTES, OUTBOX_SCHEMA_VERSION, PAST_TAIL_SENTENCE,
 };
 pub use registry::{Registry, RemoveDisposition};
+pub use registry_policy::{PolicyChange, PolicyOutcome};
 pub use resync::{ResyncBatch, ResyncCursor};
+pub use runs::{
+    decode_cursor, encode_cursor, ended_run_cutoff, LatchedBreach, ListRunsQuery, ListingCounts,
+    ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument, RunSummary,
+    ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
+};
 pub use runs::{
     validate_label_key, validate_label_value, verb_cell, Anomaly, CellBehavior, ChildRunRequest,
     ControlDepth, Label, LabelChange, LabelOrigin, LabelOutcome, LabelSource, RunError, RunEvent,
@@ -96,6 +118,16 @@ pub use runs::{
     SelectorScope, VerbCell, HOST_IDENTITY_BINDING, MAX_RUN_NESTING, MAX_SELECTED_RUNS,
     RUN_EVENT_SCHEMA_VERSION, RUN_VERBS,
 };
+pub use runs::{
+    BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyEvent, PolicyEventKind,
+    PolicyLimits, PolicyRecord, PolicyResolution, RunPolicy, ScentCheckMode, UpgradedInstance,
+    DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
+};
+pub use runs::{
+    LimitActor, LimitsDirection, RunLifecycleVerb, RunLimitChange, RunLimitField, RunLimitsOutcome,
+    RunLimitsResults, RunLimitsView, RunVerbError,
+};
+pub use runs::{OpenedRun, RunActor, MAX_CALLER_OPEN_CHILDREN};
 // The resync core is engine-internal glue the facade calls (the story-10-3
 // helper); only the cursor/batch TYPES are public surface.
 pub use restart::{is_crash_loop, BackoffSchedule, RestartPolicy, MAX_CONSECUTIVE_FAILURES};
