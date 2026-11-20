@@ -189,27 +189,36 @@ fn logs_follow_final_drain_streams_late_raw_lines_with_the_qualifier_once() {
     //
     // Drive: a `registered` (never-started) instance — not `running`, so the
     // loop enters the drain after its first poll — with an attributed
-    // backlog line the parent waits to see committed. The raw `agent.log` is
-    // created only after a settle that clears the first steady-state poll
-    // (the one-shot read ~50ms + the 300ms poll interval): the write lands
-    // inside the drain's retry window (2s bound, 20ms retries), and the
-    // drain's raw poll must deliver the line as NDJSON plus the qualifier
-    // notice exactly once. The 500ms parent settle puts the write past poll
-    // 1 by a wide margin, so the line can only surface through the drain —
-    // the same file-poll + on-disk drive method the rotation test in
-    // `agent_cli.rs` established.
+    // backlog line the parent waits to see committed, and an `agent.log`
+    // seeded with ONE early raw line BEFORE the spawn. The backlog prime
+    // re-opens the window for that early line, so it can only stream on the
+    // loop's FIRST steady-state poll; the parent WAITS for it on stdout
+    // before touching the file again. Seeing it proves the first poll (raw
+    // block included) has fully run, and the status check in the same
+    // iteration sees the never-running instance and enters the drain. The
+    // late write that follows — a GROWTH of the same file, so the shrink
+    // notice stays out of the picture — is causally after every
+    // steady-state read: on any runner speed the drain's retrying raw poll
+    // (2s bound, 20ms retries) is the ONLY reader left to deliver it. No
+    // fixed sleep to race: the synchronization is the observed early line.
     let (ctx, state) = registered_mock("rawl");
     let state_dir = state.project_dir.as_path();
     append_captured_line(state_dir, "rawl", "backlog line");
 
-    let mut child = spawn_follow(&ctx, state_dir, "rawl");
-    wait_stdout_contains(&ctx, "backlog line");
-    std::thread::sleep(Duration::from_millis(500));
-
-    // The late raw content, landing while the drain retries on empty polls.
     let raw_path = raw_agent_log_path(state_dir, "rawl");
     std::fs::create_dir_all(raw_path.parent().unwrap()).expect("create the raw log dir");
-    std::fs::write(&raw_path, "late raw line\n").expect("write the late raw line");
+    std::fs::write(&raw_path, "early raw line\n").expect("write the early raw line");
+
+    let mut child = spawn_follow(&ctx, state_dir, "rawl");
+    // The one-shot dump carries the attributed backlog…
+    wait_stdout_contains(&ctx, "backlog line");
+    // …and the first steady-state poll streams the seeded early line: only
+    // once it is observed is the drain provably the sole remaining reader.
+    wait_stdout_contains(&ctx, "early raw line");
+
+    // The late raw content, landing while the drain retries on empty polls.
+    std::fs::write(&raw_path, "early raw line\nlate raw line\n")
+        .expect("grow the raw log with the late raw line");
 
     let status = wait_exit(&mut child);
     assert_eq!(
@@ -223,8 +232,9 @@ fn logs_follow_final_drain_streams_late_raw_lines_with_the_qualifier_once() {
     let texts = assert_ndjson_texts(&stdout, "rawl");
     assert_eq!(
         texts,
-        vec!["backlog line", "late raw line"],
-        "the late raw line must be emitted, as NDJSON, after the attributed backlog"
+        vec!["backlog line", "early raw line", "late raw line"],
+        "the late raw line must be emitted, as NDJSON, through the drain — after the \
+         one-shot backlog and the first poll's early line"
     );
 
     let stderr = follow_stderr(&ctx);
