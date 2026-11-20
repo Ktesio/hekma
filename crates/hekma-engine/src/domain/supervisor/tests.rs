@@ -288,7 +288,7 @@ fn start_emits_one_diagnostic_when_a_mapped_env_target_shadows_a_base_var() {
     let err = sup.start(&registry, "shdw").unwrap_err();
     assert!(
         matches!(err, EngineError::LaunchFailed { .. }),
-        "the missing-binary spawn fails, but only AFTER the emissions; got {err:?}"
+        "the missing-binary spawn fails, but only AFTER the emissions"
     );
 
     let captured = sink_text(&buffer);
@@ -664,9 +664,9 @@ fn unresolved_secret_rejects_start_before_any_state_change() {
         EngineError::Secret { name: n, detail } => {
             assert_eq!(n, "noresolve_eng");
             // Names the NAME + resolvers, NEVER a value.
-            assert!(detail.contains(env_key), "detail must name NAME; {detail}");
+            assert!(detail.contains(env_key), "detail must name NAME");
         }
-        other => panic!("expected EngineError::Secret, got {other:?}"),
+        _other => panic!("expected EngineError::Secret"),
     }
     // Prior state preserved; no snapshot written (rejected before both).
     assert_eq!(state_of(&registry, "noresolve_eng"), prior);
@@ -861,7 +861,7 @@ fn snapshot_write_failure_rejects_the_start_before_the_starting_transition() {
     let err = sup.start(&registry, "bad").unwrap_err();
     assert!(
         matches!(&err, EngineError::Snapshot { name, .. } if name == "bad"),
-        "expected a typed Snapshot error, got {err:?}"
+        "expected a typed Snapshot error"
     );
     // The instance stayed in its prior state — the start was rejected cleanly
     // BEFORE the `starting` transition (no spurious state change, AC6).
@@ -1819,7 +1819,7 @@ fn start_with_an_unwritable_file_target_rejects_before_any_state_change() {
     let err = sup.start(&registry, "badfile").unwrap_err();
     assert!(
         matches!(err, EngineError::AdapterUnresolved { .. }),
-        "a bad file target must fail the start; got {err}"
+        "a bad file target must fail the start"
     );
     // Never reached running (the failure was before the starting transition, so
     // the instance stays registered).
@@ -2844,7 +2844,10 @@ fn restart_on_an_invalid_name_is_invalid_name() {
     let err = sup
         .restart(&registry, "Not Valid!", 1, Duration::from_millis(1))
         .unwrap_err();
-    assert!(matches!(err, EngineError::InvalidName { .. }), "{err:?}");
+    assert!(
+        matches!(err, EngineError::InvalidName { .. }),
+        "expected InvalidName for the invalid restart name"
+    );
 }
 
 #[test]
@@ -3100,14 +3103,14 @@ fn detached_start_of_an_engine_observed_instance_is_refused_before_any_side_effe
             assert_eq!(name, "obsdetach");
             assert!(
                 detail.contains("listener") && detail.contains("dies with the command or host"),
-                "the refusal must name the listener-lifetime why: {detail}"
+                "the refusal must name the listener-lifetime why"
             );
             assert!(
                 detail.contains("without --detach"),
-                "the refusal must carry the remediation: {detail}"
+                "the refusal must carry the remediation"
             );
         }
-        other => panic!("expected DetachRefused, got {other:?}"),
+        _other => panic!("expected DetachRefused"),
     }
     // NO side effects: the row is still `registered`, and no write-ahead
     // spawn record exists (nothing was spawned or half-started).
@@ -3133,7 +3136,7 @@ fn detached_start_of_an_engine_observed_instance_is_refused_before_any_side_effe
     let err2 = sup.start(&registry, "obsdetach").unwrap_err();
     assert!(
         matches!(err2, EngineError::ObservedMetering { .. }),
-        "a plain start of the observed instance must not hit DetachRefused, got {err2:?}"
+        "a plain start of the observed instance must not hit DetachRefused"
     );
 }
 
@@ -5122,11 +5125,11 @@ fn start_refuses_a_symlinked_managed_memory_dir_and_surfaces_the_log_error() {
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let err = sup.start(&registry, "symlinkmem").unwrap_err();
     let EngineError::Log { detail, .. } = &err else {
-        panic!("expected EngineError::Log for the symlinked memory dir, got {err:?}");
+        panic!("expected EngineError::Log for the symlinked memory dir");
     };
     assert!(
         detail.contains("symlink"),
-        "the refusal must name the symlink guard: {detail}"
+        "the refusal must name the symlink guard"
     );
 }
 
@@ -6779,7 +6782,7 @@ fn an_outbox_failure_fails_the_transition_with_nothing_committed() {
     let err = sup.start(&registry, "obxf").unwrap_err();
     assert!(
         err.to_string().contains("outbox"),
-        "the failure names the outbox: {err}"
+        "the failure names the outbox"
     );
     let instance = registry
         .lookup(&InstanceName::new("obxf").unwrap())
@@ -8109,14 +8112,14 @@ fn wal_spawn_record_commit_failure_lands_failed_and_tears_down_the_detached_chil
             assert_eq!(n, "walfail");
             assert!(
                 detail.contains("could not commit the write-ahead spawn record"),
-                "the error names the failed commit: {detail}"
+                "the error names the failed commit"
             );
             assert!(
                 detail.contains("injected cfg(test) WAL commit fault"),
-                "the store's abort reason rides the detail: {detail}"
+                "the store's abort reason rides the detail"
             );
         }
-        other => panic!("expected LaunchFailed, got {other:?}"),
+        _other => panic!("expected LaunchFailed"),
     }
     assert_eq!(state_of(&registry, "walfail"), LifecycleState::Failed);
     assert!(
@@ -8174,10 +8177,10 @@ fn readiness_timeout_death_recheck_failure_is_surfaced_on_the_timeout() {
             assert_eq!(n, "rdyrechk");
             assert!(
                 detail.contains("did not pass within its 400ms budget"),
-                "the timeout detail names the budget: {detail}"
+                "the timeout detail names the budget"
             );
         }
-        other => panic!("expected LaunchFailed, got {other:?}"),
+        _other => panic!("expected LaunchFailed"),
     }
     assert_eq!(state_of(&registry, "rdyrechk"), LifecycleState::Failed);
     let events = Supervisor::read_events(&registry, "rdyrechk").unwrap();
@@ -11726,11 +11729,11 @@ fn start_refuses_a_managed_memory_dir_path_blocked_by_a_file() {
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let err = sup.start(&registry, "memblocked").unwrap_err();
     let EngineError::Log { detail, path, .. } = &err else {
-        panic!("expected EngineError::Log for the blocked memory dir, got {err:?}");
+        panic!("expected EngineError::Log for the blocked memory dir");
     };
     assert!(
         detail.starts_with("could not ensure the managed memory directory: "),
-        "the refusal names the ensure step: {detail}"
+        "the refusal names the ensure step"
     );
     assert_eq!(path, &managed.to_string_lossy());
     assert!(sup.running.is_empty(), "nothing was launched");
@@ -11892,9 +11895,12 @@ fn a_failing_random_source_refuses_a_supervised_start_with_nothing_spawned_or_wr
     let err = refused.unwrap_err();
     assert!(
         matches!(err, EngineError::CredentialUnavailable { .. }),
-        "{err:?}"
+        "expected CredentialUnavailable"
     );
-    assert!(err.to_string().contains("random source failed"), "{err}");
+    assert!(
+        err.to_string().contains("random source failed"),
+        "the error names the random-source failure"
+    );
     assert_eq!(state_of(&registry, "nokey"), LifecycleState::Registered);
     assert!(registry
         .spawn_record(&InstanceName::new("nokey").unwrap())
