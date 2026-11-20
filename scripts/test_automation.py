@@ -284,7 +284,9 @@ class ReleaseDocsTests(unittest.TestCase):
         # helper-only change cannot bust it and the frozen binary silently
         # ignores flags added since (unknown args are `_ => {}`), making the
         # spawning tests wait out deadlines for output that can never arrive.
-        coverage_step = ci[ci.index("- name: Enforce coverage") :]
+        # (The step name is QUOTED in ci.yml — its `#101` provenance marker
+        # would otherwise parse as a YAML comment and truncate the name.)
+        coverage_step = ci[ci.index('- name: "Enforce coverage') :]
         self.assertIn(
             "rm -f target/debug/fake_agent target/debug/fake_agent.exe",
             coverage_step,
@@ -1253,13 +1255,32 @@ class ReleaseDocsTests(unittest.TestCase):
         )
 
     def _assert_upload_rider_discipline(self, ci: str) -> None:
-        """Job-aware checker over ci.yml text (review on #458): every
-        continue-on-error key — wherever it sits: a step key, a
-        dash-first key on the step's own line, or a job-level key
-        directly under a job header — is attributed to its owning step
-        WITHIN its owning job, and step slices never cross a job
-        boundary. Raises AssertionError on any violation."""
-        import re as _re
+        """YAML-parsed checker over ci.yml (#458 review round 2): the
+        workflow is parsed with yaml.safe_load, so key ATTRIBUTION is
+        the YAML parser's, not a text-slicer's. A job-level
+        continue-on-error is flagged wherever it sits in the job's key
+        block — before OR after the steps list (the round-1 slicer
+        credited a post-steps key to the job's LAST step, so it passed
+        silently whenever that last step was itself an upload) — and a
+        job header carrying a trailing comment is still a job header,
+        so two jobs can never merge into one section (the slicer's
+        `^  <job>:$` regex skipped commented headers). Raises
+        AssertionError on any violation."""
+        try:
+            import yaml
+        except ImportError:  # preinstalled on GitHub-hosted images
+            self.fail(
+                "the upload-rider guard parses ci.yml with PyYAML "
+                "(preinstalled on GitHub-hosted ubuntu images; locally: "
+                "pip install pyyaml)"
+            )
+
+        doc = yaml.safe_load(ci)
+        self.assertIsInstance(doc, dict, "ci.yml must parse to a mapping")
+        jobs = doc.get("jobs")
+        self.assertIsInstance(
+            jobs, dict, "ci.yml must carry a top-level jobs: mapping"
+        )
 
         uploads = {
             "test/Upload wedge post-mortem artifact",
@@ -1274,51 +1295,27 @@ class ReleaseDocsTests(unittest.TestCase):
             "perf-budgets/Run the Run-scale listing scenario (story 21-5; regressions fail this job)",
             "coverage/Enforce coverage (per-crate split + merged aggregate gate, #101)",
         ]
-        jobs_anchor = _re.search(r"^jobs:$", ci, _re.MULTILINE)
-        if jobs_anchor is None:
-            self.fail("ci.yml must carry a top-level jobs: block")
-        region = ci[jobs_anchor.end() :]
-        headers = list(
-            _re.finditer(r"^  ([A-Za-z0-9_-]+):$", region, _re.MULTILINE)
-        )
-        self.assertNotEqual(headers, [], "ci.yml must define at least one job")
-
-        # A real continue-on-error KEY: at least one space of indent,
-        # optionally the dash-first form on the step's own list line.
-        # Comment lines (a `#` before the key) never match, so prose in
-        # comments cannot trip or dodge the guard.
-        coe_key = _re.compile(r"^[ \t]+(?:- )?continue-on-error:", _re.MULTILINE)
-        step_start = _re.compile(r"^      - ", _re.MULTILINE)
-        dash_name = _re.compile(r"^      - name: (.+)$", _re.MULTILINE)
-        # The name key on its own line (the dash-first key order) sits at
-        # step-key indent; deeper `with:` inputs (10+ spaces) must not be
-        # mistaken for the step's name.
-        key_name = _re.compile(r"^        name: (.+)$", _re.MULTILINE)
 
         carriers = []
         job_level_hits = []
         steps_by_name = {}
-        for idx, header in enumerate(headers):
-            job = header.group(1)
-            section_end = (
-                headers[idx + 1].start() if idx + 1 < len(headers) else len(region)
+        for job, job_cfg in jobs.items():
+            self.assertIsInstance(
+                job_cfg, dict, f"job '{job}' must map to a block of keys"
             )
-            section = region[header.end() : section_end]
-            starts = list(step_start.finditer(section))
-            # Job-key area: the job header through its first step — a
-            # continue-on-error key here is a JOB-level continuation that
-            # masks every failure in the job (the #458 review shape).
-            job_key_area = section[: starts[0].start()] if starts else section
-            if coe_key.search(job_key_area):
+            # A job-level key masks EVERY failure in the job wherever it
+            # sits in the job's key block (the round-2 post-steps shape)
+            # — position never mattered to the mask, only to the slicer.
+            if "continue-on-error" in job_cfg:
                 job_level_hits.append(job)
-            for pos, start in enumerate(starts):
-                step_end = starts[pos + 1].start() if pos + 1 < len(starts) else len(section)
-                step_text = section[start.start() : step_end]
-                nm = dash_name.search(step_text) or key_name.search(step_text)
-                name = nm.group(1).strip() if nm else "<unnamed step>"
+            for step in job_cfg.get("steps") or []:
+                self.assertIsInstance(
+                    step, dict, f"step entries of job '{job}' must be mappings"
+                )
+                name = str(step.get("name", "<unnamed step>"))
                 handle = f"{job}/{name}"
-                steps_by_name.setdefault(handle, step_text)
-                if coe_key.search(step_text):
+                steps_by_name.setdefault(handle, step)
+                if "continue-on-error" in step:
                     carriers.append(handle)
 
         for job in job_level_hits:
@@ -1336,10 +1333,13 @@ class ReleaseDocsTests(unittest.TestCase):
             self.assertIn(
                 handle, steps_by_name, f"upload step missing or renamed: {handle}"
             )
-            block = steps_by_name[handle]
-            self.assertIn("continue-on-error: true", block, handle)
-            self.assertIn("if: always()", block, handle)
-            self.assertIn("actions/upload-artifact@", block, handle)
+            step = steps_by_name[handle]
+            self.assertIs(step.get("continue-on-error"), True, handle)
+            self.assertEqual(step.get("if"), "always()", handle)
+            self.assertTrue(
+                str(step.get("uses", "")).startswith("actions/upload-artifact@"),
+                handle,
+            )
         for handle in enforcement:
             self.assertIn(
                 handle, steps_by_name, f"enforcement step missing or renamed: {handle}"
@@ -1353,17 +1353,20 @@ class ReleaseDocsTests(unittest.TestCase):
         riders — nothing downstream gates on them — so an artifact-service
         failure (2026-11-11: HTML error pages after 5 retries) must not
         red an otherwise-green job. Every ENFORCEMENT step still fails
-        the job. The spread guard is JOB-AWARE (#458 review): ci.yml is
-        split into job sections at `^  <job>:` headers under `jobs:`, and
-        each continue-on-error key — step-key indent, dash-first on the
-        step line, or job-level under a job header — is attributed to its
-        owning step inside its own job, so neither fool-shape passes (the
-        review reproduced both against the old nearest-`- name:`
-        attribution). Pinned: (1) carriers are EXACTLY the three uploads
-        and NO job carries a job-level key; (2) each upload keeps
+        the job. The spread guard PARSES the workflow (#458 review
+        round 2): ci.yml goes through yaml.safe_load and every
+        continue-on-error key is attributed by the YAML parser — a
+        job-level key is a job-level key wherever it sits in the job's
+        block (before or after steps:), and a job header with a
+        trailing comment is still its own job — so all four fool-shapes
+        fail (round-1's nearest-`- name:` attribution and job-boundary
+        crossing, round-2's post-steps job key and commented header;
+        both review rounds reproduced theirs against the live ci.yml).
+        Pinned: (1) carriers are EXACTLY the three uploads and NO job
+        carries a job-level key; (2) each upload keeps
         if: always() and the pinned upload-artifact action; (3) the named
         enforcement steps — including the story 21-5 ps scenario — carry
-        NO continue-on-error. The two fool-shapes are negative-pinned in
+        NO continue-on-error. All four fool-shapes are negative-pinned in
         test_upload_rider_guard_rejects_job_level_and_dash_first_continuations."""
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
@@ -1374,9 +1377,12 @@ class ReleaseDocsTests(unittest.TestCase):
         self,
     ) -> None:
         """Negative pins for the #458 review shapes — a checker that
-        cannot fail vouches for nothing. Both mutations are the review's
-        own reproductions, applied to the real ci.yml text and fed
-        through the SAME checker the green test uses."""
+        cannot fail vouches for nothing. Shapes 1–2 are round 1's own
+        reproductions; shapes 3–4 are round 2's (the post-steps job
+        key and the commented job header), each verified to FOOL the
+        round-1 text slicer before the parser rewrite. All four are
+        applied to the real ci.yml text and fed through the SAME
+        checker the green test uses."""
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
@@ -1418,6 +1424,54 @@ class ReleaseDocsTests(unittest.TestCase):
         with self.assertRaises(AssertionError) as caught:
             self._assert_upload_rider_discipline(dashed)
         self.assertIn("serve-shape", str(caught.exception))
+
+        # Shape 3 (round 2, finding a): a job-level continue-on-error
+        # placed AFTER the job's steps list. The round-1 slicer credited
+        # it to the job's LAST step — and coverage's last step is the
+        # coverage upload, which already carries the key — so the
+        # masking key passed silently (verified against head's ci.yml
+        # before the rewrite; same for perf-budgets). Pin the premise,
+        # then require the parser to fail the mutation by NAME.
+        import re as _re
+
+        cov_hdr = _re.search(r"^  coverage:$", ci, _re.MULTILINE)
+        if cov_hdr is None:
+            self.fail("coverage job header not found in ci.yml")
+        nxt = _re.search(r"^  [A-Za-z0-9_-]+:$", ci[cov_hdr.end() :], _re.MULTILINE)
+        section_end = cov_hdr.end() + (
+            nxt.start() if nxt else len(ci[cov_hdr.end() :])
+        )
+        section = ci[cov_hdr.end() : section_end]
+        last_step = section.split("- name:")[-1]
+        self.assertIn(
+            "Upload the coverage measurement (diagnostics)",
+            last_step,
+            "shape-3 premise: coverage's last step must be the upload the "
+            "slicer credited the post-steps key to",
+        )
+        after_steps = (
+            ci[:section_end]
+            + "\n    continue-on-error: true  # job-level, after the steps list"
+            + ci[section_end:]
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self._assert_upload_rider_discipline(after_steps)
+        self.assertIn("job-level", str(caught.exception))
+
+        # Shape 4 (round 2, finding b): a job header carrying a trailing
+        # comment. The slicer's `^  <job>:$` header regex skipped it, so
+        # the commented job merged into the previous section and its
+        # job-level key was never seen as job-level (verified to pass the
+        # round-1 checker against head's ci.yml). YAML comments never
+        # change key structure, so the parser still owns the job.
+        commented = ci.replace(
+            "  agents-in-ci:\n",
+            "  agents-in-ci: # agents that run inside CI\n    continue-on-error: true\n",
+            1,
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self._assert_upload_rider_discipline(commented)
+        self.assertIn("job-level", str(caught.exception))
 
     def test_publish_flags_match_the_post_v070_release_state(self) -> None:
         """Publish-day state (go recorded 2026-09-09, release issue #176):

@@ -1788,7 +1788,7 @@ jobs:
         # cache hit the binary is already on PATH, so the `command -v` guard skips
         # the rebuild (matches the semver gate's guarded install, AI-23).
         run: command -v cargo-tarpaulin >/dev/null 2>&1 || cargo +stable install cargo-tarpaulin --locked
-      - name: Install lcov (per-crate coverage merge, #101)
+      - name: "Install lcov (per-crate coverage merge, #101)"
         # The per-crate split (#101) writes one LCOV tracefile per crate; lcov
         # merges them into the workspace-aggregate the --fail-under 95 gate is
         # enforced on. apt's lcov is enough — only `lcov -a`/`--summary` are used.
@@ -1813,7 +1813,7 @@ jobs:
           sudo mkswap /mnt/covswap
           sudo swapon /mnt/covswap
           echo "after:"; df -h / /mnt; free -h
-      - name: Enforce coverage (per-crate split + merged aggregate gate, #101)
+      - name: "Enforce coverage (per-crate split + merged aggregate gate, #101)"
         # NOTE for future env additions: RUST_BACKTRACE rode this step's env
         # block 2026-09-26/27 to pin the llvm_profparser partial-profraw
         # panic; it is GONE now (root-caused — see the fake_acp_agent guard
