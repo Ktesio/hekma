@@ -622,12 +622,14 @@ impl Supervisor {
                 // reads the real exit code via GetExitCodeProcess, so a
                 // Windows adopted exit normally lands in the `Exited(Some)`
                 // arm above carrying its true code (the story-11-5 closure of
-                // the 11-1 Windows-half defer).
-                CrashInput::Exited(None) if adopted => "process exited unexpectedly (exit \
-                 code unavailable — adopted process is not this engine's child)"
-                    .to_string(),
+                // the 11-1 Windows-half defer). The parentheticals are the
+                // shared fragments (issue #387) so the release pass's
+                // released-exit reconcile words the same two shapes identically.
+                CrashInput::Exited(None) if adopted => {
+                    format!("process exited unexpectedly ({CODE_LESS_ADOPTED_FRAGMENT})")
+                }
                 CrashInput::Exited(None) => {
-                    "process exited unexpectedly (terminated by signal)".to_string()
+                    format!("process exited unexpectedly ({CODE_LESS_SIGNAL_FRAGMENT})")
                 }
             };
             // Story 18-3: the classified branches pick the cause + the policy
@@ -1630,17 +1632,15 @@ impl Supervisor {
                     // are the reasons its wire fence was up. Re-raised on the
                     // re-bound listener below, so an engine restart or
                     // adoption never drops a fence the latch would stop from
-                    // re-firing. A failed config read degrades to no fence
-                    // reasons (the enforcement call returns early on that read
-                    // too); a failed breach read is SURFACED (AI-18).
-                    let (token_action, cost_action) = registry
-                        .effective_config(&name, ConfigLayer::empty())
-                        .map(|effective| {
-                            let (_budget, token_action) = config::resolve_token_budget(&effective);
-                            let (_rate, _cap, cost_action) = config::resolve_cost(&effective);
-                            (token_action, cost_action)
-                        })
-                        .unwrap_or((BreachAction::Pause, BreachAction::Pause));
+                    // re-firing. A failed resolution degrades to no fence
+                    // reasons (the enforcement call returns early on that
+                    // read too); a failed breach read is SURFACED (AI-18).
+                    // Story 21-3: the action resolves through the ONE Policy
+                    // resolver (a Policy can supply `block`).
+                    let action = registry
+                        .resolved_limits(&name, Some(&run_id))
+                        .effective_action;
+                    let (token_action, cost_action) = (action, action);
                     // cfg(test) FAULT-INJECTION SEAM (the `adoption_lease_faults`
                     // precedent): an armed instance's resumed-Run breach read
                     // fails with an injected store error so the surfaced AI-18

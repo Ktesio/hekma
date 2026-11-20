@@ -243,10 +243,30 @@ fn every_route(addr: &str) -> Vec<(&'static str, String)> {
         // auth layer — no anonymous route.
         ("GET", format!("http://{addr}/v0/export")),
         ("POST", format!("http://{addr}/v0/export/ack")),
-        // Story 21-2: the Run routes.
+        // Story 21-2: the Run routes. Story 21-5 adds the listing (`GET
+        // /v0/runs`) beside the open.
         ("POST", format!("http://{addr}/v0/runs")),
+        ("GET", format!("http://{addr}/v0/runs")),
         ("GET", format!("http://{addr}/v0/runs/run_ghost")),
         ("POST", format!("http://{addr}/v0/runs/run_ghost/close")),
+        // Story 21-9: the bound-label routes.
+        ("GET", format!("http://{addr}/v0/runs/run_ghost/labels")),
+        ("PATCH", format!("http://{addr}/v0/runs/run_ghost/labels")),
+        // Story 21-6: the Run-grain verbs, Run limits and Selector sets.
+        ("POST", format!("http://{addr}/v0/runs/run_ghost/stop")),
+        ("POST", format!("http://{addr}/v0/runs/run_ghost/pause")),
+        ("POST", format!("http://{addr}/v0/runs/run_ghost/resume")),
+        ("POST", format!("http://{addr}/v0/runs/run_ghost/drain")),
+        ("GET", format!("http://{addr}/v0/runs/run_ghost/limits")),
+        ("PATCH", format!("http://{addr}/v0/runs/run_ghost/limits")),
+        ("POST", format!("http://{addr}/v0/runs/select")),
+        ("POST", format!("http://{addr}/v0/runs/stop")),
+        ("POST", format!("http://{addr}/v0/runs/pause")),
+        ("POST", format!("http://{addr}/v0/runs/resume")),
+        ("POST", format!("http://{addr}/v0/runs/drain")),
+        ("POST", format!("http://{addr}/v0/runs/close")),
+        ("PATCH", format!("http://{addr}/v0/runs/labels")),
+        ("POST", format!("http://{addr}/v0/runs/limits")),
     ]
 }
 
@@ -264,6 +284,7 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
             "GET" => client.get(&url).call().unwrap(),
             "POST" => client.post(&url).send_json("").unwrap(),
             "PUT" => client.put(&url).send_json("").unwrap(),
+            "PATCH" => client.patch(&url).send_json("").unwrap(),
             "DELETE" => client.delete(&url).call().unwrap(),
             _ => unreachable!(),
         };
@@ -296,6 +317,11 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
                 .unwrap(),
             "PUT" => client
                 .put(&url)
+                .header("Authorization", &wrong)
+                .send_json("")
+                .unwrap(),
+            "PATCH" => client
+                .patch(&url)
                 .header("Authorization", &wrong)
                 .send_json("")
                 .unwrap(),
@@ -343,6 +369,12 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
                 // and the ghost 404 below would be unreachable).
                 .send_json(serde_json::json!({"key": "model", "value": "m"}))
                 .unwrap(),
+            // A valid label change, so the ghost Run's 404 is the answer.
+            "PATCH" => client
+                .patch(&url)
+                .header("Authorization", &right)
+                .send_json(serde_json::json!({"set": {"team": "core"}}))
+                .unwrap(),
             "DELETE" => client
                 .delete(&url)
                 .header("Authorization", &right)
@@ -356,12 +388,29 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
             // The outbox pull (story 17-4) with a valid bearer answers 200 —
             // an empty/never-written journal is a valid EMPTY batch, not a
             // missing resource.
-            || url.ends_with("/v0/export");
+            // The Run listing (story 21-5) likewise: an empty state
+            // directory is a valid EMPTY listing.
+            || url.ends_with("/v0/export")
+        // The Run listing (story 21-5) is identity-shaped only on its GET —
+        // an empty state directory is a valid EMPTY listing. The POST
+        // (open) keeps its exactly-one-parent 400 below.
+        || (method == "GET" && url.ends_with("/v0/runs"));
         let register = method == "POST" && url.ends_with("/v0/instances");
         // The ack POST reached its handler but this loop's register-shaped
         // body carries no `seq` — the Json extractor's 422 is the
         // handler-reached answer (auth passed, the request shape was wrong).
         let ack_wrong_body = method == "POST" && url.ends_with("/v0/export/ack");
+        // Story 21-6: the set routes and the limits PATCH deny unknown
+        // fields, so this loop's bodies (no `set_token`; a label change on
+        // a limits route) are the extractor's 422 — the handler-reached
+        // answer.
+        let set_wrong_body = [
+            "select", "stop", "pause", "resume", "drain", "close", "labels", "limits",
+        ]
+        .iter()
+        .any(|route| url.ends_with(&format!("/v0/runs/{route}")))
+            || (method == "PATCH" && url.ends_with("/run_ghost/limits"));
+        let ack_wrong_body = ack_wrong_body || set_wrong_body;
         // The Run open POST reached its handler: the register-shaped body
         // names no parent, so the exactly-one-parent rule answers 400.
         let run_open = method == "POST" && url.ends_with("/v0/runs");
@@ -933,6 +982,289 @@ fn the_drain_route_serves_both_outcomes_and_rejects_an_out_of_range_bound() {
         waited < 5000,
         "the stop happened right after the bound expired (waited {waited}ms)"
     );
+
+    server.stop().unwrap();
+}
+
+// The drain body's own wire forms (the arms behind the out-of-range pin
+// above): a body that is not the JSON object shape is a rejected REQUEST
+// (400, naming the expected shape — the parse arm), while the two EMPTY
+// object forms — `{}` and `{"timeout_ms":null}` — are the manifest tier's
+// equals (the absent field's explicit-null spelling is the same tier, never
+// a zero-millisecond drain).
+#[test]
+fn the_drain_route_rejects_a_non_object_body_and_reads_the_empty_forms_as_the_manifest_tier() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    // Two COMPLETED-shape drainers (the anchored fixture above: the idle
+    // signal lands 800ms after the pause sentinel, the agent self-exits
+    // 2000ms after it) — each manifest-tier leg stops its own instance.
+    // The fixture TempDirs stay BOUND for the whole test: dropping one
+    // deletes its manifest before serve ever reads it.
+    let _obj_fixture = registered_drain_fake_agent(
+        &base,
+        "objdrain",
+        &[
+            "--linger-ms",
+            "600000",
+            "--idle-on-pause",
+            "800:pause.sentinel:idle.sentinel",
+            "--exit-on-pause",
+            "2000:pause.sentinel",
+        ],
+        "timeout_ms = 10000\nidle_file = \"idle.sentinel\"",
+    );
+    let _nul_fixture = registered_drain_fake_agent(
+        &base,
+        "nulldrain",
+        &[
+            "--linger-ms",
+            "600000",
+            "--idle-on-pause",
+            "800:pause.sentinel:idle.sentinel",
+            "--exit-on-pause",
+            "2000:pause.sentinel",
+        ],
+        "timeout_ms = 10000\nidle_file = \"idle.sentinel\"",
+    );
+    // A STALLED drainer with a SHORT manifest bound (the review round 3
+    // leg): the idle file never lands, so an empty-form drain on the
+    // MANIFEST tier burns the declared 800ms and reports the timed-out
+    // shape. This is the leg that distinguishes the tiers: the asserted
+    // band below (700..2500ms) is reachable ONLY by the 800ms manifest
+    // bound timing out. The fixture's self-exit is parked at 3000ms —
+    // PAST that ceiling — so if the empty forms regressed to the route's
+    // 30s default, the child's own exit ends the wait at ~3000ms and the
+    // leg fails the ceiling fast instead of hanging for the full window
+    // (the completed-shape legs above pass under any bound above ~500ms,
+    // so they cannot see the difference on their own). The same short
+    // exit keeps the Windows stop that follows this drain (~3s — the
+    // graceful step there only waits, no signal to lean on) far inside
+    // the suite client's 10s response timeout, the sibling pattern the
+    // 1200ms-exit fixture above (in
+    // `the_drain_route_serves_both_outcomes_and_rejects_an_out_of_range_bound`)
+    // uses for the same reason.
+    let _stalled_fixture = registered_drain_fake_agent(
+        &base,
+        "stalleddrain",
+        &[
+            "--linger-ms",
+            "600000",
+            "--exit-on-pause",
+            "3000:pause.sentinel",
+        ],
+        "timeout_ms = 800\nidle_file = \"never.sentinel\"",
+    );
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let obj = format!("http://{}/v0/instances/objdrain", server.addr);
+    let nul = format!("http://{}/v0/instances/nulldrain", server.addr);
+    let stalled = format!("http://{}/v0/instances/stalleddrain", server.addr);
+    for url in [&obj, &nul, &stalled] {
+        let mut response = client
+            .post(format!("{url}/start"))
+            .header("Authorization", &auth)
+            .send("")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{url}");
+        assert_eq!(json_body(&mut response)["instance"]["state"], "running");
+    }
+
+    // A body that is not the object shape is a rejected REQUEST — five
+    // forms: non-JSON bytes, three arrays (a bare `[1500]` and `[null]` are
+    // the sequence forms serde's derive would otherwise read as
+    // `timeout_ms`, draining with 200/defaults — the route refuses them AS
+    // SHAPE, before the typed read), and a mistyped field. None of them
+    // stop the instance (the route refuses before the engine gate, the
+    // out-of-range pin's own order).
+    for body in [
+        "not json at all",
+        "[1,2,3]",
+        "[1500]",
+        "[null]",
+        "{\"timeout_ms\":\"soon\"}",
+    ] {
+        let mut response = client
+            .post(format!("{obj}/drain"))
+            .header("Authorization", &auth)
+            .send(body)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "body={body}");
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["kind"], "invalid_body", "body={body}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("must be a JSON object"),
+            "body={body}: the refusal names the expected shape"
+        );
+    }
+
+    // A duplicate key is a rejected REQUEST too — the shape check reads the
+    // body as `Value`, which would collapse the pair (last one winning),
+    // but the typed read runs on the ORIGINAL bytes, where the derived
+    // visitor still refuses it. A `Value` re-read would silently drain on
+    // the manifest tier here.
+    for body in [
+        "{\"timeout_ms\":1,\"timeout_ms\":null}",
+        "{\"timeout_ms\":null,\"timeout_ms\":1500}",
+    ] {
+        let mut response = client
+            .post(format!("{obj}/drain"))
+            .header("Authorization", &auth)
+            .send(body)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "body={body}");
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["kind"], "invalid_body", "body={body}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate field"),
+            "body={body}: the refusal names the duplicate key"
+        );
+    }
+
+    // `{}` — an object with NO timeout — is the manifest tier's equal: the
+    // drain runs on the declared 10s bound, the idle signal lands mid-wait,
+    // and the outcome is the completed shape with an honestly counted wait.
+    let mut response = client
+        .post(format!("{obj}/drain"))
+        .header("Authorization", &auth)
+        .send("{}")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["completed"], true, "{json}");
+    assert_eq!(json["instance"]["state"], "stopped");
+    let waited = json["waited_ms"].as_u64().unwrap();
+    assert!(
+        waited >= 500,
+        "the empty object's drain waited for the anchored idle signal (waited {waited}ms)"
+    );
+    assert!(
+        waited < 9000,
+        "the empty object's drain finished inside its manifest bound (waited {waited}ms)"
+    );
+
+    // `{"timeout_ms":null}` is the SAME tier — an explicit null is the
+    // absent field's equal.
+    let mut response = client
+        .post(format!("{nul}/drain"))
+        .header("Authorization", &auth)
+        .send("{\"timeout_ms\":null}")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["completed"], true, "{json}");
+    assert_eq!(json["instance"]["state"], "stopped");
+    let waited = json["waited_ms"].as_u64().unwrap();
+    assert!(
+        waited >= 500,
+        "the explicit null's drain waited for the anchored idle signal (waited {waited}ms)"
+    );
+    assert!(
+        waited < 9000,
+        "the explicit null's drain finished inside its manifest bound (waited {waited}ms)"
+    );
+
+    // The empty form on the STALLED drainer is the tier's proof: the idle
+    // file never lands, so the `{}` drain burns the manifest's declared
+    // 800ms and reports the timed-out shape inside a band ONLY that bound
+    // can produce. If the empty forms resolved to the route's 30s default
+    // instead of the manifest tier, the child's own 3000ms self-exit
+    // would end the wait past the ceiling below and fail it — the
+    // completed-shape legs above cannot see that difference on their own.
+    let mut response = client
+        .post(format!("{stalled}/drain"))
+        .header("Authorization", &auth)
+        .send("{}")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(
+        json["completed"], false,
+        "the stalled empty-form drain must burn the manifest bound, not complete ({json})"
+    );
+    assert_eq!(json["instance"]["state"], "stopped");
+    let waited = json["waited_ms"].as_u64().unwrap();
+    assert!(
+        waited >= 700,
+        "the stalled empty-form drain genuinely burned toward its 800ms manifest bound (waited {waited}ms)"
+    );
+    assert!(
+        waited < 2500,
+        "the stalled empty-form drain ran on the MANIFEST tier, not the 30s default (waited {waited}ms)"
+    );
+
+    server.stop().unwrap();
+}
+
+// The non-object refusal is a ROUTE-FAMILY contract: the same typed-body
+// read backs `start`, `stop`, and `drain`, and serde's derive would accept
+// each DTO's bare sequence form — `[true]` would start detached, `[30]`
+// would stop on a 30s window, `[1500]` would drain on 1500ms — so every
+// one of them is refused AS SHAPE, before the engine gate (the instance
+// below is never started; the refusals never reach it), naming the object
+// each route wants.
+#[test]
+fn start_stop_and_drain_refuse_the_sequence_forms_as_shape() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let _manifest = registered_fake_agent(&base, "host");
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    for (verb, body) in [("start", "[true]"), ("stop", "[30]"), ("drain", "[1500]")] {
+        let mut response = client
+            .post(format!("http://{}/v0/instances/host/{verb}", server.addr))
+            .header("Authorization", &auth)
+            .send(body)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{verb}");
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["kind"], "invalid_body", "{verb}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("must be a JSON object"),
+            "{verb}: the refusal names the expected shape"
+        );
+    }
+
+    // The duplicate-key refusal is the SAME route-family contract, one step
+    // later: the body IS an object, so the shape check passes, but the
+    // typed read runs on the ORIGINAL bytes and the derived visitor refuses
+    // the repeated field — the sequence-form loop above cannot see this
+    // (a `Value` re-read would collapse the pair and act on the last
+    // value: a detached start, a day-long window, a manifest-tier drain).
+    for (verb, body) in [
+        ("start", "{\"detach\":false,\"detach\":true}"),
+        ("stop", "{\"window_secs\":5,\"window_secs\":86400}"),
+        ("drain", "{\"timeout_ms\":1,\"timeout_ms\":null}"),
+    ] {
+        let mut response = client
+            .post(format!("http://{}/v0/instances/host/{verb}", server.addr))
+            .header("Authorization", &auth)
+            .send(body)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{verb}");
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["kind"], "invalid_body", "{verb}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate field"),
+            "{verb}: the refusal names the repeated field"
+        );
+    }
 
     server.stop().unwrap();
 }
@@ -3022,6 +3354,15 @@ fn the_run_routes_open_show_and_close_a_child_run_with_typed_refusals() {
             .unwrap()
     };
 
+    // A configured bound label the started Run will carry.
+    let mut response = client
+        .put(format!("http://{}/v0/instances/host/config", server.addr))
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({"key": "labels.team", "value": "payments"}))
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(json_body(&mut response));
+
     // No open Run yet: 409 with the stable code.
     let mut response = post(&runs, serde_json::json!({"parent_instance": "host"}));
     assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -3108,6 +3449,69 @@ fn the_run_routes_open_show_and_close_a_child_run_with_typed_refusals() {
     assert_eq!(json["run"]["control_depth"], "supervised");
     assert_eq!(json["run"]["open_children"], 1);
 
+    // Bound labels (story 21-9). The parent carries its configured label
+    // (origin `config`); the verb binds over the child's Caller label.
+    let patch = |url: &str, body: serde_json::Value| {
+        client
+            .patch(url)
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/json")
+            .send(body.to_string())
+            .unwrap()
+    };
+    let mut response = get_ok(&client, &server.addr, &format!("/v0/runs/{parent}/labels"));
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["run_id"], parent.as_str());
+    assert_eq!(json["labels"][0]["key"], "team");
+    assert_eq!(json["labels"][0]["origin"], "config");
+    let child_labels = format!("{runs}/{run_id}/labels");
+    let mut response = patch(
+        &child_labels,
+        serde_json::json!({"set": {"task": "triage"}, "dry_run": true}),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["dry_run"], true);
+    assert_eq!(json["changed"], true);
+    assert_eq!(json["labels"][0]["origin"], "label-verb");
+    let mut response = get_ok(&client, &server.addr, &format!("/v0/runs/{run_id}/labels"));
+    assert_eq!(
+        json_body(&mut response)["labels"][0]["source"],
+        "caller",
+        "a dry run writes nothing"
+    );
+    let mut response = patch(
+        &child_labels,
+        serde_json::json!({"set": {"task": "triage"}}),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["changed"], true);
+    assert_eq!(json["prior_labels"][0]["source"], "caller");
+    assert_eq!(json["prior_labels"][0]["value"], "review");
+    assert_eq!(json["labels"][0]["source"], "bound");
+    let mut response = patch(
+        &child_labels,
+        serde_json::json!({"set": {"task": "triage"}}),
+    );
+    assert_eq!(json_body(&mut response)["changed"], false);
+    // The configured key on the process-owning Run cannot be removed.
+    let mut response = patch(
+        &format!("{runs}/{parent}/labels"),
+        serde_json::json!({"remove": ["team"]}),
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let json = json_body(&mut response);
+    assert_eq!(json["error"]["code"], "label-from-config");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("labels.team"),
+        "{json}"
+    );
+
     // Close the child; closing the process-owning Run is a 409.
     let mut response = post(&format!("{runs}/{run_id}/close"), serde_json::json!({}));
     assert_eq!(response.status(), StatusCode::OK);
@@ -3117,6 +3521,10 @@ fn the_run_routes_open_show_and_close_a_child_run_with_typed_refusals() {
     let mut response = post(&format!("{runs}/{parent}/close"), serde_json::json!({}));
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_eq!(json_body(&mut response)["error"]["code"], "owns-process");
+    // An ended Run's labels cannot change.
+    let mut response = patch(&child_labels, serde_json::json!({"remove": ["task"]}));
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(&mut response)["error"]["code"], "run-ended");
     let mut response = get_ok(&client, &server.addr, "/v0/runs/run_ghost");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(json_body(&mut response)["error"]["code"], "run-not-found");
@@ -3125,6 +3533,149 @@ fn the_run_routes_open_show_and_close_a_child_run_with_typed_refusals() {
         .post(format!("http://{}/v0/instances/host/stop", server.addr))
         .header("Authorization", &auth)
         .send("");
+}
+
+// The open's `parent_run_id` arm (the hop the matrix above leaves cold): a
+// child Run opened under ANOTHER RUN — the grandchild. The 201 + Location
+// are pinned together with the parent link from BOTH sides: the new Run's
+// document names its parent, and the parent's open-children count moves.
+#[test]
+fn the_run_routes_open_a_grandchild_run_from_a_parent_run_id() {
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        // The manifest fake agent is the POSIX shape (see the lifecycle test).
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let _manifest = registered_fake_agent(&base, "host");
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let runs = format!("http://{}/v0/runs", server.addr);
+    let post = |url: &str, body: serde_json::Value| {
+        client
+            .post(url)
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/json")
+            .send(body.to_string())
+            .unwrap()
+    };
+    let mut response = client
+        .post(format!("http://{}/v0/instances/host/start", server.addr))
+        .header("Authorization", &auth)
+        .send("")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(json_body(&mut response));
+
+    // The first child under the instance's open Run (the matrix's shape).
+    let mut response = post(&runs, serde_json::json!({"parent_instance": "host"}));
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let child = json_body(&mut response)["run"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The grandchild hop: `parent_run_id` names the CHILD Run, and the open
+    // answers 201 + Location with a new Run under it — a Host-opened child
+    // Run is at most Announced, so the depth and the carried limits pin too.
+    let mut response = post(
+        &runs,
+        serde_json::json!({
+            "parent_run_id": child,
+            "labels": {"task": "grandchild"},
+            "token_budget": 250
+        }),
+    );
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let location = response
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let json = json_body(&mut response);
+    let grandchild = json["run"]["run_id"].as_str().unwrap().to_string();
+    assert_eq!(location, format!("/v0/runs/{grandchild}"));
+    assert_ne!(grandchild, child);
+    assert_eq!(json["run"]["control_depth"], "announced");
+    assert_eq!(json["run"]["limits"]["token_per_run"], 250);
+
+    // The parent link, read from both sides: the grandchild's document
+    // names its parent Run, and the parent's open-children count moved to
+    // one — a DIRECT-children count, so the ROOT Run (the child's own
+    // parent, read back the same way) also counts exactly one open child;
+    // a subtree count would read two at the root.
+    let mut response = get_ok(&client, &server.addr, &format!("/v0/runs/{grandchild}"));
+    assert_eq!(
+        json_body(&mut response)["run"]["parent_run_id"],
+        child.as_str()
+    );
+    let mut response = get_ok(&client, &server.addr, &format!("/v0/runs/{child}"));
+    let json = json_body(&mut response);
+    assert_eq!(json["run"]["open_children"], 1);
+    let root = json["run"]["parent_run_id"].as_str().unwrap().to_string();
+    let mut response = get_ok(&client, &server.addr, &format!("/v0/runs/{root}"));
+    assert_eq!(
+        json_body(&mut response)["run"]["open_children"],
+        1,
+        "open_children counts DIRECT children only — the open grandchild is not counted at the root"
+    );
+
+    let _ = client
+        .post(format!("http://{}/v0/instances/host/stop", server.addr))
+        .header("Authorization", &auth)
+        .send("");
+}
+
+#[test]
+fn the_label_routes_refuse_malformed_changes_and_unknown_runs_on_every_os() {
+    // Story 21-9: no agent process needed — the change is validated before
+    // the Run is looked up, and a valid change on an unknown Run is a 404.
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let url = format!("http://{}/v0/runs/run_ghost/labels", server.addr);
+    let patch = |body: &str| {
+        client
+            .patch(&url)
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/json")
+            .send(body.to_string())
+            .unwrap()
+    };
+    // The engine's grammar refusals are 400; a body that is not JSON is the
+    // extractor's 400, and a wrong type or an unknown field (a misspelled
+    // `dry_run` must never become a real write) is its typed 422.
+    for (body, status) in [
+        (r#"{}"#, 400),
+        (r#"{"set": {"Team": "core"}}"#, 400),
+        (r#"{"set": {"team": "has space"}}"#, 400),
+        (r#"{"set": {"team": "core"}, "remove": ["team"]}"#, 400),
+        (r#"not json"#, 400),
+        (r#"{"set": "team=core"}"#, 422),
+        (r#"{"set": {"team": "core"}, "dry-run": true}"#, 422),
+        (r#"{"set": {"team": "core"}, "dryRun": true}"#, 422),
+    ] {
+        let mut response = patch(body);
+        assert_eq!(response.status().as_u16(), status, "{body}");
+        assert_eq!(
+            json_body(&mut response)["error"]["kind"],
+            "invalid_body",
+            "{body}"
+        );
+    }
+    let mut response = patch(r#"{"set": {"team": "core"}}"#);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(json_body(&mut response)["error"]["code"], "run-not-found");
+    let mut response = get_ok(&client, &server.addr, "/v0/runs/run_ghost/labels");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    drop(json_body(&mut response));
+    server.stop().unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -3151,6 +3702,14 @@ fn call(
             .put(url)
             .header("Authorization", &auth)
             .send_json(json),
+        ("PATCH", Some(json)) => client
+            .patch(url)
+            .header("Authorization", &auth)
+            .send_json(json),
+        ("PATCH", None) => client
+            .patch(url)
+            .header("Authorization", &auth)
+            .send_empty(),
         ("DELETE", _) => client.delete(url).header("Authorization", &auth).call(),
         (other, _) => panic!("unsupported test method {other}"),
     }
@@ -3489,4 +4048,1410 @@ fn an_auto_started_host_leaves_when_its_state_root_disappears() {
         "{}",
         sink_handle.text()
     );
+}
+
+#[test]
+fn a_drain_body_that_is_not_json_is_a_bad_request_and_an_empty_object_means_the_manifest_tier() {
+    // The body is parsed BEFORE the engine is asked anything: a malformed
+    // body is a rejected REQUEST naming the expected shape, while `{}` (no
+    // `timeout_ms`) is the manifest tier and reaches the engine — which
+    // answers for the unknown instance.
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let drain = format!("http://{}/v0/instances/ghost/drain", server.addr);
+
+    let mut response = client
+        .post(&drain)
+        .header("Authorization", &auth)
+        .header("Content-Type", "application/json")
+        .send("timeout_ms=1500")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = json_body(&mut response);
+    assert_eq!(json["error"]["kind"], "invalid_body");
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("the drain body must be a JSON object like")
+            && message.contains("no body at all for the manifest tier"),
+        "the refusal names both accepted shapes: {message}"
+    );
+
+    let mut response = client
+        .post(&drain)
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({}))
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "an empty object passes the body rule and the engine answers for the instance"
+    );
+    assert_eq!(json_body(&mut response)["error"]["kind"], "not_found");
+
+    server.stop().unwrap();
+}
+
+#[test]
+fn a_memory_attach_whose_read_back_fails_still_answers_ok_and_names_the_failure() {
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        // The manifest fake agent is the POSIX shape (see the lifecycle test).
+        return;
+    }
+    // The attach commits without reading the adapter's manifest; the
+    // read-back does read it (does the config mapping target the memory
+    // key?). With the manifest gone, the attach stands and the answer
+    // carries the read-back failure instead of a fabricated status.
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let manifest = registered_fake_agent(&base, "orphan");
+    drop(manifest);
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let mut response = client
+        .put(format!("http://{}/v0/instances/orphan/memory", server.addr))
+        .header("Authorization", format!("Bearer {BEARER_VALUE}"))
+        .send_json(serde_json::json!({"kind": "filesystem"}))
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["instance"], "orphan");
+    assert!(
+        Path::new(json["dir"].as_str().unwrap()).is_dir(),
+        "the attach committed and made its directory: {json}"
+    );
+    assert!(
+        json["kind"].is_null() && json["guarantee"].is_null() && json["declared"].is_null(),
+        "no status is invented when the read-back failed: {json}"
+    );
+    assert!(
+        !json["readback_error"].as_str().unwrap_or("").is_empty(),
+        "the read-back failure is named: {json}"
+    );
+
+    server.stop().unwrap();
+}
+
+#[test]
+fn a_child_run_under_an_unknown_parent_run_is_refused_by_the_engine_not_the_body_rule() {
+    // `parent_run_id` alone is a well-formed parent: the route hands it to
+    // the engine, which refuses the Run id it does not know.
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
+    let client = client();
+    let mut response = client
+        .post(format!("http://{}/v0/runs", server.addr))
+        .header("Authorization", format!("Bearer {BEARER_VALUE}"))
+        .send_json(serde_json::json!({"parent_run_id": "run_ghost"}))
+        .unwrap();
+    let status = response.status();
+    let json = json_body(&mut response);
+    assert_ne!(
+        json["error"]["kind"], "invalid_body",
+        "a single parent passes the body rule: {json}"
+    );
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+    assert_eq!(json["error"]["kind"], "not_found", "{json}");
+
+    server.stop().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Story 21-3: the /v0/policies routes — CRUD, the reserved default, the
+// matched/fallback counts, and the typed refusals.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
+    let client = client();
+    let base = format!("http://{}/v0/policies", server.addr);
+
+    // The seeded default Policy reads before any write: warn, `off`, no
+    // ceilings, an empty Rate table (absent when empty).
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/default");
+    assert_eq!(response.status(), StatusCode::OK);
+    let document = json_body(&mut response);
+    assert_eq!(document["policy"]["limits"]["breach_action"], "warn");
+    assert_eq!(document["policy"]["limits"]["scent_check"], "off");
+
+    // Create: 201 + the Location header, answering the matched counts.
+    let mut response = call(
+        &client,
+        "POST",
+        &base,
+        Some(serde_json::json!({
+            "name": "nightly",
+            "selector": "team=research",
+            "tokens_per_run": 2_000_000,
+            "breach_action": "pause",
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response.headers()["location"].to_str().unwrap(),
+        "/v0/policies/nightly"
+    );
+    let document = json_body(&mut response);
+    assert_eq!(document["matched"], 0);
+    assert_eq!(document["fallbacks"], 0);
+
+    // A duplicate name is 409 policy-exists.
+    let mut response = call(
+        &client,
+        "POST",
+        &base,
+        Some(serde_json::json!({"name": "nightly", "selector": "team=x"})),
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(&mut response)["error"]["code"], "policy-exists");
+
+    // The default Policy's reserved shape: delete and a Selector are 409
+    // policy-default.
+    let mut response = call(&client, "DELETE", &format!("{base}/default"), None);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(&mut response)["error"]["code"], "policy-default");
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({"selector": "team=core"})),
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(&mut response)["error"]["code"], "policy-default");
+
+    // A Scent-Check Mode before Scent-Check ships is 400
+    // scent-unavailable (never stored-and-ignored).
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({"set": {"scent_check": "enforce"}})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "scent-unavailable"
+    );
+
+    // The Rate table edits through PATCH's `rates`: set, read back, remove.
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({
+            "rates": {"set": {"gpt-demo": {
+                "input_micros_per_1m": 2_000_000,
+                "output_micros_per_1m": 8_000_000,
+            }}},
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/default");
+    let document = json_body(&mut response);
+    assert_eq!(
+        document["policy"]["rates"]["gpt-demo"]["input_micros_per_1m"],
+        2_000_000
+    );
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({"rates": {"remove": ["gpt-demo"]}})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/default");
+    assert!(
+        json_body(&mut response)["policy"]["rates"].is_null(),
+        "the removed entry leaves an absent table"
+    );
+
+    // A dry run plans and writes nothing; unknown fields are 422.
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"set": {"tokens_per_run": 9_000_000}, "dry_run": true})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(&mut response)["dry_run"], true);
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/nightly");
+    assert_eq!(
+        json_body(&mut response)["policy"]["limits"]["tokens_per_run"],
+        2_000_000,
+        "the dry run wrote nothing"
+    );
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"tokens_per_run": 9})),
+    );
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Unknown fields are refused at EVERY level: a misspelled limit inside
+    // `set` (or inside a Rate) would otherwise be silently dropped, and an
+    // unknown `clear` name silently clear nothing.
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"set": {"tokens_per_rn": 5}})),
+    );
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"set": {"rate": {
+            "input_micros_per_1m": 1, "output_micros_per_1m": 1, "input_micros": 2,
+        }}})),
+    );
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // A Rate needs BOTH directions in the body: a missing one (or an
+    // empty object) is a 422, never an implicit $0; a $0 direction is the
+    // engine's 400 refusal.
+    for body in [
+        serde_json::json!({"rates": {"set": {"gpt-x": {"input_micros_per_1m": 3_000_000}}}}),
+        serde_json::json!({"rates": {"set": {"gpt-x": {"output_micros_per_1m": 3_000_000}}}}),
+        serde_json::json!({"rates": {"set": {"gpt-x": {}}}}),
+        serde_json::json!({"set": {"rate": {"input_micros_per_1m": 1}}}),
+    ] {
+        let response = call(&client, "PATCH", &format!("{base}/nightly"), Some(body));
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"set": {"rate": {
+            "input_micros_per_1m": 0, "output_micros_per_1m": 1_000_000,
+        }}})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"clear": ["tokens-per-rn"]})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "invalid-request",
+        "an unknown clear name is an engine refusal"
+    );
+
+    // The list carries every Policy, `default` included.
+    let mut response = get_ok(&client, &server.addr, "/v0/policies");
+    let document = json_body(&mut response);
+    let names: Vec<&str> = document["policies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|policy| policy["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"default"), "{names:?}");
+    assert!(names.contains(&"nightly"), "{names:?}");
+
+    // A create dry run plans and writes nothing (200, no Location).
+    let response = call(
+        &client,
+        "POST",
+        &base,
+        Some(serde_json::json!({
+            "name": "previewed", "selector": "team=x", "tokens_per_run": 5, "dry_run": true,
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = get_ok(&client, &server.addr, "/v0/policies/previewed");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND, "nothing written");
+
+    // A delete dry run reports what would loosen instead of deleting.
+    let response = call(
+        &client,
+        "DELETE",
+        &format!("{base}/nightly?dry_run=true"),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // A model in both rates.set and rates.remove is a contradiction
+    // (400), not a silent remove.
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({
+            "rates": {"set": {"gpt-x": {"input_micros_per_1m": 1, "output_micros_per_1m": 1}},
+                      "remove": ["gpt-x"]}
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // A $0 CACHED direction prices cached tokens at nothing — the engine
+    // refuses it like a $0 direction.
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({
+            "rates": {"set": {"gpt-x": {
+                "input_micros_per_1m": 1, "output_micros_per_1m": 1, "cached_micros_per_1m": 0,
+            }}}
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // An unknown name is 404 policy-not-found; delete answers 204.
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/ghost");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "policy-not-found"
+    );
+    let response = call(&client, "DELETE", &format!("{base}/nightly"), None);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = get_ok(&client, &server.addr, "/v0/policies/nightly");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    server.stop().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Story 21-6: Selector sets and set tokens, the Run-grain verbs, Run limits.
+// ---------------------------------------------------------------------------
+
+/// Stops the serve thread (draining its agents) when dropped, so a failed
+/// assertion never leaves a host or a lingering agent behind.
+struct StopOnDrop(Option<ServeHandle>);
+
+impl StopOnDrop {
+    fn addr(&self) -> String {
+        self.0.as_ref().expect("serving").addr.clone()
+    }
+
+    fn stop(mut self) {
+        if let Some(server) = self.0.take() {
+            server.stop().unwrap();
+        }
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if let Some(server) = self.0.take() {
+            let _ = server.stop();
+        }
+    }
+}
+
+fn serve_guarded(base: PathBuf, ttl: Option<Duration>) -> StopOnDrop {
+    let (sink, _diagnostics) = SharedSink::new();
+    if ttl.is_none() {
+        return StopOnDrop(Some(spawn_serve_with_api(base, sink)));
+    }
+    write_secrets_file(&base);
+    let mut server = spawn_serve(hekma_host::ServeOptions {
+        state_base: Some(base.clone()),
+        control_listen: Some("127.0.0.1:0".parse().unwrap()),
+        bearer_secret: Some(BEARER_NAME.to_string()),
+        stop_window: Some(2),
+        diagnostics: Some(diagnostic_sink_of(&sink)),
+        set_token_ttl_override: ttl,
+        ..Default::default()
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(addr) = sink
+            .text()
+            .lines()
+            .find_map(|line| line.split("control api listening on ").nth(1))
+            .map(|rest| rest.split(" (").next().unwrap().to_string())
+        {
+            server.addr = addr;
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{}", sink.text());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    StopOnDrop(Some(server))
+}
+
+/// A JSON call with `bearer`.
+fn call_as(
+    client: &ureq::Agent,
+    bearer: &str,
+    method: &str,
+    url: &str,
+    body: &str,
+) -> ureq::http::Response<ureq::Body> {
+    let auth = format!("Bearer {bearer}");
+    let request = match method {
+        "POST" => client.post(url),
+        "PATCH" => client.patch(url),
+        other => panic!("unsupported {other}"),
+    };
+    request
+        .header("Authorization", &auth)
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
+        .unwrap_or_else(|err| panic!("{method} {url}: {err}"))
+}
+
+#[test]
+fn set_tokens_are_single_use_credential_bound_expiring_and_forgotten_by_a_restart() {
+    // Every OS, no agent process: an empty set still mints a token whose
+    // whole lifecycle is observable.
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let server = serve_guarded(base.clone(), None);
+    let addr = server.addr();
+    let client = client();
+    let local_token = hekma_host::read_discovery(&base).unwrap().token;
+    let select = |bearer: &str| {
+        let mut response = call_as(
+            &client,
+            bearer,
+            "POST",
+            &format!("http://{addr}/v0/runs/select"),
+            r#"{"selector": "team=core"}"#,
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(&mut response)
+    };
+    let act = |bearer: &str, path: &str, body: String| {
+        let mut response = call_as(
+            &client,
+            bearer,
+            if path == "labels" { "PATCH" } else { "POST" },
+            &format!("http://{addr}/v0/runs/{path}"),
+            &body,
+        );
+        let status = response.status().as_u16();
+        (status, json_body(&mut response))
+    };
+    let document = select(BEARER_VALUE);
+    let token = document["token"].as_str().unwrap().to_string();
+    assert!(token.starts_with("hkset_"), "{token}");
+    assert_eq!(document["matched"], 0);
+    assert_eq!(document["runs"], serde_json::json!([]));
+    assert!(document["expires_at"].as_str().unwrap().ends_with('Z'));
+    // Another credential cannot use it (and does not consume it).
+    let (status, body) = act(
+        &local_token,
+        "stop",
+        format!(r#"{{"set_token": "{token}"}}"#),
+    );
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"]["code"], "set-token-foreign");
+    // The creator acts once …
+    let (status, body) = act(
+        BEARER_VALUE,
+        "stop",
+        format!(r#"{{"set_token": "{token}"}}"#),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["verb"], "stop");
+    assert_eq!(body["dry_run"], false);
+    assert_eq!(body["matched"], 0);
+    // … and only once.
+    let (status, body) = act(
+        BEARER_VALUE,
+        "pause",
+        format!(r#"{{"set_token": "{token}"}}"#),
+    );
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"]["code"], "set-token-used");
+    assert!(
+        !body.to_string().contains(&token),
+        "a refusal never echoes the token"
+    );
+    // An unknown token; the body's shape per verb.
+    let (status, body) = act(
+        BEARER_VALUE,
+        "resume",
+        r#"{"set_token": "hkset_nope"}"#.into(),
+    );
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (404, Some("set-token-not-found"))
+    );
+    for (path, body) in [
+        ("pause", r#"{"set_token": "x", "window_secs": 5}"#),
+        ("stop", r#"{"set_token": "x", "timeout_ms": 5}"#),
+        ("stop", r#"{"set_token": "x", "window_secs": 0}"#),
+        ("drain", r#"{"set_token": "x", "timeout_ms": 0}"#),
+        ("close", r#"{"set_token": "x", "window_secs": 5}"#),
+        ("labels", r#"{"set_token": "x", "set": {"Team": "core"}}"#),
+        ("limits", r#"{"set_token": "x"}"#),
+        ("limits", r#"{"set_token": "x", "clear": ["rate"]}"#),
+        ("limits", r#"{"set_token": "x", "dollars_per_run": "-1"}"#),
+        (
+            "limits",
+            r#"{"set_token": "x", "breach_action": "explode"}"#,
+        ),
+    ] {
+        let (status, response) = act(BEARER_VALUE, path, body.to_string());
+        assert_eq!(status, 400, "{path} {body}: {response}");
+    }
+    for (path, body) in [
+        ("stop", r#"{}"#),
+        ("stop", r#"{"set_token": "x", "verbose": true}"#),
+        ("limits", r#"{"set_token": "x", "token_per_run": 5}"#),
+    ] {
+        let (status, response) = act(BEARER_VALUE, path, body.to_string());
+        assert_eq!(status, 422, "{path} {body}: {response}");
+    }
+    let mut response = call_as(
+        &client,
+        BEARER_VALUE,
+        "POST",
+        &format!("http://{addr}/v0/runs/select"),
+        r#"{"selector": "team"}"#,
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    drop(json_body(&mut response));
+    // Every set route consumes: labels, limits and close each once.
+    for (path, body) in [
+        ("labels", r#""set": {"team": "core"}"#),
+        ("limits", r#""tokens_per_run": 5"#),
+        ("close", ""),
+        ("drain", r#""timeout_ms": 1500"#),
+    ] {
+        let token = select(BEARER_VALUE)["token"].as_str().unwrap().to_string();
+        let comma = if body.is_empty() { "" } else { ", " };
+        let payload = format!(r#"{{"set_token": "{token}"{comma}{body}}}"#);
+        let (status, response) = act(BEARER_VALUE, path, payload.clone());
+        assert_eq!(status, 200, "{path}: {response}");
+        let (status, _) = act(BEARER_VALUE, path, payload);
+        assert_eq!(status, 409, "{path}: used");
+    }
+    // The per-Run routes on an unknown Run are 404s.
+    for (method, path, body) in [
+        ("POST", "run_ghost/stop", ""),
+        ("POST", "run_ghost/pause", ""),
+        ("POST", "run_ghost/resume", ""),
+        ("POST", "run_ghost/drain", ""),
+        ("PATCH", "run_ghost/limits", r#"{"tokens_per_run": 5}"#),
+    ] {
+        let (status, response) = {
+            let mut response = call_as(
+                &client,
+                BEARER_VALUE,
+                method,
+                &format!("http://{addr}/v0/runs/{path}"),
+                body,
+            );
+            (response.status().as_u16(), json_body(&mut response))
+        };
+        assert_eq!(status, 404, "{path}: {response}");
+        assert_eq!(response["error"]["code"], "run-not-found");
+    }
+    let mut response = get_ok(&client, &addr, "/v0/runs/run_ghost/limits");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    drop(json_body(&mut response));
+    // A token minted before a restart is forgotten (re-select).
+    let stale = select(BEARER_VALUE)["token"].as_str().unwrap().to_string();
+    server.stop();
+    let server = serve_guarded(base.clone(), None);
+    let addr = server.addr();
+    let mut response = call_as(
+        &client,
+        BEARER_VALUE,
+        "POST",
+        &format!("http://{addr}/v0/runs/stop"),
+        &format!(r#"{{"set_token": "{stale}"}}"#),
+    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "set-token-not-found"
+    );
+    server.stop();
+    // After its lifetime a token is expired (a zero lifetime: no sleeping).
+    let server = serve_guarded(base, Some(Duration::ZERO));
+    let addr = server.addr();
+    let mut response = call_as(
+        &client,
+        BEARER_VALUE,
+        "POST",
+        &format!("http://{addr}/v0/runs/select"),
+        r#"{"selector": "team=core"}"#,
+    );
+    let token = json_body(&mut response)["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut response = call_as(
+        &client,
+        BEARER_VALUE,
+        "POST",
+        &format!("http://{addr}/v0/runs/stop"),
+        &format!(r#"{{"set_token": "{token}"}}"#),
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "set-token-expired"
+    );
+    server.stop();
+}
+
+#[test]
+fn a_selected_set_acts_per_run_with_the_child_refused_and_limits_scoped_to_the_run() {
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        // The manifest fake agent is the POSIX shape (see the lifecycle test).
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let _manifest = registered_fake_agent(&base, "setter");
+    let server = serve_guarded(base, None);
+    let addr = server.addr();
+    let client = ladder_client();
+    let json = |method: &str, path: &str, body: serde_json::Value| {
+        let mut response = call(&client, method, &format!("http://{addr}{path}"), Some(body));
+        let status = response.status().as_u16();
+        (status, json_body(&mut response))
+    };
+    let (status, _) = json(
+        "PUT",
+        "/v0/instances/setter/config",
+        serde_json::json!({"key": "labels.team", "value": "core"}),
+    );
+    assert_eq!(status, 200);
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("http://{addr}/v0/instances/setter/start"),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(json_body(&mut response));
+    let (status, child) = json(
+        "POST",
+        "/v0/runs",
+        serde_json::json!({"parent_instance": "setter", "labels": {"team": "core"}}),
+    );
+    assert_eq!(status, 201, "{child}");
+    let child = child["run"]["run_id"].as_str().unwrap().to_string();
+
+    // Select: the owner and the child.
+    let select = || {
+        let (status, document) = json(
+            "POST",
+            "/v0/runs/select",
+            serde_json::json!({"selector": "team=core"}),
+        );
+        assert_eq!(status, 200, "{document}");
+        document
+    };
+    let document = select();
+    assert_eq!(document["matched"], 2, "{document}");
+    // Each selected Run is its listing row (the `GET /v0/runs` item): the
+    // Run's own fields flattened, plus its labels and usage.
+    for run in document["runs"].as_array().unwrap() {
+        assert!(run["run_id"].is_string(), "{run}");
+        assert!(
+            run["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|label| label["key"] == "team" && label["value"] == "core"),
+            "{run}"
+        );
+        assert!(run["usage"]["input_tokens"].is_u64(), "{run}");
+    }
+    let owner = document["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["process_owner"] == true)
+        .unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Run limits: Run-scoped; a child's cumulative ceiling is refused.
+    let (status, outcome) = json(
+        "PATCH",
+        &format!("/v0/runs/{owner}/limits"),
+        serde_json::json!({"tokens_cumulative": 1_000_000, "dollars_per_run": "3.00"}),
+    );
+    assert_eq!(status, 200, "{outcome}");
+    assert_eq!(outcome["run_scoped"], true);
+    assert_eq!(outcome["resolution"]["sources"]["tokens_cumulative"], "run");
+    let (status, refused) = json(
+        "PATCH",
+        &format!("/v0/runs/{child}/limits"),
+        serde_json::json!({"tokens_cumulative": 5}),
+    );
+    assert_eq!(
+        (status, refused["error"]["code"].as_str()),
+        (400, Some("scope-unavailable"))
+    );
+    let (status, planned) = json(
+        "PATCH",
+        &format!("/v0/runs/{owner}/limits"),
+        serde_json::json!({"clear": ["tokens-cumulative"], "dry_run": true}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(planned["dry_run"], true);
+    assert_eq!(planned["direction"], "cleared");
+    let mut response = get_ok(&client, &addr, &format!("/v0/runs/{owner}/limits"));
+    let view = json_body(&mut response);
+    assert_eq!(
+        view["limits"]["token_cumulative"], 1_000_000,
+        "the dry run wrote nothing"
+    );
+
+    // Limits over the set: one result per Run.
+    let token = select()["token"].as_str().unwrap().to_string();
+    let (status, results) = json(
+        "POST",
+        "/v0/runs/limits",
+        serde_json::json!({"set_token": token, "tokens_per_run": 5_000_000}),
+    );
+    assert_eq!(status, 200, "{results}");
+    assert_eq!(results["verb"], "budget", "the CLI's verb name");
+    assert_eq!(results["dry_run"], false);
+    assert_eq!(results["matched"], 2);
+    for row in results["results"].as_array().unwrap() {
+        assert_eq!(row["limits"]["run_scoped"], true, "{row}");
+    }
+    // A cumulative ceiling over the set: the owner takes it, the child is
+    // its own refusal.
+    let token = select()["token"].as_str().unwrap().to_string();
+    let (status, results) = json(
+        "POST",
+        "/v0/runs/limits",
+        serde_json::json!({"set_token": token, "tokens_cumulative": 9_000_000}),
+    );
+    assert_eq!(status, 200, "{results}");
+    let rows = results["results"].as_array().unwrap();
+    let child_row = rows
+        .iter()
+        .find(|row| row["run_id"] == child.as_str())
+        .unwrap();
+    assert_eq!(child_row["error"]["code"], "scope-unavailable", "{results}");
+    // Close over a set: a closable child closes, the owner is refused.
+    let (status, extra) = json(
+        "POST",
+        "/v0/runs",
+        serde_json::json!({"parent_instance": "setter", "labels": {"task": "x"}}),
+    );
+    assert_eq!(status, 201, "{extra}");
+    let (status, document) = json(
+        "POST",
+        "/v0/runs/select",
+        serde_json::json!({"selector": "task=x"}),
+    );
+    assert_eq!(status, 200);
+    let token = document["token"].as_str().unwrap().to_string();
+    let (status, results) = json(
+        "POST",
+        "/v0/runs/close",
+        serde_json::json!({"set_token": token}),
+    );
+    assert_eq!(status, 200, "{results}");
+    assert_eq!(results["verb"], "close");
+    assert_eq!(results["results"][0]["outcome"], "closed");
+    assert_eq!(results["results"][0]["run"]["status"], "ended");
+
+    // Labels over the set: one PATCH.
+    let token = select()["token"].as_str().unwrap().to_string();
+    let (status, results) = json(
+        "PATCH",
+        "/v0/runs/labels",
+        serde_json::json!({"set_token": token, "set": {"tier": "gold"}}),
+    );
+    assert_eq!(status, 200, "{results}");
+    assert_eq!(results["verb"], "label");
+    assert!(results["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["outcome"] == "labeled"));
+
+    // Pause over the set: the owner pauses; the child is refused from its
+    // own cell (its lifecycle acts on calls), never skipped.
+    let token = select()["token"].as_str().unwrap().to_string();
+    let (status, results) = json(
+        "POST",
+        "/v0/runs/pause",
+        serde_json::json!({"set_token": token}),
+    );
+    assert_eq!(status, 200, "{results}");
+    let rows = results["results"].as_array().unwrap();
+    let row = |id: &str| rows.iter().find(|row| row["run_id"] == id).unwrap().clone();
+    assert_eq!(row(&owner)["outcome"], "paused");
+    assert_eq!(row(&owner)["instance"]["state"], "paused");
+    assert_eq!(row(&child)["outcome"], "refused");
+    assert_eq!(row(&child)["error"]["code"], "verb-unavailable");
+    assert!(row(&child)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("announced"));
+    // The token is spent.
+    let (status, _) = json(
+        "POST",
+        "/v0/runs/resume",
+        serde_json::json!({"set_token": token}),
+    );
+    assert_eq!(status, 409);
+    // The held child's resume names its parent; the owner resumes per Run.
+    let (status, refused) = json(
+        "POST",
+        &format!("/v0/runs/{child}/resume"),
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 409, "{refused}");
+    assert!(refused["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("parent-paused"));
+    let (status, resumed) = json(
+        "POST",
+        &format!("/v0/runs/{owner}/resume"),
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 200, "{resumed}");
+    assert_eq!(resumed["instance"]["state"], "running");
+
+    // A set whose Runs end between select and act: per-Run `run-ended`.
+    let token = select()["token"].as_str().unwrap().to_string();
+    let (status, stopped) = json(
+        "POST",
+        &format!("/v0/runs/{owner}/stop"),
+        serde_json::json!({"window_secs": 2}),
+    );
+    assert_eq!(status, 200, "{stopped}");
+    assert_eq!(stopped["instance"]["state"], "stopped");
+    let (status, results) = json(
+        "POST",
+        "/v0/runs/stop",
+        serde_json::json!({"set_token": token, "window_secs": 2}),
+    );
+    assert_eq!(status, 200, "{results}");
+    assert!(
+        results["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["error"]["code"] == "run-ended"),
+        "{results}"
+    );
+    assert_eq!(select()["matched"], 0, "every Run ended");
+    server.stop();
+}
+
+// ---------------------------------------------------------------------------
+// The Run listing + the SSE ids / Selector / resume (story 21-5).
+// ---------------------------------------------------------------------------
+
+/// Seed `base` with the listing fixture BEFORE the serve opens (the same
+/// shape `ps_cli` seeds): one engine open migrates the store and creates
+/// the `tight` Policy (a Policy event lands in the outbox), SQL seeds the
+/// Run rows and labels, and a second open's initial sweep resolves the open
+/// Runs. `journal_seed` (optional) stages a pre-existing outbox floor: a
+/// legacy journal file whose single entry carries `seq`, imported by the
+/// v12 step of the FIRST open — so a below-floor resume is reachable.
+fn seed_listing_state(base: &Path, journal_seed: Option<u64>) {
+    if let Some(seq) = journal_seed {
+        std::fs::write(
+            base.join(hekma_engine::paths::OUTBOX_JOURNAL_FILE),
+            outbox_entry_line(seq),
+        )
+        .unwrap();
+    }
+    {
+        let engine = hekma_engine::Engine::open(Some(base.to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        facade
+            .create_policy(
+                hekma_engine::PolicyChange {
+                    name: "tight".to_string(),
+                    selector: Some("team=core".parse().unwrap()),
+                    set: hekma_engine::PolicyLimits {
+                        tokens_per_run: Some(1_000),
+                        ..Default::default()
+                    },
+                    clear: Vec::new(),
+                    rates: Default::default(),
+                },
+                false,
+            )
+            .unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(base.join("state.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO agent_instances (name, kind, state, agent_home, created_at, \
+                 updated_at) VALUES ('demo', 'mock', 'running', '/h', 't', 't'); \
+             INSERT INTO agent_instances (name, kind, state, agent_home, created_at, \
+                 updated_at) VALUES ('calm', 'mock', 'running', '/h', 't', 't');",
+        )
+        .unwrap();
+        let demo: i64 = conn
+            .query_row(
+                "SELECT id FROM agent_instances WHERE name = 'demo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let calm: i64 = conn
+            .query_row(
+                "SELECT id FROM agent_instances WHERE name = 'calm'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute_batch(&format!(
+            "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+             instance_id, process_owner, created_at, updated_at) \
+             VALUES ('run_J', 'supervised', 0, 'active', 'breach', {demo}, 1, 't', 't'); \
+             INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+             parent_run_id, instance_id, process_owner, created_at, updated_at) \
+             VALUES ('run_H', 'supervised', 0, 'held', '', 'run_J', {demo}, 0, 't', 't'); \
+             INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+             instance_id, process_owner, created_at, updated_at) \
+             VALUES ('run_K', 'supervised', 0, 'active', '', {calm}, 1, 't', 't'); \
+             INSERT INTO run_labels (run_id, key, value, source, origin) VALUES \
+             ('run_J', 'team', 'core', 'bound', 'config'); \
+             INSERT INTO run_labels (run_id, key, value, source, origin) VALUES \
+             ('run_H', 'flow', 'triage', 'caller', NULL); \
+             INSERT INTO run_latches (run_id, dimension, scope, action, latched_at) VALUES \
+             ('run_J', 'tokens', 'per-run', 'block', 't');"
+        ))
+        .unwrap();
+    }
+    {
+        let engine = hekma_engine::Engine::open(Some(base.to_path_buf())).unwrap();
+        let _ = engine.blocking().policies();
+    }
+}
+
+#[test]
+fn a_selection_past_the_verb_cap_is_refused_whole_never_cut() {
+    // Every OS, no process: 1001 open Runs carry `team=bulk` (seeded as SQL
+    // rows before the serve opens). Selecting them to act on is refused
+    // whole — `400 too-many-runs` — and mints no set.
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    drop(hekma_engine::Engine::open(Some(base.clone())).unwrap());
+    {
+        let mut conn = rusqlite::Connection::open(base.join("state.db")).unwrap();
+        let tx = conn.transaction().unwrap();
+        for index in 0..=hekma_engine::MAX_SELECTED_RUNS {
+            let run_id = format!("run-{index}-1");
+            tx.execute(
+                "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+                 process_owner, created_at, updated_at) \
+                 VALUES (?1, 'observed', 0, 'active', '', 0, 't', 't')",
+                [&run_id],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO run_labels (run_id, key, value, source, origin) \
+                 VALUES (?1, 'team', 'bulk', 'bound', 'config')",
+                [&run_id],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let server = serve_guarded(base, None);
+    let addr = server.addr();
+    let client = client();
+    let mut response = call_as(
+        &client,
+        BEARER_VALUE,
+        "POST",
+        &format!("http://{addr}/v0/runs/select"),
+        r#"{"selector": "team=bulk"}"#,
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(&mut response);
+    assert_eq!(body["error"]["code"], "too-many-runs", "{body}");
+    assert!(body.get("token").is_none(), "{body}");
+    server.stop();
+}
+
+#[test]
+fn the_runs_route_defaults_to_the_documented_page_of_fifty() {
+    // No `limit`: the documented default page (50), the same first page and
+    // cursor `hekma ps` prints — not the 1000-row maximum.
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    seed_listing_state(&base, None);
+    {
+        let conn = rusqlite::Connection::open(base.join("state.db")).unwrap();
+        let demo: i64 = conn
+            .query_row(
+                "SELECT id FROM agent_instances WHERE name = 'demo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for index in 0..60 {
+            conn.execute(
+                "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+                 parent_run_id, instance_id, process_owner, created_at, updated_at) \
+                 VALUES (?1, 'supervised', 0, 'active', 'failed', 'run_J', ?2, 0, 't', 't')",
+                rusqlite::params![format!("run_Z{index:03}"), demo],
+            )
+            .unwrap();
+        }
+    }
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base.clone(), sink_handle);
+    let client = client();
+    let mut response = get_ok(&client, &server.addr, "/v0/runs");
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["counts"]["listed"], 62, "{}", json["counts"]);
+    assert_eq!(
+        json["items"].as_array().unwrap().len(),
+        hekma_engine::LISTING_DEFAULT_LIMIT,
+        "the default page is the documented 50"
+    );
+    assert!(json["next_cursor"].is_string(), "a further page exists");
+    // Parity with the CLI's default read (ListRunsQuery::exceptions()).
+    let engine = hekma_engine::Engine::open_read_only(Some(base.clone())).unwrap();
+    let listing = engine
+        .blocking()
+        .list_runs(hekma_engine::ListRunsQuery::exceptions())
+        .unwrap();
+    let reference =
+        serde_json::to_value(listing.into_document(hekma_engine::ListingView::Exceptions, None))
+            .unwrap();
+    assert_eq!(json, reference);
+}
+
+#[test]
+fn the_runs_route_serves_the_listing_and_refuses_bad_params() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    seed_listing_state(&base, None);
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base.clone(), sink_handle);
+    let client = client();
+
+    let mut response = get_ok(&client, &server.addr, "/v0/runs");
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["view"], "exceptions");
+    assert_eq!(json["counts"]["listed"], 2, "{json}");
+    assert_eq!(json["counts"]["healthy_open"], 1);
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items[0]["run_id"], "run_J");
+    assert_eq!(items[1]["run_id"], "run_H");
+    assert_eq!(items[0]["status"], "active");
+    assert_eq!(
+        items[0]["latched"],
+        serde_json::json!([{"dimension": "tokens", "scope": "per-run", "action": "block"}])
+    );
+    assert_eq!(items[0]["budget"]["per_run_remaining"], 1000);
+    assert_eq!(
+        items[0]["budget"]["sources"]["tokens_per_run"],
+        serde_json::json!({"policy": "tight"})
+    );
+
+    // Byte-shape parity with the engine's own document — the same struct
+    // `hekma ps --json` prints.
+    let engine = hekma_engine::Engine::open_read_only(Some(base.clone())).unwrap();
+    let listing = engine
+        .blocking()
+        .list_runs(hekma_engine::ListRunsQuery::exceptions())
+        .unwrap();
+    let reference =
+        serde_json::to_value(listing.into_document(hekma_engine::ListingView::Exceptions, None))
+            .unwrap();
+    assert_eq!(json, reference);
+
+    // The all view + a page + the cursor round-trip.
+    let mut response = get_ok(&client, &server.addr, "/v0/runs?view=all&limit=2");
+    assert_eq!(response.status(), StatusCode::OK);
+    let page_one = json_body(&mut response);
+    assert_eq!(page_one["items"].as_array().unwrap().len(), 2);
+    let cursor = page_one["next_cursor"].as_str().unwrap().to_string();
+    assert!(!cursor.is_empty());
+    let mut response = get_ok(
+        &client,
+        &server.addr,
+        &format!(
+            "/v0/runs?view=all&limit=2&cursor={}",
+            percent_encode(&cursor)
+        ),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let page_two = json_body(&mut response);
+    assert_eq!(page_two["items"][0]["run_id"], "run_H");
+    assert!(page_two["next_cursor"].is_null());
+
+    // A Selector composes with the view.
+    let mut response = get_ok(&client, &server.addr, "/v0/runs?selector=team=core");
+    let filtered = json_body(&mut response);
+    assert_eq!(filtered["items"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["items"][0]["run_id"], "run_J");
+    // A caller label selects too (bound and caller alike).
+    let mut response = get_ok(
+        &client,
+        &server.addr,
+        "/v0/runs?view=all&selector=flow=triage",
+    );
+    let filtered = json_body(&mut response);
+    assert_eq!(filtered["items"][0]["run_id"], "run_H");
+
+    // The typed refusals: 400 with the finer machine codes.
+    let auth = format!("Bearer {BEARER_VALUE}");
+    for (query, code) in [
+        ("selector=no-equals", "invalid-selector"),
+        ("cursor=!!!", "invalid-cursor"),
+        ("limit=abc", "invalid-limit"),
+        ("view=everything", "invalid-view"),
+    ] {
+        let mut response = client
+            .get(format!("http://{}/v0/runs?{query}", server.addr))
+            .header("Authorization", &auth)
+            .call()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["code"], code, "{query}: {json}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
+fn the_sse_stream_carries_outbox_ids_and_resumes_from_last_event_id() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    // A pre-existing floor of 5 (the journal import): the below-floor 409
+    // is reachable and the replay set is small and known.
+    seed_listing_state(&base, Some(5));
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+
+    // Where the outbox stands: the staged floor is 5 (the journal import);
+    // the tight Policy's create landed after it. A pull from the floor
+    // minus one is the lossless entry point (a cursor below the floor is
+    // the typed 409 — asserted further down).
+    let mut response = get_ok(
+        &client,
+        &server.addr,
+        &format!("/v0/export?cursor={}", percent_encode("{\"seq\":4}")),
+    );
+    let export = json_body(&mut response);
+    let seqs: Vec<u64> = export["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["seq"].as_u64().unwrap())
+        .collect();
+    assert!(!seqs.is_empty(), "the seeded policy event exported");
+    assert_eq!(export["retained_from"].as_u64().unwrap(), 5);
+
+    // Live: every frame carries id: <seq>, monotone with the outbox.
+    let mut response = client
+        .get(format!("http://{}/v0/events", server.addr))
+        .header("Authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Drive a NEW committed event on another connection.
+    let mut create = client
+        .post(format!("http://{}/v0/policies", server.addr))
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({
+            "name": "later",
+            "selector": "team=later",
+        }))
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let _ = create.body_mut().read_to_string();
+
+    let mut reader = BufReader::new(response.body_mut().as_reader());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let policy_id = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no policy frame in time"
+        );
+        let (id, event) = read_sse_frame(&mut reader);
+        if event["kind"] == "policy" {
+            break id;
+        }
+    };
+    // The id IS the outbox seq of that event: the export agrees.
+    let mut response = get_ok(
+        &client,
+        &server.addr,
+        &format!("/v0/export?cursor={}", percent_encode("{\"seq\":4}")),
+    );
+    let export = json_body(&mut response);
+    let later = export["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["event"]["kind"] == "policy" && entry["event"]["name"] == "later")
+        .expect("the later policy exported");
+    assert_eq!(later["seq"].as_u64().unwrap(), policy_id);
+
+    // Resume: a reconnect from before the `later` event replays everything
+    // after the id through the same filter, then goes live — no duplicate,
+    // no gap. Reading one replayed frame (bounded) proves the seam.
+    let mut response = client
+        .get(format!("http://{}/v0/events", server.addr))
+        .header("Authorization", &auth)
+        .header("Last-Event-ID", (policy_id - 1).to_string())
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut reader = BufReader::new(response.body_mut().as_reader());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    assert!(
+        std::time::Instant::now() < deadline,
+        "no replayed frame in time"
+    );
+    let (id, event) = read_sse_frame(&mut reader);
+    assert_eq!(id, policy_id, "the replay starts past the id, at `later`");
+    assert_eq!(event["kind"], "policy");
+
+    // The typed 409s at connect — never a clamp.
+    for (id, code) in [
+        (3u64, "cursor-below-retention"),
+        (999_999, "cursor-past-tail"),
+    ] {
+        let mut response = client
+            .get(format!("http://{}/v0/events", server.addr))
+            .header("Authorization", &auth)
+            .header("Last-Event-ID", id.to_string())
+            .call()
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "Last-Event-ID {id}"
+        );
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["code"], code, "Last-Event-ID {id}: {json}");
+    }
+    // A malformed Last-Event-ID is the 400 invalid-cursor refusal.
+    let mut response = client
+        .get(format!("http://{}/v0/events", server.addr))
+        .header("Authorization", &auth)
+        .header("Last-Event-ID", "not-a-number")
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&mut response)["error"]["code"], "invalid-cursor");
+    // A malformed Selector on the stream likewise.
+    let mut response = client
+        .get(format!("http://{}/v0/events?selector=bad", server.addr))
+        .header("Authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "invalid-selector"
+    );
+    server.stop().unwrap();
+}
+
+#[test]
+fn the_sse_selector_filters_by_the_subject_runs_current_labels() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    seed_listing_state(&base, None);
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+
+    let mut response = client
+        .get(format!(
+            "http://{}/v0/events?selector=team%3Dcore",
+            server.addr
+        ))
+        .header("Authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Two events while the stream is open: a label change on run_J (its
+    // subject Run carries team=core → delivered) and a Policy create (no
+    // subject Run → dropped under the Selector).
+    let mut label = client
+        .patch(format!("http://{}/v0/runs/run_J/labels", server.addr))
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({"set": {"env": "prod"}}))
+        .unwrap();
+    assert_eq!(label.status(), StatusCode::OK);
+    let _ = label.body_mut().read_to_string();
+    let mut create = client
+        .post(format!("http://{}/v0/policies", server.addr))
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({"name": "quiet", "selector": "team=quiet"}))
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let _ = create.body_mut().read_to_string();
+
+    let mut reader = BufReader::new(response.body_mut().as_reader());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "no run frame in time");
+        let (id, event) = read_sse_frame(&mut reader);
+        assert!(id > 0, "every event frame carries an id");
+        assert_ne!(
+            event["kind"], "policy",
+            "a no-Run event is dropped under a selector"
+        );
+        if event["kind"] == "run" && event["run_id"] == "run_J" {
+            assert_eq!(event["change"], "labels-changed");
+            break;
+        }
+    }
+    server.stop().unwrap();
+}
+
+/// Read ONE SSE event frame (an `id:` line then its `data:` line); any
+/// marker frame without an id panics naming it. Returns `(id, payload)`.
+fn read_sse_frame<R: std::io::BufRead>(reader: &mut R) -> (u64, serde_json::Value) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut id: Option<u64> = None;
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no complete frame in time"
+        );
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => panic!("the stream ended mid-frame"),
+            Ok(_) => {}
+            Err(err) => panic!("the SSE read failed: {err}"),
+        }
+        let line = line.trim_end().to_string();
+        if let Some(raw) = line.strip_prefix("id: ") {
+            id = Some(raw.parse().expect("the id is numeric"));
+        } else if let Some(payload) = line.strip_prefix("data: ") {
+            let event: serde_json::Value = serde_json::from_str(payload.trim())
+                .expect("every data frame is the engine's JSON");
+            let id = id.expect("every event frame carries an id");
+            return (id, event);
+        } else if line.starts_with(':') {
+            // A keep-alive comment.
+        } else if line.is_empty() {
+            // A frame terminator.
+        }
+    }
 }

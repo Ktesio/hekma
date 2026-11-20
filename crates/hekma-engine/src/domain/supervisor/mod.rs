@@ -207,6 +207,25 @@ const USAGE_PARK_MAX_ATTEMPTS: u32 = 3;
 /// SKIP bound above is the per-event counterpart of this whole-buffer bound.
 const OBSERVED_PARK_MAX_EVENTS: usize = 1024;
 
+/// AI-13's cause vocabulary for a CODE-LESS exit (`code: None`), shared by the
+/// reaper's crash path and the release pass's released-exit reconcile so the
+/// two surfaces cannot drift (issue #387). An ADOPTED handle's code is
+/// unrecoverable BY STRUCTURE — this engine is not the parent, so it reads
+/// liveness via `kill(pid, 0)` + the start-time fingerprint and can never hold
+/// an `ExitStatus` — while the engine's OWN child's code-less exit IS a signal
+/// termination (`try_wait` held the authoritative status; on Unix
+/// `ExitStatus::code() == None` ⟺ `WIFSIGNALED`). On WINDOWS the adopted
+/// handle's poll reads the real code via `GetExitCodeProcess`
+/// (backends/windows reap_if_exited), so a code-less exit there is
+/// genuinely-unreadable, not signal-shaped — both fragments are worded for
+/// that honesty.
+const CODE_LESS_ADOPTED_FRAGMENT: &str =
+    "exit code unavailable — adopted process is not this engine's child";
+
+/// The own-child counterpart of [`CODE_LESS_ADOPTED_FRAGMENT`] (see its doc
+/// for the platform shape and why one const guards both surfaces).
+const CODE_LESS_SIGNAL_FRAGMENT: &str = "terminated by signal";
+
 /// A scheduled restart of a crashed instance (story 1-6, AC4). Returned by
 /// [`Supervisor::poll_once`] for each crashed `on-failure` instance that has not
 /// hit the crash-loop threshold; the engine cadence sleeps [`RestartPlan::delay`]
@@ -937,6 +956,11 @@ pub struct Supervisor {
     agent_log_truncate_deferred: bool,
     /// The stderr channel's twin of [`Self::agent_log_truncate_deferred`].
     agent_stderr_truncate_deferred: bool,
+    /// Story 21-3 (review round 2): the degraded-policy-cache notice latch
+    /// — a tick-time reload failure announces ONCE and re-arms when the
+    /// cache reads healthy again (enforcement continues under the last
+    /// good set with the action held at pause in the meantime).
+    policies_degraded_noted: bool,
     /// Review finding 16: whether [`Supervisor::set_serve_options`] has run
     /// on this supervisor — the OPEN-TIME-ONLY latch. The engine's open path
     /// applies once, on a fresh supervisor, before any lifecycle; any second
@@ -1070,6 +1094,23 @@ pub struct Supervisor {
     /// `liveness_commit_fault_names`.
     #[cfg(test)]
     transition_fault_names: std::collections::HashSet<InstanceName>,
+    /// Story 21-1 follow-up — cfg(test) FAULT-INJECTION SEAM at the budget
+    /// EVALUATION writer job: an instance name listed here fails the
+    /// `pipeline::evaluate` commit itself (before any breach is built), so
+    /// the surfaced-not-silent Err arm — no breach recorded, the next usage
+    /// event evaluates again — runs deterministically without staging a real
+    /// store outage. Same placement rationale as `transition_fault_names`.
+    /// Never compiled outside the lib's own test builds.
+    #[cfg(test)]
+    usage_eval_fault_names: std::collections::HashSet<InstanceName>,
+    /// The record-side twin of `usage_eval_fault_names`: an armed name fails
+    /// the breach-record writer job (`pipeline::record_breach`), driving the
+    /// "mandated breach record was NOT written" diagnostic. The seam's only
+    /// consumer (`persist_breach_event`) is itself test-only, so this can
+    /// never fire in a production build. Never compiled outside the lib's own
+    /// test builds.
+    #[cfg(test)]
+    breach_record_fault_names: std::collections::HashSet<InstanceName>,
     /// Coverage second pass (epic 20-1) — cfg(test) FAULT-INJECTION SEAM at
     /// the backend STOP boundary: a pid entry here makes the LIVENESS-EXPIRY
     /// teardown's force-kill (reaper.rs) and the READINESS-TIMEOUT teardown's
@@ -1180,6 +1221,7 @@ impl Supervisor {
             #[cfg(test)]
             agent_log_cap_override: None,
             agent_log_truncate_deferred: false,
+            policies_degraded_noted: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
             stable_run_window: STABLE_RUN_WINDOW,
@@ -1201,6 +1243,10 @@ impl Supervisor {
             liveness_commit_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             transition_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            usage_eval_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            breach_record_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             stop_fault_pids: std::collections::HashMap::new(),
             #[cfg(test)]
@@ -1237,6 +1283,7 @@ impl Supervisor {
             #[cfg(test)]
             agent_log_cap_override: None,
             agent_log_truncate_deferred: false,
+            policies_degraded_noted: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
             stable_run_window: STABLE_RUN_WINDOW,
@@ -1258,6 +1305,10 @@ impl Supervisor {
             liveness_commit_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             transition_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            usage_eval_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            breach_record_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             stop_fault_pids: std::collections::HashMap::new(),
             #[cfg(test)]
@@ -1294,6 +1345,7 @@ impl Supervisor {
             #[cfg(test)]
             agent_log_cap_override: None,
             agent_log_truncate_deferred: false,
+            policies_degraded_noted: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
             stable_run_window: STABLE_RUN_WINDOW,
@@ -1315,6 +1367,10 @@ impl Supervisor {
             liveness_commit_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             transition_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            usage_eval_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            breach_record_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             stop_fault_pids: std::collections::HashMap::new(),
             #[cfg(test)]
@@ -1338,17 +1394,20 @@ impl Supervisor {
         self.events.clone()
     }
 
-    /// Publish one committed event onto the bus (story 7-2).
+    /// Publish one committed event — with its outbox `seq` — onto the bus
+    /// (story 7-2; the seq rides since story 21-5).
     ///
-    /// Called EXCLUSIVELY from the three commit points, immediately AFTER the
-    /// durable append/commit succeeded. Every caller runs while the supervisor
-    /// lock is held — a CALLER-ENFORCED obligation (the bus itself does not
-    /// serialize; see the `domain::bus` module's ordering invariant) — so
-    /// publishes are serialized in durable-append order: the per-instance FIFO
-    /// guarantee. Publishing cannot fail supervision: a send with no receivers
-    /// (or any send error) is swallowed by the bus.
-    fn publish(&self, event: EngineEvent) {
-        self.events.publish(event);
+    /// Called EXCLUSIVELY from the commit points, immediately AFTER the
+    /// durable append/commit succeeded, with the seq that append minted
+    /// (the SSE path frames it as the event's `id:`). Every caller runs
+    /// while the supervisor lock is held — a CALLER-ENFORCED obligation
+    /// (the bus itself does not serialize; see the `domain::bus` module's
+    /// ordering invariant) — so publishes are serialized in durable-append
+    /// order: the per-instance FIFO guarantee. Publishing cannot fail
+    /// supervision: a send with no receivers (or any send error) is
+    /// swallowed by the bus.
+    pub(crate) fn publish(&self, seq: u64, event: EngineEvent) {
+        self.events.publish(seq, event);
     }
 
     /// Install (or replace) the host-provided diagnostic sink (story 10-2).
@@ -1795,7 +1854,7 @@ impl Supervisor {
     ) {
         for (event, append) in events {
             self.note_outbox_append(&append);
-            self.publish(EngineEvent::Run(event));
+            self.publish(append.seq, event);
         }
     }
 
@@ -1944,7 +2003,7 @@ impl Supervisor {
             ));
         }
         self.note_outbox_append(append);
-        self.publish(EngineEvent::Transition(event.clone()));
+        self.publish(append.seq, EngineEvent::Transition(event.clone()));
         if let Some(capture) = log_capture {
             let text = engine_transition_line_text(event);
             capture.send_engine_line(LogLine::new(
@@ -2094,11 +2153,34 @@ impl Default for Supervisor {
 ///
 /// [`METERING_BASE_URL_KEY`]: crate::domain::METERING_BASE_URL_KEY
 /// [`MEMORY_DIR_KEY`]: crate::domain::MEMORY_DIR_KEY
+#[cfg(test)]
 fn invocation_overrides(base_url: Option<&str>, memory_dir: Option<&Path>) -> Option<ConfigLayer> {
-    if base_url.is_none() && memory_dir.is_none() {
+    invocation_overrides_with_keys(base_url, memory_dir, &[])
+}
+
+/// [`invocation_overrides`] plus the reserved credential leaves (story
+/// 22-1): each `(dotted key, marker)` lands as a nested leaf whose VALUE is
+/// only the marker (`run-key:<token id>`) — the cleartext travels in the
+/// per-launch secrets map, never in a config layer.
+fn invocation_overrides_with_keys(
+    base_url: Option<&str>,
+    memory_dir: Option<&Path>,
+    run_keys: &[(&str, String)],
+) -> Option<ConfigLayer> {
+    if base_url.is_none() && memory_dir.is_none() && run_keys.is_empty() {
         return None;
     }
     let mut table = toml::value::Table::new();
+    for (key, marker) in run_keys {
+        if let Some((section, leaf)) = key.split_once('.') {
+            let entry = table
+                .entry(section.to_string())
+                .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+            if let toml::Value::Table(inner) = entry {
+                inner.insert(leaf.to_string(), toml::Value::String(marker.clone()));
+            }
+        }
+    }
     if let Some(url) = base_url {
         // A DOTTED key (`metering.base_url`) is a nested table in TOML; build the
         // nested shape so `resolve` flattens it to the dotted leaf the mapping targets.
@@ -2447,6 +2529,22 @@ fn snapshot_to_engine(err: super::error::RegistryError) -> EngineError {
 /// [`snapshot_to_engine`]). The [`SecretError`] message names the `NAME` + the
 /// resolvers tried (or the `chmod 600` remediation) but NEVER a resolved value, so
 /// mapping it into [`EngineError::Secret`]'s `detail` cannot leak a secret (AC-B).
+/// Map a credential mint failure (story 22-1: the OS random source failed)
+/// into the typed start refusal.
+fn credential_to_engine(
+    name: &InstanceName,
+    err: crate::domain::credential::CredentialError,
+) -> EngineError {
+    match err {
+        crate::domain::credential::CredentialError::RandomSourceFailed { detail } => {
+            EngineError::CredentialUnavailable {
+                name: name.as_str().to_string(),
+                detail,
+            }
+        }
+    }
+}
+
 fn secret_to_engine(name: &InstanceName, err: crate::ports::SecretError) -> EngineError {
     EngineError::Secret {
         name: name.as_str().to_string(),

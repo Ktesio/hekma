@@ -290,6 +290,13 @@ impl MetricState {
             // instance-level attributes only (no run id on a metric), so
             // they export nothing until `otlp-metrics v2`.
             EngineEvent::Run(_) => {}
+            // Story 21-3: Policy changes and the one-time breach-default
+            // upgrade carry no instance or run id, so `otlp-metrics v1` has
+            // no series for them (the AD-21 interim, as for Run events).
+            EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => {}
+            // Story 22-1: credential events carry no counter before
+            // `otlp-metrics v2` (and never a token) — ignored.
+            EngineEvent::Credential(_) => {}
         }
     }
 

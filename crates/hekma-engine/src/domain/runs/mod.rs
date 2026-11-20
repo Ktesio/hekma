@@ -30,13 +30,33 @@ use super::lifecycle::LifecycleState;
 use super::usage::RunId;
 use crate::ports::StoreError;
 
+pub(crate) mod keys;
 pub(crate) mod labels;
+pub(crate) mod limits;
+pub(crate) mod listing;
 pub(crate) mod ops;
+pub(crate) mod policy;
+pub mod selector;
 pub(crate) mod snapshot;
 pub mod verbs;
 
-pub use labels::{validate_label_key, validate_label_value};
-pub use verbs::{verb_cell, CellBehavior, RunVerb, VerbCell, RUN_VERBS};
+pub use labels::{validate_label_key, validate_label_value, LabelChange, LabelOutcome};
+pub use limits::{
+    LimitActor, LimitsDirection, RunLimitChange, RunLimitField, RunLimitsOutcome, RunLimitsResults,
+    RunLimitsView,
+};
+pub use listing::{
+    decode_cursor, encode_cursor, ended_run_cutoff, LatchedBreach, ListRunsQuery, ListingCounts,
+    ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument, RunSummary,
+    ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
+};
+pub use policy::{
+    BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyEvent, PolicyEventKind,
+    PolicyLimits, PolicyRecord, PolicyResolution, ResolveInputs, RunPolicy, ScentCheckMode,
+    UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
+};
+pub use selector::{Selector, SelectorScope, MAX_SELECTED_RUNS};
+pub use verbs::{verb_cell, CellBehavior, RunLifecycleVerb, RunVerb, VerbCell, RUN_VERBS};
 
 /// The schema version stamped on every [`RunEvent`] (AD-14). Independent of
 /// the transition, breach and usage event schemas; bumped only on an
@@ -46,6 +66,51 @@ pub const RUN_EVENT_SCHEMA_VERSION: u32 = 1;
 /// The deepest a Run tree may nest: the root is level 1 (PRD FR-49).
 pub const MAX_RUN_NESTING: usize = 8;
 
+/// The most open children one parent may have when a Caller opens them with
+/// a Run Key (story 22-1, threat T1.9: a Run Key can create Runs). The
+/// Operator and Host are not capped.
+pub const MAX_CALLER_OPEN_CHILDREN: u64 = 1000;
+
+/// Who acts on a Run (story 22-1, spine AD-20): the Operator, a Host, or a
+/// Run's own Caller presenting its Run Key. A Caller may open, close and
+/// tighten only within its own Run's subtree; every Caller-authorized job
+/// re-validates the presenting token inside its transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunActor {
+    /// The Operator (the CLI, the Control API's operator bearer).
+    Operator,
+    /// A Host acting on its own Runs.
+    Host,
+    /// A Run's Caller, authenticated by the Run Key with this hash.
+    Caller {
+        /// The Run the presented key belongs to.
+        run_id: RunId,
+        /// The presented key's hash (re-validated in the job).
+        token_hash: crate::domain::credential::TokenHash,
+    },
+}
+
+impl RunActor {
+    /// The limits actor this actor writes as (21-6's [`LimitActor`]).
+    pub fn limit_actor(&self) -> LimitActor {
+        match self {
+            RunActor::Operator => LimitActor::Operator,
+            RunActor::Host => LimitActor::Host,
+            RunActor::Caller { .. } => LimitActor::Caller,
+        }
+    }
+
+    /// Who issued a credential this actor asked for (`operator`, `host`, or
+    /// the presenting key's token id).
+    pub(crate) fn issuer(&self) -> String {
+        match self {
+            RunActor::Operator => "operator".to_string(),
+            RunActor::Host => "host".to_string(),
+            RunActor::Caller { token_hash, .. } => token_hash.token_id(),
+        }
+    }
+}
+
 /// The identity binding a Host-supplied external id resolves under
 /// (`run_identities`, AD-25). Later stories add identity-header and announce
 /// bindings beside it.
@@ -53,11 +118,16 @@ pub const HOST_IDENTITY_BINDING: &str = "host";
 
 /// How far Hekma controls a Run — a strict ladder, each rung including the
 /// one below (PRD Glossary). `supervised (no wire)` is depth `supervised`
-/// with `wire_path: false` on every surface (AD-25).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// with `wire_path: false` on every surface (AD-25). `Default` is the
+/// ladder's lowest rung (a resolution input with no depth named resolves
+/// the least control).
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum ControlDepth {
     /// Known from its telemetry or announcement only.
+    #[default]
     Observed,
     /// Its model traffic crosses the Metering Proxy.
     Wire,
@@ -160,8 +230,9 @@ impl RunStatus {
 }
 
 /// A condition Hekma makes loud (PRD Glossary). An Anomaly never acts on a
-/// Run by itself. Story 21-2 stores these three; later stories add the
-/// unscented, bypass, silent and policy-fallback kinds.
+/// Run by itself. Story 21-2 stores the first three; 21-3 adds the
+/// unpriced-model kind; later stories add the unscented, bypass and silent
+/// kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Anomaly {
@@ -174,10 +245,23 @@ pub enum Anomaly {
     /// A Breach Action set on the Run cannot execute at its current depth
     /// and acts as `warn`; cleared when the depth supports it again.
     DepthFallback,
+    /// A resolved Cost Cap has no resolvable Rate (a Policy-supplied cap on
+    /// an unpriced model), so the cap cannot fire; cleared when a Rate
+    /// resolves (story 21-3 — never silently inert).
+    UnpricedModel,
+    /// A used refresh credential was presented again (story 22-1): the Run's
+    /// credentials were revoked. Cleared by an Operator `revoke-keys`.
+    CredentialReuse,
 }
 
 impl Anomaly {
-    const ALL: [Anomaly; 3] = [Anomaly::Breach, Anomaly::Failed, Anomaly::DepthFallback];
+    const ALL: [Anomaly; 5] = [
+        Anomaly::Breach,
+        Anomaly::Failed,
+        Anomaly::DepthFallback,
+        Anomaly::UnpricedModel,
+        Anomaly::CredentialReuse,
+    ];
 
     /// The stable wire form.
     pub fn as_str(&self) -> &'static str {
@@ -185,6 +269,8 @@ impl Anomaly {
             Anomaly::Breach => "breach",
             Anomaly::Failed => "failed",
             Anomaly::DepthFallback => "depth-fallback",
+            Anomaly::UnpricedModel => "unpriced-model",
+            Anomaly::CredentialReuse => "credential-reuse",
         }
     }
 
@@ -250,7 +336,41 @@ impl LabelSource {
     }
 }
 
-/// One `key=value` label with its source.
+/// Where a bound label came from (story 21-9). Per key, `label-verb` wins
+/// over `config`, and any bound label wins over a Caller's (FR-49): a
+/// configuration re-sync replaces only `config` rows, and the label verb never
+/// rewrites the configuration. Later sources join beside these (a Run Key, an
+/// endpoint binding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LabelOrigin {
+    /// The instance's `labels.<key>` configuration.
+    Config,
+    /// The Operator's label verb (`hekma label`, `PATCH /v0/runs/{id}/labels`).
+    LabelVerb,
+}
+
+impl LabelOrigin {
+    /// The stable wire form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LabelOrigin::Config => "config",
+            LabelOrigin::LabelVerb => "label-verb",
+        }
+    }
+
+    /// Parse the wire form.
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "config" => Some(LabelOrigin::Config),
+            "label-verb" => Some(LabelOrigin::LabelVerb),
+            _ => None,
+        }
+    }
+}
+
+/// One `key=value` label with its source (and, for a bound label, its
+/// origin).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Label {
     /// The key (see [`validate_label_key`]).
@@ -259,15 +379,29 @@ pub struct Label {
     pub value: String,
     /// Who set it.
     pub source: LabelSource,
+    /// Where a bound label came from; `None` on a Caller label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<LabelOrigin>,
 }
 
 impl Label {
-    /// A bound label.
+    /// A bound label from the instance configuration (origin `config`).
     pub fn bound(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::bound_by(key, value, LabelOrigin::Config)
+    }
+
+    /// A bound label set by the label verb (origin `label-verb`).
+    pub fn verb(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::bound_by(key, value, LabelOrigin::LabelVerb)
+    }
+
+    /// A bound label with an explicit origin.
+    pub fn bound_by(key: impl Into<String>, value: impl Into<String>, origin: LabelOrigin) -> Self {
         Self {
             key: key.into(),
             value: value.into(),
             source: LabelSource::Bound,
+            origin: Some(origin),
         }
     }
 
@@ -277,13 +411,29 @@ impl Label {
             key: key.into(),
             value: value.into(),
             source: LabelSource::Caller,
+            origin: None,
         }
+    }
+
+    /// Whether this label is bound.
+    pub fn is_bound(&self) -> bool {
+        self.source == LabelSource::Bound
+    }
+
+    /// A bound label's effective origin: a bound row with no recorded origin
+    /// can only have come from configuration (the one bound source before
+    /// origins were recorded). `None` on a Caller label.
+    pub fn bound_origin(&self) -> Option<LabelOrigin> {
+        self.is_bound()
+            .then(|| self.origin.unwrap_or(LabelOrigin::Config))
     }
 }
 
-/// The limits set directly on a Run (story 21-2: on a child Run at open).
-/// A supervised Run's ceilings come from its instance configuration, which
-/// the pipeline resolves; these are the Run-level ones (`run_limits`).
+/// The limits set directly on a Run (`run_limits`): on a child Run at open
+/// (story 21-2), or through `hekma budget` on any non-ended Run (story
+/// 21-6). A limit set here BELONGS TO THE RUN — it ends with the Run, and a
+/// fresh start mints a new Run without it. It outranks the instance
+/// configuration and every Policy for that limit (FR-60).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunLimits {
     /// A per-run token ceiling over the Run's subtree usage.
@@ -292,15 +442,36 @@ pub struct RunLimits {
     /// A per-run dollar cap over the Run's subtree cost, in micro-dollars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dollar_per_run_micros: Option<Micros>,
+    /// A cumulative token ceiling, enforced against the hosting instance's
+    /// lifetime ledger while this Run is open (story 21-6; process-owning
+    /// Runs only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_cumulative: Option<u64>,
+    /// A cumulative dollar cap in micro-dollars, enforced against the
+    /// hosting instance's lifetime ledger while this Run is open (story
+    /// 21-6; process-owning Runs only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dollar_cumulative_micros: Option<Micros>,
     /// The Breach Action for these ceilings (`warn` when unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub breach_action: Option<BreachAction>,
 }
 
 impl RunLimits {
-    /// Whether any ceiling is set.
+    /// Whether any per-run ceiling is set (a child level's arms: a child
+    /// carries no cumulative scope).
     pub fn is_armed(&self) -> bool {
         self.token_per_run.is_some() || self.dollar_per_run_micros.is_some()
+    }
+
+    /// Whether any field at all is set (a ceiling of either scope, or the
+    /// Breach Action).
+    pub fn is_set(&self) -> bool {
+        self.token_per_run.is_some()
+            || self.dollar_per_run_micros.is_some()
+            || self.token_cumulative.is_some()
+            || self.dollar_cumulative_micros.is_some()
+            || self.breach_action.is_some()
     }
 
     /// The Breach Action these ceilings execute (`warn` when unset).
@@ -377,6 +548,9 @@ pub struct RunView {
     pub labels: Vec<Label>,
     /// Limits set directly on the Run.
     pub limits: RunLimits,
+    /// Its stored Policy resolution, when one exists (story 21-3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyResolution>,
     /// Its subtree usage.
     pub usage: RunUsage,
     /// How many of its children have not ended.
@@ -403,6 +577,10 @@ pub struct ChildRunRequest {
     pub limits: RunLimits,
     /// An external id under which a retried open returns the same Run.
     pub external_id: Option<String>,
+    /// Whether to issue the child's Run Key and refresh credential (story
+    /// 22-1): returned once by [`crate::Engine::open_child_run_as`].
+    /// [`crate::Engine::open_child_run`] never issues them.
+    pub issue_credentials: bool,
 }
 
 impl ChildRunRequest {
@@ -413,8 +591,19 @@ impl ChildRunRequest {
             labels: Vec::new(),
             limits: RunLimits::default(),
             external_id: None,
+            issue_credentials: false,
         }
     }
+}
+
+/// What a child open returns (story 22-1): the Run, and — when the request
+/// asked — its credentials, shown once.
+#[derive(Debug)]
+pub struct OpenedRun {
+    /// The opened (or, on a retried external id, the existing) Run.
+    pub view: RunView,
+    /// Its Run Key and refresh credential, when issued.
+    pub credentials: Option<crate::domain::credential::IssuedCredentials>,
 }
 
 /// What happened to a Run (the `change` of a [`RunEvent`]).
@@ -431,6 +620,8 @@ pub enum RunEventKind {
     AnomaliesChanged,
     /// Its bound labels changed.
     LabelsChanged,
+    /// Its own limits changed (story 21-6: `hekma budget set`).
+    LimitsChanged,
     /// It ended.
     Ended,
 }
@@ -444,6 +635,7 @@ impl RunEventKind {
             RunEventKind::StatusChanged => "status-changed",
             RunEventKind::AnomaliesChanged => "anomalies-changed",
             RunEventKind::LabelsChanged => "labels-changed",
+            RunEventKind::LimitsChanged => "limits-changed",
             RunEventKind::Ended => "ended",
         }
     }
@@ -485,9 +677,32 @@ pub struct RunEvent {
     pub anomalies: Vec<Anomaly>,
     /// Its bound labels after the change.
     pub labels: Vec<Label>,
-    /// Why (a transition cause, `parent-paused`, `closed`, …).
+    /// Its bound labels before the change, on `labels-changed` (story 21-9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_labels: Option<Vec<Label>>,
+    /// Its own limits after the change, on `limits-changed` (story 21-6;
+    /// boxed to keep the event small on the bus — the wire form is the
+    /// plain object).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<Box<RunLimits>>,
+    /// Its own limits before the change, on `limits-changed` (story 21-6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_limits: Option<Box<RunLimits>>,
+    /// Which layer `limits` and `prior_limits` describe, on
+    /// `limits-changed` (story 22-1, the 21-6 review's N3): `run` (the
+    /// Operator/Host layer) or `caller` (the Caller's own layer, applied
+    /// only where tighter). Neither is the effective limit — the Run's
+    /// resolution (`hekma budget show`) is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits_layer: Option<String>,
+    /// Why (a transition cause, `parent-paused`, `closed`, `label-verb`,
+    /// `config`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<String>,
+    /// The names of the Policies that supplied the Run's limits after the
+    /// change (story 21-3, AD-14: `default` counts; empty when none did).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<String>,
     /// RFC 3339 time of the change.
     pub at: String,
 }
@@ -502,12 +717,16 @@ pub enum RunError {
         run_id: String,
     },
     /// The instance has no open supervised Run to open a child under.
-    #[error(
-        "Agent Instance `{instance}` has no open Run — start it before opening a child Run \
-         under it"
-    )]
+    #[error("Agent Instance `{instance}` has no open Run — start it first")]
     NoOpenRun {
         /// The instance asked for.
+        instance: String,
+    },
+    /// No Agent Instance has this name (story 21-9: an agent named as a
+    /// label target).
+    #[error("no Agent Instance is named `{instance}`")]
+    InstanceNotFound {
+        /// The name asked for.
         instance: String,
     },
     /// The parent has ended.
@@ -552,6 +771,140 @@ pub enum RunError {
         /// Its instance.
         instance: String,
     },
+    /// The Run has ended, so it cannot change (story 21-9: its labels;
+    /// story 21-6: its limits and lifecycle verbs too).
+    #[error("Run `{run_id}` has ended, so it cannot change")]
+    RunEnded {
+        /// The Run.
+        run_id: String,
+    },
+    /// A limit scope the Run cannot carry (story 21-6): a cumulative
+    /// ceiling belongs to the hosting agent's lifetime ledger, so only its
+    /// process-owning Run carries one.
+    #[error(
+        "`{limit}` cannot be set on Run `{run_id}`: it is a child Run, and a cumulative \
+         ceiling counts the hosting agent's lifetime usage — set it on the agent's own Run, \
+         or in the agent's `budget.*` configuration"
+    )]
+    ScopeUnavailable {
+        /// The Run.
+        run_id: String,
+        /// The refused limit (`tokens-cumulative`, …).
+        limit: String,
+    },
+    /// A Caller may only tighten a Run's limits (story 21-6, PRD FR-60).
+    #[error(
+        "Run `{run_id}`'s limits can only be tightened by its Caller, and this change loosens \
+         `{limit}` — an Operator or Host raises a ceiling"
+    )]
+    RaiseForbidden {
+        /// The Run.
+        run_id: String,
+        /// The first limit the change loosens.
+        limit: String,
+    },
+    /// A lifecycle verb the Run's Control Depth does not serve yet (story
+    /// 21-6: the verb × depth table's cell, answered per Run).
+    #[error("`{verb}` on Run `{run_id}` is refused: {reason}")]
+    VerbUnavailable {
+        /// The Run.
+        run_id: String,
+        /// The verb (`stop`, `pause`, `resume`, `drain`).
+        verb: String,
+        /// The Run's depth, rendered (`announced`, `supervised (no wire)`).
+        depth: String,
+        /// Why, naming the depth (or the Metering Source) and the way out.
+        reason: String,
+    },
+    /// The label verb cannot remove a label the instance configuration binds
+    /// (story 21-9).
+    #[error(
+        "label `{key}` on Run `{run_id}` comes from the configuration key `labels.{key}` of \
+         agent `{instance}`, so it cannot be removed from the Run — change it with \
+         `hekma agent config set {instance} labels.{key} <value>`, or override it on the Run \
+         with `hekma label set {run_id} {key}=<value>`"
+    )]
+    LabelFromConfig {
+        /// The Run.
+        run_id: String,
+        /// The label key.
+        key: String,
+        /// The instance whose configuration binds it.
+        instance: String,
+    },
+    /// The label verb removes bound labels only; this key is a Caller's.
+    #[error(
+        "label `{key}` on Run `{run_id}` was set by the Run's Caller, not bound, so the label \
+         verb cannot remove it (it removes only labels it set)"
+    )]
+    LabelNotBound {
+        /// The Run.
+        run_id: String,
+        /// The label key.
+        key: String,
+    },
+    /// A Caller label write names a key already bound on the Run (FR-49).
+    #[error("label `{key}` is bound on Run `{run_id}`, so a Caller cannot set it")]
+    LabelBound {
+        /// The Run.
+        run_id: String,
+        /// The label key.
+        key: String,
+    },
+    /// A Selector matched more Runs than one request may act on.
+    #[error(
+        "Selector `{selector}` matches more than {max} Runs — narrow it with another \
+         `key=value` term"
+    )]
+    TooManyRuns {
+        /// The Selector.
+        selector: String,
+        /// [`MAX_SELECTED_RUNS`].
+        max: usize,
+    },
+    /// No Policy has this name (story 21-3).
+    #[error("no Policy is named `{name}`")]
+    PolicyNotFound {
+        /// The name asked for.
+        name: String,
+    },
+    /// A Policy with this name already exists (story 21-3): change it
+    /// instead of creating it again.
+    #[error(
+        "a Policy named `{name}` already exists — change it with `hekma policy change {name}`"
+    )]
+    PolicyExists {
+        /// The existing Policy's name.
+        name: String,
+    },
+    /// The `default` Policy's reserved shape forbids the change (story
+    /// 21-3): it cannot be deleted or carry a Selector — it is the
+    /// fallback every Run resolves through.
+    #[error("the default Policy {what} — it is the fallback every Run resolves through, and every limit it carries applies to every Run")]
+    PolicyDefault {
+        /// What it cannot do (`"cannot be deleted"`, `"cannot carry a Selector"`).
+        what: &'static str,
+    },
+    /// A Scent-Check Mode other than `off` before Scent-Check ships
+    /// (story 21-3, PRD §13 Q9's interim): an accepted-but-inert mode
+    /// would be a silent no-op.
+    #[error(
+        "Scent-Check Modes land with their own story — only `off` is accepted for now; `{mode}` \
+         does nothing until then"
+    )]
+    ScentUnavailable {
+        /// The refused mode.
+        mode: String,
+    },
+    /// A listing cursor that is not the codec's form (story 21-5): a bad
+    /// base64url body, a foreign version prefix, an empty run id. The typed
+    /// `invalid-cursor` refusal — a future key shape never mispages, it
+    /// refuses.
+    #[error("{detail}")]
+    InvalidCursor {
+        /// Why the cursor cannot be used.
+        detail: String,
+    },
     /// A malformed request field.
     #[error("{field}: {reason}")]
     Invalid {
@@ -560,9 +913,56 @@ pub enum RunError {
         /// Why.
         reason: String,
     },
+    /// A Caller acted outside its own Run's subtree (story 22-1).
+    #[error(
+        "Run `{run_id}` is outside the presenting Run Key's own Run and its children, so the \
+         key cannot act on it"
+    )]
+    RunOutOfScope {
+        /// The Run asked for.
+        run_id: String,
+    },
+    /// The presented credential is no longer honoured (story 22-1).
+    #[error("the presented credential has been revoked")]
+    CredentialRevoked,
+    /// The presented credential is not one Hekma issued (story 22-1).
+    #[error("the presented credential is not recognised")]
+    CredentialUnknown,
+    /// A credential could not be issued (story 22-1): the operating system's
+    /// random source failed. There is no fallback.
+    #[error(
+        "the operating system's random source failed, so no credential was issued and nothing \
+         was changed ({detail})"
+    )]
+    CredentialUnavailable {
+        /// The source's own error text.
+        detail: String,
+    },
+    /// A Caller opened more open children under one parent than
+    /// [`MAX_CALLER_OPEN_CHILDREN`] (story 22-1).
+    #[error(
+        "Run `{parent}` already has {max} open children opened with a Run Key — close some \
+         before opening more"
+    )]
+    TooManyChildren {
+        /// The parent.
+        parent: String,
+        /// [`MAX_CALLER_OPEN_CHILDREN`].
+        max: u64,
+    },
     /// The store refused or failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+impl From<crate::domain::credential::CredentialError> for RunError {
+    fn from(err: crate::domain::credential::CredentialError) -> Self {
+        match err {
+            crate::domain::credential::CredentialError::RandomSourceFailed { detail } => {
+                RunError::CredentialUnavailable { detail }
+            }
+        }
+    }
 }
 
 impl RunError {
@@ -571,15 +971,49 @@ impl RunError {
         match self {
             RunError::NotFound { .. } => "run-not-found",
             RunError::NoOpenRun { .. } => "no-open-run",
+            RunError::InstanceNotFound { .. } => "instance-not-found",
             RunError::ParentEnded { .. } => "parent-ended",
             RunError::NestingTooDeep { .. } => "nesting-too-deep",
             RunError::ActionUnavailable { .. } => "action-unavailable",
             RunError::OwnsProcess { .. } => "owns-process",
+            RunError::RunEnded { .. } => "run-ended",
+            RunError::ScopeUnavailable { .. } => "scope-unavailable",
+            RunError::RaiseForbidden { .. } => "raise-forbidden",
+            RunError::VerbUnavailable { .. } => "verb-unavailable",
+            RunError::LabelFromConfig { .. } => "label-from-config",
+            RunError::LabelNotBound { .. } => "label-not-bound",
+            RunError::LabelBound { .. } => "label-bound",
+            RunError::TooManyRuns { .. } => "too-many-runs",
+            RunError::PolicyNotFound { .. } => "policy-not-found",
+            RunError::PolicyExists { .. } => "policy-exists",
+            RunError::PolicyDefault { .. } => "policy-default",
+            RunError::ScentUnavailable { .. } => "scent-unavailable",
+            RunError::InvalidCursor { .. } => "invalid-cursor",
             RunError::Invalid { .. } => "invalid-request",
+            RunError::RunOutOfScope { .. } => "run-out-of-scope",
+            RunError::CredentialRevoked => "credential-revoked",
+            RunError::CredentialUnknown => "unauthorized",
+            RunError::CredentialUnavailable { .. } => "credential-unavailable",
+            RunError::TooManyChildren { .. } => "too-many-children",
             RunError::Store(_) => "store",
         }
     }
 }
 
+/// Why a lifecycle verb addressed to a Run failed (story 21-6): the
+/// Run-level refusal (not found, ended, the depth's cell), or the instance
+/// verb's own error once the Run mapped to its instance.
+#[derive(Debug, thiserror::Error)]
+pub enum RunVerbError {
+    /// The Run refused the verb.
+    #[error(transparent)]
+    Run(#[from] RunError),
+    /// The instance verb failed.
+    #[error(transparent)]
+    Engine(#[from] crate::domain::EngineError),
+}
+
+#[cfg(test)]
+mod keys_tests;
 #[cfg(test)]
 mod tests;

@@ -215,13 +215,14 @@ The rules:
   reaches such an instance some other way, for example through a hand-edited
   config file, a breach is recorded, acts as `warn`, and the engine log says
   the fence could not be raised.
-- **It lifts with the Run.** The fence lives as long as the Run. It lifts when
-  the Run ends (`stop` then `start`). A Run is checked before its process
-  starts: if
-  it already sits at or over a `block` ceiling (usually the cumulative one), the
-  fence is up before its first call. To un-fence, raise the ceiling, then start
-  a new Run. Un-fencing a live Run when its ceiling is raised is planned for a
-  later release.
+- **It lifts with the Run, or with a raised ceiling.** The fence lives as long
+  as the Run. It lifts when the Run ends (`stop` then `start`), or as soon as
+  the matching ceiling is raised above the totals on the live Run — through
+  `hekma budget set`, an agent `budget.*` configuration write or a Policy
+  change. It lifts reason by reason: a fence still holding another latched
+  `block` reason stays up until that ceiling is raised too. A Run is checked
+  before its process starts: if it already sits at or over a `block` ceiling
+  (usually the cumulative one), the fence is up before its first call.
 - **A relaunch keeps the fence.** A Restart Policy relaunch continues the same
   Run, so its per-run totals keep counting and a per-run `block` fence is up
   again on the relaunched listener before its first call.

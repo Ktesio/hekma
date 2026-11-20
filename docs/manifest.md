@@ -230,6 +230,25 @@ Notes:
 - **Self-updating agents** (contract v1): an adapter for an agent that downloads its own updates MUST map that agent's update-disable mechanism (env or config) so the pinned, supervised binary stays pinned. The adapter docs must additionally state whether the agent's config chain contains a higher-authority (managed/MDM) layer that can override supervisor-delivered values, so an operator on a managed machine can verify the pin survived.
 - **Isolation keys**: an adapter documents which environment levers give each Agent Instance its own data/config roots (for Hermes, `HERMES_HOME`; for XDG-based agents like opencode, `XDG_DATA_HOME` + `XDG_CONFIG_HOME`). Per-instance isolated roots inside each Agent Home are the RECOMMENDED normative posture (they make shared-root concurrency out of scope); where a lever is an undocumented agent interface, say so and re-validate it per pinned release. Per-OS support levels remain the declaration's own honesty job — an agent whose vendor recommends a compatibility layer on Windows is best declared `best-effort` there, but that cap is the adapter author's choice, not a contract mandate.
 
+#### Reserved credential keys
+
+Two reserved keys carry a supervised launch's credentials (see [Run Keys](run-keys.md)): `run.key` (the launch's Run Key) and `run.refresh_key` (a refresh credential). The engine delivers them; an operator never sets them.
+
+```toml
+# Also deliver the Run Key in the agent's own variable (it always gets HEKMA_RUN_KEY).
+[config."run.key"]
+env = "MY_AGENT_HEKMA_KEY"
+
+# Ask for a refresh credential too (none is issued unless this is mapped).
+[config."run.refresh_key"]
+env = "MY_AGENT_HEKMA_REFRESH"
+```
+
+- Every agent receives its Run Key in `HEKMA_RUN_KEY`, whatever the manifest maps.
+- Only an `env` target is accepted for either key. A `flag` or `file` target is refused at registration, naming the key: an argv is readable by other local users, and a file would put the credential in the Agent Home.
+- A refresh credential is issued to a supervised launch only when `run.refresh_key` is mapped to an `env` target.
+- No Adapter Contract change: these are ordinary `[config]` mappings of two reserved keys.
+
 ### `[readiness]` — the readiness probe (added at contract 1.1.0)
 
 ONE declared probe the engine must satisfy before the instance reaches `running`. Optional: a manifest without this section behaves exactly as before (the process-level startup watch alone). With it, `hekma agent start` reaches `running` only once the probe passes within its own `timeout_ms`; a timeout lands the instance `failed` with the probe **named** — and that failure is **terminal**: the Restart Policy is not consulted, because an adapter that launched but never became ready is a broken deployment a restart would only replay.

@@ -322,6 +322,7 @@ mod bench {
 
     fn job(instance: &str, run: &str, sequence: u64, ceiling: u64) -> UsageJob {
         UsageJob {
+            row_rate: None,
             event: UsageEvent {
                 instance: instance.to_string(),
                 run_id: RunId::from_wire(run),
@@ -502,4 +503,35 @@ fn a_failed_commit_answers_every_job_in_the_batch_not_applied() {
     );
     assert!(reader.get_instance(&name("doomed")).unwrap().is_none());
     create(&writer, "next").unwrap();
+}
+
+#[test]
+fn a_batch_whose_transaction_cannot_open_answers_every_job_not_applied() {
+    // The connection refuses to open the batch's write transaction (here a
+    // query-only connection; in the field a lock or I/O failure): no job of
+    // that batch runs, each one hears a typed "not applied" error naming
+    // the cause, and an unacked job is counted as failed.
+    let (_dir, writer, reader) = writer();
+    writer
+        .call(|ctx| {
+            ctx.store()
+                .conn()
+                .execute_batch("PRAGMA query_only = ON")
+                .map_err(super::super::sqlite::backend)
+        })
+        .unwrap();
+    writer
+        .submit(|ctx| ctx.store().create_instance(&instance("unacked")))
+        .unwrap();
+    let err = create(&writer, "acked").unwrap_err();
+    match &err {
+        StoreError::Backend(detail) => {
+            assert!(detail.contains("did not commit"), "{detail}");
+            assert!(detail.contains("not applied"), "{detail}");
+        }
+        other => panic!("expected a backend error, got {other:?}"),
+    }
+    assert_eq!(writer.stats().unacked_failures.load(Ordering::Relaxed), 1);
+    assert!(reader.get_instance(&name("unacked")).unwrap().is_none());
+    assert!(reader.get_instance(&name("acked")).unwrap().is_none());
 }
