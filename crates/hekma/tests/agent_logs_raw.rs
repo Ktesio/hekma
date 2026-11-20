@@ -6,9 +6,13 @@
 //! poll: first-show of the un-attributed qualifier, the raw emit + pipe-close
 //! return, the cursor advance and the bound-elapsed break) and 2048–2052 (the
 //! `note_if_raw_shrunk` body). The STEADY-STATE raw poll and the attributed
-//! rotation notices are already pinned in `agent_cli.rs`; these two tests pin
+//! rotation notices are already pinned in `agent_cli.rs`; these tests pin
 //! the same contract observed through the drain's retry loop, where no prior
-//! test ever delivered raw content.
+//! test ever delivered raw content. The drain's OWN qualifier first-show
+//! (its `!shown` arm, as opposed to the steady-state poll's identical one)
+//! is pinned by the dedicated third test: in the first test the early raw
+//! line streams on the first steady-state poll, so the qualifier fires
+//! there, not in the drain.
 //!
 //! Cross-OS by construction (the `agent_cli.rs` rotation-test spine): a
 //! `registered` (never-started) instance is not `running` on every OS, so the
@@ -196,11 +200,14 @@ fn logs_follow_final_drain_streams_late_raw_lines_with_the_qualifier_once() {
     // before touching the file again. Seeing it proves the first poll (raw
     // block included) has fully run, and the status check in the same
     // iteration sees the never-running instance and enters the drain. The
-    // late write that follows — a GROWTH of the same file, so the shrink
-    // notice stays out of the picture — is causally after every
-    // steady-state read: on any runner speed the drain's retrying raw poll
-    // (2s bound, 20ms retries) is the ONLY reader left to deliver it. No
-    // fixed sleep to race: the synchronization is the observed early line.
+    // late write that follows — a growth-only APPEND of the same file, so
+    // the shrink notice stays out of the picture BY CONSTRUCTION (an append
+    // never shortens the file; a truncate-and-rewrite would briefly report
+    // length 0 and a drain poll in that window would misread it as a
+    // shrink) — is causally after every steady-state read: on any runner
+    // speed the drain's retrying raw poll (2s bound, 20ms retries) is the
+    // ONLY reader left to deliver it. No fixed sleep to race: the
+    // synchronization is the observed early line.
     let (ctx, state) = registered_mock("rawl");
     let state_dir = state.project_dir.as_path();
     append_captured_line(state_dir, "rawl", "backlog line");
@@ -217,8 +224,21 @@ fn logs_follow_final_drain_streams_late_raw_lines_with_the_qualifier_once() {
     wait_stdout_contains(&ctx, "early raw line");
 
     // The late raw content, landing while the drain retries on empty polls.
-    std::fs::write(&raw_path, "early raw line\nlate raw line\n")
-        .expect("grow the raw log with the late raw line");
+    // APPEND, never rewrite: `fs::write` opens with O_TRUNC, so a
+    // truncate-and-rewrite briefly reports length 0 and a drain poll landing
+    // in that window would see a shrink and stream the early line twice. The
+    // append keeps the length monotonically growing — the growth the comment
+    // above promises holds by construction, not by timing luck.
+    {
+        use std::io::Write as _;
+        let mut raw_log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&raw_path)
+            .expect("open the raw log for the growth-only append");
+        raw_log
+            .write_all(b"late raw line\n")
+            .expect("append the late raw line");
+    }
 
     let status = wait_exit(&mut child);
     assert_eq!(
@@ -251,6 +271,96 @@ fn logs_follow_final_drain_streams_late_raw_lines_with_the_qualifier_once() {
     assert!(
         stderr.contains("no further output"),
         "the honest follow-exit note belongs on stderr; stderr={stderr}"
+    );
+}
+
+#[test]
+fn logs_follow_final_drain_owns_the_qualifier_first_show() {
+    // The qualifier's once-per-session first-show has TWO call sites — the
+    // steady-state raw poll's and the drain's identical twin. In the test
+    // above the early raw line streams on the first steady-state poll, so
+    // the qualifier there fires on the STEADY-STATE arm and the drain's own
+    // `!shown` arm stays dark. Pin it in isolation: no raw file exists at
+    // all until the parent creates one AFTER the one steady-state
+    // iteration has provably completed, so the session's FIRST non-empty
+    // raw read happens inside the drain's retry loop.
+    //
+    // Drive: a `registered` (never-started) instance — never `running`, so
+    // the loop enters the drain after exactly ONE steady-state iteration —
+    // with an attributed backlog line the one-shot dump carries, plus a
+    // SECOND attributed line appended only after the dump is observed. That
+    // marker rides the first steady-state poll's attributed read (the
+    // one-shot dump is done; the outer loop's 300ms poll interval is its
+    // delivery window, and the parent's observe-and-append runs in tens of
+    // milliseconds — it cannot slip past the whole interval into a drain
+    // iteration, where delivering it would trip the drain's found-content
+    // break before any raw content exists). Observing the marker on stdout
+    // is causal proof the ENTIRE first iteration ran: the attributed read
+    // emitted it, the raw read that follows in the same iteration found no
+    // `agent.log` (empty — the qualifier stayed hidden; that read is
+    // sub-milliseconds behind the attributed emit, while the parent's
+    // stdout observation polls every ~20ms), and the status check after it
+    // entered the drain. The parent then CREATES `agent.log` with a single
+    // line — strictly after the last steady-state raw read — so the only
+    // reader that can ever see it is a drain poll: the session's first
+    // non-empty raw read fires the qualifier INSIDE the drain, the line
+    // streams as NDJSON, the drain breaks on found content, and the follow
+    // exits cleanly. No fixed sleep anywhere: every ordering claim is
+    // carried by an observed output line.
+    let (ctx, state) = registered_mock("rawq");
+    let state_dir = state.project_dir.as_path();
+    append_captured_line(state_dir, "rawq", "backlog line");
+
+    let mut child = spawn_follow(&ctx, state_dir, "rawq");
+    // The one-shot dump carries the attributed backlog…
+    wait_stdout_contains(&ctx, "backlog line");
+    // …and the marker appended now rides the first steady-state poll's
+    // attributed read. Observing it proves that poll — and the empty raw
+    // read paired with it — has fully run.
+    append_captured_line(state_dir, "rawq", "steady-state marker");
+    wait_stdout_contains(&ctx, "steady-state marker");
+
+    // The session's first raw content, created when only drain polls remain.
+    let raw_path = raw_agent_log_path(state_dir, "rawq");
+    std::fs::create_dir_all(raw_path.parent().unwrap()).expect("create the raw log dir");
+    std::fs::write(&raw_path, "drain raw line\n").expect("create the raw log with its only line");
+
+    let status = wait_exit(&mut child);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "follow must exit 0; stderr={}",
+        follow_stderr(&ctx)
+    );
+
+    let stdout = follow_stdout(&ctx);
+    let texts = assert_ndjson_texts(&stdout, "rawq");
+    assert_eq!(
+        texts,
+        vec!["backlog line", "steady-state marker", "drain raw line"],
+        "the drain's raw line streams after the dump and the marker — the \
+         marker is the proof the first steady-state poll ran before any raw \
+         content existed"
+    );
+
+    let stderr = follow_stderr(&ctx);
+    let qualifier = "may be un-attributed raw passthrough from agent.log";
+    assert_eq!(
+        stderr.matches(qualifier).count(),
+        1,
+        "the qualifier is surfaced ONCE — its first display of the session, \
+         on the drain's own arm; stderr={stderr}"
+    );
+    let qualifier_at = stderr
+        .find(qualifier)
+        .expect("the qualifier must ride stderr");
+    let exit_note_at = stderr
+        .find("no further output")
+        .expect("the follow-exit note must ride stderr");
+    assert!(
+        qualifier_at < exit_note_at,
+        "the qualifier fires inside the drain, before the exit note that \
+         ends it; stderr={stderr}"
     );
 }
 
