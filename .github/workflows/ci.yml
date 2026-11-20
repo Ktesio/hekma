@@ -98,11 +98,10 @@ jobs:
         # capped and session-quarantined, and its JOB timeout is carried as
         # matrix data — 40m since the 2026-11-20 unify (the freeze-era 25m
         # fast-fail, recalibrated 15m→25m on 2026-10-31, retired with the
-        # pin; see the run-step comment below for the measured history) —
-        # see the "Run
-        # tests (nextest)" step below for the full why (two wedge classes;
-        # the class-2 freeze was environment-bounded via the 26.04 pin
-        # until the label became that same image).
+        # pin). See the "Run tests (nextest)" step below for the full why
+        # and the measured history (two wedge classes; the class-2 freeze
+        # was environment-bounded via the 26.04 pin until the label became
+        # that same image).
         # Carried as matrix DATA (not an in-step OS comparison) so the run step
         # stays one uniform invocation for all three OSes.
         # nextest profile per leg (2026-10-27): the windows-latest leg runs
@@ -151,7 +150,7 @@ jobs:
     # .config/nextest.toml) remains the cross-OS per-test hang guard; the
     # residual Windows slow-runner flake family (TCK observed-section 30s
     # contention timeouts + a still-unidentified silent stall) is chartered
-    # under epic-12 retro item 95 (see #236). The matrix `include` tightens
+    # under epic-12 retro item 95 (see #236). The matrix `include` tightened
     # the PINNED ubuntu-26.04 leg (tracking #292), originally to 15m when the
     # healthy lane was ~4.5m. RECALIBRATED 15m→25m (2026-10-31): the suite
     # outgrew the cap — green main runs measured 653–818s of job time across
@@ -159,11 +158,11 @@ jobs:
     # 41189022237), and run 41193980277 (post-#358 main) hit the 15m job
     # timeout with the runner healthy (post-mortem: load 0.1, zero PSI
     # pressure, no D-state) and the suite still PROGRESSING (the in-flight
-    # test 17s old at the cap) — growth, not a wedge recurrence. 25m restores
+    # test 17s old at the cap) — growth, not a wedge recurrence. 25m restored
     # ~2x headroom over the worst observed green while a class-2 freeze still
-    # costs the 25+5m service window instead of 45m and still surfaces as a
+    # cost the 25+5m service window instead of 45m and still surfaced as a
     # fast visible cancel rather than a silent three-quarter-hour burn; it
-    # stays strictly under the 30m in-step supervisor cap, preserving the
+    # stayed strictly under the 30m in-step supervisor cap, preserving the
     # class-1 quarantine's role. UNIFY (2026-11-20, #292): the ubuntu-latest
     # label completed its migration to the 26.04 image (verified on hekma's
     # own ubuntu-latest job logs), the pin was retired, and

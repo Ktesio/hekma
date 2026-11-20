@@ -589,8 +589,8 @@ class ReleaseDocsTests(unittest.TestCase):
         # 2026-11-20 unify — #292). The cap rides
         # the matrix `include` as DATA (not an in-step OS comparison). Pin
         # the deliberate shape so a future edit cannot silently drop the
-        # observability, loosen the fast-fail timeout, or resurrect the
-        # un-enforceable timeout(1) form.
+        # observability, walk the job timeout back off the calibrated 40,
+        # or resurrect the un-enforceable timeout(1) form.
         self.assertIn("nextest_wallclock_cap: 30m", ci)
         self.assertIn("setsid bash -c", ci)
         self.assertIn('echo $? > "$exitf"', ci)
