@@ -571,10 +571,16 @@ jobs:
     # serve runs; not ratcheted — the canonical baseline carries no serve
     # metrics). Its report file rides the SAME artifact as the default
     # report (two files, one artifact).
+    # Story 21-5: the job ALSO runs the Run-scale listing scenario
+    # (--ps-seed 10000, its own step below) — the listing's first page plus
+    # counts over 10 000 seeded Runs, gated strict at p99 < 1 s (bound only
+    # on ps runs; not ratcheted — the canonical baseline carries no ps
+    # metric). Its report file rides the same artifact.
     runs-on: ubuntu-latest
     # Story 17-1: the job now runs the harness TWICE (default + --serve-shape,
-    # ~2 min more on a warm cache) — the ceiling grows with it.
-    timeout-minutes: 25
+    # ~2 min more on a warm cache) — the ceiling grows with it. Story 21-5:
+    # a THIRD run (--ps-seed 10000) grows it again.
+    timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -665,12 +671,34 @@ jobs:
             exit 1
           }
           target/release/examples/perf-budgets --serve-shape
+      - name: Run the Run-scale listing scenario (story 21-5; regressions fail this job)
+        # The THIRD explicit run (story 21-5): gated budgets CI never runs
+        # are not gates, so the listing scenario is its own blocking step.
+        # It seeds 10 000 Runs straight into the harness's store (no extra
+        # processes) and gates the first exceptions page plus its counts at
+        # p99 < 1 s strict (the CI once-retry re-measures the whole set
+        # once). WITHOUT --baseline — the canonical baseline carries no ps
+        # metric and the ps gate binds only on ps runs. Same contract as the
+        # steps above: no redirection, no `|| true`, the bare binary
+        # invocation (+ its flags) as the last line.
+        timeout-minutes: 10
+        env:
+          PERF_BUDGETS_REPORT_PATH: perf-budgets-ps-report.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/release/examples/perf-budgets || {
+            echo "::error::perf-budgets binary not found at target/release/examples/perf-budgets — the build step above failed or the output path moved."
+            exit 1
+          }
+          target/release/examples/perf-budgets --ps-seed 10000
       - name: Upload the measured report (artifact)
         # The measured record of record also lives in this job's log; the
         # artifact makes it downloadable for trend inspection. `if: always()`
         # so a red (regression) run's numbers are preserved too — that is
         # exactly when the record matters most. Story 17-1: ONE artifact
-        # carries BOTH report files (the default run's and the serve run's).
+        # carries BOTH report files (the default run's and the serve run's);
+        # story 21-5 adds the ps run's as the third.
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -678,6 +706,7 @@ jobs:
           path: |
             perf-budgets-report.json
             perf-budgets-serve-report.json
+            perf-budgets-ps-report.json
           if-no-files-found: warn
 
   agents-in-ci:
@@ -760,7 +789,7 @@ jobs:
             .github/fixtures/agents-in-ci-adapter.toml > "$leg/manifest/adapter.toml"
           "$hekma" agent register ci-bot --manifest "$leg/manifest"
           "$hekma" agent config set ci-bot budget.tokens.cumulative 100000
-          "$hekma" agent config set ci-bot budget.breach_action pause
+          "$hekma" agent config set ci-bot budget.breach_action stop
           "$hekma" agent config set ci-bot cost.rate.input 3.00
           "$hekma" agent config set ci-bot cost.rate.output 15.00
           "$hekma" agent start ci-bot --detach
@@ -791,7 +820,7 @@ jobs:
           # breach leg validates its enforcement; this pins its projection).
           s_limit=$(jq -r '.instance.budget.cumulative_limit // empty' "$leg/show.json")
           s_action=$(jq -r '.instance.budget.breach_action // empty' "$leg/show.json")
-          if [ "$s_limit" != "100000" ] || [ "$s_action" != "pause" ]; then
+          if [ "$s_limit" != "100000" ] || [ "$s_action" != "stop" ]; then
             echo "::error::success leg: show --json budget block missing/wrong (limit=$s_limit action=$s_action)"
             cat "$leg/show.json"
             exit 1
@@ -837,15 +866,18 @@ jobs:
             cat "$leg/final.json"
             exit 1
           fi
-      - name: Breach leg — the 90-token ceiling pauses the agent; the row proves it
+      - name: Breach leg — the 90-token ceiling stops the agent; the row proves it
         # The proven recipe: fixed 10-in/20-out sentinels against a cumulative
-        # ceiling of 90 tokens crosses at event 3. No rate is configured on
-        # this leg, and the summary's dollar cell renders the honest absence
-        # (`—`, never a fabricated $0.00) only AFTER the absence is asserted
-        # from `usage --json`. The breach proof is the paused
-        # Fleet row + budget fields (cumulative_limit 90, remaining clamped
-        # to 0, breach_action pause) read through `show --json` — the CLI
-        # has no breach exit code and the lane does not pretend otherwise.
+        # ceiling of 90 tokens crosses at event 3, and the recipe sets the
+        # Breach Action to `stop` explicitly (the default is `warn` since
+        # Policies landed — a spend cap in CI must end the job, not just
+        # record). No rate is configured on this leg, and the summary's
+        # dollar cell renders the honest absence (`—`, never a fabricated
+        # $0.00) only AFTER the absence is asserted from `usage --json`. The
+        # breach proof is the stopped Fleet row + budget fields
+        # (cumulative_limit 90, remaining clamped to 0, breach_action stop)
+        # read through `show --json` — the CLI has no breach exit code and
+        # the lane does not pretend otherwise.
         env:
           KTESIO_NO_UPDATE_CHECK: "1"
         shell: bash
@@ -859,23 +891,23 @@ jobs:
             .github/fixtures/agents-in-ci-adapter.toml > "$leg/manifest/adapter.toml"
           "$hekma" agent register ci-breach --manifest "$leg/manifest"
           "$hekma" agent config set ci-breach budget.tokens.cumulative 90
-          "$hekma" agent config set ci-breach budget.breach_action pause
+          "$hekma" agent config set ci-breach budget.breach_action stop
           "$hekma" agent start ci-breach --detach
-          paused=""
+          stopped=""
           for i in $(seq 1 60); do
             "$hekma" agent show ci-breach --json > "$leg/show.json" || { sleep 1; continue; }
             state=$(jq -r '.instance.state // empty' "$leg/show.json")
             limit=$(jq -r '.instance.budget.cumulative_limit // empty' "$leg/show.json")
             remaining=$(jq -r '.instance.budget.cumulative_remaining // empty' "$leg/show.json")
             action=$(jq -r '.instance.budget.breach_action // empty' "$leg/show.json")
-            if [ "$state" = "paused" ] && [ "$limit" = "90" ] && [ "$remaining" = "0" ] && [ "$action" = "pause" ]; then
-              paused=1
+            if [ "$state" = "stopped" ] && [ "$limit" = "90" ] && [ "$remaining" = "0" ] && [ "$action" = "stop" ]; then
+              stopped=1
               break
             fi
             sleep 1
           done
-          if [ -z "$paused" ]; then
-            echo "::error::breach leg: the agent never reached paused with its budget fields within the bound; last read:"
+          if [ -z "$stopped" ]; then
+            echo "::error::breach leg: the agent never reached stopped with its budget fields within the bound; last read:"
             cat "$leg/show.json"
             exit 1
           fi
@@ -883,7 +915,7 @@ jobs:
           out_tok=$(jq -r '.instance.usage.cumulative_output_tokens // 0' "$leg/show.json")
           total=$((in_tok + out_tok))
           if [ "$total" -lt 90 ]; then
-            echo "::error::breach leg: the paused row shows only $total committed tokens, below the 90 ceiling"
+            echo "::error::breach leg: the stopped row shows only $total committed tokens, below the 90 ceiling"
             cat "$leg/show.json"
             exit 1
           fi
@@ -899,16 +931,17 @@ jobs:
             echo "## Agents in CI — breach leg"
             echo ""
             echo "ci-breach crossed its cumulative ceiling of ${limit} tokens"
-            echo "(committed ${total}: ${in_tok} in / ${out_tok} out) and was paused by the"
+            echo "(committed ${total}: ${in_tok} in / ${out_tok} out) and was stopped by the"
             echo "configured Breach Action (\`${action}\`). There is no dedicated breach"
-            echo "exit code — this paused Fleet row IS the proof."
+            echo "exit code — this stopped Fleet row IS the proof."
             echo ""
             echo "| agent | state | ceiling tok | remaining | breach action | committed tok | cost |"
             echo "|-------|-------|-------------|-----------|---------------|---------------|------|"
             printf '| %s | %s | %s | %s | %s | %s | — (no rate configured) |\n' \
               ci-breach "$state" "$limit" "$remaining" "$action" "$total"
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-          "$hekma" agent stop ci-breach --timeout 0
+          # No teardown stop: the breach's `stop` already stopped the agent
+          # (asserted above), and stopping a stopped agent is refused (exit 4).
 
   docs:
     name: docs
@@ -1565,6 +1598,9 @@ jobs:
         # `fence` kind, whose refusals a Host re-derives below. Story 21-2
         # (vectors 1.2.0) adds the `ancestor-ceilings` rule and the `chain`
         # kind (one outcome per level, never a latched pair re-firing).
+        # Story 21-6 (vectors 1.4.0) adds the `re-arm` rule and the `rearm`
+        # kind, whose released latches and lifted fence reasons a Host
+        # re-derives below.
         run: |
           python3 - <<'PY'
           import json
@@ -1595,6 +1631,8 @@ jobs:
               "no-retro-repricing",
               "block-fence",
               "ancestor-ceilings",
+              "policy-resolution",
+              "re-arm",
           }
           missing = expected - tags
           assert not missing, f"uncovered rules: {sorted(missing)}"
@@ -1602,6 +1640,8 @@ jobs:
           assert kinds.get("derivation"), f"no derivation cases: {kinds}"
           assert kinds.get("fence"), f"no fence cases: {kinds}"
           assert kinds.get("chain"), f"no chain cases: {kinds}"
+          assert kinds.get("policy"), f"no policy cases: {kinds}"
+          assert kinds.get("rearm"), f"no rearm cases: {kinds}"
           for case in document["cases"]:
               if case["kind"] != "chain":
                   continue
@@ -1633,6 +1673,32 @@ jobs:
               assert (expected["dimension"], expected["scope"]) == first, case["id"]
               code = f"{first[0]}_{first[1].replace('-', '_')}"
               assert expected["code"] == code, case["id"]
+          # The re-arm rule (vectors 1.4.0), re-implemented as a Host
+          # would: a latch re-arms when its ceiling is now above its total
+          # or unset; its `block` fence reason lifts per reason.
+          totals_key = {
+              ("tokens", "per-run"): ("tokens_per_run", "run_tokens"),
+              ("tokens", "cumulative"): ("tokens_cumulative", "cumulative_tokens"),
+              ("dollars", "per-run"): ("dollars_per_run_micros", "run_cost_micros"),
+              ("dollars", "cumulative"): ("dollars_cumulative_micros", "cumulative_cost_micros"),
+          }
+          for case in document["cases"]:
+              if case["kind"] != "rearm":
+                  continue
+              arms = case["input"]["arms"]
+              totals = case["input"]["totals"]
+              released = []
+              lifted = []
+              for latched in case["input"]["latched"]:
+                  key = (latched["reason"]["dimension"], latched["reason"]["scope"])
+                  arm, total = totals_key[key]
+                  ceiling = arms.get(arm)
+                  if (ceiling is None or ceiling > totals[total]) and latched not in released:
+                      released.append(latched)
+                      if latched["action"] == "block" and latched["reason"] not in lifted:
+                          lifted.append(latched["reason"])
+              assert case["expected"]["unlatched"] == released, case["id"]
+              assert case["expected"]["fence_cleared"] == lifted, case["id"]
           print(
               "governance vectors ok:"
               f" {len(document['cases'])} cases {kinds},"

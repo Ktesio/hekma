@@ -212,7 +212,7 @@ pub enum AdapterResolveError {
 /// — just the manifest's `[lifecycle.start]` exec/args/env) and does so through a
 /// dedicated `LaunchSnapshot` DTO, mirroring the serialize-a-DTO-not-the-live-type
 /// discipline of the effective-config snapshot.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StartLaunch {
     /// The executable to run (program name or path).
     pub exec: String,
@@ -220,6 +220,24 @@ pub struct StartLaunch {
     pub args: Vec<String>,
     /// Environment overrides.
     pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// A redacting `Debug` (story 22-1): after the mapping runs the environment
+/// can carry resolved secrets and the launch's Run Key, so its values print
+/// as `[REDACTED]` (the names are kept).
+impl std::fmt::Debug for StartLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env: std::collections::BTreeMap<&str, &str> = self
+            .env
+            .keys()
+            .map(|key| (key.as_str(), crate::domain::REDACTED))
+            .collect();
+        f.debug_struct("StartLaunch")
+            .field("exec", &self.exec)
+            .field("args", &self.args)
+            .field("env", &env)
+            .finish()
+    }
 }
 
 /// Why a `start` launch could not be resolved (story 1.4).
@@ -532,7 +550,10 @@ pub fn resolve_config_mapping(
     // NATIVE code-declared mapping is validated here too, so a native `File`
     // target can never be absolute or escape the Agent Home. A malformed rule
     // rejects the start (a bad rule is an adapter authoring bug).
-    if let Err((key, detail)) = mapping.validate() {
+    if let Err((key, detail)) = mapping
+        .validate()
+        .and_then(|()| refuse_credential_targets(&mapping))
+    {
         return Err(LaunchResolveError::InvalidConfigMapping {
             adapter: kind.to_string(),
             key,
@@ -540,6 +561,32 @@ pub fn resolve_config_mapping(
         });
     }
     Ok(mapping)
+}
+
+/// Refuse a mapping that would deliver a credential anywhere but an
+/// environment variable (story 22-1): a `flag` target puts it on an argv
+/// other local users can read, a `file` target writes it into the Agent
+/// Home. Returns the offending key and the remediation.
+pub fn refuse_credential_targets(mapping: &ConfigMapping) -> Result<(), (String, String)> {
+    for key in [
+        crate::domain::config::RUN_KEY_KEY,
+        crate::domain::config::RUN_REFRESH_KEY_KEY,
+    ] {
+        match mapping.target(key) {
+            None | Some(ConfigTarget::Env { .. }) => {}
+            Some(ConfigTarget::Flag { .. }) | Some(ConfigTarget::File(_)) => {
+                return Err((
+                    key.to_string(),
+                    format!(
+                        "`{key}` carries a credential, so it may only be delivered through an \
+                         environment variable — map it with `env = \"…\"` (a `flag` would put \
+                         it on the command line, a `file` would write it into the Agent Home)"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the adapter's optional declared readiness gate
@@ -824,6 +871,28 @@ pub fn apply_config_mapping(
         // the plain display(); a secret leaf missing from `secrets` fails CLOSED to
         // the masked display() (never a leak). This is the ONE place cleartext is
         // exposed for delivery — display() everywhere else stays masked.
+        // Story 22-1: a reserved credential leaf is delivered ONLY from the
+        // per-launch secrets map (its stored value is a marker); a leaf with
+        // no secret delivers nothing. The Run Key always reaches the
+        // engine's default environment variable as well as any `env`
+        // target the Adapter maps it to.
+        if crate::domain::config::is_reserved_credential_key(dotted_key) {
+            let Some(secret) = secrets.get(dotted_key) else {
+                continue;
+            };
+            if dotted_key == crate::domain::config::RUN_KEY_KEY {
+                launch.env.insert(
+                    crate::domain::config::RUN_KEY_ENV.to_string(),
+                    secret.expose_secret().to_string(),
+                );
+            }
+            if let Some(ConfigTarget::Env { env }) = mapping.target(dotted_key) {
+                launch
+                    .env
+                    .insert(env.clone(), secret.expose_secret().to_string());
+            }
+            continue;
+        }
         let value = match secrets.get(dotted_key) {
             Some(secret) => secret.expose_secret().to_string(),
             None => resolved.display(),
@@ -1038,6 +1107,14 @@ fn resolve_manifest(path: &Path) -> Result<ResolvedAdapter, AdapterResolveError>
     manifest
         .validate()
         .map_err(|e| to_invalid(&manifest_path, e))?;
+    // Story 22-1: a credential key mapped to a `flag` or `file` target is
+    // refused at registration, naming the key and the remediation.
+    if let Err((key, detail)) = refuse_credential_targets(&manifest.config_mapping()) {
+        return Err(AdapterResolveError::ManifestInvalid {
+            path: manifest_path.to_string_lossy().into_owned(),
+            detail: format!("[config.\"{key}\"]: {detail}"),
+        });
+    }
 
     // Contract v1 negotiation (story 6-6, FR-30): registration REFUSES a
     // manifest whose contract major differs from this engine's, naming both
@@ -2701,6 +2778,77 @@ max_age_ms = 5000
                 assert!(detail.contains("1..=600_000"), "{detail}");
             }
             other => panic!("expected InvalidDrain, got {other}"),
+        }
+    }
+
+    #[test]
+    fn resolve_drain_plan_refuses_an_out_of_range_drain_bound() {
+        // A `[drain]` bound hand-edited to zero after registration: the verb
+        // refuses with InvalidDrain naming the adapter and the bound, never a
+        // drain that completes before it waited at all.
+        let tmp = TempDir::new().unwrap();
+        let body = DRAIN_PLAN_MANIFEST.replace("timeout_ms = 5_000", "timeout_ms = 0");
+        let path = write_manifest(tmp.path(), &body);
+        match resolve_drain_plan("demo", Some(&path)).unwrap_err() {
+            LaunchResolveError::InvalidDrain { adapter, detail } => {
+                assert_eq!(adapter, "demo");
+                assert!(detail.contains("timeout_ms"), "{detail}");
+                assert!(detail.contains("1..=600_000"), "{detail}");
+            }
+            other => panic!("expected InvalidDrain, got {other}"),
+        }
+    }
+
+    /// Every per-call manifest resolver, run against one manifest path, its
+    /// outcome reduced to the error (or `None` when it resolved).
+    fn every_resolver_error(path: &Path) -> Vec<(&'static str, Option<LaunchResolveError>)> {
+        vec![
+            (
+                "readiness",
+                resolve_readiness_probe("demo", Some(path)).err(),
+            ),
+            ("liveness", resolve_liveness_check("demo", Some(path)).err()),
+            ("exit codes", resolve_exit_codes("demo", Some(path)).err()),
+            ("drain plan", resolve_drain_plan("demo", Some(path)).err()),
+        ]
+    }
+
+    #[test]
+    fn every_manifest_resolver_reports_a_vanished_manifest_as_unreadable_naming_the_path() {
+        // The manifest was deleted after registration: each per-call resolver
+        // refuses with ManifestUnreadable naming the path it tried, never a
+        // silent "nothing declared" that would drop the declared section.
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("gone").join(MANIFEST_FILE);
+        for (what, err) in every_resolver_error(&missing) {
+            match err {
+                Some(LaunchResolveError::ManifestUnreadable { path, detail }) => {
+                    assert_eq!(path, missing.to_string_lossy(), "{what}");
+                    assert!(!detail.is_empty(), "{what}: the I/O cause is carried");
+                }
+                other => panic!("{what}: expected ManifestUnreadable, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_manifest_resolver_reports_a_corrupted_manifest_as_unreadable_naming_the_path() {
+        // The manifest was hand-edited into invalid TOML after registration:
+        // each per-call resolver refuses with ManifestUnreadable naming the
+        // path and the parse failure, never a launch from a guessed section.
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(tmp.path(), "contract_version = = \"1.1.0\"");
+        for (what, err) in every_resolver_error(&path) {
+            match err {
+                Some(LaunchResolveError::ManifestUnreadable {
+                    path: named,
+                    detail,
+                }) => {
+                    assert_eq!(named, path.to_string_lossy(), "{what}");
+                    assert!(!detail.is_empty(), "{what}: the parse cause is carried");
+                }
+                other => panic!("{what}: expected ManifestUnreadable, got {other:?}"),
+            }
         }
     }
 }

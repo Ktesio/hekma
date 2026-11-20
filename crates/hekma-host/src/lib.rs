@@ -139,6 +139,12 @@ pub struct ServeOptions {
     /// production caller) keeps the 30 s window. Not an operator surface.
     #[doc(hidden)]
     pub autostart_idle_override: Option<std::time::Duration>,
+    /// Story 21-6's TEST SCALING SEAM for the Control API's set tokens:
+    /// `Some(ttl)` overrides the 10-minute lifetime (`Duration::ZERO`
+    /// expires every token at once). `None` (every production caller)
+    /// keeps 10 minutes. Not an operator surface.
+    #[doc(hidden)]
+    pub set_token_ttl_override: Option<std::time::Duration>,
 }
 
 /// Story 21-4: how long an AUTO-STARTED host waits with no live agent and no
@@ -390,6 +396,7 @@ where
         autostart,
         build_version,
         autostart_idle_override,
+        set_token_ttl_override,
     } = options;
     let has_caller_sink = diagnostics.is_some();
     let notifier = match diagnostics {
@@ -788,6 +795,7 @@ where
         resolver,
         note_tap,
         notifier.sink.clone(),
+        set_token_ttl_override,
     )) {
         Ok(api) => api,
         Err(message) => {

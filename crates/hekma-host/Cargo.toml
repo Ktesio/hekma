@@ -81,6 +81,10 @@ rustls-pki-types = { version = "1", features = ["std"] }
 ring = { version = "0.17", default-features = false }
 
 [dev-dependencies]
+# Story 21-5: the listing tests seed Run rows straight into the store the
+# same way the CLI suite does (rows, no processes — Windows-safe); the
+# workspace's bundled-SQLite pin, dev-only.
+rusqlite = { workspace = true }
 # Story 21-4: a self-signed certificate for the TLS listener tests (the
 # workspace's dev-only rcgen pin — never a shipping artifact).
 rcgen = { workspace = true }

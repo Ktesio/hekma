@@ -170,6 +170,9 @@ fn a_dollar_cap_breach_pauses_by_default_and_records_a_dollar_breach() {
     facade
         .set_config("capdollar", "budget.dollars.cumulative", "0.00009")
         .unwrap();
+    facade
+        .set_config("capdollar", "budget.breach_action", "pause")
+        .unwrap();
 
     facade.start("capdollar").unwrap();
 
@@ -268,6 +271,9 @@ fn the_ge_boundary_a_cost_exactly_at_the_cap_breaches() {
     set_unit_rate(&facade, "edgedollar");
     facade
         .set_config("edgedollar", "budget.dollars.cumulative", "0.00003")
+        .unwrap();
+    facade
+        .set_config("edgedollar", "budget.breach_action", "pause")
         .unwrap();
 
     facade.start("edgedollar").unwrap();
@@ -429,6 +435,9 @@ fn a_cost_cap_with_no_rate_is_inert_while_token_budgets_still_fire() {
     // (90 tokens; 30 tokens/event).
     facade
         .set_config("inert", "budget.dollars.cumulative", "0.00001")
+        .unwrap();
+    facade
+        .set_config("inert", "budget.breach_action", "pause")
         .unwrap();
     facade
         .set_config("inert", "budget.tokens.cumulative", "90")
