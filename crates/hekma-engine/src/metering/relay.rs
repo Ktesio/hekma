@@ -236,6 +236,9 @@ pub(crate) fn proxy_client(tls: Arc<rustls::ClientConfig>) -> ForwardClient {
     let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
     http.enforce_http(false);
     http.set_connect_timeout(Some(std::time::Duration::from_secs(10)));
+    // No Nagle on the upstream hop either (the accepted side already sets
+    // it): a small request must not wait on the peer's delayed ACK.
+    http.set_nodelay(true);
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config((*tls).clone())
         .https_or_http()
