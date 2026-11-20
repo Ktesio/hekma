@@ -79,6 +79,8 @@ The `[config]` mapping turns documented unified keys into native mechanisms (`en
 - **Self-updating agents** must have their update-disable mechanism mapped and delivered by the start seam, and adapter docs must state whether the agent's config chain contains a higher-authority (managed/MDM) layer that could override supervisor-delivered values (so an operator can verify the pin survived).
 - **Isolation keys**: adapters document the environment levers that give each instance its own data/config roots (Hermes: `HERMES_HOME`; XDG-based agents: `XDG_DATA_HOME` + `XDG_CONFIG_HOME`). **Per-instance isolated roots inside each Agent Home are the recommended normative posture** — they make shared-root concurrency out of contract scope. Where a lever is an undocumented agent interface, the adapter must say so and re-validate per pinned release (undocumented levers are acceptable with that per-release obligation, not silently).
 
+The engine reserves two more delivery keys for a launch's credentials, `run.key` and `run.refresh_key` ([Run Keys](run-keys.md)): every agent receives its Run Key in `HEKMA_RUN_KEY`, an adapter may map either key to an `env` target only (a `flag` or `file` target is refused at registration), and a refresh credential is issued only when `run.refresh_key` is mapped. They are ordinary `[config]` mappings; the contract version does not change.
+
 ### What is checked versus honored (the TCK's honest reach)
 
 The contract's duties split into two classes, and adapter authors should know which is which:

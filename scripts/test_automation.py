@@ -673,7 +673,18 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertNotIn("--profile parallel-heavy", ci)
         # The unbounded group + shadow profile exist.
         self.assertIn("[test-groups.unbounded]", nextest)
-        self.assertIn("max-threads = 2147483647", nextest)
+        self.assertIn("max-threads = 512", nextest)
+        # No group may ask for a huge max-threads: nextest reserves every
+        # defined group's slot heap at run start (8 bytes a slot), and the
+        # old i32::MAX value was a 16 GiB request that aborted ubuntu runs
+        # when Linux refused it (2026-11-13 to 11-16).
+        caps = [
+            int(line.split("=", 1)[1].strip())
+            for line in nextest.splitlines()
+            if line.strip().startswith("max-threads") and line.split("=", 1)[1].strip().isdigit()
+        ]
+        self.assertTrue(caps, "the test groups declare numeric max-threads")
+        self.assertTrue(all(cap <= 4096 for cap in caps), caps)
         self.assertIn("[profile.parallel-heavy]", nextest)
         # Shadow-pair equality: each serialized filter appears EXACTLY
         # twice — once under `default`'s overrides (serialized group) and
@@ -1183,6 +1194,38 @@ class ReleaseDocsTests(unittest.TestCase):
             serve_step_slice,
             "the serve step writes its own report file (perf-budgets-serve-report.json)",
         )
+        # Story 21-5: the Run-scale listing scenario is its OWN blocking run
+        # step too (gated budgets CI never runs are not gates), pinned like
+        # the serve step: the last line is EXACTLY the bare binary plus
+        # `--ps-seed 10000` (the CI seed), `set -euo pipefail`, no
+        # failure-swallowing idiom, no baseline (the canonical baseline
+        # carries no ps metric), and its own report-path env var scoped to
+        # the step.
+        self.assertIn("- name: Run the Run-scale listing scenario", perf_job)
+        ps_step = perf_job.index("- name: Run the Run-scale listing scenario")
+        self.assertGreater(ps_step, serve_step, "the ps run follows the serve run")
+        ps_text = perf_job[perf_job.index("run: |", ps_step) :]
+        next_ps_step = _re.search(r"\n      - name:", ps_text[1:])
+        ps_block = ps_text[: 1 + next_ps_step.start()] if next_ps_step else ps_text
+        ps_last_line = next(
+            line for line in reversed(ps_block.splitlines()) if line.strip()
+        )
+        self.assertEqual(
+            ps_last_line.strip(),
+            "target/release/examples/perf-budgets --ps-seed 10000",
+            "the ps run's last line is the bare binary + its flag — no "
+            "redirection, no chaining",
+        )
+        self.assertIn("set -euo pipefail", ps_block)
+        self.assertNotIn("|| true", ps_block)
+        self.assertNotIn("exit 0", ps_block)
+        self.assertNotIn("--baseline", ps_block, "the ps run does not ratchet")
+        ps_upload = perf_job.index("- name: Upload the measured report", ps_step)
+        self.assertIn(
+            "PERF_BUDGETS_REPORT_PATH: perf-budgets-ps-report.json",
+            perf_job[ps_step:ps_upload],
+            "the ps step writes its own report file (perf-budgets-ps-report.json)",
+        )
         # The measured record is also uploaded as the job's artifact (even on
         # a red run): the harness writes it via the env var, the upload step
         # publishes it, and the upload is not skipped on failure.
@@ -1196,6 +1239,11 @@ class ReleaseDocsTests(unittest.TestCase):
             "perf-budgets-serve-report.json",
             upload,
             "story 17-1: ONE artifact carries both report files (default + serve)",
+        )
+        self.assertIn(
+            "perf-budgets-ps-report.json",
+            upload,
+            "story 21-5: the same artifact carries the ps run's report",
         )
         self.assertTrue(example.is_file(), "the perf-budgets harness example must exist")
         self.assertTrue(

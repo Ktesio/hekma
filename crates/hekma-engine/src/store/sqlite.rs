@@ -91,7 +91,13 @@ use crate::ports::{
 /// see [`super::runs_sqlite`].
 /// v14 (story 21-9): `run_labels.origin`, each bound label's origin —
 /// see [`super::runs_sqlite`].
-const SCHEMA_VERSION: i64 = 14;
+/// v15 (story 21-3): Policies, the per-Run resolutions, and the FR-21
+/// upgrade marker — see [`super::runs_sqlite`].
+/// v16 (story 21-5): the Run listing's three partial indexes —
+/// see [`super::runs_sqlite`].
+/// v17 (story 22-1): `tokens`, the credential hashes and their metadata —
+/// see [`super::tokens_sqlite`].
+pub(crate) const SCHEMA_VERSION: i64 = 17;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -388,18 +394,22 @@ impl SqliteStore {
     /// the state dir before opening. Idempotent across reopens.
     #[cfg(test)]
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        Self::open_with_legacy(path, &NoLegacy).map(|(store, _notes)| store)
+        Self::open_with_legacy(path, &NoLegacy, &super::runs_sqlite::NoBreachDefault)
+            .map(|(store, _notes)| store)
     }
 
     /// Open read-write and migrate, importing the pre-v12 event files from
-    /// `legacy` if the v12 step runs (story 21-1). The store writer's open.
+    /// `legacy` if the v12 step runs (story 21-1) and reading the persisted
+    /// config layers through `breach` if the v15 step runs (story 21-3).
+    /// The store writer's open.
     pub(crate) fn open_with_legacy(
         path: &Path,
         legacy: &dyn LegacySource,
+        breach: &dyn super::runs_sqlite::BreachDefaultSource,
     ) -> Result<(Self, OpenNotes), StoreError> {
         let conn = Connection::open(path).map_err(backend)?;
         Self::configure(&conn)?;
-        let notes = migrate(&conn, legacy)?;
+        let notes = migrate(&conn, legacy, breach)?;
         // Fold any usage row another writer left unfolded (an older engine
         // still running against this database after the upgrade).
         in_immediate_txn(&conn, || super::run_store_sqlite::fold_unfolded_rows(&conn))?;
@@ -457,7 +467,7 @@ impl SqliteStore {
     /// `query_only` — nothing is created on disk.
     pub(crate) fn open_empty_read_only() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory().map_err(backend)?;
-        migrate(&conn, &NoLegacy)?;
+        migrate(&conn, &NoLegacy, &super::runs_sqlite::NoBreachDefault)?;
         conn.pragma_update(None, "query_only", "ON")
             .map_err(backend)?;
         Ok(Self { conn })
@@ -473,7 +483,7 @@ impl SqliteStore {
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory().map_err(backend)?;
         Self::configure(&conn)?;
-        migrate(&conn, &NoLegacy)?;
+        migrate(&conn, &NoLegacy, &super::runs_sqlite::NoBreachDefault)?;
         Ok(Self { conn })
     }
 
@@ -628,7 +638,11 @@ impl SqliteStore {
 /// [`SCHEMA_VERSION`] was written by a newer ktesio. We refuse it with
 /// [`StoreError::SchemaTooNew`] rather than skip the DDL and stamp the version
 /// back down — the old behavior silently downgraded a forward schema.
-fn migrate(conn: &Connection, legacy: &dyn LegacySource) -> Result<OpenNotes, StoreError> {
+fn migrate(
+    conn: &Connection,
+    legacy: &dyn LegacySource,
+    breach: &dyn super::runs_sqlite::BreachDefaultSource,
+) -> Result<OpenNotes, StoreError> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(backend)?;
@@ -707,6 +721,23 @@ fn migrate(conn: &Connection, legacy: &dyn LegacySource) -> Result<OpenNotes, St
     // `config` (one crash-atomic step).
     if version < 14 {
         super::runs_sqlite::migrate_v14(conn)?;
+    }
+    // Story 21-3: v15 adds Policies, the per-Run resolutions, and the FR-21
+    // breach-default upgrade's pending list (one crash-atomic step; the
+    // config.toml writes and the closing transaction run after the writer
+    // opens — see the registry's finish pass).
+    if version < 15 {
+        super::runs_sqlite::migrate_v15(conn, breach)?;
+    }
+    // Story 21-5: v16 adds the Run listing's three partial indexes (one
+    // crash-atomic step, additive DDL only).
+    if version < 16 {
+        super::runs_sqlite::migrate_v16(conn)?;
+    }
+    // Story 22-1: v17 adds `tokens` and its three indexes (one crash-atomic
+    // step, additive DDL only, no backfill).
+    if version < 17 {
+        super::tokens_sqlite::migrate_v17(conn)?;
     }
     Ok(notes)
 }
@@ -5257,5 +5288,49 @@ mod tests {
         )
         .expect("an already-migrated database is not migrated twice");
         assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn per_instance_reads_and_idempotent_clears_on_an_unregistered_name_are_empty_successes() {
+        // A name with no instance row: every read answers the honest empty
+        // value and every idempotent clear succeeds (the desired end state
+        // already holds) — none of them is an error, and none writes a row.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let ghost = name("ghost");
+        assert!(store.usage_events(&ghost).unwrap().is_empty());
+        assert!(store.get_spawn_record(&ghost).unwrap().is_none());
+        assert!(store.get_memory_backing(&ghost).unwrap().is_none());
+        store.clear_spawn_record(&ghost).unwrap();
+        store.clear_memory_backing(&ghost).unwrap();
+        // A vanished record adopts nothing: the lease answers "skip".
+        assert!(!store
+            .try_acquire_adoption_lease(&ghost, None, ProcessFingerprint::new(1, 1))
+            .unwrap());
+        assert!(store.list_instances().unwrap().is_empty());
+        assert!(store.list_spawn_records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn identity_writes_against_an_unregistered_name_are_not_found_naming_it() {
+        // The resume id and the durable Run id must never vanish silently:
+        // writing either for a name with no instance row is NotFound naming
+        // that name (the caller surfaces it), never a quiet no-op.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let ghost = name("ghost");
+        // The assertion messages stay static: a resume id is never printed.
+        let session = store.set_acp_session_id(&ghost, Some("sess-1"));
+        assert!(
+            matches!(&session, Err(StoreError::NotFound { name }) if name == "ghost"),
+            "a resume id written for an unregistered name is NotFound naming it"
+        );
+        let run = store.set_spawn_run_id(
+            &ghost,
+            &RunId::from_wire("run-1"),
+            &ProcessFingerprint::new(42, 7),
+        );
+        assert!(
+            matches!(&run, Err(StoreError::NotFound { name }) if name == "ghost"),
+            "a Run id written for an unregistered name is NotFound naming it"
+        );
     }
 }
