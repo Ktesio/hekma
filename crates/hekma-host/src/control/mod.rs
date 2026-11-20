@@ -25,6 +25,7 @@ mod dto;
 mod error;
 pub(crate) mod notes;
 mod routes;
+pub(crate) mod sets;
 mod sse;
 pub(crate) mod tls;
 
@@ -37,7 +38,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::middleware;
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::Router;
 use hekma_engine::DiagnosticSink;
 use tokio::sync::watch;
@@ -77,6 +78,16 @@ pub(crate) struct ApiState {
     /// only): `/v0/version` — the CLI's discovery probe — must never wait
     /// on an engine lock that a long `stop` holds (story 21-4 review).
     log_capture: hekma_engine::LogCaptureMode,
+    /// The pending Run sets `POST /v0/runs/select` minted (story 21-6):
+    /// host memory only, shared by every listener.
+    sets: sets::SetStore,
+    /// Story 22-1: whether THIS listener is loopback — a supervised Run's
+    /// Run Key is refused beyond loopback (it has no network use). Each
+    /// listener gets its own router over a state that says which it is.
+    loopback: bool,
+    /// Story 22-1: the rate-limited count of unresolved presentations,
+    /// shared by every listener.
+    auth_diagnostics: auth::AuthDiagnostics,
 }
 
 /// The API's request activity (story 21-4): how many authenticated requests
@@ -208,15 +219,54 @@ fn router(state: ApiState) -> Router {
             put(routes::restart_policy_put),
         )
         // Runs (story 21-2): open a child Run, read a Run, close a child.
-        .route("/v0/runs", post(routes::run_open))
+        // Story 21-5: the listing (`GET /v0/runs`) — the same document
+        // `hekma ps --json` prints.
+        .route("/v0/runs", get(routes::runs_list).post(routes::run_open))
         .route("/v0/runs/{id}", get(routes::run_show))
         .route("/v0/runs/{id}/close", post(routes::run_close))
+        // Story 22-1: Run Keys — trade a refresh credential (no id in the
+        // path: the credential names its Run), revoke a Run's keys, list
+        // a Run's key metadata.
+        .route("/v0/runs/refresh", post(routes::run_refresh))
+        .route("/v0/runs/{id}/revoke-keys", post(routes::run_revoke_keys))
+        .route("/v0/runs/{id}/keys", get(routes::run_keys))
+        // Story 21-6: the Run-grain lifecycle verbs, Run-level limits, and
+        // Selector sets (select once, act on exactly that set — the token
+        // rides the body, never a URL).
+        .route("/v0/runs/{id}/stop", post(routes::run_stop))
+        .route("/v0/runs/{id}/pause", post(routes::run_pause))
+        .route("/v0/runs/{id}/resume", post(routes::run_resume))
+        .route("/v0/runs/{id}/drain", post(routes::run_drain))
+        .route(
+            "/v0/runs/{id}/limits",
+            get(routes::run_limits_get).patch(routes::run_limits_patch),
+        )
+        .route("/v0/runs/select", post(routes::runs_select))
+        .route("/v0/runs/stop", post(routes::runs_stop))
+        .route("/v0/runs/pause", post(routes::runs_pause))
+        .route("/v0/runs/resume", post(routes::runs_resume))
+        .route("/v0/runs/drain", post(routes::runs_drain))
+        .route("/v0/runs/close", post(routes::runs_close))
+        .route("/v0/runs/labels", patch(routes::runs_labels_patch))
+        .route("/v0/runs/limits", post(routes::runs_limits))
         // Bound labels (story 21-9): read a Run's labels, bind and unbind
         // them as the Operator (this bearer is the Operator's; the Run Key
         // and announce credential classes never reach these routes).
         .route(
             "/v0/runs/{id}/labels",
             get(routes::run_labels_get).patch(routes::run_labels_patch),
+        )
+        // Policies (story 21-3): Operator-set limits for the Runs a
+        // Selector matches by bound label (this bearer is the Operator's).
+        .route(
+            "/v0/policies",
+            get(routes::policies_list).post(routes::policy_create),
+        )
+        .route(
+            "/v0/policies/{name}",
+            get(routes::policy_show)
+                .patch(routes::policy_change)
+                .delete(routes::policy_delete),
         )
         // Live events (SSE).
         .route("/v0/events", get(sse::live_events))
@@ -241,6 +291,12 @@ fn router(state: ApiState) -> Router {
             state.clone(),
             auth::require_bearer,
         ))
+        // Story 22-1: OUTSIDE the auth layer — a credential in a path or
+        // query is refused (and revoked) before anything authenticates.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::refuse_credential_in_url,
+        ))
         .with_state(state)
 }
 
@@ -249,6 +305,80 @@ fn router(state: ApiState) -> Router {
 /// (the cooperative close), so this is generous headroom for the rest — one
 /// second is plenty for loopback reads.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Test-only construction of an [`ApiState`] over a read-only engine on a
+/// fresh temp state dir, with its shutdown SENDER so a test can fire the
+/// cooperative close (the streams watch THIS channel; a separate
+/// `watch::channel` in the test would never be observed).
+///
+/// The engine (and its runtime) are LEAKED, never dropped: these tests run
+/// inside `#[tokio::test]`'s async context, where dropping a runtime
+/// panics ("blocking is not allowed"), and the state's own temp root rides
+/// `TempDir::into_path` for the same reason. Four seams, one process — the
+/// leak is bounded and test-only.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn quiet_api_state() -> (ApiState, watch::Sender<bool>) {
+        // Build on a plain thread: a blocking context for the engine's own
+        // runtime construction, however the test is driven.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let root = tempfile::TempDir::new().expect("a temp state root");
+            let engine = hekma_engine::Engine::open_read_only(Some(root.path().to_path_buf()))
+                .expect("a read-only engine");
+            let engine = std::sync::Arc::new(engine);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let state = ApiState {
+                engine: std::sync::Arc::clone(&engine),
+                resolver: CredentialResolver::new([("quiet", CredentialClass::OperatorBearer)]),
+                config_write: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                shutdown: shutdown_rx,
+                activity: Activity::new(),
+                notes: NoteTap::keeping_startup_notes(),
+                log_capture: hekma_engine::LogCaptureMode::Full,
+                sets: sets::SetStore::new(None),
+                loopback: true,
+                auth_diagnostics: auth::AuthDiagnostics::new(None, auth::AuthDiagnostics::INTERVAL),
+            };
+            // Leak the engine (never dropped) and the temp root.
+            std::mem::forget(engine);
+            std::mem::forget(root);
+            let _ = tx.send((state, shutdown_tx));
+        });
+        rx.recv().expect("the quiet state")
+    }
+
+    /// Like [`quiet_api_state`] over a WRITABLE engine (story 21-5's SSE
+    /// seam tests commit events through it). Leaked the same way.
+    pub(crate) fn writable_api_state() -> (ApiState, watch::Sender<bool>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let root = tempfile::TempDir::new().expect("a temp state root");
+            let engine = hekma_engine::Engine::open(Some(root.path().to_path_buf()))
+                .expect("a writable engine");
+            let engine = std::sync::Arc::new(engine);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let state = ApiState {
+                engine: std::sync::Arc::clone(&engine),
+                resolver: CredentialResolver::new([("quiet", CredentialClass::OperatorBearer)]),
+                config_write: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                shutdown: shutdown_rx,
+                activity: Activity::new(),
+                notes: NoteTap::keeping_startup_notes(),
+                log_capture: hekma_engine::LogCaptureMode::Full,
+                sets: sets::SetStore::new(None),
+                loopback: true,
+                auth_diagnostics: auth::AuthDiagnostics::new(None, auth::AuthDiagnostics::INTERVAL),
+            };
+            std::mem::forget(engine);
+            std::mem::forget(root);
+            let _ = tx.send((state, shutdown_tx));
+        });
+        rx.recv().expect("the writable state")
+    }
+}
 
 /// One listener the API serves on (story 21-4).
 pub(crate) enum ListenerSpec {
@@ -323,11 +453,12 @@ impl BoundListeners {
         resolver: CredentialResolver,
         notes: NoteTap,
         sink: DiagnosticSink,
+        set_token_ttl: Option<Duration>,
     ) -> Result<ControlApi, String> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let activity = Activity::new();
         let log_capture = engine.log_capture_mode().await;
-        let app = router(ApiState {
+        let state = ApiState {
             engine,
             resolver,
             config_write: Arc::new(tokio::sync::Mutex::new(())),
@@ -335,10 +466,22 @@ impl BoundListeners {
             activity: activity.clone(),
             notes,
             log_capture,
-        });
+            sets: sets::SetStore::new(set_token_ttl),
+            loopback: true,
+            auth_diagnostics: auth::AuthDiagnostics::new(
+                Some(Notifier::over(sink.clone())),
+                auth::AuthDiagnostics::INTERVAL,
+            ),
+        };
         let mut tasks = Vec::with_capacity(self.bound.len());
         let mut accept_tasks = Vec::new();
         for (listener, local_addr, tls) in self.bound {
+            // One router per listener, sharing every piece of state but the
+            // loopback fact (story 22-1, P5).
+            let app = router(ApiState {
+                loopback: local_addr.ip().is_loopback(),
+                ..state.clone()
+            });
             let notifier = Notifier::over(sink.clone());
             let task = match tls {
                 None => spawn_serve(listener, app.clone(), shutdown_rx.clone(), notifier),

@@ -12,17 +12,25 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Current time as whole seconds since the Unix epoch.
+///
+/// The companion of [`now_rfc3339`] for callers that need arithmetic on the
+/// instant (the Run listing's ended-Run window: `now − N days`, formatted
+/// back through [`format_rfc3339`]). Clamps to the epoch like its sibling.
+pub fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Current time as an RFC 3339 UTC string, e.g. `2026-07-03T14:05:09Z`.
 ///
 /// Uses the system clock. Times before the Unix epoch (clock set wildly in the
 /// past) clamp to the epoch rather than panicking — this is state metadata, not
 /// a correctness-critical value.
 pub fn now_rfc3339() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format_rfc3339(secs)
+    format_rfc3339(now_unix_secs())
 }
 
 /// Format a count of whole seconds since the Unix epoch as RFC 3339 UTC.

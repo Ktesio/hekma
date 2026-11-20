@@ -94,6 +94,16 @@ fn recorded_state_note(entry: &FleetEntry) -> Option<String> {
     })
 }
 
+/// The FR-21 "kept on pause by upgrade" note (story 21-3): the instance's
+/// effective Breach Action is `pause` because the upgrade wrote it, and it
+/// stays until a Breach Action is set explicitly. `None` for every other
+/// row.
+fn breach_default_note(entry: &FleetEntry) -> Option<&'static str> {
+    entry
+        .breach_default_upgraded
+        .then_some("kept on pause by upgrade (set a Breach Action to change it)")
+}
+
 /// The stderr gap NOTE for one gapped entry (story 14-3, AI-18 — the narrow
 /// `list` cell truncates to the bare `—`, so the full tier breakdown rides
 /// the stderr note channel, AD-12). Composed from the engine's structured
@@ -617,8 +627,14 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
         // synthesized.
         let entry = facade.fleet_entry(name).map_err(map_error)?;
         let gone_note = recorded_state_note(&entry);
+        let upgraded_note = breach_default_note(&entry);
         let json = show_json(entry)?;
         println!("{json}");
+        if let Some(note) = upgraded_note {
+            // stderr beside the pure-JSON stdout (AD-12): the row's
+            // `breach_default_upgraded` field carries it for machines.
+            ui::note(note);
+        }
         if let Some(note) = gone_note {
             ui::note(note);
         }
@@ -641,6 +657,9 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .and_then(|f| f.into_iter().find(|e| e.name.as_str() == name));
             render_runtime_status(&status, entry.as_ref());
+            if let Some(note) = entry.as_ref().and_then(breach_default_note) {
+                ui::note(note);
+            }
             if let Some(note) = entry.as_ref().and_then(recorded_state_note) {
                 ui::note(note);
             }
@@ -1159,6 +1178,9 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         let empty = listing.instances.is_empty();
         let document = fleet_json(&listing)?;
         println!("{document}");
+        for note in listing.instances.iter().filter_map(breach_default_note) {
+            ui::note(note);
+        }
         for note in listing.instances.iter().filter_map(recorded_state_note) {
             ui::note(note);
         }
@@ -1482,6 +1504,21 @@ pub fn start(name: &str, detach: bool) -> Result<(), Box<dyn std::error::Error>>
 const STOP_WINDOW_MIN_SECS: u64 = hekma_host::MIN_STOP_WINDOW_SECS;
 const STOP_WINDOW_MAX_SECS: u64 = hekma_host::MAX_STOP_WINDOW_SECS;
 
+/// `--timeout <secs>` as the Service Host serves it: within
+/// 1..=86400 s (a zero window would be an instant kill, a longer one a
+/// lifetime), a value outside served at the nearest bound — and said so
+/// (AI-18). Every stop path (an agent, a run id, a Selector) uses it.
+pub(crate) fn served_stop_window(secs: u64) -> u64 {
+    let served = secs.clamp(STOP_WINDOW_MIN_SECS, STOP_WINDOW_MAX_SECS);
+    if served != secs {
+        ui::note(format!(
+            "--timeout {secs} is served as a {served}s window (the stop window is bounded to \
+             {STOP_WINDOW_MIN_SECS}..={STOP_WINDOW_MAX_SECS} seconds)"
+        ));
+    }
+    served
+}
+
 /// `hekma agent stop <name> [--timeout <secs>]` — stop a running Agent Instance
 /// (AC3/AC4).
 ///
@@ -1491,19 +1528,7 @@ const STOP_WINDOW_MAX_SECS: u64 = hekma_host::MAX_STOP_WINDOW_SECS;
 /// stop on `stopped`, AC4) to stderr.
 pub fn stop(name: &str, timeout_secs: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
     validate_instance_name(name)?;
-    // The Service Host serves a stop window within 1..=86400 s (a zero
-    // window would be an instant kill, a longer one a lifetime): a value
-    // outside it is served at the nearest bound — and said so (AI-18).
-    let window = timeout_secs.map(|secs| {
-        let served = secs.clamp(STOP_WINDOW_MIN_SECS, STOP_WINDOW_MAX_SECS);
-        if served != secs {
-            ui::note(format!(
-                "--timeout {secs} is served as a {served}s window (the stop window is bounded \
-                 to {STOP_WINDOW_MIN_SECS}..={STOP_WINDOW_MAX_SECS} seconds)"
-            ));
-        }
-        served
-    });
+    let window = timeout_secs.map(served_stop_window);
     let body = window.map(|secs| json!({ "window_secs": secs }));
     let routed = route(
         "POST",
@@ -2074,7 +2099,7 @@ fn follow_exit_note(name: &str, state: LifecycleState) -> String {
 /// uses — no `Engine::pause` signature change). A read-back failure is swallowed:
 /// it must never turn a successful pause into a CLI error (the state already
 /// changed and the machine-readable qualifier is already in the event log).
-fn note_if_best_effort(name: &str, op: &str) {
+pub(crate) fn note_if_best_effort(name: &str, op: &str) {
     let Ok(engine) = open_read_only_engine() else {
         return;
     };
@@ -2794,18 +2819,27 @@ fn governance_vectors_summary(
     };
     // Counted per kind with an exhaustive match, so a new case kind can never
     // be folded silently into another kind's count.
-    let (mut decision_cases, mut derivation_cases, mut fence_cases, mut chain_cases) = (0, 0, 0, 0);
+    let (
+        mut decision_cases,
+        mut derivation_cases,
+        mut fence_cases,
+        mut chain_cases,
+        mut policy_cases,
+        mut rearm_cases,
+    ) = (0, 0, 0, 0, 0, 0);
     for case in &document.cases {
         match case {
             hekma_engine::Case::Decision(_) => decision_cases += 1,
             hekma_engine::Case::Derivation(_) => derivation_cases += 1,
             hekma_engine::Case::Fence(_) => fence_cases += 1,
             hekma_engine::Case::Chain(_) => chain_cases += 1,
+            hekma_engine::Case::Policy(_) => policy_cases += 1,
+            hekma_engine::Case::Rearm(_) => rearm_cases += 1,
         }
     }
     Ok(format!(
         "{}\n  checksum  sha256:{checksum}\n  cases     {} ({} decision, {} derivation, {} fence, \
-         {} chain)\n  \
+         {} chain, {} policy, {} rearm)\n  \
          artifact  {}\n  pin       vectors_version + sha256 — re-run every case against your \
          guard on any upgrade\n",
         ui::success_text(format!(
@@ -2817,6 +2851,8 @@ fn governance_vectors_summary(
         derivation_cases,
         fence_cases,
         chain_cases,
+        policy_cases,
+        rearm_cases,
         hekma_engine::GOVERNANCE_VECTORS_ARTIFACT_PATH,
     ))
 }
@@ -2960,10 +2996,35 @@ impl RoutedError {
 /// (the host had just exited) finds or starts the owner again and retries
 /// once — a refused connection never applied anything.
 pub(crate) fn route(method: &str, path: &str, body: Option<Value>) -> Result<Routed, RoutedError> {
+    route_with(method, path, body, None)
+}
+
+/// [`route`] with the call bounded overall by `bound` (story 21-6: a set
+/// act's bounded wait — past it the command reports that it lost patience
+/// and the acts may still be committing, never a hang).
+pub(crate) fn route_bounded(
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    bound: std::time::Duration,
+) -> Result<Routed, RoutedError> {
+    route_with(method, path, body, Some(bound))
+}
+
+fn route_with(
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    bound: Option<std::time::Duration>,
+) -> Result<Routed, RoutedError> {
     let root = state_root().map_err(RoutedError::Diagnostic)?;
     let mut retried = false;
     loop {
         let client = HostClient::connect(&root).map_err(RoutedError::Call)?;
+        let client = match bound {
+            Some(bound) => client.bounded(bound),
+            None => client,
+        };
         match client.call(method, path, body.as_ref()) {
             Ok(value) => {
                 return Ok(Routed {
@@ -3183,7 +3244,7 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
 /// (AC4) and the launch-failed diagnostic (AC2) get their own codes; the shared
 /// registry-shaped variants (NotFound / InvalidName / Store) reuse the existing
 /// agent diagnostics for a consistent surface.
-fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
+pub(crate) fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
     match err {
         EngineError::NotFound { name } => AgentNotFound {
             message: format!(
@@ -3211,6 +3272,16 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             message: format!(
                 "Agent Instance '{name}' failed to launch: {detail}. The instance is now in the \
                  'failed' state; fix the adapter's launch command and try starting it again."
+            ),
+        }
+        .into(),
+        // Story 22-1: no Run Key could be issued (the OS random source
+        // failed): nothing was spawned and nothing changed.
+        EngineError::CredentialUnavailable { name, .. } => AgentLaunchFailed {
+            message: format!(
+                "The operating system's random source failed, so no Run Key was issued and the \
+                 agent '{name}' was not started. Nothing changed; check the system's random \
+                 source and try again."
             ),
         }
         .into(),
@@ -4276,6 +4347,7 @@ mod tests {
             // live spawn record, so it is not supervised.
             supervision: None,
             recorded_state: None,
+            breach_default_upgraded: false,
             agent_home: format!("/x/agents/{name}"),
         }
     }
@@ -5075,6 +5147,7 @@ mod tests {
         breach_action: hekma_engine::BreachAction,
     ) -> BudgetView {
         BudgetView {
+            policies: Vec::new(),
             per_run_limit: per_run.map(|(limit, _)| limit),
             per_run_remaining: per_run.map(|(_, remaining)| remaining),
             cumulative_limit: cumulative.map(|(limit, _)| limit),
@@ -5550,7 +5623,7 @@ mod tests {
             "the summary names the artifact path: {summary}"
         );
         assert!(
-            summary.contains("18 decision")
+            summary.contains("20 decision")
                 && summary.contains("11 derivation")
                 && summary.contains("5 fence"),
             "the summary gives the case mix: {summary}"
@@ -5821,6 +5894,7 @@ mod tests {
             usage_gap: None,
             supervision: None,
             recorded_state: None,
+            breach_default_upgraded: false,
             agent_home: "/h".into(),
         };
         let routed = Routed {
@@ -5838,5 +5912,497 @@ mod tests {
         let err = empty.instance_or_err("w").unwrap_err();
         assert!(err.to_string().contains("pid 9"), "{err}");
         assert!(err.downcast_ref::<AgentIo>().is_some());
+    }
+
+    #[test]
+    fn an_unreported_context_window_renders_as_unknown() {
+        let mut entry = sample_fleet_entry("acp-3");
+        entry.acp_context_usage = Some(hekma_engine::AcpContextUsageView {
+            used: None,
+            size: None,
+            cost: None,
+        });
+        assert_eq!(
+            acp_context_cell(&entry),
+            "used unknown of unknown context tokens (agent-reported)"
+        );
+    }
+
+    #[test]
+    fn the_open_time_guards_map_to_their_exit_one_diagnostics() {
+        use crate::exit_code::{classify, ExitCode};
+        let guard = map_error(RegistryError::ServeOptionsOpenTimeOnly {
+            detail: "serve options apply once".to_string(),
+        });
+        assert!(guard.downcast_ref::<AgentConfig>().is_some(), "{guard}");
+        assert!(
+            guard.to_string().starts_with("serve options apply once."),
+            "{guard}"
+        );
+        assert!(guard.to_string().contains("please report it"), "{guard}");
+        assert_eq!(classify(guard.as_ref()), ExitCode::General);
+        let outbox = map_error(RegistryError::OutboxOpenRefused {
+            detail: "the outbox journal is unreadable".to_string(),
+        });
+        assert!(outbox.downcast_ref::<AgentIo>().is_some(), "{outbox}");
+        assert_eq!(
+            outbox.to_string(),
+            "the outbox journal is unreadable. Nothing was started or changed."
+        );
+        assert_eq!(classify(outbox.as_ref()), ExitCode::General);
+    }
+
+    // ---- Routed writes against a scripted local Service Host ----
+
+    /// `KTESIO_STATE_DIR` pointed at one directory for one test, cleared on
+    /// drop (a failed assertion included). Hold `STATE_DIR_ENV_LOCK` while
+    /// it lives.
+    struct StateDirEnv;
+
+    impl StateDirEnv {
+        fn set(dir: &std::path::Path) -> Self {
+            // SAFETY: the caller holds STATE_DIR_ENV_LOCK.
+            unsafe {
+                std::env::set_var("KTESIO_STATE_DIR", dir);
+            }
+            StateDirEnv
+        }
+    }
+
+    impl Drop for StateDirEnv {
+        fn drop(&mut self) {
+            // SAFETY: the caller holds STATE_DIR_ENV_LOCK.
+            unsafe {
+                std::env::remove_var("KTESIO_STATE_DIR");
+            }
+        }
+    }
+
+    type HostScript = dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync;
+
+    /// A scripted loopback Service Host: `GET /v0/version` answers as the
+    /// Control API, every other request gets the `(status, body)` the
+    /// script picks from its method, path and body. Runs until the test
+    /// process exits.
+    fn scripted_host(script: Box<HostScript>) -> std::net::SocketAddr {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let script: std::sync::Arc<HostScript> = std::sync::Arc::from(script);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let script = std::sync::Arc::clone(&script);
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    let _ = reader.read_line(&mut request_line);
+                    let mut length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; length];
+                    let _ = reader.read_exact(&mut body);
+                    let body = String::from_utf8_lossy(&body).into_owned();
+                    let mut parts = request_line.split_whitespace();
+                    let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                    let (status, answer) = if (method, path) == ("GET", "/v0/version") {
+                        (200, r#"{"api":"hekma-control-api"}"#.to_string())
+                    } else {
+                        script(method, path, &body)
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                        answer.len()
+                    );
+                });
+            }
+        });
+        addr
+    }
+
+    /// Publish `addr` as the current state root's Service Host, from this
+    /// build.
+    fn publish_host(addr: std::net::SocketAddr) {
+        publish_host_from(addr, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Publish `addr` as the current state root's Service Host, from the
+    /// hekma build `version`.
+    fn publish_host_from(addr: std::net::SocketAddr, version: &str) {
+        let root = state_root().unwrap();
+        hekma_host::write_discovery(
+            &root,
+            &hekma_host::Discovery {
+                schema_version: hekma_host::DISCOVERY_SCHEMA_VERSION,
+                pid: 4242,
+                addr,
+                token: "ab".repeat(32),
+                hekma_version: version.to_string(),
+                autostarted: true,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_memory_attach_the_local_state_cannot_read_back_names_the_persisted_attach() {
+        let _lock = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _env = StateDirEnv::set(tmp.path());
+        {
+            let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+            engine.blocking().register("bare", "mock").unwrap();
+        }
+        let dir = tmp.path().join("agents/bare/memory");
+        let answer = json!({ "dir": dir.to_str().unwrap() }).to_string();
+        publish_host(scripted_host(Box::new(move |method, path, _| {
+            assert_eq!(method, "PUT", "{path}");
+            (200, answer.clone())
+        })));
+        // The host says it attached, but the local read finds no backing.
+        let err = memory_attach("bare", "filesystem", true).unwrap_err();
+        assert!(err.downcast_ref::<AgentIo>().is_some(), "{err}");
+        assert!(
+            err.to_string().contains("the engine reports no attachment"),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("hekma agent memory attach bare --kind filesystem --json"),
+            "{err}"
+        );
+        // The local read fails outright: the attach still stands, and says so.
+        let err = memory_attach("unseen", "native", true).unwrap_err();
+        assert!(err.downcast_ref::<AgentIo>().is_some(), "{err}");
+        assert!(
+            err.to_string().starts_with(
+                "Attached the Memory Backing to 'unseen', but reading the attachment back failed"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_older_schema_read_needs_a_host_that_can_migrate_it() {
+        use crate::error::ServiceHostUnavailable;
+        let _lock = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _env = StateDirEnv::set(tmp.path());
+        {
+            let db = hekma_engine::Registry::resolve_state_paths(None)
+                .unwrap()
+                .state_db();
+            let conn = rusqlite::Connection::open(db).unwrap();
+            conn.execute_batch("PRAGMA user_version = 3").unwrap();
+        }
+        let unwrap_err = |opened: Result<Engine, Box<dyn std::error::Error>>| match opened {
+            Ok(_) => panic!("an older schema never opens read-only"),
+            Err(err) => err,
+        };
+        // No host to migrate it (and a unit test never starts one).
+        let err = unwrap_err(open_read_only_engine());
+        assert!(err.is::<ServiceHostUnavailable>(), "{err}");
+        assert!(err.to_string().contains("hekma serve"), "{err}");
+        // A host from an older build keeps the old schema: restart it.
+        let host = scripted_host(Box::new(|_, _, _| (404, String::new())));
+        publish_host_from(host, "0.0.0-older");
+        let err = unwrap_err(open_read_only_engine());
+        assert!(err.is::<ServiceHostUnavailable>(), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("schema v3"), "{message}");
+        assert!(message.contains("pid 4242"), "{message}");
+        assert!(message.contains("from hekma 0.0.0-older"), "{message}");
+        assert!(message.contains("restart it (end pid 4242)"), "{message}");
+        // A host from this build that has not migrated it yet: the store's
+        // own refusal, not a host to restart.
+        publish_host(host);
+        let err = unwrap_err(open_read_only_engine());
+        assert!(err.downcast_ref::<AgentStore>().is_some(), "{err}");
+        assert!(!err.to_string().contains("restart it"), "{err}");
+    }
+
+    #[test]
+    fn a_registration_answer_without_its_row_is_read_back_locally() {
+        use crate::exit_code::{classify, ExitCode};
+        let _lock = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _env = StateDirEnv::set(tmp.path());
+        {
+            let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+            engine.blocking().register("committed", "mock").unwrap();
+        }
+        let foreign_row = json!({
+            "schema_version": FLEET_SCHEMA_VERSION,
+            "instance": sample_fleet_entry("elsewhere"),
+        })
+        .to_string();
+        publish_host(scripted_host(Box::new(move |method, path, body| {
+            let name = serde_json::from_str::<Value>(body)
+                .ok()
+                .and_then(|body| body["name"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            match (method, path, name.as_str()) {
+                ("POST", "/v0/instances", "committed" | "vanished") => (201, String::new()),
+                ("POST", "/v0/instances", "elsewhere") => (201, foreign_row.clone()),
+                _ => (
+                    500,
+                    r#"{"error":{"kind":"internal","message":"the host broke"}}"#.to_string(),
+                ),
+            }
+        })));
+        let mock = AdapterArg::Kind("mock".to_string());
+        // An empty 201: the row is read from the local state instead.
+        register("committed", &mock).expect("the local row stands in for the read-back");
+        // An empty 201 for a row the local state does not have: not found.
+        let err = register("vanished", &mock).unwrap_err();
+        assert_eq!(classify(err.as_ref()), ExitCode::NotFound, "{err}");
+        assert!(err.to_string().contains("vanished"), "{err}");
+        // A row whose capabilities cannot be read back here: still registered
+        // (the read-back failure is a warning, never the command's failure).
+        register("elsewhere", &mock).expect("a capability read-back never fails a registration");
+        // A refusal with no engine error: the host's own class, exit 1.
+        let err = register("broken", &mock).unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::error::ServiceHostRefused>()
+                .is_some(),
+            "{err}"
+        );
+        assert!(err.to_string().contains("the host broke"), "{err}");
+        assert_eq!(classify(err.as_ref()), ExitCode::General);
+    }
+
+    #[test]
+    fn a_child_run_open_sends_every_flag_to_the_host() {
+        use crate::cli::run::{open, OpenArgs};
+        let _lock = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _env = StateDirEnv::set(tmp.path());
+        let parent = "run_01JZ6Q9G3S8V2X7K4M1N5P0R2T";
+        let args = || OpenArgs {
+            parent: parent.to_string(),
+            labels: vec!["task=review".to_string()],
+            token_budget: Some(500),
+            dollar_cap: Some("1.50".to_string()),
+            breach_action: Some("warn".to_string()),
+            external_id: Some("job-7".to_string()),
+            print_key: false,
+            json: false,
+        };
+        // No host serves the root (and a unit test never starts one): the
+        // host's own class, never a Run refusal.
+        let err = open(args()).unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::error::ServiceHostUnavailable>()
+                .is_some(),
+            "{err}"
+        );
+        assert!(err.to_string().contains("hekma serve"), "{err}");
+        // A host that refuses with the body it received: every flag is in it.
+        publish_host(scripted_host(Box::new(|method, path, body| {
+            assert_eq!((method, path), ("POST", "/v0/runs"));
+            (
+                400,
+                json!({"error": {"code": "invalid-request", "message": body}}).to_string(),
+            )
+        })));
+        let err = open(args()).unwrap_err();
+        assert!(err.is::<crate::error::RunInvalid>(), "{err}");
+        let sent: Value = serde_json::from_str(&err.to_string()).unwrap();
+        assert_eq!(sent["parent_run_id"], parent);
+        assert_eq!(sent["labels"]["task"], "review");
+        assert_eq!(sent["token_budget"], 500);
+        assert_eq!(sent["dollar_cap"], "1.50");
+        assert_eq!(sent["breach_action"], "warn");
+        assert_eq!(sent["external_id"], "job-7");
+        assert!(sent.get("parent_instance").is_none(), "{sent}");
+    }
+
+    #[test]
+    fn a_call_refused_before_it_was_sent_finds_the_owner_again_once() {
+        use std::io::{BufRead, BufReader, Write};
+        let _lock = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _env = StateDirEnv::set(tmp.path());
+        // A host that answers the discovery probe and is gone before the
+        // call: it stops listening the moment it accepts the probe.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let probe = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            drop(listener);
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let body = r#"{"api":"hekma-control-api"}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        publish_host(addr);
+        let routed = route("POST", "/v0/runs/run_X/close", None);
+        probe.join().unwrap();
+        // The refused call was retried through a fresh discovery, which
+        // found no host — the "start one" answer, not the transport failure.
+        match routed {
+            Err(RoutedError::Call(CallError::Unavailable(message))) => {
+                assert!(message.contains("start one with: hekma serve"), "{message}")
+            }
+            Err(RoutedError::Call(other)) => panic!("{other:?}"),
+            Err(RoutedError::Diagnostic(err)) => panic!("{err}"),
+            Ok(_) => panic!("no host can have served the call"),
+        }
+    }
+
+    #[test]
+    fn best_effort_and_live_capture_reads_swallow_an_unusable_state_root() {
+        let _lock = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let _env = StateDirEnv::set(std::path::Path::new("relative/state-root"));
+            let err = state_root().unwrap_err();
+            assert!(err.to_string().contains("relative/state-root"), "{err}");
+            // Neither read turns the unusable root into a failure.
+            assert!(!host_holds_live_capture("w"));
+            note_if_best_effort("w", "pause");
+        }
+        // A usable root that has no such instance: swallowed too.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _env = StateDirEnv::set(tmp.path());
+        assert!(!host_holds_live_capture("ghost"));
+        note_if_best_effort("ghost", "pause");
+    }
+
+    fn label_args(
+        verb: crate::cli::label::LabelVerb,
+        selector: Option<&str>,
+        positionals: &[&str],
+        dry_run: bool,
+    ) -> crate::cli::label::LabelArgs {
+        crate::cli::label::LabelArgs {
+            verb,
+            selector: selector.map(str::to_string),
+            args: positionals.iter().map(|s| s.to_string()).collect(),
+            dry_run,
+            yes: true,
+            json: false,
+        }
+    }
+
+    #[test]
+    fn label_refusals_keep_the_first_class_and_a_silent_host_is_named() {
+        use crate::cli::label::{run as label, LabelVerb};
+        use crate::error::{RunInvalidState, ServiceHostUnavailable};
+        let _lock = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _env = StateDirEnv::set(tmp.path());
+        let manifest = tempfile::TempDir::new().unwrap();
+        hekma_conformance::test_support::ManifestFixture::new("fake", &["--linger-ms", "60000"])
+            .guaranteed_on_all_oses("interaction")
+            .write(manifest.path());
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        facade
+            .register_with_adapter(
+                "labelled",
+                &AdapterRef::Manifest(manifest.path().to_path_buf()),
+            )
+            .unwrap();
+        facade.start("labelled").unwrap();
+        let owner = facade
+            .instance_run("labelled")
+            .map(|view| view.record.run_id.to_string());
+        let child = facade.open_child_run(hekma_engine::ChildRunRequest {
+            parent: hekma_engine::RunParent::Instance("labelled".to_string()),
+            labels: vec![
+                ("flow".to_string(), "x".to_string()),
+                ("task".to_string(), "a".to_string()),
+            ],
+            limits: Default::default(),
+            external_id: None,
+            issue_credentials: false,
+        });
+        // A planned removal of a Caller label the verb never bound.
+        let planned = label(label_args(
+            LabelVerb::Remove,
+            Some("flow=x"),
+            &["task"],
+            true,
+        ));
+        // A write with no host to route it to.
+        let unrouted = label(label_args(
+            LabelVerb::Set,
+            Some("flow=x"),
+            &["tier=gold"],
+            false,
+        ));
+        // Stop before asserting, so a failure never leaves the agent behind.
+        facade
+            .stop("labelled", Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let owner = owner.unwrap();
+        child.unwrap();
+
+        let err = planned.unwrap_err();
+        assert!(err.is::<RunInvalidState>(), "{err}");
+        assert!(
+            err.to_string()
+                .starts_with("1 of 1 Runs would not be labeled; the first refusal:"),
+            "{err}"
+        );
+        let err = unrouted.unwrap_err();
+        assert!(err.is::<ServiceHostUnavailable>(), "{err}");
+        // With no host to route to, nothing was matched: the refusal is the
+        // unreachable host itself, with no "N of M Runs" summary.
+        assert!(err.to_string().contains("hekma serve"), "{err}");
+        assert!(
+            !hekma_host::control_file(tmp.path()).exists(),
+            "a unit test starts no host"
+        );
+
+        // The agent's own Run has ended: a dry run is refused by the engine.
+        let err = label(label_args(
+            LabelVerb::Set,
+            None,
+            &[&owner, "tier=gold"],
+            true,
+        ))
+        .unwrap_err();
+        assert!(err.is::<RunInvalidState>(), "{err}");
+        assert!(err.to_string().contains("has ended"), "{err}");
+
+        // A host that applies the write but answers without the labels.
+        publish_host(scripted_host(Box::new(|method, path, _| {
+            assert_eq!(method, "PATCH", "{path}");
+            (200, r#"{"schema_version":1}"#.to_string())
+        })));
+        let err = label(label_args(
+            LabelVerb::Set,
+            None,
+            &[&owner, "tier=gold"],
+            false,
+        ))
+        .unwrap_err();
+        assert!(err.downcast_ref::<AgentIo>().is_some(), "{err}");
+        assert!(err.to_string().contains("pid 4242"), "{err}");
+        assert!(err.to_string().contains("sent no labels"), "{err}");
+        assert!(
+            err.to_string().contains(&format!("hekma run show {owner}")),
+            "{err}"
+        );
     }
 }

@@ -4,7 +4,7 @@ use super::ops::{self, RunFate, SupervisedRun};
 use super::snapshot::SnapshotPublisher;
 use super::*;
 use crate::domain::name::InstanceName;
-use crate::ports::RunRecords;
+use crate::ports::{PolicyRecords as _, RunRecords};
 use crate::store::{SqliteStore, StoreWriter};
 use tempfile::TempDir;
 
@@ -31,11 +31,19 @@ fn supervised(run_id: &RunId, wire_path: bool, fresh: bool) -> SupervisedRun {
         wire_path,
         labels: vec![Label::bound("team", "payments")],
         fresh,
+        inputs: None,
     }
 }
 
 fn child(store: &SqliteStore, parent: RunParent) -> Result<RunId, RunError> {
-    ops::open_child(store, &ChildRunRequest::under(parent), RunId::mint(), AT).map(|(id, _)| id)
+    ops::open_child(
+        store,
+        &ChildRunRequest::under(parent),
+        RunId::mint(),
+        None,
+        AT,
+    )
+    .map(|(id, _)| id)
 }
 
 fn status(store: &SqliteStore, id: &RunId) -> (RunStatus, Vec<Anomaly>, Option<String>) {
@@ -54,7 +62,10 @@ fn a_fresh_start_creates_and_a_relaunch_keeps_the_supervised_run() {
         created.events[0].labels,
         vec![Label::bound("team", "payments")]
     );
-    assert_eq!(created.entries.len(), 1);
+    // Two entries: the `created` entry, then the creation-time Policy
+    // resolution's entry (the one carrying the resolution — it publishes
+    // last, so the snapshot entry holds the resolution).
+    assert_eq!(created.entries.len(), 2);
     // A relaunch with the same id and facts changes nothing.
     let kept = ops::ensure_supervised(&store, &supervised(&first, true, false), AT).unwrap();
     assert!(kept.events.is_empty());
@@ -267,7 +278,7 @@ fn opening_a_child_is_refused_with_a_typed_cause() {
     for action in [BreachAction::Pause, BreachAction::Stop, BreachAction::Block] {
         let mut request = ChildRunRequest::under(RunParent::Run(owner.clone()));
         request.limits.breach_action = Some(action);
-        match ops::open_child(&store, &request, RunId::mint(), AT) {
+        match ops::open_child(&store, &request, RunId::mint(), None, AT) {
             Err(RunError::ActionUnavailable {
                 metering_source, ..
             }) => assert_eq!(metering_source, "self-reported"),
@@ -277,12 +288,12 @@ fn opening_a_child_is_refused_with_a_typed_cause() {
     let mut request = ChildRunRequest::under(RunParent::Run(owner.clone()));
     request.labels = vec![("BAD".to_string(), "x".to_string())];
     assert!(matches!(
-        ops::open_child(&store, &request, RunId::mint(), AT),
+        ops::open_child(&store, &request, RunId::mint(), None, AT),
         Err(RunError::Invalid { .. })
     ));
     request.labels = vec![("k".into(), "1".into()), ("k".into(), "2".into())];
     assert!(matches!(
-        ops::open_child(&store, &request, RunId::mint(), AT),
+        ops::open_child(&store, &request, RunId::mint(), None, AT),
         Err(RunError::Invalid { .. })
     ));
     // An ended parent.
@@ -301,7 +312,7 @@ fn a_wire_child_refuses_hold_actions_until_they_exist_and_warn_is_accepted() {
     ops::ensure_supervised(&store, &supervised(&owner, true, true), AT).unwrap();
     let mut request = ChildRunRequest::under(RunParent::Run(owner.clone()));
     request.limits.breach_action = Some(BreachAction::Block);
-    match ops::open_child(&store, &request, RunId::mint(), AT) {
+    match ops::open_child(&store, &request, RunId::mint(), None, AT) {
         Err(err @ RunError::ActionUnavailable { .. }) => {
             assert!(err.to_string().contains("not available yet"), "{err}");
             assert_eq!(err.code(), "action-unavailable");
@@ -312,7 +323,7 @@ fn a_wire_child_refuses_hold_actions_until_they_exist_and_warn_is_accepted() {
     request.limits.token_per_run = Some(10);
     request.labels = vec![("task".into(), "review".into())];
     request.external_id = Some("job-7".into());
-    let (id, changes) = ops::open_child(&store, &request, RunId::mint(), AT).unwrap();
+    let (id, changes) = ops::open_child(&store, &request, RunId::mint(), None, AT).unwrap();
     assert_eq!(changes.events[0].change, RunEventKind::Created);
     assert!(
         changes.events[0].labels.is_empty(),
@@ -323,7 +334,7 @@ fn a_wire_child_refuses_hold_actions_until_they_exist_and_warn_is_accepted() {
     assert!(row.wire_path);
     assert_eq!(row.instance.as_deref(), Some("a"));
     // The same external id returns the same Run, changing nothing.
-    let (again, changes) = ops::open_child(&store, &request, RunId::mint(), AT).unwrap();
+    let (again, changes) = ops::open_child(&store, &request, RunId::mint(), None, AT).unwrap();
     assert_eq!(again, id);
     assert!(changes.events.is_empty());
 }
@@ -383,6 +394,7 @@ fn a_depth_change_raises_and_clears_depth_fallback_for_a_set_action() {
                 token_per_run: Some(5),
                 dollar_per_run_micros: None,
                 breach_action: Some(BreachAction::Pause),
+                ..RunLimits::default()
             },
             identity: None,
         })
@@ -408,16 +420,18 @@ fn labels_sync_once_and_breach_marks_once() {
     let (_tmp, store) = store();
     let run = RunId::mint();
     ops::ensure_supervised(&store, &supervised(&run, true, true), AT).unwrap();
-    let same =
-        ops::sync_bound_labels(&store, &run, &[Label::bound("team", "payments")], AT).unwrap();
+    let same = ops::sync_bound_labels(&store, &run, &[Label::bound("team", "payments")], None, AT)
+        .unwrap();
     assert!(same.events.is_empty());
-    let moved = ops::sync_bound_labels(&store, &run, &[Label::bound("team", "core")], AT).unwrap();
+    let moved =
+        ops::sync_bound_labels(&store, &run, &[Label::bound("team", "core")], None, AT).unwrap();
     assert_eq!(moved.events[0].change, RunEventKind::LabelsChanged);
     assert_eq!(moved.events[0].labels, vec![Label::bound("team", "core")]);
     assert!(ops::sync_bound_labels(
         &store,
         &RunId::from_wire("gone"),
         &[Label::bound("x", "y")],
+        None,
         AT
     )
     .unwrap()
@@ -644,6 +658,7 @@ fn a_child_opened_under_a_held_parent_starts_held() {
         &store,
         &ChildRunRequest::under(RunParent::Run(owner.clone())),
         RunId::mint(),
+        None,
         AT,
     )
     .unwrap();
@@ -683,6 +698,173 @@ fn runs_of_agents_with_no_process_end_with_their_children() {
 }
 
 // ---- Story 21-9: bound labels and the label verb ----
+
+// ---- Story 21-3 (review round 1): creation and depth changes resolve ----
+
+#[test]
+fn a_directly_set_depth_fallback_survives_a_label_change_re_resolve() {
+    // Round 2, N8: a child Run whose run_limits carry a directly set
+    // action its depth cannot execute keeps the 21-2 `depth-fallback`
+    // Anomaly through every re-resolve — the resolver raises it only for
+    // POLICY-sourced actions, and a label change once stripped the
+    // directly set signal while the Run still could not execute.
+    // (open_child refuses such an action at creation, so the row is
+    // seeded directly — the defensive pin.)
+    let (_tmp, store) = store();
+    let owner = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&owner, true, true), AT).unwrap();
+    let kid = child(&store, RunParent::Run(owner.clone())).unwrap();
+    // A directly set per-run ceiling with `pause` on the ANNOUNCED child.
+    store.execute_batch_for_test(&format!(
+        "INSERT INTO run_limits (run_id, dimension, scope, limit_value, action, source, \
+         set_at) VALUES ('{}', 'tokens', 'per-run', 100, 'pause', 'host', 't')",
+        kid.as_str()
+    ));
+    // A depth change to the (still unexecutable) announced depth raises
+    // the 21-2 Anomaly.
+    let record = store.run_record(&kid).unwrap().unwrap();
+    ops::sync_depth(&store, record, ControlDepth::Supervised, false, AT).unwrap();
+    let record = store.run_record(&kid).unwrap().unwrap();
+    assert!(
+        record.anomalies.contains(&Anomaly::DepthFallback),
+        "the directly set action raises the 21-2 signal: {:?}",
+        record.anomalies
+    );
+    // A label change re-resolves: the signal SURVIVES (the pre-fix
+    // store_changes stripped every DepthFallback it did not re-raise).
+    verb(&store, &kid, set(&[("env", "prod")]), &[], false).unwrap();
+    let record = store.run_record(&kid).unwrap().unwrap();
+    assert!(
+        record.anomalies.contains(&Anomaly::DepthFallback),
+        "the directly set signal survives the re-resolve: {:?}",
+        record.anomalies
+    );
+}
+
+#[test]
+fn a_kept_run_whose_labels_changed_resolves_with_the_fresh_inputs() {
+    // Round 2, N9: an adoption/relaunch re-syncs the kept Run's bound
+    // labels against a config it just read — the re-resolution uses the
+    // caller's FRESH inputs, not the row's stored ones (which are one
+    // read stale), so the stored row and the snapshot agree with live
+    // enforcement.
+    let (_tmp, store) = store();
+    let run = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&run, true, true), AT).unwrap();
+    let inputs = |ceiling: u64| super::policy::ResolveInputs {
+        explicit: super::PolicyLimits {
+            tokens_per_run: Some(ceiling),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // A kept Run whose labels CHANGED resolves with the fresh inputs.
+    let mut kept = supervised(&run, true, false);
+    kept.labels = vec![Label::bound("team", "fresh")];
+    kept.inputs = Some(inputs(200));
+    ops::ensure_supervised(&store, &kept, AT).unwrap();
+    let row = store.run_policy(&run).unwrap().unwrap();
+    assert_eq!(
+        row.resolution.tokens.per_run,
+        Some(200),
+        "the fresh inputs resolved, not the stored row's"
+    );
+    // A kept Run whose labels did NOT change resolves with the fresh
+    // inputs too (the separate resolve half).
+    let mut same = supervised(&run, true, false);
+    same.inputs = Some(inputs(300));
+    ops::ensure_supervised(&store, &same, AT).unwrap();
+    let row = store.run_policy(&run).unwrap().unwrap();
+    assert_eq!(row.resolution.tokens.per_run, Some(300));
+}
+
+#[test]
+fn a_created_run_resolves_against_the_policies_in_its_creation_job() {
+    // The 21-9 deferral, filled: a fresh Run's resolution is stored in the
+    // creation job itself (a Policy created while this engine was off, a
+    // hand-edited config — caught at creation, not at the first label
+    // change).
+    let (_tmp, store) = store();
+    store
+        .put_policy(&PolicyRecord {
+            name: "cap".to_string(),
+            selector: Some("team=payments".parse().unwrap()),
+            limits: crate::domain::runs::PolicyLimits {
+                tokens_per_run: Some(100),
+                ..Default::default()
+            },
+            rates: Default::default(),
+        })
+        .unwrap();
+    let owner = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&owner, true, true), AT).unwrap();
+    let resolution = store
+        .run_policy(&owner)
+        .unwrap()
+        .expect("resolved at creation");
+    assert_eq!(resolution.resolution.tokens.per_run, Some(100));
+    assert!(matches!(
+        resolution.resolution.sources.tokens_per_run,
+        super::LimitSource::Policy(ref name) if name == "cap"
+    ));
+    // A child created under it resolves too (its Caller labels select
+    // nothing, so its ceiling stays honestly unset).
+    let kid = child(&store, RunParent::Run(owner.clone())).unwrap();
+    let kid_resolution = store.run_policy(&kid).unwrap().expect("the child resolved");
+    assert_eq!(kid_resolution.resolution.tokens.per_run, None);
+}
+
+#[test]
+fn a_depth_change_re_resolves_the_policy_sourced_fallback() {
+    // A Policy-sourced `pause` on an announced-depth child falls back to
+    // `warn` with the `depth-fallback` Anomaly; a depth change to
+    // `supervised` re-resolves in the same job and the Anomaly clears (the
+    // pre-fix depth change never re-resolved, so the Anomaly stuck).
+    let (_tmp, store) = store();
+    store
+        .put_policy(&PolicyRecord {
+            name: "act".to_string(),
+            selector: Some("team=payments".parse().unwrap()),
+            limits: crate::domain::runs::PolicyLimits {
+                breach_action: Some(crate::domain::BreachAction::Pause),
+                ..Default::default()
+            },
+            rates: Default::default(),
+        })
+        .unwrap();
+    let owner = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&owner, true, true), AT).unwrap();
+    let kid = child(&store, RunParent::Run(owner.clone())).unwrap();
+    verb(&store, &kid, set(&[("team", "payments")]), &[], false).unwrap();
+    let record = store.run_record(&kid).unwrap().unwrap();
+    assert!(
+        record.anomalies.contains(&Anomaly::DepthFallback),
+        "the announced child cannot execute the Policy's pause: {:?}",
+        record.anomalies
+    );
+    // The depth change re-resolves: supervised executes `pause`, so the
+    // Anomaly clears in the same job.
+    let changes = ops::sync_depth(&store, record, ControlDepth::Supervised, true, AT).unwrap();
+    assert!(
+        changes
+            .events
+            .iter()
+            .any(|event| event.change == RunEventKind::AnomaliesChanged),
+        "the clearing publishes: {:?}",
+        changes.events
+    );
+    let record = store.run_record(&kid).unwrap().unwrap();
+    assert!(
+        !record.anomalies.contains(&Anomaly::DepthFallback),
+        "cleared at the executable depth: {:?}",
+        record.anomalies
+    );
+    let resolution = store.run_policy(&kid).unwrap().unwrap();
+    assert_eq!(
+        resolution.resolution.effective_action,
+        crate::domain::BreachAction::Pause
+    );
+}
 
 fn verb(
     store: &SqliteStore,
@@ -725,8 +907,14 @@ fn the_label_verb_binds_once_with_one_event_and_a_repeat_changes_nothing() {
         event.prior_labels.as_deref(),
         Some(&[Label::bound("team", "payments")][..])
     );
-    assert_eq!(changes.entries.len(), 1);
+    // Story 21-3: the Policy re-resolution republishes the Run's entry
+    // (carrying its stored resolution) beside the label change's entry.
+    assert_eq!(changes.entries.len(), 2);
     assert_eq!(changes.entries[0].labels, outcome.labels);
+    assert!(
+        changes.entries[1].policy.is_some(),
+        "the resolution rides the entry"
+    );
     let json = serde_json::to_value(event).unwrap();
     assert_eq!(json["labels"][0]["origin"], "label-verb");
     assert_eq!(json["prior_labels"][0]["origin"], "config");
@@ -758,10 +946,10 @@ fn a_verb_label_outranks_config_across_syncs_and_its_removal_restores_config() {
     ops::ensure_supervised(&store, &supervised(&run, true, true), AT).unwrap();
     verb(&store, &run, set(&[("team", "core")]), &config, false).unwrap();
     // A config write, a relaunch and an adoption all keep the verb's value.
-    let synced = ops::sync_bound_labels(&store, &run, &config, AT).unwrap();
+    let synced = ops::sync_bound_labels(&store, &run, &config, None, AT).unwrap();
     assert!(synced.events.is_empty());
     let changed_config = [Label::bound("team", "other"), Label::bound("tier", "gold")];
-    let synced = ops::sync_bound_labels(&store, &run, &changed_config, AT).unwrap();
+    let synced = ops::sync_bound_labels(&store, &run, &changed_config, None, AT).unwrap();
     assert_eq!(synced.events.len(), 1, "tier is new");
     assert_eq!(synced.events[0].cause.as_deref(), Some("config"));
     let mut relaunch = supervised(&run, true, false);
@@ -805,7 +993,7 @@ fn the_verb_replaces_a_caller_value_but_never_removes_a_caller_label() {
         ("task".to_string(), "x".to_string()),
         ("flow".to_string(), "f".to_string()),
     ];
-    let (child, _) = ops::open_child(&store, &request, RunId::mint(), AT).unwrap();
+    let (child, _) = ops::open_child(&store, &request, RunId::mint(), None, AT).unwrap();
     // Configuration never reaches a child: the planner is given none.
     let config = [Label::bound("task", "cfg")];
     let (outcome, changes) = verb(&store, &child, set(&[("task", "y")]), &config, false).unwrap();
@@ -855,8 +1043,8 @@ fn a_selector_matches_open_runs_by_any_label_in_run_id_order() {
         ("team".to_string(), "payments".to_string()),
         ("env".to_string(), "prod".to_string()),
     ];
-    let (c1, _) = ops::open_child(&store, &request, RunId::mint(), AT).unwrap();
-    let (c2, _) = ops::open_child(&store, &request, RunId::mint(), AT).unwrap();
+    let (c1, _) = ops::open_child(&store, &request, RunId::mint(), None, AT).unwrap();
+    let (c2, _) = ops::open_child(&store, &request, RunId::mint(), None, AT).unwrap();
     ops::close(&store, &c2, AT).unwrap();
     let selector = Selector::parse("team=payments,env=prod").unwrap();
     let mut expected = vec![owner.clone(), c1.clone()];
@@ -926,7 +1114,9 @@ fn every_bound_label_path_calls_the_policy_hook_inside_the_writer_job() {
     let (resolved, _) = job(Box::new(move |s| {
         ops::ensure_supervised(s, &supervised(&r, true, true), AT).unwrap()
     }));
-    assert!(resolved.is_empty(), "creation is not a label change");
+    // Creation resolves since 21-3 (the 21-9 deferral, filled): the hook
+    // runs inside the creation job itself.
+    assert_eq!(resolved, vec![run.clone()], "creation resolves");
     // The verb.
     let r = run.clone();
     let (resolved, events) = job(Box::new(move |s| {
@@ -938,7 +1128,7 @@ fn every_bound_label_path_calls_the_policy_hook_inside_the_writer_job() {
     // A config write's re-sync.
     let r = run.clone();
     let (resolved, _) = job(Box::new(move |s| {
-        ops::sync_bound_labels(s, &r, &[Label::bound("team", "core")], AT).unwrap()
+        ops::sync_bound_labels(s, &r, &[Label::bound("team", "core")], None, AT).unwrap()
     }));
     assert_eq!(resolved, vec![run.clone()]);
     // A relaunch and an adoption (both keep the Run through
@@ -955,7 +1145,7 @@ fn every_bound_label_path_calls_the_policy_hook_inside_the_writer_job() {
     // Nothing changed: no hook.
     let r = run.clone();
     let (resolved, events) = job(Box::new(move |s| {
-        ops::sync_bound_labels(s, &r, &[Label::bound("team", "again")], AT).unwrap()
+        ops::sync_bound_labels(s, &r, &[Label::bound("team", "again")], None, AT).unwrap()
     }));
     assert!(resolved.is_empty() && events == 0);
     // A dry run never calls it.
@@ -970,4 +1160,130 @@ fn every_bound_label_path_calls_the_policy_hook_inside_the_writer_job() {
     let snapshot = publisher.current();
     let entry = snapshot.run(&run).unwrap();
     assert!(entry.labels.contains(&Label::verb("env", "prod")));
+}
+
+// ---------------------------------------------------------------------------
+// The listing's per-row assembly (story 21-5): labels, the STORED
+// resolution's headroom, subtree and cumulative usage, latches.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_listing_assembles_each_row_from_its_stored_facts() {
+    use crate::domain::budget::{BreachAction, BreachScope};
+    use crate::domain::cost::Rate;
+    use crate::domain::event::BreachDimension;
+    use crate::domain::runs::listing::{self, ListingView};
+    use crate::domain::usage::UsageEvent;
+    use crate::ports::{PolicyRecords as _, RunRecords as _, RunStore as _};
+
+    let (_tmp, store) = store();
+    let owner = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&owner, true, true), AT).unwrap();
+    let child_id = child(&store, RunParent::Run(owner.clone())).unwrap();
+
+    // A Policy that arms the owner's level: a per-run token ceiling, a
+    // per-run dollar cap, and a Rate — then a re-resolve stores it.
+    store
+        .put_policy(&super::PolicyRecord {
+            name: "tight".to_string(),
+            selector: Some("team=payments".parse().unwrap()),
+            limits: super::PolicyLimits {
+                tokens_per_run: Some(1_000),
+                dollars_per_run_micros: Some(500_000),
+                rate: Some(Rate::new(1_000_000, 2_000_000)),
+                ..Default::default()
+            },
+            rates: Default::default(),
+        })
+        .unwrap();
+    ops::mark_breach(&store, &owner, AT).unwrap();
+    super::policy::resolve_run(&store, &owner, None, AT).unwrap();
+
+    // Usage on the owner's Run folds into its subtree rollup AND the
+    // instance's cumulative rollup (10k in / 20k out at $1/$2 per 1M).
+    let event = UsageEvent {
+        instance: "a".to_string(),
+        run_id: owner.clone(),
+        input_tokens: 10_000,
+        output_tokens: 20_000,
+        cached_tokens: None,
+        metering_source: "engine-observed".to_string(),
+        sequence: 0,
+        occurred_at: AT.to_string(),
+    };
+    store
+        .insert_usage(&event, Some(Rate::new(1_000_000, 2_000_000)), 0)
+        .unwrap();
+    // A latched `block` from an earlier breach (the fence-visibility slice).
+    store
+        .latch(
+            &owner,
+            crate::domain::LatchKey {
+                dimension: BreachDimension::Tokens,
+                scope: BreachScope::PerRun,
+            },
+            BreachAction::Block,
+            AT,
+        )
+        .unwrap();
+
+    let (rows, _) = store
+        .list_runs(
+            ListingView::Exceptions,
+            None,
+            None,
+            50,
+            "2026-11-02T00:00:00Z",
+        )
+        .unwrap();
+    let items = listing::assemble(&store, rows).unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "the breached owner; the healthy child is counted"
+    );
+    let row = &items[0];
+    assert_eq!(row.record.run_id, owner);
+    assert_eq!(row.record.anomalies, vec![Anomaly::Breach]);
+    assert!(row.labels.contains(&Label::bound("team", "payments")));
+    // Subtree usage: 30k tokens and the derived cost at the stored Rate
+    // ($10 per 1M in + $20 per 1M out over 10k/20k = $0.50).
+    assert_eq!(row.usage.input_tokens, 10_000);
+    assert_eq!(row.usage.output_tokens, 20_000);
+    // The derived cost at the stored Rate: 10k in at $1/1M ($0.01) + 20k
+    // out at $2/1M ($0.04) = $0.05.
+    assert_eq!(row.usage.cost_micros.0, 50_000);
+    // The owner carries the instance cumulative usage; the budget block
+    // computes headroom against the POLICY-sourced ceilings.
+    let cumulative = row.cumulative_usage.as_ref().expect("owner carries it");
+    assert_eq!(cumulative.input_tokens, 10_000);
+    let budget = row.budget.as_ref().expect("the policy arms the level");
+    assert_eq!(budget.view.per_run_limit, Some(1_000));
+    // The subtree (30k tokens) already exceeds the 1000-token ceiling: the
+    // remaining saturates at zero, never negative. The dollar headroom:
+    // $0.50 cap − $0.05 spent.
+    assert_eq!(budget.view.per_run_remaining, Some(0));
+    assert_eq!(
+        budget.view.per_run_dollars_remaining,
+        Some(crate::domain::cost::Micros(450_000))
+    );
+    assert!(budget.view.policies.contains(&"tight".to_string()));
+    assert_eq!(row.latched.len(), 1);
+    assert_eq!(row.latched[0].action, BreachAction::Block);
+    assert_eq!(row.latched[0].dimension, BreachDimension::Tokens);
+
+    // The child row: cumulative usage ABSENT (not zero), no breach, and a
+    // budget block from the default policy (nothing set) — an honest None.
+    let (rows, _) = store
+        .list_runs(ListingView::All, None, None, 50, "2026-11-02T00:00:00Z")
+        .unwrap();
+    let items = listing::assemble(&store, rows).unwrap();
+    let child_row = items
+        .iter()
+        .find(|row| row.record.run_id == child_id)
+        .expect("the child lists in the all view");
+    assert!(child_row.cumulative_usage.is_none());
+    assert!(child_row.budget.is_none());
+    assert_eq!(child_row.usage.input_tokens, 0);
+    assert!(child_row.latched.is_empty());
 }

@@ -115,7 +115,7 @@ impl std::fmt::Display for LogCaptureMode {
 /// The resolved launch of an Agent Instance (built from a manifest `OpTemplate`
 /// or a native adapter). Everything the backend needs to spawn the process, in
 /// domain terms.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SpawnSpec {
     /// The executable to run (a program name resolved on `PATH`, or a path).
     pub exec: String,
@@ -264,6 +264,34 @@ pub struct SpawnSpec {
     /// backends stay capture-agnostic dumb executors, exactly like
     /// [`SpawnSpec::pipe_stdin`].
     pub capture_mode: LogCaptureMode,
+}
+
+/// A redacting `Debug` (story 22-1): the environment can carry resolved
+/// secrets and the launch's Run Key, so its values print as `[REDACTED]`
+/// (the names are kept); every other field prints as derived.
+impl std::fmt::Debug for SpawnSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env: BTreeMap<&str, &str> = self
+            .env
+            .keys()
+            .map(|key| (key.as_str(), crate::domain::REDACTED))
+            .collect();
+        f.debug_struct("SpawnSpec")
+            .field("exec", &self.exec)
+            .field("args", &self.args)
+            .field("env", &env)
+            .field("working_dir", &self.working_dir)
+            .field("log_file", &self.log_file)
+            .field("attributed_log_path", &self.attributed_log_path)
+            .field("stderr_log_file", &self.stderr_log_file)
+            .field("instance_name", &self.instance_name)
+            .field("pipe_stdin", &self.pipe_stdin)
+            .field("detach", &self.detach)
+            .field("pipe_stdout", &self.pipe_stdout)
+            .field("inherit_env", &self.inherit_env)
+            .field("capture_mode", &self.capture_mode)
+            .finish()
+    }
 }
 
 /// The outcome of a [`ProcessBackend::stop`] call (AC3).
@@ -2673,5 +2701,99 @@ mod tests {
             !attributed.exists(),
             "Off writes nothing, not even an empty file"
         );
+    }
+
+    #[test]
+    fn tail_new_lines_in_metadata_mode_meters_a_crlf_line_without_its_carriage_return() {
+        // A CRLF-terminated line is metered and hashed as the line itself —
+        // the `\r` is framing, like `str::lines` treats it, not content.
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("stdout.raw");
+        let attributed = dir.path().join("output.log");
+        std::fs::write(&raw, b"dos line\r\n").unwrap();
+        let mut cursor = 0u64;
+        tail_new_lines(
+            &raw,
+            &mut cursor,
+            LogStream::AgentOut,
+            "svc",
+            &attributed,
+            LogCaptureMode::Metadata,
+        );
+        assert_eq!(cursor, 10, "the whole CRLF line is consumed");
+        let text = std::fs::read_to_string(&attributed).unwrap();
+        let record: MetadataLogRecord = serde_json::from_str(text.trim()).expect("one JSON row");
+        assert_eq!(
+            record.byte_len, 8,
+            "no carriage return in the metered length"
+        );
+        assert_eq!(record.sha256, sha256::to_hex(&sha256::digest(b"dos line")));
+    }
+
+    /// A backend that holds no pipes at all: it overrides none of the pipe
+    /// hand-off methods, so it gets the trait's defaults.
+    struct PipelessBackend;
+
+    impl ProcessBackend for PipelessBackend {
+        type Handle = u32;
+
+        fn spawn(&self, _spec: &SpawnSpec) -> Result<u32, BackendError> {
+            Ok(0)
+        }
+        fn stop(&self, _handle: &mut u32, _window: Duration) -> Result<StopOutcome, BackendError> {
+            Ok(StopOutcome { forced: false })
+        }
+        fn poll(&self, _handle: &mut u32) -> Result<ProcessStatus, BackendError> {
+            Ok(ProcessStatus::Alive)
+        }
+        fn pause(&self, _handle: &mut u32) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn resume(&self, _handle: &mut u32) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn pid(&self, _handle: &u32) -> u32 {
+            1
+        }
+        fn fingerprint(&self, _handle: &u32) -> ProcessFingerprint {
+            ProcessFingerprint::new(1, 1)
+        }
+        fn adopt(
+            &self,
+            _fingerprint: &ProcessFingerprint,
+            _detached: bool,
+        ) -> Result<Option<u32>, BackendError> {
+            Ok(None)
+        }
+        fn self_fingerprint(&self) -> Option<ProcessFingerprint> {
+            None
+        }
+        fn probe_alive(&self, _fingerprint: &ProcessFingerprint) -> Option<bool> {
+            None
+        }
+        fn has_stdin(&self, _handle: &u32) -> bool {
+            false
+        }
+        fn stdin_timed_out(&self, _handle: &u32) -> bool {
+            false
+        }
+        fn write_stdin(&self, _handle: &mut u32, _data: &[u8]) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn log_capture(&self, _handle: &u32) -> Option<LogCapture> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_backend_that_holds_no_pipes_hands_out_neither_half_by_default() {
+        // The pipe hand-offs default to "nothing held": a backend that never
+        // pipes a child (or an adopted handle) answers None for both halves,
+        // so the acp transport refuses to start instead of reading nothing.
+        let backend = PipelessBackend;
+        let mut handle = 0u32;
+        assert!(backend.take_stdin(&mut handle).is_none());
+        assert!(backend.take_stdout(&mut handle).is_none());
+        assert!(!backend.has_stdin(&handle));
     }
 }
