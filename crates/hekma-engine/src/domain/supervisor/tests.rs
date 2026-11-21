@@ -11696,7 +11696,7 @@ fn an_adoption_surfaces_unreadable_breach_records_and_a_stuck_launch_generation(
     );
     assert!(
         text.contains("may be deduplicated against the previous attach's rows"),
-        "the diagnostic states the dedupe-honesty consequence"
+        "the diagnostic states the dedupe-honesty consequence:\n{text}"
     );
     assert_eq!(
         sup2.running.get(&name).unwrap().launch_generation,
