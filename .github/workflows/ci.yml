@@ -167,7 +167,8 @@ jobs:
     # label completed its migration to the 26.04 image (verified on hekma's
     # own ubuntu-latest job logs), the pin was retired, and
     # test_job_timeout_minutes returned to the calibrated 40 — under the 50
-    # default with real headroom over the ~11–21m green band, while the 30m
+    # default with real headroom over the ~11–14m measured green band (the
+    # 653–818s runs cited above), while the 30m
     # in-step supervisor cap (the class-1 quarantine) still binds.
     timeout-minutes: ${{ matrix.test_job_timeout_minutes || 50 }}
     steps:
