@@ -226,16 +226,20 @@ class ReleaseDocsTests(unittest.TestCase):
             "needs: [fmt, clippy, test, build, docs, boundary, semver, governance-vectors]",
             ci,
         )
-        # Wedge forensics (2026-10-17, #292): the coverage job is pinned to
-        # ubuntu-26.04 — the same class-2 runner-freeze mitigation as the
-        # test matrix's linux leg. Both
+        # Wedge forensics (2026-10-17, #292; UNIFIED 2026-11-20): the
+        # coverage job was pinned to ubuntu-26.04 — the same class-2
+        # runner-freeze mitigation as the test matrix's linux leg. Both
         # coverage runs of bc561ee on the 24.04 image died ~52 min into
         # Enforce coverage with "the hosted runner lost communication with the
         # server" (the wedge starving the runner itself), while the PR's own
-        # ubuntu-26.04 test legs were green twice. Scope the assertion to the
-        # coverage JOB so it cannot be satisfied by another job's runner label,
-        # and so a regression back to the drifting ubuntu-latest label — or a
-        # reordering that moves the string out of this job — fails loudly.
+        # ubuntu-26.04 test legs were green twice. The pin was retired on
+        # 2026-11-20 when the ubuntu-latest label completed its migration to
+        # the 26.04 image (actions/runner-images#14748, rollout Oct 19–Nov 19
+        # 2026; verified on hekma's own job logs — Image: ubuntu-26.04), so
+        # the job rides ubuntu-latest, which IS that image now. Scope the
+        # assertion to the coverage JOB so it cannot be satisfied by another
+        # job's runner label, and so a reordering that moves the string out
+        # of this job fails loudly.
         job_start = ci.index("  coverage:")
         import re as _re
 
@@ -244,7 +248,7 @@ class ReleaseDocsTests(unittest.TestCase):
         job_end = job_start + 1 + next_job.start() if next_job else len(ci)
         coverage_job = ci[job_start:job_end]
         self.assertIn("name: coverage", coverage_job)
-        self.assertIn("runs-on: ubuntu-26.04", coverage_job)
+        self.assertIn("runs-on: ubuntu-latest", coverage_job)
         # Stable jobs are explicit about their toolchain: the root
         # rust-toolchain.toml pins bare cargo to the MSRV (1.96.1), so these jobs
         # select +stable to keep exercising latest stable (AI-17). The `msrv` job
@@ -519,7 +523,7 @@ class ReleaseDocsTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("os: [ubuntu-26.04, macos-latest, windows-latest]", ci)
+        self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", ci)
         self.assertIn("runs-on: ${{ matrix.os }}", ci)
         self.assertIn("fail-fast: false", ci)
         # Only the `test` job matrixes; the other jobs stay ubuntu-only. The
@@ -575,16 +579,18 @@ class ReleaseDocsTests(unittest.TestCase):
         # live process snapshot in the step log, and the always-on
         # post-mortem snapshot step then captures the still-live quarantined
         # tree (stat/wchan names a D-state leftover's kernel wait channel)
-        # plus a PSI readout, uploaded as a per-OS artifact. Class 2 is
-        # bounded by the ENVIRONMENT instead: the linux leg pins
-        # ubuntu-26.04 and its JOB timeout tightens via the same
-        # matrix data (recalibrated 15m→25m on 2026-10-31 after the
-        # lane outgrew the cap — a freeze recurrence costs the 25+5m
-        # service window, not 45m). The cap rides
+        # plus a PSI readout, uploaded as a per-OS artifact. Class 2 was
+        # bounded by the ENVIRONMENT instead: the linux leg pinned
+        # ubuntu-26.04 (2026-10-17 → 2026-11-20; retired once the
+        # ubuntu-latest label completed its migration to that same 26.04
+        # image — actions/runner-images#14748) and its JOB timeout rides
+        # the same matrix data (the freeze-era 25m fast-fail, recalibrated
+        # 15m→25m on 2026-10-31, returned to the calibrated 40 on the
+        # 2026-11-20 unify — #292). The cap rides
         # the matrix `include` as DATA (not an in-step OS comparison). Pin
         # the deliberate shape so a future edit cannot silently drop the
-        # observability, loosen the fast-fail timeout, or resurrect the
-        # un-enforceable timeout(1) form.
+        # observability, walk the job timeout back off the calibrated 40,
+        # or resurrect the un-enforceable timeout(1) form.
         self.assertIn("nextest_wallclock_cap: 30m", ci)
         self.assertIn("setsid bash -c", ci)
         self.assertIn('echo $? > "$exitf"', ci)
@@ -592,17 +598,19 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertNotIn("--kill-after=", ci)
         self.assertIn("- name: Wedge post-mortem snapshot", ci)
         self.assertIn("name: wedge-postmortem-${{ matrix.os }}", ci)
-        self.assertIn("- os: ubuntu-26.04", ci)
-        self.assertIn("test_job_timeout_minutes: 25", ci)
+        self.assertIn("- os: ubuntu-latest", ci)
+        self.assertIn("test_job_timeout_minutes: 40", ci)
         # Default test-job budget 40→50 (2026-10-20): the suite passed 1,671
         # nextest tests with epic-17 and the windows-latest leg rides 33-38m
         # green; run 39472620931 lost ~9m to a double cold-cache miss (new
         # Cargo.lock key + an evicted Windows-cargo-nextest-bin that rebuilt
         # nextest from source) and the 40m job timeout cancelled the suite
-        # mid-run. 50 keeps cold-cache headroom; ubuntu rides 25m via the
-        # matrix include above (recalibrated from 15m on 2026-10-31 — green
-        # runs had reached 653–818s of job time and run 41193980277 capped
-        # out at 15m mid-suite with a healthy runner).
+        # mid-run. 50 keeps cold-cache headroom; ubuntu rides 40m via the
+        # matrix include above (returned from the freeze-era 25m to the
+        # calibrated 40 on the 2026-11-20 unify — #292; during the pin era
+        # it was recalibrated 15m→25m on 2026-10-31 after green runs had
+        # reached 653–818s of job time and run 41193980277 capped out at
+        # 15m mid-suite with a healthy runner).
         self.assertIn(
             "timeout-minutes: ${{ matrix.test_job_timeout_minutes || 50 }}", ci
         )
@@ -699,8 +707,9 @@ class ReleaseDocsTests(unittest.TestCase):
         ):
             self.assertEqual(nextest.count(serialized_filter), 2)
         self.assertEqual(nextest.count('test-group = "unbounded"'), 3)
-        # The wedge's home leg keeps the serialized default.
-        self.assertIn("- os: ubuntu-26.04", ci)
+        # The wedge's home leg keeps the serialized default (unified back to
+        # the ubuntu-latest label 2026-11-20 — the label IS the 26.04 image).
+        self.assertIn("- os: ubuntu-latest", ci)
         self.assertIn("nextest_wallclock_cap: 30m", ci)
 
     def test_ci_enforces_workspace_boundary_and_semver_gates(self) -> None:
