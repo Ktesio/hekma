@@ -124,15 +124,32 @@ fn registered_mock(name: &str) -> (TestContext, TestContext) {
 /// Spawn `hekma agent logs <name> --follow --json` with stdout/stderr
 /// redirected to files the parent can poll while the child runs.
 fn spawn_follow(ctx: &TestContext, state_dir: &Path, name: &str) -> std::process::Child {
+    spawn_follow_with_env(ctx, state_dir, name, &[])
+}
+
+/// Spawn the follow child with EXTRA environment pairs — the shape tests
+/// that enable the test-only drain-entry marker
+/// (`HEKMA_TEST_LOGS_FOLLOW_DRAIN_MARKER`) synchronize on.
+fn spawn_follow_with_env(
+    ctx: &TestContext,
+    state_dir: &Path,
+    name: &str,
+    extra_env: &[(&str, &str)],
+) -> std::process::Child {
     let out_path = ctx.project_dir.join("follow-stdout.ndjson");
     let err_path = ctx.project_dir.join("follow-stderr.txt");
-    std::process::Command::new(env!("CARGO_BIN_EXE_hekma"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hekma"));
+    command
         .args(["agent", "logs", name, "--follow", "--json"])
         .current_dir(&ctx.project_dir)
         .env("KTESIO_NO_UPDATE_CHECK", "1")
         .env("KTESIO_STATE_DIR", state_dir)
         .stdout(std::fs::File::create(&out_path).expect("create follow stdout file"))
-        .stderr(std::fs::File::create(&err_path).expect("create follow stderr file"))
+        .stderr(std::fs::File::create(&err_path).expect("create follow stderr file"));
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command
         .spawn()
         .expect("spawn hekma agent logs --follow --json")
 }
@@ -150,6 +167,25 @@ fn wait_stdout_contains(ctx: &TestContext, marker: &str) {
         assert!(
             std::time::Instant::now() < deadline,
             "follow never emitted `{marker}`; stdout so far={seen}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Poll a follow-child's redirected stderr file until it contains `marker` —
+/// the same observed-output synchronization as `wait_stdout_contains`, for
+/// notices and test markers that ride stderr (stdout stays pure NDJSON).
+fn wait_stderr_contains(ctx: &TestContext, marker: &str) {
+    let err_path = ctx.project_dir.join("follow-stderr.txt");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let seen = std::fs::read_to_string(&err_path).unwrap_or_default();
+        if seen.contains(marker) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "follow never emitted `{marker}` on stderr; stderr so far={seen}"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -280,45 +316,37 @@ fn logs_follow_final_drain_owns_the_qualifier_first_show() {
     // steady-state raw poll's and the drain's identical twin. In the test
     // above the early raw line streams on the first steady-state poll, so
     // the qualifier there fires on the STEADY-STATE arm and the drain's own
-    // `!shown` arm stays dark. Pin it in isolation: no raw file exists at
-    // all until the parent creates one AFTER the one steady-state
-    // iteration has provably completed, so the session's FIRST non-empty
-    // raw read happens inside the drain's retry loop.
-    //
-    // Drive: a `registered` (never-started) instance — never `running`, so
-    // the loop enters the drain after exactly ONE steady-state iteration —
-    // with an attributed backlog line the one-shot dump carries, plus a
-    // SECOND attributed line appended only after the dump is observed. That
-    // marker rides the first steady-state poll's attributed read (the
-    // one-shot dump is done; the outer loop's 300ms poll interval is its
-    // delivery window, and the parent's observe-and-append runs in tens of
-    // milliseconds — it cannot slip past the whole interval into a drain
-    // iteration, where delivering it would trip the drain's found-content
-    // break before any raw content exists). Observing the marker on stdout
-    // is causal proof the ENTIRE first iteration ran: the attributed read
-    // emitted it, the raw read that follows in the same iteration found no
-    // `agent.log` (empty — the qualifier stayed hidden; that read is
-    // sub-milliseconds behind the attributed emit, while the parent's
-    // stdout observation polls every ~20ms), and the status check after it
-    // entered the drain. The parent then CREATES `agent.log` with a single
-    // line — strictly after the last steady-state raw read — so the only
-    // reader that can ever see it is a drain poll: the session's first
-    // non-empty raw read fires the qualifier INSIDE the drain, the line
-    // streams as NDJSON, the drain breaks on found content, and the follow
-    // exits cleanly. No fixed sleep anywhere: every ordering claim is
-    // carried by an observed output line.
+    // `!shown` arm stays dark. Pin it in isolation: the child is spawned
+    // under HEKMA_TEST_LOGS_FOLLOW_DRAIN_MARKER, so the follow ITSELF
+    // announces drain entry with a stderr marker printed between the status
+    // check that ended the steady-state loop and the drain's first poll.
+    // The parent creates `agent.log` (the session's first raw content) only
+    // AFTER observing that marker, so the file provably did not exist
+    // during ANY steady-state read: the session's first non-empty raw read
+    // happens inside the drain's retry loop, firing the drain's own
+    // qualifier first-show, streaming the line as NDJSON, and breaking the
+    // drain on found content. No poll-interval margin is involved anywhere
+    // — the previous drive raced its attributed marker against the 300 ms
+    // interval (a parent descheduled past it delivered the marker through
+    // the drain instead and failed spuriously); the only bound left now is
+    // the drain's own 2 s retry window vs the parent's marker-to-create
+    // latency, a single observed file create.
     let (ctx, state) = registered_mock("rawq");
     let state_dir = state.project_dir.as_path();
     append_captured_line(state_dir, "rawq", "backlog line");
 
-    let mut child = spawn_follow(&ctx, state_dir, "rawq");
+    let mut child = spawn_follow_with_env(
+        &ctx,
+        state_dir,
+        "rawq",
+        &[("HEKMA_TEST_LOGS_FOLLOW_DRAIN_MARKER", "1")],
+    );
     // The one-shot dump carries the attributed backlog…
     wait_stdout_contains(&ctx, "backlog line");
-    // …and the marker appended now rides the first steady-state poll's
-    // attributed read. Observing it proves that poll — and the empty raw
-    // read paired with it — has fully run.
-    append_captured_line(state_dir, "rawq", "steady-state marker");
-    wait_stdout_contains(&ctx, "steady-state marker");
+    // …and the follow itself announces drain entry on stderr: only once
+    // that marker is observed is the raw file created, strictly after the
+    // last steady-state read.
+    wait_stderr_contains(&ctx, "logs-follow: final drain entered");
 
     // The session's first raw content, created when only drain polls remain.
     let raw_path = raw_agent_log_path(state_dir, "rawq");
@@ -337,10 +365,9 @@ fn logs_follow_final_drain_owns_the_qualifier_first_show() {
     let texts = assert_ndjson_texts(&stdout, "rawq");
     assert_eq!(
         texts,
-        vec!["backlog line", "steady-state marker", "drain raw line"],
-        "the drain's raw line streams after the dump and the marker — the \
-         marker is the proof the first steady-state poll ran before any raw \
-         content existed"
+        vec!["backlog line", "drain raw line"],
+        "the drain's raw line streams after the dump — the observed drain-entry \
+         marker is the proof no steady-state read ever saw the raw file"
     );
 
     let stderr = follow_stderr(&ctx);
