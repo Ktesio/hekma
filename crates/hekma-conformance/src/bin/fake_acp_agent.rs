@@ -338,24 +338,32 @@ fn emit_stderr_sentinel(sequence: u64) {
 }
 
 /// ONE OpenAI-compatible POST to the injected base URL (story 14-3, T2): the
-/// observed-call mode's model traffic for the loopback forward listener to
-/// intercept. Pure `std` (a blocking `TcpStream`), bounded reads, no
+/// observed-call mode's model traffic for the shared metering proxy to
+/// intercept. The base URL carries a Run-route path
+/// (`http://127.0.0.1:<port>/_hekma/runs/<run id>`) that a conforming agent
+/// KEEPS — the endpoint path appends to it (the concatenating behaviour the
+/// docs pin). Pure `std` (a blocking `TcpStream`), bounded reads, no
 /// dependency; a failed call is noted on stderr and the turn continues (the
 /// engine's ledger simply stays empty — the honest gap).
 #[cfg(not(tarpaulin_include))]
 fn post_one_observed_call(base_url: &str) {
-    // Parse `http://127.0.0.1:<port>` into host:port (loopback only in tests).
-    let Some(authority) = base_url.strip_prefix("http://") else {
+    // Parse `http://127.0.0.1:<port>[/<route path>]` into host:port + path.
+    let Some(rest) = base_url.strip_prefix("http://") else {
         eprintln!("fake_acp_agent: unsupported base URL shape: {base_url}");
         return;
     };
+    let (authority, route) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (rest, String::new()),
+    };
+    let route = route.trim_end_matches('/').to_string();
     let (host, port) = match authority.rsplit_once(':') {
         Some((host, port)) => (host, port),
         None => (authority, "80"),
     };
     let body = r#"{"model":"fake-acp","messages":[{"role":"user","content":"hi"}]}"#;
     let request = format!(
-        "POST /chat/completions HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: \
+        "POST {route}/chat/completions HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: \
          application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
         len = body.len(),
     );

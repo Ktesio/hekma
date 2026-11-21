@@ -495,6 +495,23 @@ impl From<hekma_engine::RunVerbError> for ApiError {
     }
 }
 
+impl From<hekma_engine::BindingError> for ApiError {
+    fn from(err: hekma_engine::BindingError) -> Self {
+        use hekma_engine::BindingError as B;
+        let message = err.to_string();
+        let kind = match &err {
+            B::NotFound { .. } | B::RouteNotFound { .. } => ApiErrorKind::NotFound,
+            B::Exists { .. } | B::PrefixTaken { .. } | B::TooMany { .. } => ApiErrorKind::Conflict,
+            B::LegacyRoute { .. } => ApiErrorKind::Conflict,
+            B::Invalid { .. } => ApiErrorKind::InvalidBody,
+            B::Credential(_) | B::Store(_) => ApiErrorKind::Internal,
+        };
+        let mut error = Self::new(kind, message);
+        error.code = Some(err.code());
+        error
+    }
+}
+
 impl From<ConfigError> for ApiError {
     fn from(err: ConfigError) -> Self {
         let encoded = crate::wire::encode_config(&err);

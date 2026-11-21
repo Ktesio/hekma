@@ -37,6 +37,9 @@ pub struct ServeFlags {
     pub stop_window: Option<u64>,
     /// `--metering-listen <port>`.
     pub metering_listen: u16,
+    /// `--no-identity-headers` (story 23-1): send neither
+    /// `x-hekma-run-id` nor `x-hekma-labels` to the model provider.
+    pub no_identity_headers: bool,
     /// `--state-dir <dir>`.
     pub state_dir: Option<String>,
     /// `--listen <addr>`.
@@ -91,6 +94,7 @@ pub fn run(flags: ServeFlags) -> Result<(), Box<dyn std::error::Error>> {
         state_base: flags.state_dir.map(PathBuf::from),
         stop_window: flags.stop_window,
         metering_listen_port: flags.metering_listen,
+        identity_headers: !flags.no_identity_headers,
         control_listen: flags.listen,
         bearer_secret: flags.bearer_secret,
         // Story 17-4: the capture posture — `None` (no flag) means the

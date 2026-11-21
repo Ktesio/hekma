@@ -1445,6 +1445,52 @@ impl RunRecords for SqliteStore {
     fn active_key_rows(&self) -> Result<Vec<crate::ports::TokenRow>, StoreError> {
         super::tokens_sqlite::active_key_rows(self.conn())
     }
+
+    fn set_run_upstream(&self, run_id: &RunId, upstream: Option<&str>) -> Result<(), StoreError> {
+        self.record_run_upstream(run_id, upstream)
+    }
+
+    fn recently_revoked_keys(
+        &self,
+        since: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::credential::TokenHash>, StoreError> {
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT token_hash FROM tokens WHERE class = 'run' AND state = 'revoked' \
+                 AND revoked_at >= ?1 ORDER BY revoked_at DESC LIMIT ?2",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![since, limit.min(i64::MAX as usize) as i64],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(backend)?;
+        let mut hashes = Vec::new();
+        for row in rows {
+            if let Ok(bytes) = <[u8; 32]>::try_from(row.map_err(backend)?) {
+                hashes.push(crate::domain::credential::TokenHash::from_bytes(bytes));
+            }
+        }
+        Ok(hashes)
+    }
+
+    fn entry_extras(
+        &self,
+        run_id: &RunId,
+    ) -> Result<crate::domain::runs::snapshot::EntryExtras, StoreError> {
+        use crate::ports::RunStore;
+        let latches = self.latches(run_id)?;
+        let upstream = self.run_upstream(run_id)?;
+        let identity = self.run_identity(run_id)?;
+        Ok(crate::domain::runs::snapshot::EntryExtras {
+            disposition: crate::domain::runs::snapshot::Disposition::of_latches(&latches),
+            upstream: upstream.map(std::sync::Arc::from),
+            identity,
+        })
+    }
 }
 
 /// The ancestors of `run_id` (nearest first) with their hosting instance

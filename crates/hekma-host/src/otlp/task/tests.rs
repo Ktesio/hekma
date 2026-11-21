@@ -73,7 +73,8 @@ fn transition(seq: u64) -> EngineEvent {
 fn usage(instance: &str, run: &str, seq: u64) -> EngineEvent {
     use hekma_engine::{RunId, UsageEvent, UsageUpdateEvent};
     EngineEvent::UsageUpdate(UsageUpdateEvent::new(UsageEvent {
-        instance: instance.to_string(),
+        instance: Some(instance.to_string()),
+        call_id: None,
         run_id: RunId::from_wire(run),
         input_tokens: 10,
         output_tokens: 20,

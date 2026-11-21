@@ -234,7 +234,10 @@ pub(crate) fn plan_label_change(
         };
         match existing.bound_origin() {
             None => return Err(LabelRefusal::NotBound(key.clone())),
-            Some(LabelOrigin::Config) => return Err(LabelRefusal::FromConfig(key.clone())),
+            // A binding's label is changed through the binding (story 23-1).
+            Some(LabelOrigin::Config | LabelOrigin::Binding) => {
+                return Err(LabelRefusal::FromConfig(key.clone()))
+            }
             Some(LabelOrigin::LabelVerb) => {
                 next.remove(key);
                 if let Some(configured) = config.iter().find(|label| &label.key == key) {
@@ -250,6 +253,31 @@ pub(crate) fn plan_label_change(
         next.insert(key.clone(), Label::verb(key.clone(), value.clone()));
     }
     Ok(next.into_values().collect())
+}
+
+/// Plan a binding re-sync (story 23-1) of a binding Run whose labels are
+/// `current` against its binding's labels now: every `binding` row is
+/// replaced by `binding`, a `label-verb` key is never touched (the verb
+/// wins), and a binding key replaces a Caller row (bound wins). Returns the
+/// next full label set, sorted by key.
+pub(crate) fn plan_binding_sync(current: &[Label], binding: &[(String, String)]) -> Vec<Label> {
+    let mut next: BTreeMap<String, Label> = current
+        .iter()
+        .filter(|label| label.bound_origin() != Some(LabelOrigin::Binding))
+        .map(|label| (label.key.clone(), label.clone()))
+        .collect();
+    for (key, value) in binding {
+        let verb_owned = next
+            .get(key)
+            .is_some_and(|existing| existing.bound_origin() == Some(LabelOrigin::LabelVerb));
+        if !verb_owned {
+            next.insert(
+                key.clone(),
+                Label::bound_by(key.clone(), value.clone(), LabelOrigin::Binding),
+            );
+        }
+    }
+    next.into_values().collect()
 }
 
 /// Plan a configuration re-sync of a Run whose labels are `current` against

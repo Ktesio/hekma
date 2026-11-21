@@ -63,6 +63,7 @@ impl Supervisor {
             // inputs; an unreadable configuration fail-closes the action to
             // `pause` in the resolution (never resolved as if unset).
             inputs: Some(registry.resolve_inputs_fail_closed(name)),
+            upstream: None,
         };
         match registry.ensure_supervised_run(run) {
             Ok(events) => self.publish_run_events(events),
@@ -170,16 +171,11 @@ impl Supervisor {
     ) -> crate::domain::registry_policy::InstanceContext {
         match self.running.get(name) {
             Some(supervised) => crate::domain::registry_policy::InstanceContext {
-                fence: supervised
-                    .observed_listener
-                    .as_ref()
-                    .map(crate::metering::ObservedListener::fence),
                 metering_source: supervised.metering_source.clone(),
                 supervised: true,
                 inputs: Some(registry.try_resolve_inputs_for(name.as_str())),
             },
             None => crate::domain::registry_policy::InstanceContext {
-                fence: None,
                 metering_source: String::new(),
                 supervised: false,
                 inputs: Some(registry.try_resolve_inputs_for(name.as_str())),
@@ -292,10 +288,6 @@ impl Supervisor {
                 (
                     name.as_str().to_string(),
                     crate::domain::registry_policy::InstanceContext {
-                        fence: supervised
-                            .observed_listener
-                            .as_ref()
-                            .map(crate::metering::ObservedListener::fence),
                         metering_source: supervised.metering_source.clone(),
                         supervised: true,
                         inputs: Some(registry.try_resolve_inputs_for(name.as_str())),
@@ -317,7 +309,6 @@ impl Supervisor {
                     contexts.insert(
                         instance.to_string(),
                         crate::domain::registry_policy::InstanceContext {
-                            fence: None,
                             metering_source: String::new(),
                             supervised: false,
                             inputs: Some(registry.try_resolve_inputs_for(instance)),
@@ -476,7 +467,17 @@ impl Supervisor {
         let mut actions: Vec<(InstanceName, Vec<crate::domain::pipeline::CommittedBreach>)> =
             Vec::new();
         for breach in breaches {
-            let instance = breach.event.instance.clone();
+            let Some(instance) = breach.event.instance.clone() else {
+                // Story 23-1: a breach on a Run with no Agent Instance (a
+                // wire Run) has no process to act on — it is recorded and
+                // published; `block` already rode the snapshot.
+                self.note_outbox_append(&breach.outbox);
+                self.publish(
+                    breach.outbox.seq,
+                    crate::domain::EngineEvent::BudgetBreach(breach.event.clone()),
+                );
+                continue;
+            };
             let name = match InstanceName::new(&instance) {
                 Ok(name) => name,
                 Err(err) => {

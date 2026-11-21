@@ -11,6 +11,7 @@
 
 mod budget;
 mod bus;
+pub(crate) mod calls;
 pub(crate) mod config;
 mod cost;
 pub(crate) mod credential;
@@ -50,6 +51,9 @@ mod secret;
 mod supervisor;
 mod transition;
 mod usage;
+pub(crate) use usage::mint_ulid;
+#[cfg(test)]
+pub(crate) use usage::CROCKFORD;
 
 pub use budget::{
     BreachAction, BreachDecision, BreachScope, BudgetEvaluator, ParseBreachActionError, TokenBudget,
@@ -128,6 +132,12 @@ pub use runs::{
     RunLimitsResults, RunLimitsView, RunVerbError,
 };
 pub use runs::{OpenedRun, RunActor, MAX_CALLER_OPEN_CHILDREN};
+// Story 23-1: Operator endpoint bindings.
+pub use runs::bindings::{
+    Binding, BindingChange, BindingCredential, BindingCredentialClass, BindingError, BindingEvent,
+    BindingOutcome, BindingPatch, BindingRoute, BindingSpec, IssuedBindingCredential, RouteSpec,
+    BINDING_EVENT_SCHEMA_VERSION, MAX_BINDINGS, MAX_BINDING_ROUTES,
+};
 // The resync core is engine-internal glue the facade calls (the story-10-3
 // helper); only the cursor/batch TYPES are public surface.
 pub use restart::{is_crash_loop, BackoffSchedule, RestartPolicy, MAX_CONSECUTIVE_FAILURES};

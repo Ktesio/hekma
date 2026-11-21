@@ -23,8 +23,8 @@ use crate::domain::budget::BreachAction;
 /// * `warn` always executes (it only signals);
 /// * `pause` / `stop` are process actions — the supervised depth only
 ///   (below it they need wire hold/reject, story 23.4);
-/// * `block` fences the metering listener — supervised with a wire path
-///   only (`supervised (no wire)` cannot; FR-49).
+/// * `block` fences the shared Metering Proxy — any depth with a wire path
+///   (story 23-1; a Run with no wire path cannot; FR-49).
 ///
 /// A resolved action that cannot execute falls back to `warn` with the
 /// `depth-fallback` Anomaly (FR-60); it takes effect when the Run's depth
@@ -37,7 +37,10 @@ pub(crate) fn action_executable(
     match action {
         BreachAction::Warn => true,
         BreachAction::Pause | BreachAction::Stop => depth == ControlDepth::Supervised,
-        BreachAction::Block => depth == ControlDepth::Supervised && wire_path,
+        // Story 23-1: the shared proxy fences every Run with a wire path,
+        // at any depth (the snapshot's disposition over the ancestor
+        // chain) — `block` needs no process.
+        BreachAction::Block => wire_path,
     }
 }
 

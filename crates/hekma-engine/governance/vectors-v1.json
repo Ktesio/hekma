@@ -3324,6 +3324,282 @@
           "policy": "p"
         }
       }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-wire-block-executes-at-wire-depth",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "wire",
+        "wire_path": true,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "tokens_per_run": 1000,
+              "breach_action": "block"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 1000,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "block",
+        "effective_action": "block",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": {
+            "policy": "p"
+          },
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": {
+            "policy": "p"
+          },
+          "scent_check": "default",
+          "rate": "unset"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-wire-block-executes-at-announced-depth",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "announced",
+        "wire_path": true,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "tokens_per_run": 1000,
+              "breach_action": "block"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 1000,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "block",
+        "effective_action": "block",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": {
+            "policy": "p"
+          },
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": {
+            "policy": "p"
+          },
+          "scent_check": "default",
+          "rate": "unset"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-wire-pause-falls-back-at-wire-depth",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "wire",
+        "wire_path": true,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "tokens_per_run": 1000,
+              "breach_action": "pause"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 1000,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "pause",
+        "effective_action": "warn",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": {
+            "policy": "p"
+          },
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": {
+            "policy": "p"
+          },
+          "scent_check": "default",
+          "rate": "unset"
+        },
+        "fallback": {
+          "policy": "p",
+          "action": "pause"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-wire-stop-falls-back-at-announced-depth",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "announced",
+        "wire_path": true,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "tokens_per_run": 1000,
+              "breach_action": "stop"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 1000,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "stop",
+        "effective_action": "warn",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": {
+            "policy": "p"
+          },
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": {
+            "policy": "p"
+          },
+          "scent_check": "default",
+          "rate": "unset"
+        },
+        "fallback": {
+          "policy": "p",
+          "action": "stop"
+        }
+      }
     }
   ]
 }

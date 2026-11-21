@@ -85,12 +85,18 @@ pub struct ServeOptions {
     /// (review finding 9); an out-of-bounds value is
     /// [`ServeError::InvalidOptions`].
     pub stop_window: Option<u64>,
-    /// The fixed loopback PORT every `engine-observed` instance's metering
-    /// listener binds for this host's lifetime (`0` = OS-ephemeral, the
-    /// pre-17-2 default). Non-zero is what keeps an adopted observed
-    /// instance's injected `base_url` live across host restarts (the AI-46
-    /// strand closure).
+    /// The shared Metering Proxy's loopback port (story 23-1, the
+    /// `--metering-listen` flag): `0` (the default) means the port recorded
+    /// for this state directory, else an OS pick that is then recorded —
+    /// one stable address for adopted agents and external clients. A taken
+    /// port never hops: the host serves on, says which port and why, and
+    /// refuses `engine-observed` starts until it is free.
     pub metering_listen_port: u16,
+    /// Story 23-1 (`--no-identity-headers`): when `false` (the default) the
+    /// proxy adds `x-hekma-run-id` and `x-hekma-labels` to outbound calls
+    /// (the run id and labels sent to the model provider — on by default);
+    /// `true` sends neither.
+    pub identity_headers: bool,
     /// The address the v0 Control API binds (`None` = API off — the default;
     /// serve is byte-identical to 17-2). Requires [`ServeOptions::bearer_secret`]
     /// (a missing partner is [`ServeError::InvalidOptions`] — the API never
@@ -386,6 +392,7 @@ where
         state_base,
         stop_window,
         metering_listen_port,
+        identity_headers,
         control_listen,
         bearer_secret,
         log_capture,
@@ -717,7 +724,19 @@ where
         hekma_engine::Engine::open_with_options(
             state_base.clone(),
             hekma_engine::EngineOptions {
-                metering_listen_port,
+                // Story 23-1: the shared Metering Proxy — sticky per state
+                // directory (the flag's port, else the recorded one, else an
+                // OS pick that is then recorded), with the host's
+                // identity-header posture. A taken port is surfaced by the
+                // engine's open note (the host keeps serving; engine-observed
+                // starts are refused until the port is free).
+                metering_proxy: hekma_engine::MeteringProxyOptions {
+                    enabled: true,
+                    port: metering_listen_port,
+                    sticky: true,
+                    identity_headers,
+                    ..hekma_engine::MeteringProxyOptions::default()
+                },
                 child_env_allowlist: !autostart,
                 // Story 17-4: the engine's log-capture posture — every spawn
                 // this host supervises resolves the SAME mode (open-time
@@ -744,6 +763,14 @@ where
         "host started; state root {} — supervising agents until SIGTERM/SIGINT",
         state_root.display()
     ));
+    // Story 23-1: the shared Metering Proxy's URL rides the started notice
+    // beside the state root — the address every metered agent and binding
+    // client points at. (A bind failure was already surfaced by the
+    // engine's open note; this stays silent then.)
+    let proxy_url = engine.metering_proxy().map(|info| info.url);
+    if let Some(url) = &proxy_url {
+        notifier.note(&format!("the metering proxy is listening on {url}."));
+    }
 
     // (5.5) The Control API mounts here: AFTER the engine opens and the
     // started notice lands, BEFORE the signal wait. The LOCAL endpoint
@@ -778,6 +805,9 @@ where
         token: local_token,
         hekma_version: build_version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
         autostarted: autostart,
+        // Story 23-1: where the shared Metering Proxy listens (absent when
+        // it could not bind — `GET /v0/proxy` and the open note say why).
+        metering_proxy_url: proxy_url,
     };
     if let Err(err) = local::write_discovery(&state_root, &discovery) {
         drop(bound);
