@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["pyyaml>=5.4"]
+# ///
 """Unit tests for repository automation helpers."""
 
 from __future__ import annotations
@@ -1272,7 +1276,9 @@ class ReleaseDocsTests(unittest.TestCase):
             self.fail(
                 "the upload-rider guard parses ci.yml with PyYAML "
                 "(preinstalled on GitHub-hosted ubuntu images; locally: "
-                "pip install pyyaml)"
+                "`uv run scripts/test_automation.py` resolves the PEP 723 "
+                "dependency header in this file automatically, or "
+                "`pip install pyyaml`)"
             )
 
         doc = yaml.safe_load(ci)
@@ -1451,7 +1457,7 @@ class ReleaseDocsTests(unittest.TestCase):
         )
         after_steps = (
             ci[:section_end]
-            + "\n    continue-on-error: true  # job-level, after the steps list"
+            + "\n    continue-on-error: true  # job-level, after the steps list\n"
             + ci[section_end:]
         )
         with self.assertRaises(AssertionError) as caught:
