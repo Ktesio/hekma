@@ -1707,6 +1707,21 @@ const FOLLOW_FINAL_DRAIN_BOUND: Duration = Duration::from_secs(2);
 /// How often the final-drain retry (above) re-polls while waiting.
 const FOLLOW_FINAL_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Test-only observability for the final drain (above): when set to a
+/// non-empty value, entering the drain prints one marker line
+/// ([`LOGS_FOLLOW_DRAIN_MARKER`]) to stderr. Integration tests that must
+/// create on-disk content STRICTLY after every steady-state read — so the
+/// session's first non-empty raw read provably happens inside the drain's
+/// retry loop — synchronize on that observed marker instead of on any
+/// poll-interval margin (a parent descheduled past the interval would
+/// otherwise race its own content into the wrong arm). Nothing is emitted
+/// when the knob is unset, so ordinary runs stay byte-identical.
+const LOGS_FOLLOW_DRAIN_MARKER_ENV: &str = "HEKMA_TEST_LOGS_FOLLOW_DRAIN_MARKER";
+
+/// The marker line printed at drain entry under
+/// [`LOGS_FOLLOW_DRAIN_MARKER_ENV`].
+const LOGS_FOLLOW_DRAIN_MARKER: &str = "logs-follow: final drain entered";
+
 /// The once-per-session qualifier for the RAW `agent.log` fallback lines
 /// (story 15-2, AI-18): between commands a detached instance's stdout lands
 /// only in the raw, un-attributed capture, so `logs --follow` in a new
@@ -1914,6 +1929,14 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
 
         let status = facade.instance_status(name).map_err(map_engine_error)?;
         if status.instance.state != LifecycleState::Running {
+            // Test-only drain-entry marker (LOGS_FOLLOW_DRAIN_MARKER_ENV):
+            // the observable proof the steady-state loop has ended — the
+            // status check above already ran, so no steady-state read can
+            // follow — for tests that stage late content only after
+            // seeing it. Inert (and silent) in ordinary runs.
+            if std::env::var_os(LOGS_FOLLOW_DRAIN_MARKER_ENV).is_some_and(|v| !v.is_empty()) {
+                eprintln!("{LOGS_FOLLOW_DRAIN_MARKER}");
+            }
             // AC-C: a BOUNDED final drain (fix pass, M2) so nothing emitted
             // right up to the transition is lost — retries briefly rather
             // than a single unretried read (see FOLLOW_FINAL_DRAIN_BOUND's
@@ -1948,7 +1971,13 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
                     return Ok(());
                 }
                 raw_cursor = next_raw_cursor;
-                if (more.is_empty() && raw_more.is_empty()) || Instant::now() >= final_deadline {
+                // Break when a poll FOUND content (either stream — the late
+                // engine-line write the drain exists to catch), or when the
+                // bound elapsed — RETRY while the poll comes back empty.
+                // (Restored from the inverted form that broke on the FIRST
+                // empty read, which re-exposed the exact cross-process race
+                // FOLLOW_FINAL_DRAIN_BOUND's docs say the retry closes.)
+                if !(more.is_empty() && raw_more.is_empty()) || Instant::now() >= final_deadline {
                     break;
                 }
                 std::thread::sleep(FOLLOW_FINAL_DRAIN_POLL_INTERVAL);
