@@ -403,9 +403,10 @@ fn logs_follow_reports_a_shrunk_raw_log_as_truncated_not_rotated() {
     //
     // Drive: the raw file exists at follow start with one long line, which
     // the steady-state poll streams (qualifier fired there, cursor at the
-    // complete-line end). Once the parent SEES that line committed, the
-    // follow has moved into the drain (retrying on empty every 20ms); the
-    // parent then replaces the file — atomically, via rename, the same
+    // complete-line end). The parent then waits for the follow's OWN
+    // drain-entry marker (the test-only HEKMA_TEST_LOGS_FOLLOW_DRAIN_MARKER
+    // knob, the same synchronization the qualifier test above uses) before
+    // replacing the file — atomically, via rename, the same
     // never-torn shape `rotate_generations` itself uses — with a SHORTER
     // one. The drain's next raw poll observes cursor > length, snaps to the
     // new end, delivers nothing (the engine's documented shrink semantics),
@@ -419,13 +420,22 @@ fn logs_follow_reports_a_shrunk_raw_log_as_truncated_not_rotated() {
     let long_line = "a long raw line that the truncation is going to eat";
     std::fs::write(&raw_path, format!("{long_line}\n")).expect("write the long raw line");
 
-    let mut child = spawn_follow(&ctx, state_dir, "rawsh");
-    // Wait until the raw line itself is committed — by then poll 1's raw
-    // read has set the cursor at the complete-line end and the follow has
-    // entered the drain's retry window (poll 1 runs ~350ms in; the 500ms
-    // settle clears it by a wide margin, so the replace lands mid-drain).
+    let mut child = spawn_follow_with_env(
+        &ctx,
+        state_dir,
+        "rawsh",
+        &[("HEKMA_TEST_LOGS_FOLLOW_DRAIN_MARKER", "1")],
+    );
+    // Wait until the raw line itself is committed — poll 1's raw read has
+    // set the cursor at the complete-line end — and then for the follow's
+    // OWN drain-entry marker: under HEKMA_TEST_LOGS_FOLLOW_DRAIN_MARKER the
+    // status check that ends the steady-state loop prints one stderr marker
+    // before the drain's first poll, so the rename below provably lands
+    // mid-drain. No poll-interval margin is involved anywhere — the
+    // previous fixed 500 ms settle raced the replace against the 300 ms
+    // interval.
     wait_stdout_contains(&ctx, long_line);
-    std::thread::sleep(Duration::from_millis(500));
+    wait_stderr_contains(&ctx, "logs-follow: final drain entered");
 
     // The recreate: stage a SHORTER fresh file next to it and rename it over
     // (atomic — a concurrent reader sees the old or the new generation,
