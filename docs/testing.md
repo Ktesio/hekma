@@ -431,3 +431,12 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
 
 These tests cover release-note and changelog rendering, Homebrew formula
 generation, installer dry-run decisions, and CI/workflow expectations.
+
+The upload-rider guard parses `ci.yml` with **PyYAML**. It is preinstalled on
+GitHub-hosted runner images, so the bare `python3` invocation above works in
+CI; locally, either `pip install pyyaml` or let `uv` resolve the script's
+PEP 723 dependency header (see the top of `scripts/test_automation.py`):
+
+```bash
+uv run scripts/test_automation.py
+```
