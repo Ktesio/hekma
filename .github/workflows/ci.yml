@@ -85,17 +85,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux leg PINNED to ubuntu-26.04 (class-2 runner-freeze mitigation,
-        # tracking #292): the wedging image is 24.04 (kernel 6.17.0-1022-azure);
-        # 26.04 is GA and is where ubuntu-latest migrates anyway Oct 19–Nov 19
-        # 2026 (actions/runner-images#14748). Unify back post-migration.
-        os: [ubuntu-26.04, macos-latest, windows-latest]
+        # Linux leg UNIFIED back to ubuntu-latest (2026-11-20, #292's
+        # unification step): the label migration completed (actions/
+        # runner-images#14748, rollout Oct 19–Nov 19 2026 — verified on
+        # hekma's own job logs: ubuntu-latest now reports Image:
+        # ubuntu-26.04), and the pinned 26.04 leg ran freeze-free from
+        # Oct 17 → Nov 20. The 2026-10-17 pin was the class-2 runner-freeze
+        # mitigation (the wedging image was 24.04); ubuntu-latest IS the
+        # 26.04 image now, so the pin no longer buys anything.
+        os: [ubuntu-latest, macos-latest, windows-latest]
         # Wedge forensics (2026-10-17): the ubuntu leg's test RUN is wall-clock
-        # capped and session-quarantined, and its JOB timeout tightened to 25m
-        # (recalibrated 2026-10-31 — the lane outgrew the original 15m; see the
-        # run-step comment below for the measured history) — see the "Run
-        # tests (nextest)" step below for the full why (two wedge classes; the
-        # freeze class is environment-bounded via the 26.04 pin).
+        # capped and session-quarantined, and its JOB timeout is carried as
+        # matrix data — 40m since the 2026-11-20 unify (the freeze-era 25m
+        # fast-fail, recalibrated 15m→25m on 2026-10-31, retired with the
+        # pin). See the "Run tests (nextest)" step below for the full why
+        # and the measured history (two wedge classes; the class-2 freeze
+        # was environment-bounded via the 26.04 pin until the label became
+        # that same image).
         # Carried as matrix DATA (not an in-step OS comparison) so the run step
         # stays one uniform invocation for all three OSes.
         # nextest profile per leg (2026-10-27): the windows-latest leg runs
@@ -112,9 +118,9 @@ jobs:
         # behavior-identical to the bare invocation). Carried as matrix
         # DATA so the run step stays one uniform invocation.
         include:
-          - os: ubuntu-26.04
+          - os: ubuntu-latest
             nextest_wallclock_cap: 30m
-            test_job_timeout_minutes: 25
+            test_job_timeout_minutes: 40
             nextest_profile: default
           - os: macos-latest
             nextest_profile: default
@@ -144,7 +150,7 @@ jobs:
     # .config/nextest.toml) remains the cross-OS per-test hang guard; the
     # residual Windows slow-runner flake family (TCK observed-section 30s
     # contention timeouts + a still-unidentified silent stall) is chartered
-    # under epic-12 retro item 95 (see #236). The matrix `include` tightens
+    # under epic-12 retro item 95 (see #236). The matrix `include` tightened
     # the PINNED ubuntu-26.04 leg (tracking #292), originally to 15m when the
     # healthy lane was ~4.5m. RECALIBRATED 15m→25m (2026-10-31): the suite
     # outgrew the cap — green main runs measured 653–818s of job time across
@@ -152,12 +158,18 @@ jobs:
     # 41189022237), and run 41193980277 (post-#358 main) hit the 15m job
     # timeout with the runner healthy (post-mortem: load 0.1, zero PSI
     # pressure, no D-state) and the suite still PROGRESSING (the in-flight
-    # test 17s old at the cap) — growth, not a wedge recurrence. 25m restores
+    # test 17s old at the cap) — growth, not a wedge recurrence. 25m restored
     # ~2x headroom over the worst observed green while a class-2 freeze still
-    # costs the 25+5m service window instead of 45m and still surfaces as a
+    # cost the 25+5m service window instead of 45m and still surfaced as a
     # fast visible cancel rather than a silent three-quarter-hour burn; it
-    # stays strictly under the 30m in-step supervisor cap, preserving the
-    # class-1 quarantine's role.
+    # stayed strictly under the 30m in-step supervisor cap, preserving the
+    # class-1 quarantine's role. UNIFY (2026-11-20, #292): the ubuntu-latest
+    # label completed its migration to the 26.04 image (verified on hekma's
+    # own ubuntu-latest job logs), the pin was retired, and
+    # test_job_timeout_minutes returned to the calibrated 40 — under the 50
+    # default with real headroom over the ~11–14m measured green band (the
+    # 653–818s runs cited above), while the 30m
+    # in-step supervisor cap (the class-1 quarantine) still binds.
     timeout-minutes: ${{ matrix.test_job_timeout_minutes || 50 }}
     steps:
       - name: Checkout
@@ -351,19 +363,22 @@ jobs:
         # ENVIRONMENT, so this matrix's linux leg is pinned to
         # ubuntu-26.04 (kernel 7.0.0-1012-azure vs the wedging 24.04
         # image's 6.17.0-1022-azure; GA for production) — which is where
-        # ubuntu-latest is migrating anyway (actions/runner-images#14748,
-        # rollout Oct 19–Nov 19 2026), so the pin carries no migration
-        # debt; unify back to ubuntu-latest once that migration
-        # completes. Corroboration that this is a tree×24.04-kernel
+        # ubuntu-latest was migrating anyway (actions/runner-images#14748,
+        # rollout Oct 19–Nov 19 2026), so the pin carried no migration
+        # debt; unified back to ubuntu-latest on 2026-11-20 once that
+        # migration completed (verified: the label's jobs now report
+        # Image: ubuntu-26.04). Corroboration that this is a tree×24.04-kernel
         # interaction, not a fleet incident: bite-mcp's ubuntu-latest CI
         # stayed green through the same window, and hekma main run
         # 39016343545 ran the SAME ubuntu suite green in 4m36s at 08:10Z
         # the same day — the trigger is nondeterministic. The pinned
-        # leg's JOB timeout drops to 25m (matrix data below; recalibrated
+        # leg's JOB timeout dropped to 25m (matrix data below; recalibrated
         # from 15m on 2026-10-31 after green runs reached 653–818s and
         # run 41193980277 capped out mid-suite on a healthy runner): a
         # class-2 recurrence on 26.04 costs the 25+5m service window,
-        # not 45m, and surfaces as a fast visible cancel. The cap rides
+        # not 45m, and surfaces as a fast visible cancel — a fast-fail
+        # window retired with the pin on 2026-11-20 (the unified
+        # ubuntu-latest leg rides the calibrated 40 again). The cap rides
         # the matrix `include` as data; the other legs render an empty cap
         # and run the plain uncapped invocation. Tracking issue: #292.
         shell: bash
@@ -1728,9 +1743,12 @@ jobs:
     # build had long finished; tarpaulin was mid-suite). The same PR's
     # test (ubuntu-26.04) legs were green twice, and the wedge-postmortem
     # artifact shows 26.04 carrying the same fake_agent leftovers with no
-    # freeze — so the pin moves the last 24.04 consumer off the drifting
-    # ubuntu-latest label (migrating Oct 19–Nov 19 anyway).
-    runs-on: ubuntu-26.04
+    # freeze — so the pin moved the last 24.04 consumer off the then-drifting
+    # ubuntu-latest label. UNIFIED back to ubuntu-latest on 2026-11-20: the
+    # label migration completed (actions/runner-images#14748; verified — the
+    # label's jobs now report Image: ubuntu-26.04), so the label IS the
+    # pinned image and the pin no longer buys anything.
+    runs-on: ubuntu-latest
     needs: [fmt, clippy, test, build, docs, boundary, semver, governance-vectors]
     # 90: the FIRST run on a cold coverage cache must compile the ENTIRE dependency
     # graph WITH coverage instrumentation — a separate fingerprint from the other
