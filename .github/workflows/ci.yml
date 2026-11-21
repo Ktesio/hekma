@@ -989,7 +989,15 @@ jobs:
       - name: Validate release doc generation
         run: python3 scripts/generate_release_docs.py v0.0.0 --output-dir target/release-docs-test
       - name: Test automation helpers
-        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
+        run: |
+          # test_automation.py parses ci.yml through PyYAML (the script's
+          # PEP 723 header declares it). Preinstalled on GitHub-hosted
+          # images, but install it explicitly so the step never leans on
+          # that preinstall (--break-system-packages for PEP 668 images,
+          # falling back to plain pip where the flag is unknown).
+          python3 -m pip install --quiet --break-system-packages "pyyaml>=5.4" \
+            || python3 -m pip install --quiet "pyyaml>=5.4"
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
       - name: Install docs site dependencies
         run: npm ci --prefix docs
       - name: Build docs site

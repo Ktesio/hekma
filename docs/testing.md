@@ -20,6 +20,10 @@ python3 scripts/generate_release_docs.py v0.0.0 --output-dir target/release-docs
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
 ```
 
+The last command needs **PyYAML** — see
+[Automation Helper Tests](#automation-helper-tests) for the `uv`/`pip` ways
+to get it.
+
 ### Toolchain
 
 The workspace ships a root `rust-toolchain.toml` pinning the toolchain to the MSRV (Rust **1.96.1**, with `clippy` + `rustfmt`), so a bare `cargo` — `cargo build`, `cargo test`, `cargo clippy`, `cargo fmt` — uses 1.96.1 without typing `cargo +1.96.1`. The explicit `+1.96.1` form still works and remains the escape hatch. Keep the pinned `channel` in lockstep with `rust-version` in the root `Cargo.toml`.

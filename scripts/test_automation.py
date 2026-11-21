@@ -17,6 +17,11 @@ from pathlib import Path
 import generate_release_docs as release_docs
 import generate_homebrew_formula as homebrew_formula
 
+try:  # the upload-rider guard parses ci.yml through PyYAML
+    import yaml  # noqa: F401
+except ImportError:
+    yaml = None
+
 
 class ReleaseDocsTests(unittest.TestCase):
     def test_release_body_has_single_download_table(self) -> None:
@@ -1361,6 +1366,11 @@ class ReleaseDocsTests(unittest.TestCase):
             )
             self.assertNotIn("continue-on-error", steps_by_name[handle], handle)
 
+    @unittest.skipUnless(
+        yaml is not None,
+        "the upload-rider guard needs PyYAML (`uv run scripts/test_automation.py` "
+        "resolves the PEP 723 header, or `pip install pyyaml`)",
+    )
     def test_diagnostic_artifact_uploads_carry_continue_on_error_enforcement_does_not(
         self,
     ) -> None:
@@ -1388,6 +1398,11 @@ class ReleaseDocsTests(unittest.TestCase):
         )
         self._assert_upload_rider_discipline(ci)
 
+    @unittest.skipUnless(
+        yaml is not None,
+        "the upload-rider guard needs PyYAML (`uv run scripts/test_automation.py` "
+        "resolves the PEP 723 header, or `pip install pyyaml`)",
+    )
     def test_upload_rider_guard_rejects_job_level_and_dash_first_continuations(
         self,
     ) -> None:
