@@ -1716,11 +1716,53 @@ const FOLLOW_FINAL_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// poll-interval margin (a parent descheduled past the interval would
 /// otherwise race its own content into the wrong arm). Nothing is emitted
 /// when the knob is unset, so ordinary runs stay byte-identical.
+///
+/// Compiled ONLY into debug/dev builds (`cfg(debug_assertions)`, round 5 of
+/// #404): integration tests spawn the dev-profile binary
+/// (`CARGO_BIN_EXE_hekma`), so they keep the sync hook, while RELEASE
+/// binaries carry no `HEKMA_TEST_*` read at all — this is otherwise the
+/// only test knob production code reads, and a released binary must not
+/// grow an undocumented stderr line just because some environment happens
+/// to export the variable (a CI job or shell copying a test env file would
+/// get `logs-follow: final drain entered` from every follow that drains).
+#[cfg(debug_assertions)]
 const LOGS_FOLLOW_DRAIN_MARKER_ENV: &str = "HEKMA_TEST_LOGS_FOLLOW_DRAIN_MARKER";
 
 /// The marker line printed at drain entry under
 /// [`LOGS_FOLLOW_DRAIN_MARKER_ENV`].
+#[cfg(debug_assertions)]
 const LOGS_FOLLOW_DRAIN_MARKER: &str = "logs-follow: final drain entered";
+
+/// Emit the test-only drain-entry marker when
+/// [`LOGS_FOLLOW_DRAIN_MARKER_ENV`] is set (see its docs for the sync
+/// contract). Debug/dev builds only.
+#[cfg(debug_assertions)]
+fn emit_logs_follow_drain_marker() {
+    if std::env::var_os(LOGS_FOLLOW_DRAIN_MARKER_ENV).is_some_and(|v| !v.is_empty()) {
+        eprintln!("{LOGS_FOLLOW_DRAIN_MARKER}");
+    }
+}
+
+/// Release-build twin of [`emit_logs_follow_drain_marker`]: the marker and
+/// its knob are debug-only, so a release binary has nothing to emit — the
+/// call site stays unconditional and branch-free.
+#[cfg(not(debug_assertions))]
+fn emit_logs_follow_drain_marker() {}
+
+/// (round 5 of #404, pure + unit-pinned) When a final-drain poll SETTLES
+/// the drain: only a QUIET poll — both streams empty — and only AFTER the
+/// drain has already seen content. Quiet-before-content keeps retrying
+/// (the in-flight engine line has not landed yet — the entire reason the
+/// drain exists), and a poll that FOUND content never settles it, first or
+/// otherwise: the late engine-line write can land right AFTER an attributed
+/// agent-out line already in the file, so content EXTENDS the drain
+/// instead of ending it. Extracted so the settle rule is pinnable without
+/// a timed harness — every earlier break shape here missed one half of the
+/// contract (first-empty re-exposed the cross-process race; first-content
+/// still missed an engine line landing just after agent output).
+fn final_drain_settles(seen_content: bool, poll_is_quiet: bool) -> bool {
+    poll_is_quiet && seen_content
+}
 
 /// The once-per-session qualifier for the RAW `agent.log` fallback lines
 /// (story 15-2, AI-18): between commands a detached instance's stdout lands
@@ -1933,19 +1975,22 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
             // the observable proof the steady-state loop has ended — the
             // status check above already ran, so no steady-state read can
             // follow — for tests that stage late content only after
-            // seeing it. Inert (and silent) in ordinary runs.
-            if std::env::var_os(LOGS_FOLLOW_DRAIN_MARKER_ENV).is_some_and(|v| !v.is_empty()) {
-                eprintln!("{LOGS_FOLLOW_DRAIN_MARKER}");
-            }
+            // seeing it. Inert (and silent) in ordinary runs, and compiled
+            // out of release builds entirely (see the const's docs).
+            emit_logs_follow_drain_marker();
             // AC-C: a BOUNDED final drain (fix pass, M2) so nothing emitted
             // right up to the transition is lost — retries briefly rather
             // than a single unretried read (see FOLLOW_FINAL_DRAIN_BOUND's
-            // docs for why); RETRIES while a poll comes back empty (the
-            // writer thread has not caught up yet) and stops as soon as
-            // EITHER a poll finds new content or the bound elapses —
-            // never the reverse (stopping on the FIRST empty read would
-            // defeat the retry's whole purpose).
+            // docs for why). Settle discipline (round 5 of #404): a poll
+            // that FINDS content does NOT end the drain — the late
+            // engine-line write it exists to catch can land right AFTER an
+            // attributed agent-out line already in the file, so content
+            // EXTENDS the drain; only a poll that comes back empty from
+            // BOTH streams, AFTER content has been seen, settles it (see
+            // [`final_drain_settles`]). Quiet polls before any content keep
+            // retrying — that window is the retry's whole purpose.
             let final_deadline = Instant::now() + FOLLOW_FINAL_DRAIN_BOUND;
+            let mut drain_saw_content = false;
             loop {
                 let (more, next_cursor) = facade
                     .read_agent_log_since(name, cursor)
@@ -1971,13 +2016,19 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
                     return Ok(());
                 }
                 raw_cursor = next_raw_cursor;
-                // Break when a poll FOUND content (either stream — the late
-                // engine-line write the drain exists to catch), or when the
-                // bound elapsed — RETRY while the poll comes back empty.
-                // (Restored from the inverted form that broke on the FIRST
-                // empty read, which re-exposed the exact cross-process race
-                // FOLLOW_FINAL_DRAIN_BOUND's docs say the retry closes.)
-                if !(more.is_empty() && raw_more.is_empty()) || Instant::now() >= final_deadline {
+                // Settle when a QUIET poll follows content (both streams
+                // empty — the late write, whichever stream it rode, has
+                // had its catch-up poll), or when the bound elapsed. A
+                // poll WITH content never settles the drain, first or
+                // later: stopping at the first non-empty poll (round 5 of
+                // #404) is exactly how an engine line landing right after
+                // an agent-out line got missed, and stopping at the first
+                // empty read (the older inverted form) re-exposed the
+                // cross-process race the retry closes.
+                drain_saw_content = drain_saw_content || !(more.is_empty() && raw_more.is_empty());
+                if final_drain_settles(drain_saw_content, more.is_empty() && raw_more.is_empty())
+                    || Instant::now() >= final_deadline
+                {
                     break;
                 }
                 std::thread::sleep(FOLLOW_FINAL_DRAIN_POLL_INTERVAL);
@@ -3610,6 +3661,34 @@ mod tests {
     /// clearing the var mid-run would break another's `open_engine`). A poisoned
     /// lock is fine — the guard is only for env-var mutual exclusion.
     static STATE_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Round 5 of #404: the final drain's settle rule, pinned without a
+    /// timed harness. Every earlier break shape missed one half of the
+    /// contract — breaking on the FIRST EMPTY read re-exposed the
+    /// cross-process race the retry closes, and breaking on the FIRST
+    /// NON-EMPTY read still missed an engine line landing right after an
+    /// agent-out line already in the file.
+    #[test]
+    fn final_drain_settles_only_on_quiet_after_content() {
+        assert!(
+            !final_drain_settles(false, false),
+            "a poll that FOUND content never settles — the late engine line \
+             can land right after it"
+        );
+        assert!(
+            !final_drain_settles(true, false),
+            "content after content EXTENDS the drain, never ends it"
+        );
+        assert!(
+            !final_drain_settles(false, true),
+            "quiet BEFORE any content keeps retrying — the in-flight line \
+             has not landed yet"
+        );
+        assert!(
+            final_drain_settles(true, true),
+            "quiet AFTER content settles: the writer has had its catch-up poll"
+        );
+    }
 
     #[test]
     fn disposition_from_flags_resolves_each_combination() {

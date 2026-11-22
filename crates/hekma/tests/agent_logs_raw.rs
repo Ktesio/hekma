@@ -64,6 +64,28 @@ fn append_captured_line(state_dir: &Path, name: &str, text: &str) {
     file.flush().expect("flush the attributed output log");
 }
 
+/// The same attributed append with the caller's [`LogStream`]: the late
+/// ENGINE line the final drain exists to catch arrives on
+/// [`LogStream::Engine`], not `agent-out`, and the round-5 test drives
+/// both halves of the attributed stream through the same on-disk shape.
+fn append_captured_line_as(state_dir: &Path, name: &str, stream: LogStream, text: &str) {
+    use std::io::Write;
+    let path = state_dir
+        .join("agents")
+        .join(name)
+        .join("logs")
+        .join("output.log");
+    std::fs::create_dir_all(path.parent().unwrap()).expect("create the instance log dir");
+    let line = hekma_engine::LogLine::new(name, stream, text, "2026-07-20T12:00:01Z");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("open the attributed output log");
+    writeln!(file, "{}", serde_json::to_string(&line).unwrap()).expect("append a log line");
+    file.flush().expect("flush the attributed output log");
+}
+
 /// Assert every non-empty stdout line is ONE complete, compact `LogLine` JSON
 /// object with the frozen key-set at the pinned schema version, and return the
 /// `text` values in order (the same wire contract `agent_cli.rs` asserts —
@@ -388,6 +410,65 @@ fn logs_follow_final_drain_owns_the_qualifier_first_show() {
         qualifier_at < exit_note_at,
         "the qualifier fires inside the drain, before the exit note that \
          ends it; stderr={stderr}"
+    );
+}
+
+#[test]
+fn logs_follow_final_drain_catches_a_late_attributed_engine_line() {
+    // Round 5 of #404: every drain test above stages its late content on
+    // the RAW agent.log half, but the race the PR is justified by is the
+    // ATTRIBUTED one — `transition_with_log_capture` persists the new
+    // state FIRST and writes output.log's engine line afterwards, so
+    // `logs --follow` (a separate process) can enter the final drain
+    // before that line exists. Drive the attributed half directly,
+    // synchronized on the drain-entry marker like the tests above: an
+    // agent-out line and then the engine line are appended to output.log
+    // STRICTLY after every steady-state read. The drain must deliver
+    // BOTH — and the poll that returns the agent-out line must not
+    // settle it (the round-5 finding: stopping at the first non-empty
+    // poll is exactly how an engine line landing right after agent
+    // output gets missed); it settles on the quiet poll AFTER content.
+    // The two appends are back-to-back, so the drain observes them in
+    // either batch shape — one poll or two — and must stream both in
+    // file order either way; the settle rule itself is unit-pinned in
+    // `agent.rs` (`final_drain_settles_only_on_quiet_after_content`), so
+    // this test needs no poll-interval margin anywhere.
+    let (ctx, state) = registered_mock("rawe");
+    let state_dir = state.project_dir.as_path();
+    append_captured_line(state_dir, "rawe", "backlog line");
+
+    let mut child = spawn_follow_with_env(
+        &ctx,
+        state_dir,
+        "rawe",
+        &[("HEKMA_TEST_LOGS_FOLLOW_DRAIN_MARKER", "1")],
+    );
+    // The one-shot dump carries the attributed backlog…
+    wait_stdout_contains(&ctx, "backlog line");
+    // …then the follow announces drain entry; only after that marker —
+    // provably inside the drain, past every steady-state read — does the
+    // late ATTRIBUTED content land in output.log: agent output first,
+    // then the engine line the drain exists to catch.
+    wait_stderr_contains(&ctx, "logs-follow: final drain entered");
+    append_captured_line(state_dir, "rawe", "late agent line");
+    append_captured_line_as(state_dir, "rawe", LogStream::Engine, "late engine line");
+
+    let status = wait_exit(&mut child);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "follow must exit 0; stderr={}",
+        follow_stderr(&ctx)
+    );
+
+    let stdout = follow_stdout(&ctx);
+    let texts = assert_ndjson_texts(&stdout, "rawe");
+    assert_eq!(
+        texts,
+        vec!["backlog line", "late agent line", "late engine line"],
+        "the drain must deliver the late ATTRIBUTED engine line — the exact \
+         cross-process write it exists to catch — after the agent-out line, \
+         not exit at the first non-empty poll"
     );
 }
 
