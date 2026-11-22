@@ -995,9 +995,13 @@ jobs:
           # images, but install it explicitly so the step never leans on
           # that preinstall (--break-system-packages for PEP 668 images,
           # falling back to plain pip where the flag is unknown).
+          # HEKMA_REQUIRE_YAML=1 turns a missing PyYAML into a hard
+          # failure instead of a skip, so the upload-rider guard can
+          # never be silently lost — even if a future edit drops the
+          # install lines above.
           python3 -m pip install --quiet --break-system-packages "pyyaml>=5.4" \
             || python3 -m pip install --quiet "pyyaml>=5.4"
-          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
+          PYTHONDONTWRITEBYTECODE=1 HEKMA_REQUIRE_YAML=1 python3 scripts/test_automation.py
       - name: Install docs site dependencies
         run: npm ci --prefix docs
       - name: Build docs site

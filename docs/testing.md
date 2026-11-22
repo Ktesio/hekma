@@ -20,9 +20,11 @@ python3 scripts/generate_release_docs.py v0.0.0 --output-dir target/release-docs
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
 ```
 
-The last command needs **PyYAML** — see
-[Automation Helper Tests](#automation-helper-tests) for the `uv`/`pip` ways
-to get it.
+The last command needs **PyYAML** — without it the two upload-rider tests
+are reported as **skipped** (a green local run has not exercised the spread
+guard); see [Automation Helper Tests](#automation-helper-tests) for the
+`uv`/`pip` ways to get it. CI runs the script under `HEKMA_REQUIRE_YAML=1`,
+where a missing PyYAML **fails** instead of skipping.
 
 ### Toolchain
 
@@ -436,9 +438,14 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
 These tests cover release-note and changelog rendering, Homebrew formula
 generation, installer dry-run decisions, and CI/workflow expectations.
 
-The upload-rider guard parses `ci.yml` with **PyYAML**. It is preinstalled on
-GitHub-hosted runner images, so the bare `python3` invocation above works in
-CI; locally, either `pip install pyyaml` or let `uv` resolve the script's
+The upload-rider guard parses `ci.yml` with **PyYAML**. CI does not rely
+on the runner preinstall: the `Test automation helpers` step installs
+`pyyaml>=5.4` explicitly and runs the script under `HEKMA_REQUIRE_YAML=1`,
+which turns a missing PyYAML into a **failure** rather than a skip — the
+guard can never silently not run in CI, even if a future workflow edit
+drops the install line. Locally without PyYAML the two upload-rider tests
+are reported as **skipped**, so a green run has not exercised the spread
+guard; either `pip install pyyaml` or let `uv` resolve the script's
 PEP 723 dependency header (see the top of `scripts/test_automation.py`):
 
 ```bash

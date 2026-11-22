@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import subprocess
@@ -21,6 +22,41 @@ try:  # the upload-rider guard parses ci.yml through PyYAML
     import yaml  # noqa: F401
 except ImportError:
     yaml = None
+
+# CI sets HEKMA_REQUIRE_YAML=1 wherever this script runs (ci.yml's "Test
+# automation helpers" step): a missing PyYAML then FAILS the upload-rider
+# tests instead of skipping them, so no workflow invocation can silently
+# lose the guard (#458 review round 5).
+YAML_REQUIRED = os.environ.get("HEKMA_REQUIRE_YAML") == "1"
+
+
+def _upload_rider_guard(test_method):
+    """Gate the upload-rider tests on PyYAML (#458 round 5). Without
+    PyYAML they SKIP — visibly, with a reason naming both install
+    paths — unless HEKMA_REQUIRE_YAML=1, which turns the missing
+    dependency into a hard failure (the strict mode CI runs in, so a
+    dropped install line can never produce a green-but-unchecked run)."""
+    if yaml is not None:
+        return test_method
+
+    if YAML_REQUIRED:
+
+        @functools.wraps(test_method)
+        def _required(self):
+            self.fail(
+                "HEKMA_REQUIRE_YAML=1: the upload-rider guard needs "
+                "PyYAML (locally: `uv run scripts/test_automation.py` "
+                "resolves the PEP 723 dependency header automatically, "
+                "or `pip install pyyaml`)"
+            )
+
+        return _required
+
+    return unittest.skip(
+        "the upload-rider guard needs PyYAML (`uv run "
+        "scripts/test_automation.py` resolves the PEP 723 header, or "
+        "`pip install pyyaml`) — skipped, not run"
+    )(test_method)
 
 
 class ReleaseDocsTests(unittest.TestCase):
@@ -1284,16 +1320,11 @@ class ReleaseDocsTests(unittest.TestCase):
         so two jobs can never merge into one section (the slicer's
         `^  <job>:$` regex skipped commented headers). Raises
         AssertionError on any violation."""
-        try:
-            import yaml
-        except ImportError:  # preinstalled on GitHub-hosted images
-            self.fail(
-                "the upload-rider guard parses ci.yml with PyYAML "
-                "(preinstalled on GitHub-hosted ubuntu images; locally: "
-                "`uv run scripts/test_automation.py` resolves the PEP 723 "
-                "dependency header in this file automatically, or "
-                "`pip install pyyaml`)"
-            )
+        # The @_upload_rider_guard decorator guarantees PyYAML is importable
+        # here: locally the gate skips without it, and under
+        # HEKMA_REQUIRE_YAML=1 (CI) a missing PyYAML fails the test before
+        # this body runs — so there is no fail-quiet path left to guard.
+        import yaml
 
         doc = yaml.safe_load(ci)
         self.assertIsInstance(doc, dict, "ci.yml must parse to a mapping")
@@ -1366,11 +1397,7 @@ class ReleaseDocsTests(unittest.TestCase):
             )
             self.assertNotIn("continue-on-error", steps_by_name[handle], handle)
 
-    @unittest.skipUnless(
-        yaml is not None,
-        "the upload-rider guard needs PyYAML (`uv run scripts/test_automation.py` "
-        "resolves the PEP 723 header, or `pip install pyyaml`)",
-    )
+    @_upload_rider_guard
     def test_diagnostic_artifact_uploads_carry_continue_on_error_enforcement_does_not(
         self,
     ) -> None:
@@ -1398,11 +1425,7 @@ class ReleaseDocsTests(unittest.TestCase):
         )
         self._assert_upload_rider_discipline(ci)
 
-    @unittest.skipUnless(
-        yaml is not None,
-        "the upload-rider guard needs PyYAML (`uv run scripts/test_automation.py` "
-        "resolves the PEP 723 header, or `pip install pyyaml`)",
-    )
+    @_upload_rider_guard
     def test_upload_rider_guard_rejects_job_level_and_dash_first_continuations(
         self,
     ) -> None:
