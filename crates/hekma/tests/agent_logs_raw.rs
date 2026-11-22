@@ -64,11 +64,21 @@ fn append_captured_line(state_dir: &Path, name: &str, text: &str) {
     file.flush().expect("flush the attributed output log");
 }
 
-/// The same attributed append with the caller's [`LogStream`]: the late
-/// ENGINE line the final drain exists to catch arrives on
-/// [`LogStream::Engine`], not `agent-out`, and the round-5 test drives
-/// both halves of the attributed stream through the same on-disk shape.
-fn append_captured_line_as(state_dir: &Path, name: &str, stream: LogStream, text: &str) {
+/// The late ATTRIBUTED pair — agent-out line and the ENGINE line the
+/// final drain exists to catch — appended in ONE `write_all` (round 6 of
+/// #404): two separate appends left a drain-poll-lands-between-them window
+/// where the drain could see only the first line, settle on the next quiet
+/// poll, and spuriously miss the engine line. One write puts both lines in
+/// the same poll's read BY CONSTRUCTION, so the test drives DELIVERY of
+/// the late attributed pair (the cross-process race the fix closes) and
+/// leaves distinguishing the settle rules themselves to the unit pin
+/// (`final_drain_settles_only_on_quiet_after_content`).
+fn append_captured_late_pair_one_write(
+    state_dir: &Path,
+    name: &str,
+    agent_text: &str,
+    engine_text: &str,
+) {
     use std::io::Write;
     let path = state_dir
         .join("agents")
@@ -76,13 +86,25 @@ fn append_captured_line_as(state_dir: &Path, name: &str, stream: LogStream, text
         .join("logs")
         .join("output.log");
     std::fs::create_dir_all(path.parent().unwrap()).expect("create the instance log dir");
-    let line = hekma_engine::LogLine::new(name, stream, text, "2026-07-20T12:00:01Z");
+    let agent = hekma_engine::LogLine::new(
+        name,
+        LogStream::AgentOut,
+        agent_text,
+        "2026-07-20T12:00:00Z",
+    );
+    let engine =
+        hekma_engine::LogLine::new(name, LogStream::Engine, engine_text, "2026-07-20T12:00:01Z");
+    let mut bytes = serde_json::to_string(&agent).unwrap();
+    bytes.push('\n');
+    bytes.push_str(&serde_json::to_string(&engine).unwrap());
+    bytes.push('\n');
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .expect("open the attributed output log");
-    writeln!(file, "{}", serde_json::to_string(&line).unwrap()).expect("append a log line");
+    file.write_all(bytes.as_bytes())
+        .expect("append the late attributed pair");
     file.flush().expect("flush the attributed output log");
 }
 
@@ -422,17 +444,15 @@ fn logs_follow_final_drain_catches_a_late_attributed_engine_line() {
     // `logs --follow` (a separate process) can enter the final drain
     // before that line exists. Drive the attributed half directly,
     // synchronized on the drain-entry marker like the tests above: an
-    // agent-out line and then the engine line are appended to output.log
-    // STRICTLY after every steady-state read. The drain must deliver
-    // BOTH — and the poll that returns the agent-out line must not
-    // settle it (the round-5 finding: stopping at the first non-empty
-    // poll is exactly how an engine line landing right after agent
-    // output gets missed); it settles on the quiet poll AFTER content.
-    // The two appends are back-to-back, so the drain observes them in
-    // either batch shape — one poll or two — and must stream both in
-    // file order either way; the settle rule itself is unit-pinned in
-    // `agent.rs` (`final_drain_settles_only_on_quiet_after_content`), so
-    // this test needs no poll-interval margin anywhere.
+    // agent-out line AND the engine line land in output.log STRICTLY
+    // after every steady-state read — in ONE write (round 6 of #404), so
+    // a single drain poll observes both together and no poll can land
+    // between them. The drain must deliver BOTH, in file order.
+    // Distinguishing the settle rules themselves — first-content vs
+    // quiet-after-content — is NOT this test's job: one atomic write
+    // passes under either rule, so that distinction is unit-pinned in
+    // `agent.rs` (`final_drain_settles_only_on_quiet_after_content`)
+    // rather than claimed here.
     let (ctx, state) = registered_mock("rawe");
     let state_dir = state.project_dir.as_path();
     append_captured_line(state_dir, "rawe", "backlog line");
@@ -447,11 +467,10 @@ fn logs_follow_final_drain_catches_a_late_attributed_engine_line() {
     wait_stdout_contains(&ctx, "backlog line");
     // …then the follow announces drain entry; only after that marker —
     // provably inside the drain, past every steady-state read — does the
-    // late ATTRIBUTED content land in output.log: agent output first,
-    // then the engine line the drain exists to catch.
+    // late ATTRIBUTED pair land in output.log as one write: agent output
+    // first, then the engine line the drain exists to catch.
     wait_stderr_contains(&ctx, "logs-follow: final drain entered");
-    append_captured_line(state_dir, "rawe", "late agent line");
-    append_captured_line_as(state_dir, "rawe", LogStream::Engine, "late engine line");
+    append_captured_late_pair_one_write(state_dir, "rawe", "late agent line", "late engine line");
 
     let status = wait_exit(&mut child);
     assert_eq!(
@@ -468,7 +487,7 @@ fn logs_follow_final_drain_catches_a_late_attributed_engine_line() {
         vec!["backlog line", "late agent line", "late engine line"],
         "the drain must deliver the late ATTRIBUTED engine line — the exact \
          cross-process write it exists to catch — after the agent-out line, \
-         not exit at the first non-empty poll"
+         in file order"
     );
 }
 

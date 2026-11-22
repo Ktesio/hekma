@@ -1697,7 +1697,11 @@ const LOGS_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// state via `instance_status` (step one) a moment before that OTHER
 /// process has finished the engine-line write (step two) — a real,
 /// cross-process race, distinct from (and independent of) the reader/tailer
-/// mechanics. Retrying briefly here closes it. Mirrors
+/// mechanics. Retrying briefly here closes the common shape of the race —
+/// a line landing before ANY content does (quiet polls keep retrying) or
+/// while output is still flowing (content extends the drain). What it does
+/// NOT guarantee: a line landing only after the settling quiet poll is
+/// the rule's named residual — see [`final_drain_settles`]. Mirrors
 /// `crates/hekma-engine/tests/logs.rs`'s
 /// `follow_drains_and_exits_cleanly_on_stop`'s own accommodation for this
 /// exact race (there, a 3s bound); kept short here since the remaining gap
@@ -1760,6 +1764,16 @@ fn emit_logs_follow_drain_marker() {}
 /// a timed harness — every earlier break shape here missed one half of the
 /// contract (first-empty re-exposed the cross-process race; first-content
 /// still missed an engine line landing just after agent output).
+///
+/// The rule's own residual (named in review round 6 of #404, so no reader
+/// over-reads the guarantee): a line that lands only AFTER the settling
+/// quiet poll — more than one poll interval after the last other content,
+/// with quiet in between — is missed. Waiting for an explicit
+/// `LogStream::Engine` line instead of settling would close that, but it
+/// holds EVERY drain to the bound, including follows that can never see
+/// an engine line (raw-fallback captures and unclean deaths write none),
+/// so quiet-after-content is the chosen trade; [`FOLLOW_FINAL_DRAIN_BOUND`]
+/// caps the whole wait either way.
 fn final_drain_settles(seen_content: bool, poll_is_quiet: bool) -> bool {
     poll_is_quiet && seen_content
 }
@@ -1850,8 +1864,10 @@ fn raw_fallback_qualifier(skipped_beyond: u64) -> String {
 /// engine's returned cursor snaps BELOW the one just passed in), prints one
 /// honest notice rather than silently claiming completeness. On a non-
 /// `running` state, performs a bounded final drain (fix pass, M2 — see
-/// [`FOLLOW_FINAL_DRAIN_BOUND`]; so no line emitted before the transition is
-/// lost) and exits cleanly with a state-appropriate note — a `paused`
+/// [`FOLLOW_FINAL_DRAIN_BOUND`]; the drain keeps polling while content
+/// keeps arriving and settles on the first quiet poll after it — its
+/// guarantees and named residual are stated at [`final_drain_settles`])
+/// and exits cleanly with a state-appropriate note — a `paused`
 /// instance is not "gone", so it gets an honest "paused" note, not an
 /// error. No special Ctrl-C handling is needed: this is a read-only command
 /// holding no supervising handle, so a SIGINT exit is always safe.
@@ -2017,14 +2033,17 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
                 }
                 raw_cursor = next_raw_cursor;
                 // Settle when a QUIET poll follows content (both streams
-                // empty — the late write, whichever stream it rode, has
-                // had its catch-up poll), or when the bound elapsed. A
-                // poll WITH content never settles the drain, first or
-                // later: stopping at the first non-empty poll (round 5 of
-                // #404) is exactly how an engine line landing right after
-                // an agent-out line got missed, and stopping at the first
-                // empty read (the older inverted form) re-exposed the
-                // cross-process race the retry closes.
+                // empty — the writer was idle for a full poll interval)
+                // or when the bound elapsed. A poll WITH content never
+                // settles the drain, first or later: stopping at the
+                // first non-empty poll (round 5 of #404) is exactly how
+                // an engine line landing right after an agent-out line
+                // got missed, and stopping at the first empty read (the
+                // older inverted form) re-exposed the cross-process race
+                // the retry closes. Honest limit (round 6): settling on
+                // the first quiet poll after content can still miss a
+                // line that lands only AFTER that quiet poll — the
+                // residual documented on [`final_drain_settles`].
                 drain_saw_content = drain_saw_content || !(more.is_empty() && raw_more.is_empty());
                 if final_drain_settles(drain_saw_content, more.is_empty() && raw_more.is_empty())
                     || Instant::now() >= final_deadline
@@ -3686,7 +3705,9 @@ mod tests {
         );
         assert!(
             final_drain_settles(true, true),
-            "quiet AFTER content settles: the writer has had its catch-up poll"
+            "quiet AFTER content settles: the writer was idle a full poll \
+             interval (its residual — a line landing only after that quiet \
+             poll — is documented on final_drain_settles)"
         );
     }
 
