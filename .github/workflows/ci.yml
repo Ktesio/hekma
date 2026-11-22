@@ -482,6 +482,13 @@ jobs:
             ps -eo pid,stat,args 2>/dev/null | grep -E "nextest|fake_agent|fake_acp_agent|hermes_shim|hekma" | grep -v grep || echo "(none)"
           } | tee "$RUNNER_TEMP/wedge-postmortem.txt"
       - name: Upload wedge post-mortem artifact
+        # Diagnostics-only rider: nothing downstream gates on this
+        # artifact, so the upload itself must not red an otherwise-green
+        # job (2026-11-11: the artifact service degraded — HTML error
+        # pages after 5 retries — and put red rows on green test legs).
+        # always() still ships the post-mortem when the service is
+        # healthy; the job's verdict comes from the enforcement steps.
+        continue-on-error: true
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -714,6 +721,10 @@ jobs:
         # exactly when the record matters most. Story 17-1: ONE artifact
         # carries BOTH report files (the default run's and the serve run's);
         # story 21-5 adds the ps run's as the third.
+        # Diagnostics-only rider (same 2026-11-11 artifact-service
+        # degradation): a failed upload must not red a green perf leg —
+        # the ratchet verdicts live in the run steps above.
+        continue-on-error: true
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -978,7 +989,19 @@ jobs:
       - name: Validate release doc generation
         run: python3 scripts/generate_release_docs.py v0.0.0 --output-dir target/release-docs-test
       - name: Test automation helpers
-        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_automation.py
+        run: |
+          # test_automation.py parses ci.yml through PyYAML (the script's
+          # PEP 723 header declares it). Preinstalled on GitHub-hosted
+          # images, but install it explicitly so the step never leans on
+          # that preinstall (--break-system-packages for PEP 668 images,
+          # falling back to plain pip where the flag is unknown).
+          # HEKMA_REQUIRE_YAML=1 turns a missing PyYAML into a hard
+          # failure instead of a skip, so the upload-rider guard can
+          # never be silently lost — even if a future edit drops the
+          # install lines above.
+          python3 -m pip install --quiet --break-system-packages "pyyaml>=5.4" \
+            || python3 -m pip install --quiet "pyyaml>=5.4"
+          PYTHONDONTWRITEBYTECODE=1 HEKMA_REQUIRE_YAML=1 python3 scripts/test_automation.py
       - name: Install docs site dependencies
         run: npm ci --prefix docs
       - name: Build docs site
@@ -1795,7 +1818,7 @@ jobs:
         # cache hit the binary is already on PATH, so the `command -v` guard skips
         # the rebuild (matches the semver gate's guarded install, AI-23).
         run: command -v cargo-tarpaulin >/dev/null 2>&1 || cargo +stable install cargo-tarpaulin --locked
-      - name: Install lcov (per-crate coverage merge, #101)
+      - name: "Install lcov (per-crate coverage merge, #101)"
         # The per-crate split (#101) writes one LCOV tracefile per crate; lcov
         # merges them into the workspace-aggregate the --fail-under 95 gate is
         # enforced on. apt's lcov is enough — only `lcov -a`/`--summary` are used.
@@ -1820,7 +1843,7 @@ jobs:
           sudo mkswap /mnt/covswap
           sudo swapon /mnt/covswap
           echo "after:"; df -h / /mnt; free -h
-      - name: Enforce coverage (per-crate split + merged aggregate gate, #101)
+      - name: "Enforce coverage (per-crate split + merged aggregate gate, #101)"
         # NOTE for future env additions: RUST_BACKTRACE rode this step's env
         # block 2026-09-26/27 to pin the llvm_profparser partial-profraw
         # panic; it is GONE now (root-caused — see the fake_acp_agent guard
@@ -2132,6 +2155,10 @@ jobs:
         # themselves — header-declared size vs actual bytes answers WHO wrote
         # an incomplete profile, which the logs cannot (the panicking job's
         # runner discards them otherwise).
+        # Diagnostics-only rider (same 2026-11-11 artifact-service
+        # degradation): the 95% gate above enforces; a failed upload
+        # must not red a green coverage leg.
+        continue-on-error: true
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
