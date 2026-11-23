@@ -368,8 +368,11 @@ fn logs_follow_final_drain_owns_the_qualifier_first_show() {
     // AFTER observing that marker, so the file provably did not exist
     // during ANY steady-state read: the session's first non-empty raw read
     // happens inside the drain's retry loop, firing the drain's own
-    // qualifier first-show, streaming the line as NDJSON, and breaking the
-    // drain on found content. No poll-interval margin is involved anywhere
+    // qualifier first-show and streaming the line as NDJSON; the drain
+    // then settles on the first QUIET poll after that content, not on
+    // the content itself (the settle-rule distinction is pinned by
+    // `final_drain_settles_only_on_quiet_after_content`). No poll-interval
+    // margin is involved anywhere
     // — the previous drive raced its attributed marker against the 300 ms
     // interval (a parent descheduled past it delivered the marker through
     // the drain instead and failed spuriously); the only bound left now is
