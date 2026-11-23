@@ -12432,3 +12432,487 @@ fn a_token_the_metering_listener_saw_in_a_url_is_revoked_by_the_reaper() {
     sup.stop(&registry, "urlkey", Some(Duration::from_secs(5)))
         .unwrap();
 }
+
+// ---- The publish_and_act dispatch arms + the breach-action dimension arms ----
+
+use crate::domain::governance::GovernanceDecision;
+
+/// A hand-staged [`crate::domain::pipeline::CommittedBreach`] for the
+/// dispatch arms the store-side pipeline cannot produce on its own (an
+/// instance name that does not parse, a Run this engine never supervised):
+/// the same fields `pipeline::evaluate` stamps, at a fixed outbox seq.
+fn staged_breach(
+    instance: &str,
+    run_id: &str,
+    decision: GovernanceDecision,
+    seq: u64,
+) -> crate::domain::pipeline::CommittedBreach {
+    let event = match decision.dimension {
+        BreachDimension::Tokens => BudgetBreachEvent::new(
+            instance,
+            run_id,
+            decision.scope,
+            decision.limit,
+            decision.observed,
+            decision.action,
+            "self-reported",
+            now_rfc3339(),
+        ),
+        BreachDimension::Dollars => BudgetBreachEvent::new_cost(
+            instance,
+            run_id,
+            decision.scope,
+            Micros(decision.limit as i64),
+            Micros(decision.observed as i64),
+            EstimateLabel::Estimated,
+            decision.action,
+            "self-reported",
+            now_rfc3339(),
+        ),
+    };
+    crate::domain::pipeline::CommittedBreach {
+        event,
+        decision,
+        outbox: crate::ports::OutboxAppend {
+            seq,
+            dropped_acked: 0,
+            dropped_unacked: 0,
+        },
+        process_level: true,
+    }
+}
+
+/// Wait until the agent's output log carries `want` usage sentinel lines —
+/// the manual-drain tests' ingestion handshake (the drain owns commitment,
+/// so the test waits for the LOG, never for the ledger).
+fn wait_for_usage_sentinels(path: &std::path::Path, want: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = std::fs::read_to_string(path)
+            .map(|c| c.matches("KTESIO_USAGE").count())
+            .unwrap_or(0);
+        if seen >= want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the usage sentinels never reached the expected count"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_block_breach_records_and_surfaces_the_missing_wire_listener() {
+    // The `block` Breach Action arm: `block` is process-level but never
+    // touches the lifecycle — it raises the wire fence when the instance
+    // has one, and says so honestly when it does not. The config layer
+    // REFUSES `block` for self-reported metering by design (no listener to
+    // fence), so the arm is staged through the pub(crate) dispatch with a
+    // hand-built decision — the same fields the pipeline stamps — which is
+    // exactly the degraded shape the arm must survive: breach mirrored,
+    // honest breadcrumb, process untouched.
+    let (_state, _manifest, registry) = setup_fake("blockarm", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("blockarm").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "blockarm").unwrap();
+
+    sup.publish_and_act(
+        &registry,
+        vec![staged_breach(
+            "blockarm",
+            "run-1",
+            GovernanceDecision {
+                dimension: BreachDimension::Tokens,
+                scope: BreachScope::Cumulative,
+                action: BreachAction::Block,
+                limit: 30,
+                observed: 30,
+            },
+            1,
+        )],
+        Vec::new(),
+        Vec::new(),
+        &[],
+        "a money job",
+    );
+
+    // Mirrored: the breach event is on file for the agent.
+    let mirrored =
+        std::fs::read_to_string(registry.instance_breach_log_path(&name)).unwrap_or_default();
+    assert!(
+        mirrored.contains("blockarm") && mirrored.contains("run-1"),
+        "the block breach must be mirrored to the breach log"
+    );
+    // `block` never transitions the lifecycle: the row stays running.
+    assert_eq!(
+        state_of(&registry, "blockarm"),
+        LifecycleState::Running,
+        "a block breach must not pause or stop the process"
+    );
+    // Self-reported metering has no wire listener to fence — the honest
+    // breadcrumb names the instance and the remedy.
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains(
+            "blockarm: budget breach (tokens cumulative) is configured to `block`, but this \
+             instance has no wire listener to fence"
+        ),
+        "the missing-listener breadcrumb must be surfaced"
+    );
+    sup.stop(&registry, "blockarm", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn a_dollar_cap_breach_pauses_with_the_cost_cap_cause() {
+    // The Dollars arm of the breach-action dispatch: a per-run Cost Cap
+    // ($0.05) reached by event 1's derived cost (30 tokens at $2000/1M
+    // each way = $0.06) under `pause` drives the pause through the
+    // COST-CAP cause — micro-dollars both ways, `estimated` label — the
+    // money twin of the token pause. Uses the pause-guaranteed manifest +
+    // the polling drain (the established token-pause choreography).
+    let (_state, _manifest, registry) = setup_pause_guaranteed(
+        "dollarpause",
+        &["--emit-usage", "2", "--linger-ms", "600000"],
+    );
+    let name = InstanceName::new("dollarpause").unwrap();
+    registry
+        .set_config(&name, "cost.rate.input", "2000.00")
+        .unwrap();
+    registry
+        .set_config(&name, "cost.rate.output", "2000.00")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.dollars.per_run", "0.05")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.breach_action", "pause")
+        .unwrap();
+
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let _buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "dollarpause").unwrap();
+
+    // The polling drain lands the pause (its own assert carries the
+    // never-reached-Paused failure).
+    drain_until_state(&mut sup, &registry, "dollarpause", LifecycleState::Paused);
+
+    let breaches = Supervisor::read_breach_events(&registry, "dollarpause").unwrap();
+    assert_eq!(
+        breaches.len(),
+        1,
+        "exactly one breach for the single crossing"
+    );
+    assert_eq!(breaches[0].dimension, BreachDimension::Dollars);
+    assert_eq!(breaches[0].action.as_str(), "pause");
+    assert_eq!(breaches[0].scope, BreachScope::PerRun);
+    // The transition carries the COST-cap cause, not the token one: the
+    // pause edge's machine-readable cause kind is the cost-cap tag.
+    let events = Supervisor::read_events(&registry, "dollarpause").unwrap();
+    let edge = events
+        .iter()
+        .find(|e| e.prior_state == LifecycleState::Running && e.new_state == LifecycleState::Paused)
+        .expect("the pause edge must be recorded");
+    let cause = serde_json::to_string(&edge.cause).unwrap();
+    assert!(
+        cause.contains("\"kind\":\"budget-exceeded\"")
+            && cause.contains("\"dimension\":\"dollars\""),
+        "the pause edge must carry the DOLLARS budget-exceeded cause"
+    );
+}
+
+#[test]
+fn both_dimensions_breaching_in_one_batch_fold_into_one_action_set() {
+    // The second-breach fold: when BOTH dimensions cross in ONE evaluation
+    // (event 1's 30 tokens reaching the per-run token ceiling of 30, and
+    // the same tokens' derived cost reaching the $0.05 per-run Cost Cap),
+    // the agent's second breach folds into its already-open action entry —
+    // one agent, two breaches, one dispatch — in the documented
+    // token-before-dollar fire order, and `warn` leaves the lifecycle
+    // untouched.
+    let (_state, _manifest, registry) = setup_fake(
+        "dualbreach",
+        &["--emit-usage", "2", "--linger-ms", "600000"],
+    );
+    let name = InstanceName::new("dualbreach").unwrap();
+    registry
+        .set_config(&name, "cost.rate.input", "2000.00")
+        .unwrap();
+    registry
+        .set_config(&name, "cost.rate.output", "2000.00")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.tokens.per_run", "30")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.dollars.per_run", "0.05")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.breach_action", "warn")
+        .unwrap();
+
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "dualbreach").unwrap();
+
+    wait_for_usage_sentinels(&registry.agent_output_log_path(&name), 1);
+    sup.drain_usage_all(&registry);
+
+    let breaches = Supervisor::read_breach_events(&registry, "dualbreach").unwrap();
+    assert_eq!(breaches.len(), 2, "both dimensions fired in the one batch");
+    assert_eq!(
+        breaches[0].dimension,
+        BreachDimension::Tokens,
+        "the token dimension fires first"
+    );
+    assert_eq!(
+        breaches[1].dimension,
+        BreachDimension::Dollars,
+        "the dollar dimension fires second"
+    );
+    assert_eq!(breaches[0].scope, BreachScope::PerRun);
+    assert_eq!(breaches[1].scope, BreachScope::PerRun);
+    assert_eq!(
+        breaches[0].run_id, breaches[1].run_id,
+        "both breaches belong to the same Run"
+    );
+    // `warn` never transitions the lifecycle and attempts no enforcement.
+    assert_eq!(
+        state_of(&registry, "dualbreach"),
+        LifecycleState::Running,
+        "the warn action transitions nothing"
+    );
+    assert!(
+        !sink_text(&buffer).contains("could not be honored"),
+        "no enforcement may be attempted under warn"
+    );
+    sup.stop(&registry, "dualbreach", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn a_staged_dollar_pause_through_the_dispatch_carries_the_cost_cause() {
+    // The runs.rs Dollars arm of `execute_breach_actions` (the money-job
+    // dispatch half — the drain's twin lives in `apply_evaluation` and is
+    // pinned by the drain test above): a Dollars+`pause` decision handed
+    // to `publish_and_act` for a SUPERVISED, pause-capable agent drives
+    // the pause through the COST-cap cause — micro-dollars both ways,
+    // `estimated` label.
+    let (_state, _manifest, registry) =
+        setup_pause_guaranteed("stagedusd", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let _buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "stagedusd").unwrap();
+
+    sup.publish_and_act(
+        &registry,
+        vec![staged_breach(
+            "stagedusd",
+            "run-1",
+            GovernanceDecision {
+                dimension: BreachDimension::Dollars,
+                scope: BreachScope::PerRun,
+                action: BreachAction::Pause,
+                limit: 50_000,
+                observed: 60_000,
+            },
+            1,
+        )],
+        Vec::new(),
+        Vec::new(),
+        &[],
+        "a money job",
+    );
+
+    assert_eq!(
+        state_of(&registry, "stagedusd"),
+        LifecycleState::Paused,
+        "the dispatched dollar pause must land"
+    );
+    let events = Supervisor::read_events(&registry, "stagedusd").unwrap();
+    let edge = events
+        .iter()
+        .find(|e| e.prior_state == LifecycleState::Running && e.new_state == LifecycleState::Paused)
+        .expect("the pause edge must be recorded");
+    let cause = serde_json::to_string(&edge.cause).unwrap();
+    assert!(
+        cause.contains("\"kind\":\"budget-exceeded\"")
+            && cause.contains("\"dimension\":\"dollars\"")
+            && cause.contains("\"dollar_limit\":50000")
+            && cause.contains("\"dollar_observed\":60000"),
+        "the pause edge must carry the DOLLARS cause with its labeled micros"
+    );
+}
+
+#[test]
+fn a_second_breach_for_the_same_agent_folds_into_its_open_action_entry() {
+    // The fold arm of the dispatch loop: when ONE money job fires TWO
+    // breaches for the SAME agent (the token dimension and the dollar
+    // dimension of one crossing), the second breach folds into the
+    // agent's already-open action entry instead of opening a duplicate —
+    // one agent, one action pass over both breaches, both published in
+    // order. `warn` keeps the lifecycle untouched, so the pin is the
+    // double mirror + the single survive.
+    let (_state, _manifest, registry) = setup_fake("foldtwo", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("foldtwo").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "foldtwo").unwrap();
+
+    sup.publish_and_act(
+        &registry,
+        vec![
+            staged_breach(
+                "foldtwo",
+                "run-1",
+                GovernanceDecision {
+                    dimension: BreachDimension::Tokens,
+                    scope: BreachScope::PerRun,
+                    action: BreachAction::Warn,
+                    limit: 30,
+                    observed: 30,
+                },
+                1,
+            ),
+            staged_breach(
+                "foldtwo",
+                "run-1",
+                GovernanceDecision {
+                    dimension: BreachDimension::Dollars,
+                    scope: BreachScope::PerRun,
+                    action: BreachAction::Warn,
+                    limit: 50_000,
+                    observed: 60_000,
+                },
+                2,
+            ),
+        ],
+        Vec::new(),
+        Vec::new(),
+        &[],
+        "a money job",
+    );
+
+    // Both breaches mirrored, in fire order (token before dollar).
+    let mirrored =
+        std::fs::read_to_string(registry.instance_breach_log_path(&name)).unwrap_or_default();
+    assert_eq!(
+        mirrored.matches("run-1").count(),
+        2,
+        "both breaches must be mirrored for the agent"
+    );
+    // `warn` never transitions the lifecycle.
+    assert_eq!(
+        state_of(&registry, "foldtwo"),
+        LifecycleState::Running,
+        "the warn action transitions nothing"
+    );
+    assert!(
+        !sink_text(&buffer).contains("could not be honored"),
+        "no enforcement may be attempted under warn"
+    );
+    sup.stop(&registry, "foldtwo", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn a_breach_on_an_unparseable_instance_name_is_still_recorded_and_published() {
+    // The unparseable-name arm: the breach is durable and publishable even
+    // when its instance name cannot parse — the diagnostic says exactly
+    // that, and no process action is attempted (there is no name to find a
+    // process under).
+    let state = tempfile::tempdir().unwrap();
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+
+    sup.publish_and_act(
+        &registry,
+        vec![staged_breach(
+            "Not A Valid Name!",
+            "run-1",
+            GovernanceDecision {
+                dimension: BreachDimension::Tokens,
+                scope: BreachScope::PerRun,
+                action: BreachAction::Pause,
+                limit: 30,
+                observed: 30,
+            },
+            1,
+        )],
+        Vec::new(),
+        Vec::new(),
+        &[],
+        "a test batch",
+    );
+
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("fired a breach on `Not A Valid Name!`, which is not a valid agent name"),
+        "the diagnostic must name the unparseable instance"
+    );
+    assert!(
+        text.contains("the breach is recorded but its action was not executed"),
+        "the no-action outcome must be stated, never silent"
+    );
+}
+
+#[test]
+fn a_breach_on_a_run_this_engine_does_not_supervise_is_mirrored_and_named_once() {
+    // The foreign-supervision arm: a breach whose agent is REGISTERED but
+    // not supervised by this engine (never started here — the shape an
+    // announced/leased Run produces) is still mirrored into the breach log
+    // and published, ONE diagnostic names the split of responsibility, and
+    // no lifecycle action is attempted on this side.
+    let (_state, _manifest, registry) = setup_fake("foreigner", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("foreigner").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    let before = state_of(&registry, "foreigner");
+
+    sup.publish_and_act(
+        &registry,
+        vec![staged_breach(
+            "foreigner",
+            "run-7",
+            GovernanceDecision {
+                dimension: BreachDimension::Tokens,
+                scope: BreachScope::Cumulative,
+                action: BreachAction::Pause,
+                limit: 30,
+                observed: 30,
+            },
+            1,
+        )],
+        Vec::new(),
+        Vec::new(),
+        &[],
+        "a money job",
+    );
+
+    // Mirrored: the breach event is on file for the agent (the dispatch's
+    // mirror half — the store row belongs to the committing engine).
+    let mirrored =
+        std::fs::read_to_string(registry.instance_breach_log_path(&name)).unwrap_or_default();
+    assert!(
+        mirrored.contains("foreigner") && mirrored.contains("run-7"),
+        "the foreign breach must be mirrored to the breach log"
+    );
+    // Named once, with the responsibility split.
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains(
+            "foreigner: a money job fired 1 breach(es) on a Run of an agent this engine \
+             does not supervise"
+        ),
+        "the single diagnostic must name the instance and the supervising engine's role"
+    );
+    // And nothing moved here: not our process, not our transition.
+    assert_eq!(
+        state_of(&registry, "foreigner"),
+        before,
+        "no lifecycle action may be attempted for a foreign-supervised Run"
+    );
+}
