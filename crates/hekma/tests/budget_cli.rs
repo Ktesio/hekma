@@ -2,7 +2,8 @@
 //! codes on every OS with no agent process, and on Unix the Run-scoped pin
 //! — a limit set on an agent's open Run says it is Run-scoped (human line
 //! and `--json`), outranks the configuration, and is gone from the fresh
-//! Run a stop and start mints.
+//! Run a stop and start mints. A Selector's `--dry-run` plans each open Run
+//! through the read-only engine and writes nothing.
 
 mod helpers;
 
@@ -347,5 +348,91 @@ fn a_run_limit_says_it_is_run_scoped_and_a_fresh_run_carries_none_unix() {
         run.stdout.contains("set on this Run    no Run-level limit"),
         "{}",
         run.stdout
+    );
+}
+
+#[test]
+fn a_selector_dry_run_plans_each_open_run_and_writes_nothing_unix() {
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        // A detached agent dies with the command's job on Windows; the
+        // refusals test above covers the exit codes there.
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let hekma = |args: &[&str]| run_hekma_agent(args, &ctx.project_dir, state_dir);
+    let _cleanup = Cleanup {
+        ctx: &ctx.project_dir,
+        state: state_dir,
+    };
+    let manifest = ctx.project_dir.join("manifest");
+    std::fs::create_dir_all(&manifest).unwrap();
+    ManifestFixture::new("planned", &["--linger-ms", "600000"])
+        .guaranteed_on_all_oses("interaction")
+        .write(&manifest);
+    let run = hekma(&[
+        "agent",
+        "register",
+        "planned",
+        "--manifest",
+        manifest.to_str().unwrap(),
+    ]);
+    assert!(run.success, "{}", run.stderr);
+    let run = hekma(&["agent", "config", "set", "planned", "labels.team", "core"]);
+    assert!(run.success, "{}", run.stderr);
+    let run = hekma(&[
+        "agent",
+        "config",
+        "set",
+        "planned",
+        "budget.tokens.cumulative",
+        "7000000",
+    ]);
+    assert!(run.success, "{}", run.stderr);
+    let run = hekma(&["agent", "start", "planned", "--detach"]);
+    assert!(run.success, "{}", run.stderr);
+
+    // A Selector's dry run plans the one open Run on the read-only engine
+    // (the per-Run plan closure).
+    let run = hekma(&[
+        "budget",
+        "set",
+        "--selector",
+        "team=core",
+        "--tokens-cumulative",
+        "1000000",
+        "--dry-run",
+        "--json",
+    ]);
+    assert!(run.success, "{}", run.stderr);
+    let doc = json(&run.stdout);
+    assert_eq!(doc["dry_run"], true);
+    assert_eq!(doc["matched"], 1, "exactly the one open Run: {doc}");
+    let result = &doc["results"][0];
+    assert_eq!(result["outcome"], "would-set");
+    assert_eq!(result["run_scoped"], true);
+    assert!(result["note"]
+        .as_str()
+        .unwrap()
+        .contains("ends with the Run"));
+    assert_eq!(
+        result["limits"]["resolution"]["sources"]["tokens_cumulative"], "run",
+        "the planned row resolves from the Run: {result}"
+    );
+
+    // Nothing was written: the instance's own configuration still owns the
+    // ceiling and no run_limits row exists.
+    let run = hekma(&["budget", "show", "--selector", "team=core", "--json"]);
+    assert!(run.success, "{}", run.stderr);
+    let item = &json(&run.stdout)["items"][0];
+    assert_eq!(
+        item["limits"],
+        serde_json::json!({}),
+        "no run_limits row was written by the dry run"
+    );
+    assert_eq!(
+        item["resolution"]["sources"]["tokens_cumulative"],
+        "instance"
     );
 }
