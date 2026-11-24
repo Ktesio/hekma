@@ -782,4 +782,87 @@ mod tests {
             assert!(!source_text(&source).is_empty());
         }
     }
+
+    #[test]
+    fn the_show_renderer_marks_absent_cumulative_scopes_the_caller_layer_and_notes() {
+        use hekma_engine::{CostCap, LimitSources, RunStatus, ScentCheckMode, TokenBudget};
+        let view = RunLimitsView {
+            run: RunRecord {
+                run_id: hekma_engine::RunId::from_wire("run_A"),
+                control_depth: hekma_engine::ControlDepth::Supervised,
+                wire_path: false,
+                status: RunStatus::Active,
+                anomalies: Vec::new(),
+                parent_run_id: None,
+                instance: Some("money".to_string()),
+                process_owner: true,
+                end_cause: None,
+                created_at: "t".to_string(),
+                updated_at: "t".to_string(),
+                ended_at: None,
+            },
+            limits: RunLimits::default(),
+            caller_limits: RunLimits {
+                token_per_run: Some(7_000_000),
+                ..RunLimits::default()
+            },
+            resolution: PolicyResolution {
+                tokens: TokenBudget::none(),
+                dollars: CostCap::none(),
+                action: BreachAction::Pause,
+                effective_action: BreachAction::Pause,
+                scent_check: ScentCheckMode::Off,
+                rate: None,
+                sources: LimitSources {
+                    tokens_per_run: LimitSource::Unset,
+                    tokens_cumulative: LimitSource::Unset,
+                    dollars_per_run: LimitSource::Unset,
+                    dollars_cumulative: LimitSource::Unset,
+                    breach_action: LimitSource::Unset,
+                    scent_check: LimitSource::Unset,
+                    rate: LimitSource::Unset,
+                },
+                fallback: None,
+                unpriced: None,
+                fail_closed: None,
+            },
+            usage: hekma_engine::RunUsage::default(),
+            cumulative_usage: None,
+            budget: None,
+            latched: Vec::new(),
+            notes: vec!["the dollar cap has no price".to_string()],
+        };
+        let rendered = render_view(&view);
+        // No cumulative usage: both cumulative rows show an em dash as used.
+        assert!(
+            rendered.contains("  tokens cumulative  —  used —"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  dollars cumulative —  used —"),
+            "{rendered}"
+        );
+        // A set Caller layer names itself and where it applies.
+        assert!(rendered.contains("set by the Caller"), "{rendered}");
+        assert!(
+            rendered.contains("(applies only where tighter)"),
+            "{rendered}"
+        );
+        // The read's notes ride along as note lines.
+        assert!(
+            rendered.contains("  note: the dollar cap has no price"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_dollars_per_run_flag_carries_its_micros_text_in_the_change_body() {
+        let change = change_from(&SetArgs {
+            dollars_per_run: Some("0.5".into()),
+            ..set_args()
+        })
+        .unwrap();
+        let body = change_body(&change);
+        assert_eq!(body["dollars_per_run"], "0.500000");
+    }
 }

@@ -4878,6 +4878,24 @@ fn a_selected_set_acts_per_run_with_the_child_refused_and_limits_scoped_to_the_r
         .iter()
         .all(|row| row["outcome"] == "labeled"));
 
+    // The same label set again changes nothing: every outcome says
+    // `unchanged` (the labels already carry these values).
+    let token = select()["token"].as_str().unwrap().to_string();
+    let (status, results) = json(
+        "PATCH",
+        "/v0/runs/labels",
+        serde_json::json!({"set_token": token, "set": {"tier": "gold"}}),
+    );
+    assert_eq!(status, 200, "{results}");
+    assert!(
+        results["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["outcome"] == "unchanged"),
+        "{results}"
+    );
+
     // Pause over the set: the owner pauses; the child is refused from its
     // own cell (its lifecycle acts on calls), never skipped.
     let token = select()["token"].as_str().unwrap().to_string();

@@ -1915,3 +1915,34 @@ fn l2_a_caller_may_not_trade_pause_or_stop_for_the_cooperative_block() {
     .unwrap();
     assert_eq!(outcome.resolution.effective_action, BreachAction::Block);
 }
+
+#[test]
+fn a_guarded_limit_write_names_a_ghost_run_not_found() {
+    let seeded = seed();
+    let ghost = RunId::mint();
+    // The guard presents a real Run's key; the TARGET does not exist, so
+    // the gate answers the target's own not-found before any key check.
+    let guard = || RunActor::Caller {
+        run_id: seeded.run.clone(),
+        token_hash: crate::domain::credential::TokenHash::of("caller-key"),
+    };
+    let change = limits(RunLimits {
+        token_per_run: Some(1_000),
+        ..RunLimits::default()
+    });
+    for refusal in [
+        seeded
+            .registry
+            .plan_run_limits_guarded(&ghost, &change, LimitActor::Operator, None, Some(&guard()))
+            .err(),
+        seeded
+            .registry
+            .apply_run_limits_guarded(&ghost, &change, LimitActor::Operator, None, Some(guard()))
+            .err(),
+    ] {
+        match refusal {
+            Some(RunError::NotFound { run_id }) => assert_eq!(run_id, ghost.as_str()),
+            other => panic!("a ghost target is the target's own not-found: {other:?}"),
+        }
+    }
+}

@@ -1684,4 +1684,13 @@ mod tests {
         assert!(wire.get("instance").is_none(), "{wire}");
         assert!(wire.get("error").is_none(), "{wire}");
     }
+
+    #[test]
+    fn the_past_tense_names_every_lifecycle_verb() {
+        use hekma_engine::RunLifecycleVerb as Verb;
+        assert_eq!(past_tense(Verb::Stop), "stopped");
+        assert_eq!(past_tense(Verb::Pause), "paused");
+        assert_eq!(past_tense(Verb::Resume), "resumed");
+        assert_eq!(past_tense(Verb::Drain), "drained");
+    }
 }
