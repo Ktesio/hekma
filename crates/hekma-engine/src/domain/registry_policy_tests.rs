@@ -2575,13 +2575,18 @@ fn the_fleet_batch_resolves_every_row_exactly_as_the_per_row_read() {
 #[test]
 fn policy_names_outside_the_grammar_are_refused_with_the_shape_rule() {
     // The name grammar's refusal arm (validate_change): every bad shape is
-    // a typed `Invalid` naming the rule, and the 63-character boundary
-    // passes the shape check (it creates — nothing else refuses it).
+    // a typed `Invalid` naming the rule — the empty name (the lower bound
+    // alone), a bad leading character, a bad body character, a non-lowercase
+    // letter in the body — and the 64th character (the upper bound alone).
+    // The 63-character boundary passes the shape check (it creates —
+    // nothing else refuses it).
     let seeded = seed(1_000);
     for name in [
+        String::new(),
         "Team".to_string(),
         "-team".to_string(),
         "team!".to_string(),
+        "teAm".to_string(),
         "a".repeat(64),
     ] {
         let refusal = seeded
@@ -2738,7 +2743,10 @@ fn a_kept_marker_read_failure_fails_the_breach_action_closed_to_pause() {
 fn a_delete_whose_store_write_fails_surfaces_the_typed_store_error() {
     // apply_policy_delete's writer-fault tail: the delete itself failing
     // inside the job surfaces as the typed Store error (never a panic,
-    // never a silent success).
+    // never a silent success). Only the DELETE is refused — the `policies`
+    // table stays readable — so a swallowed delete error cannot hide behind
+    // the re-resolution's own Store error: the error names the refused
+    // write, and the row the delete was to remove is still there.
     let seeded = seed(1_000);
     change(
         &seeded.registry,
@@ -2750,15 +2758,28 @@ fn a_delete_whose_store_write_fails_surfaces_the_typed_store_error() {
         .registry
         .writer
         .call(|ctx| {
-            ctx.store().execute_batch_for_test("DROP TABLE policies");
+            ctx.store().execute_batch_for_test(
+                "CREATE TRIGGER no_delete BEFORE DELETE ON policies \
+                 BEGIN SELECT RAISE(ABORT, 'sabotaged delete'); END;",
+            );
             Ok(())
         })
         .unwrap();
+    // The normal path: the caller's decoded prior record names the scope.
+    let existing = seeded.registry.policy("team").unwrap();
     let refusal = seeded
         .registry
-        .apply_policy_delete("team", None, None, contexts())
+        .apply_policy_delete("team", existing, None, contexts())
         .unwrap_err();
     assert!(matches!(&refusal, RunError::Store(_)), "{refusal}");
+    assert!(
+        refusal.to_string().contains("sabotaged delete"),
+        "the error names the refused write: {refusal}"
+    );
+    assert!(
+        seeded.registry.policy("team").unwrap().is_some(),
+        "the refused delete left the Policy in place"
+    );
 }
 
 #[test]
