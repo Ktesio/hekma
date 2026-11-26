@@ -857,12 +857,22 @@ mod tests {
 
     #[test]
     fn a_dollars_per_run_flag_carries_its_micros_text_in_the_change_body() {
+        // A value whose micros text needs its zero padding: written
+        // unpadded, fifty cents would read back as "0.50000" — half a
+        // dollar of cap the caller never asked for.
+        let change = change_from(&SetArgs {
+            dollars_per_run: Some("0.05".into()),
+            ..set_args()
+        })
+        .unwrap();
+        let body = change_body(&change);
+        assert_eq!(body["dollars_per_run"], "0.050000");
+        // A full six-digit fraction carries through unchanged.
         let change = change_from(&SetArgs {
             dollars_per_run: Some("0.5".into()),
             ..set_args()
         })
         .unwrap();
-        let body = change_body(&change);
-        assert_eq!(body["dollars_per_run"], "0.500000");
+        assert_eq!(change_body(&change)["dollars_per_run"], "0.500000");
     }
 }
