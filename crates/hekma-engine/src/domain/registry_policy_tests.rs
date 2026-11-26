@@ -2647,10 +2647,13 @@ fn a_named_runs_facts_read_failure_fails_its_resolution_closed_to_pause() {
 
 #[test]
 fn an_instance_shaped_read_resolves_through_its_open_process_owning_runs_facts() {
-    // The owner path's success arm: with no Run named, the instance-shaped
-    // read resolves through the OPEN PROCESS-OWNING Run's facts — the
-    // Run's bound labels select the Policy, not the instance's config
-    // (which sets nothing here).
+    // The owner path's success arm as a DIRECT VALUE PIN: with no Run
+    // named, the instance-shaped read resolves through the OPEN
+    // PROCESS-OWNING Run's facts — the Run's bound labels select the
+    // Policy, not the instance's config (which sets nothing here). The
+    // fleet-batch parity test already reaches this arm end-to-end; this
+    // pin names the resolved values directly, as the counterweight the
+    // fault arms need.
     let seeded = seed(1_000);
     change(
         &seeded.registry,
@@ -2759,29 +2762,39 @@ fn a_delete_whose_store_write_fails_surfaces_the_typed_store_error() {
 }
 
 #[test]
-fn an_upgrade_pending_list_read_failure_stays_paused_and_defers_to_the_next_open() {
-    // finish_breach_default_upgrade's pending-read fault arm: the list
-    // read failing pushes the open note (the kept instances stay on pause
-    // through their markers), fires NO upgrade event, and the next open
-    // retries.
+fn an_upgrade_pending_list_read_failure_keeps_the_marker_on_pause_until_the_next_open() {
+    // finish_breach_default_upgrade's pending-read fault arm, with the open
+    // note's claims made real: the list read failing pushes the open note
+    // and fires NO upgrade event, but LEAVES the marker rows untouched —
+    // the kept instance still resolves to Pause through its marker, and a
+    // fresh open (open() retries the upgrade) finishes the list and emits
+    // exactly one BreachDefaultUpgraded event.
     let state = tempfile::TempDir::new().unwrap();
     let mut registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
     registry
-        .writer
-        .call(|ctx| {
-            ctx.store().execute_batch_for_test(
-                "INSERT INTO agent_instances (id, name, kind, state, agent_home, created_at, \
-                 updated_at) VALUES (1, 'kept', 'mock', 'registered', '/h', 't', 't'); \
-                 INSERT INTO breach_default_upgrade (instance_id, listed_at) VALUES (1, 't')",
-            );
-            Ok(())
-        })
+        .register_with_adapter(
+            "kept",
+            &crate::adapter::AdapterRef::Manifest(fake_manifest("kept")),
+        )
         .unwrap();
     registry
         .writer
         .call(|ctx| {
-            ctx.store()
-                .execute_batch_for_test("DROP TABLE breach_default_upgrade");
+            ctx.store().execute_batch_for_test(
+                "INSERT INTO breach_default_upgrade (instance_id, listed_at) \
+                 SELECT id, 't' FROM agent_instances WHERE name = 'kept'",
+            );
+            Ok(())
+        })
+        .unwrap();
+    // Fail ONLY the pending-list read — the marker data itself survives
+    // (the table is renamed away, then back).
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "ALTER TABLE breach_default_upgrade RENAME TO breach_default_upgrade_aside",
+            );
             Ok(())
         })
         .unwrap();
@@ -2797,6 +2810,40 @@ fn an_upgrade_pending_list_read_failure_stays_paused_and_defers_to_the_next_open
         .take_open_events()
         .iter()
         .any(|(_, event)| matches!(event, EngineEvent::BreachDefaultUpgraded(_))));
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "ALTER TABLE breach_default_upgrade_aside RENAME TO breach_default_upgrade",
+            );
+            Ok(())
+        })
+        .unwrap();
+    // The failed attempt left the marker intact: the kept read still sees
+    // it, and the instance still resolves to Pause through it (no fault
+    // note — this pause is the marker's doing, not a fail-closed read).
+    let name = InstanceName::new("kept").unwrap();
+    let (_, kept) = registry.resolved_limits_and_kept(&name, None, None);
+    assert!(kept, "the marker row survived the failed attempt");
+    let resolution = registry.resolved_limits(&name, None);
+    assert_eq!(resolution.effective_action, BreachAction::Pause);
+    assert!(
+        resolution.fail_closed.is_none(),
+        "{:?}",
+        resolution.fail_closed
+    );
+    // The next open retries the upgrade to completion: exactly one event.
+    drop(registry);
+    let mut reopened = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let events = reopened.take_open_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(_, event)| matches!(event, EngineEvent::BreachDefaultUpgraded(_)))
+            .count(),
+        1,
+        "{events:?}"
+    );
 }
 
 #[test]
