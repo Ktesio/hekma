@@ -2,7 +2,8 @@
 //! codes on every OS with no agent process, and on Unix the Run-scoped pin
 //! — a limit set on an agent's open Run says it is Run-scoped (human line
 //! and `--json`), outranks the configuration, and is gone from the fresh
-//! Run a stop and start mints.
+//! Run a stop and start mints. A Selector's `--dry-run` plans each open Run
+//! through the read-only engine and writes nothing.
 
 mod helpers;
 
@@ -116,12 +117,14 @@ fn budget_refusals_map_to_the_documented_exit_codes() {
 struct Cleanup<'a> {
     ctx: &'a std::path::Path,
     state: &'a std::path::Path,
+    /// The agent whose Run the test opened — the one `agent stop` names.
+    agent: &'a str,
 }
 
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         let _ = run_hekma_agent(
-            &["agent", "stop", "budgeted", "--timeout", "2"],
+            &["agent", "stop", self.agent, "--timeout", "2"],
             self.ctx,
             self.state,
         );
@@ -143,6 +146,7 @@ fn a_run_limit_says_it_is_run_scoped_and_a_fresh_run_carries_none_unix() {
     let _cleanup = Cleanup {
         ctx: &ctx.project_dir,
         state: state_dir,
+        agent: "budgeted",
     };
     let manifest = ctx.project_dir.join("manifest");
     std::fs::create_dir_all(&manifest).unwrap();
@@ -348,4 +352,144 @@ fn a_run_limit_says_it_is_run_scoped_and_a_fresh_run_carries_none_unix() {
         "{}",
         run.stdout
     );
+}
+
+#[test]
+fn a_selector_dry_run_plans_each_open_run_and_writes_nothing_unix() {
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        // A detached agent dies with the command's job on Windows; the
+        // refusals test above covers the exit codes there.
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let hekma = |args: &[&str]| run_hekma_agent(args, &ctx.project_dir, state_dir);
+    let _cleanup = Cleanup {
+        ctx: &ctx.project_dir,
+        state: state_dir,
+        agent: "planned",
+    };
+    let manifest = ctx.project_dir.join("manifest");
+    std::fs::create_dir_all(&manifest).unwrap();
+    ManifestFixture::new("planned", &["--linger-ms", "600000"])
+        .guaranteed_on_all_oses("interaction")
+        .write(&manifest);
+    let run = hekma(&[
+        "agent",
+        "register",
+        "planned",
+        "--manifest",
+        manifest.to_str().unwrap(),
+    ]);
+    assert!(run.success, "{}", run.stderr);
+    let run = hekma(&["agent", "config", "set", "planned", "labels.team", "core"]);
+    assert!(run.success, "{}", run.stderr);
+    let run = hekma(&[
+        "agent",
+        "config",
+        "set",
+        "planned",
+        "budget.tokens.cumulative",
+        "7000000",
+    ]);
+    assert!(run.success, "{}", run.stderr);
+    let run = hekma(&["agent", "start", "planned", "--detach"]);
+    assert!(run.success, "{}", run.stderr);
+    let run = hekma(&["budget", "show", "planned", "--json"]);
+    assert!(run.success, "{}", run.stderr);
+    let parent = json(&run.stdout)["items"][0]["run"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A second open Run under the same label: the dry run plans EACH open
+    // Run through its own per-Run plan, not only the first.
+    let run = hekma(&[
+        "run",
+        "open",
+        "--parent",
+        "planned",
+        "--label",
+        "team=core",
+        "--json",
+    ]);
+    assert!(run.success, "{}", run.stderr);
+    let child = json(&run.stdout)["run"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A Selector's dry run plans both open Runs on the read-only engine
+    // (the per-Run plan closure): the parent's row plans, and the child's
+    // cumulative ceiling is refused in its own row.
+    let run = hekma(&[
+        "budget",
+        "set",
+        "--selector",
+        "team=core",
+        "--tokens-cumulative",
+        "1000000",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(run.code, Some(2), "{}", run.stderr);
+    let doc = json(&run.stdout);
+    assert_eq!(doc["dry_run"], true);
+    assert_eq!(doc["matched"], 2, "exactly the two open Runs: {doc}");
+    let rows = doc["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "one row per matched Run: {doc}");
+    let planned: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .map(|row| row["run_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        planned,
+        std::collections::BTreeSet::from([parent.as_str(), child.as_str()]),
+        "each open Run has its own row: {doc}"
+    );
+    let row_of = |run_id: &str| {
+        rows.iter()
+            .find(|row| row["run_id"] == run_id)
+            .unwrap_or_else(|| panic!("no row for {run_id}: {doc}"))
+    };
+    let result = row_of(&parent);
+    assert_eq!(result["outcome"], "would-set", "{result}");
+    assert_eq!(result["run_scoped"], true);
+    assert!(result["note"]
+        .as_str()
+        .unwrap()
+        .contains("ends with the Run"));
+    assert_eq!(
+        result["limits"]["resolution"]["sources"]["tokens_cumulative"], "run",
+        "the planned row resolves from the Run: {result}"
+    );
+    let refused = row_of(&child);
+    assert_eq!(refused["outcome"], "refused", "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("child Run"),
+        "{refused}"
+    );
+
+    // Nothing was written: both Runs' ceilings still resolve from the
+    // instance's own configuration and no run_limits row exists.
+    let run = hekma(&["budget", "show", "--selector", "team=core", "--json"]);
+    assert!(run.success, "{}", run.stderr);
+    let shown = json(&run.stdout);
+    let items = shown["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "both open Runs: {items:?}");
+    for item in items {
+        assert_eq!(
+            item["limits"],
+            serde_json::json!({}),
+            "no run_limits row was written by the dry run: {item}"
+        );
+        assert_eq!(
+            item["resolution"]["sources"]["tokens_cumulative"],
+            "instance"
+        );
+    }
 }
