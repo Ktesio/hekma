@@ -12624,14 +12624,15 @@ fn a_dollar_cap_breach_pauses_with_the_cost_cap_cause() {
 }
 
 #[test]
-fn both_dimensions_breaching_in_one_batch_fold_into_one_action_set() {
-    // The second-breach fold: when BOTH dimensions cross in ONE evaluation
-    // (event 1's 30 tokens reaching the per-run token ceiling of 30, and
-    // the same tokens' derived cost reaching the $0.05 per-run Cost Cap),
-    // the agent's second breach folds into its already-open action entry —
-    // one agent, two breaches, one dispatch — in the documented
-    // token-before-dollar fire order, and `warn` leaves the lifecycle
-    // untouched.
+fn both_dimensions_breaching_in_one_evaluation_record_two_breaches_in_fire_order_under_warn() {
+    // The two-dimension crossing: when BOTH dimensions cross in ONE
+    // evaluation (event 1's 30 tokens reaching the per-run token ceiling of
+    // 30, and the same tokens' derived cost reaching the $0.05 per-run Cost
+    // Cap), TWO breach events are recorded for the Run — in the documented
+    // token-before-dollar fire order — and `warn` leaves the lifecycle
+    // untouched and attempts no enforcement. (How the dispatch groups the
+    // pair into one action entry is the fold test's pin, further down: a
+    // supervised agent acts on both breaches in the same order either way.)
     let (_state, _manifest, registry) = setup_fake(
         "dualbreach",
         &["--emit-usage", "2", "--linger-ms", "600000"],
@@ -12752,14 +12753,16 @@ fn a_second_breach_for_the_same_agent_folds_into_its_open_action_entry() {
     // breaches for the SAME agent (the token dimension and the dollar
     // dimension of one crossing), the second breach folds into the
     // agent's already-open action entry instead of opening a duplicate —
-    // one agent, one action pass over both breaches, both published in
-    // order. `warn` keeps the lifecycle untouched, so the pin is the
-    // double mirror + the single survive.
+    // ONE action pass carries both. The pass reports its work exactly where
+    // the fold shows: for an agent this engine does not supervise
+    // (registered, never started here), ONE diagnostic carries the whole
+    // count — never a diagnostic per breach. A supervised agent acts on
+    // both breaches in the same order with or without the fold, so only
+    // this shape can tell the two apart.
     let (_state, _manifest, registry) = setup_fake("foldtwo", &["--linger-ms", "600000"]);
     let name = InstanceName::new("foldtwo").unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let buffer = install_capture_sink(&mut sup);
-    sup.start(&registry, "foldtwo").unwrap();
 
     sup.publish_and_act(
         &registry,
@@ -12770,7 +12773,7 @@ fn a_second_breach_for_the_same_agent_folds_into_its_open_action_entry() {
                 GovernanceDecision {
                     dimension: BreachDimension::Tokens,
                     scope: BreachScope::PerRun,
-                    action: BreachAction::Warn,
+                    action: BreachAction::Pause,
                     limit: 30,
                     observed: 30,
                 },
@@ -12782,7 +12785,7 @@ fn a_second_breach_for_the_same_agent_folds_into_its_open_action_entry() {
                 GovernanceDecision {
                     dimension: BreachDimension::Dollars,
                     scope: BreachScope::PerRun,
-                    action: BreachAction::Warn,
+                    action: BreachAction::Pause,
                     limit: 50_000,
                     observed: 60_000,
                 },
@@ -12795,7 +12798,7 @@ fn a_second_breach_for_the_same_agent_folds_into_its_open_action_entry() {
         "a money job",
     );
 
-    // Both breaches mirrored, in fire order (token before dollar).
+    // Both breaches mirrored for the agent.
     let mirrored =
         std::fs::read_to_string(registry.instance_breach_log_path(&name)).unwrap_or_default();
     assert_eq!(
@@ -12803,18 +12806,28 @@ fn a_second_breach_for_the_same_agent_folds_into_its_open_action_entry() {
         2,
         "both breaches must be mirrored for the agent"
     );
-    // `warn` never transitions the lifecycle.
+    // ONE pass: a single diagnostic carrying BOTH breaches. Without the
+    // fold the batch is two passes, and the diagnostic reads `1 breach(es)`
+    // twice.
+    let text = sink_text(&buffer);
     assert_eq!(
-        state_of(&registry, "foldtwo"),
-        LifecycleState::Running,
-        "the warn action transitions nothing"
+        text.matches("fired 1 breach(es)").count(),
+        0,
+        "a second action entry must not be opened for the same agent"
     );
     assert!(
-        !sink_text(&buffer).contains("could not be honored"),
-        "no enforcement may be attempted under warn"
+        text.contains(
+            "foldtwo: a money job fired 2 breach(es) on a Run of an agent this engine \
+             does not supervise"
+        ),
+        "the one action pass must report both breaches"
     );
-    sup.stop(&registry, "foldtwo", Some(Duration::from_secs(5)))
-        .unwrap();
+    // Not ours to act on: no enforcement was attempted for either breach (a
+    // pass that tried would surface its failed pause).
+    assert!(
+        !text.contains("could not be honored"),
+        "no enforcement may be attempted for an agent this engine does not supervise"
+    );
 }
 
 #[test]
@@ -12900,7 +12913,8 @@ fn a_breach_on_a_run_this_engine_does_not_supervise_is_mirrored_and_named_once()
         mirrored.contains("foreigner") && mirrored.contains("run-7"),
         "the foreign breach must be mirrored to the breach log"
     );
-    // Named once, with the responsibility split.
+    // Named once — ONE diagnostic for the pass, never one per breach — with
+    // the responsibility split.
     let text = sink_text(&buffer);
     assert!(
         text.contains(
@@ -12909,10 +12923,21 @@ fn a_breach_on_a_run_this_engine_does_not_supervise_is_mirrored_and_named_once()
         ),
         "the single diagnostic must name the instance and the supervising engine's role"
     );
-    // And nothing moved here: not our process, not our transition.
+    assert_eq!(
+        text.matches("does not supervise").count(),
+        1,
+        "the split of responsibility must be named exactly once"
+    );
+    // And nothing was attempted here: not our process, not our transition —
+    // no enforcement ran for it (a pass that tried would surface its
+    // failed pause).
+    assert!(
+        !text.contains("could not be honored"),
+        "no enforcement may be attempted for an agent this engine does not supervise"
+    );
     assert_eq!(
         state_of(&registry, "foreigner"),
         before,
-        "no lifecycle action may be attempted for a foreign-supervised Run"
+        "no lifecycle action may land for a foreign-supervised Run"
     );
 }
