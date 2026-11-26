@@ -1685,12 +1685,75 @@ mod tests {
         assert!(wire.get("error").is_none(), "{wire}");
     }
 
+    /// Every lifecycle verb's past tense with a distinct index per arm: the
+    /// index, what [`past_tense`] answers, and the wording the table
+    /// declares for it. The exhaustive `match` ties this table to the enum
+    /// itself: a verb added later fails THIS compilation until it is mapped
+    /// — and declares its past tense beside its index — so no verb's
+    /// wording ships unpinned (the `ALL_COVERS` shape in the engine's
+    /// governance tests).
+    fn every_past_tense(
+        verb: hekma_engine::RunLifecycleVerb,
+    ) -> (usize, &'static str, &'static str) {
+        use hekma_engine::RunLifecycleVerb as Verb;
+        match verb {
+            Verb::Stop => (0, past_tense(Verb::Stop), "stopped"),
+            Verb::Pause => (1, past_tense(Verb::Pause), "paused"),
+            Verb::Resume => (2, past_tense(Verb::Resume), "resumed"),
+            Verb::Drain => (3, past_tense(Verb::Drain), "drained"),
+        }
+    }
+
+    /// Every lifecycle verb as serde itself lists them: the derived
+    /// deserializer names every variant in its unknown-variant error, so the
+    /// listing cannot go stale when the enum grows — unlike a hand-written
+    /// one. The parse depends on serde_json's exact error wording (the
+    /// ` at line ` suffix cut, the `expected` separator, the backtick-quoted
+    /// segments), so a rewording surfaces here as a red assert, not a gap.
+    fn every_lifecycle_verb_from_serde() -> Vec<hekma_engine::RunLifecycleVerb> {
+        let err = serde_json::from_str::<hekma_engine::RunLifecycleVerb>("\"__not_a_verb__\"")
+            .expect_err("the sentinel verb must fail to deserialize");
+        let message = err.to_string();
+        let message = &message[..message.find(" at line ").unwrap_or(message.len())];
+        let (_, listed) = message
+            .rsplit_once("expected")
+            .expect("the unknown-variant error names the expected verbs");
+        listed
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(|wire| {
+                serde_json::from_str(&format!("\"{wire}\""))
+                    .expect("serde's own listing must deserialize")
+            })
+            .collect()
+    }
+
     #[test]
     fn the_past_tense_names_every_lifecycle_verb() {
-        use hekma_engine::RunLifecycleVerb as Verb;
-        assert_eq!(past_tense(Verb::Stop), "stopped");
-        assert_eq!(past_tense(Verb::Pause), "paused");
-        assert_eq!(past_tense(Verb::Resume), "resumed");
-        assert_eq!(past_tense(Verb::Drain), "drained");
+        // Sweep every verb serde knows through the exhaustive table: each
+        // reads back in the past tense the table declares, and the arm
+        // indices cover 0..N exactly once — a verb added to the enum takes
+        // the next index, and cannot skip the sweep.
+        let verbs = every_lifecycle_verb_from_serde();
+        assert!(verbs.len() > 1, "serde must list the lifecycle verbs");
+        let mut indices: Vec<usize> = verbs
+            .iter()
+            .map(|verb| {
+                let (index, past, expected) = every_past_tense(*verb);
+                assert_eq!(
+                    past, expected,
+                    "the past tense must equal the wording the table declares"
+                );
+                index
+            })
+            .collect();
+        indices.sort_unstable();
+        let count = verbs.len();
+        assert_eq!(
+            indices,
+            (0..count).collect::<Vec<_>>(),
+            "every arm index 0..N exactly once: a new verb takes the next index"
+        );
     }
 }
