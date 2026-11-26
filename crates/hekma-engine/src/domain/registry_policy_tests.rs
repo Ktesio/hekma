@@ -2571,3 +2571,322 @@ fn the_fleet_batch_resolves_every_row_exactly_as_the_per_row_read() {
     let (degraded, _) = registry.resolved_limits_from_batch(&money, None, None, None);
     assert!(degraded.fail_closed.is_some());
 }
+
+#[test]
+fn policy_names_outside_the_grammar_are_refused_with_the_shape_rule() {
+    // The name grammar's refusal arm (validate_change): every bad shape is
+    // a typed `Invalid` naming the rule — the empty name (the lower bound
+    // alone), a bad leading character, a bad body character, a non-lowercase
+    // letter in the body — and the 64th character (the upper bound alone).
+    // The 63-character boundary passes the shape check (it creates —
+    // nothing else refuses it).
+    let seeded = seed(1_000);
+    for name in [
+        String::new(),
+        "Team".to_string(),
+        "-team".to_string(),
+        "team!".to_string(),
+        "teAm".to_string(),
+        "a".repeat(64),
+    ] {
+        let refusal = seeded
+            .registry
+            .apply_policy_change(
+                None,
+                PolicyChange {
+                    name,
+                    selector: Some("team=core".parse().unwrap()),
+                    set: PolicyLimits::default(),
+                    clear: Vec::new(),
+                    rates: BTreeMap::new(),
+                },
+                contexts(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&refusal, RunError::Invalid { field, reason, .. }
+                if field == "name" && reason.contains("1-63 characters")),
+            "{refusal}"
+        );
+    }
+    let boundary = seeded.registry.apply_policy_change(
+        None,
+        PolicyChange {
+            name: "a".repeat(63),
+            selector: Some("team=core".parse().unwrap()),
+            set: PolicyLimits::default(),
+            clear: Vec::new(),
+            rates: BTreeMap::new(),
+        },
+        contexts(),
+    );
+    assert!(boundary.is_ok(), "{:?}", boundary.err());
+}
+
+#[test]
+fn a_named_runs_facts_read_failure_fails_its_resolution_closed_to_pause() {
+    // read_resolution_facts' first fault arm: the NAMED Run's facts read
+    // fails → the resolution keeps what it can, carries the note naming
+    // the failed read, and fails closed to `pause`.
+    let seeded = seed(1_000);
+    seeded
+        .registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test("DROP TABLE runs");
+            Ok(())
+        })
+        .unwrap();
+    let name = InstanceName::new("money").unwrap();
+    let resolution = seeded.registry.resolved_limits(&name, Some(&seeded.run));
+    let note = resolution
+        .fail_closed
+        .expect("the failed read fails closed");
+    assert!(
+        note.contains("this Run's resolution facts could not be read"),
+        "{note}"
+    );
+    assert!(note.contains("fail closed to pause"), "{note}");
+    assert_eq!(resolution.effective_action, BreachAction::Pause);
+}
+
+#[test]
+fn an_instance_shaped_read_resolves_through_its_open_process_owning_runs_facts() {
+    // The owner path's success arm as a DIRECT VALUE PIN: with no Run
+    // named, the instance-shaped read resolves through the OPEN
+    // PROCESS-OWNING Run's facts — the Run's bound labels select the
+    // Policy, not the instance's config (which sets nothing here). The
+    // fleet-batch parity test already reaches this arm end-to-end; this
+    // pin names the resolved values directly, as the counterweight the
+    // fault arms need.
+    let seeded = seed(1_000);
+    change(
+        &seeded.registry,
+        "kid",
+        "team=core",
+        PolicyLimits {
+            tokens_per_run: Some(500),
+            ..PolicyLimits::default()
+        },
+    );
+    let name = InstanceName::new("money").unwrap();
+    let resolution = seeded.registry.resolved_limits(&name, None);
+    assert!(
+        resolution.fail_closed.is_none(),
+        "{:?}",
+        resolution.fail_closed
+    );
+    assert_eq!(
+        resolution.tokens.per_run,
+        Some(500),
+        "the owner Run's bound labels select the Policy"
+    );
+}
+
+#[test]
+fn an_open_run_read_failure_fails_the_instance_read_closed_to_pause() {
+    // read_resolution_facts' second fault arm: the OPEN Run lookup itself
+    // fails → the note names that read, and the resolution fails closed.
+    let seeded = seed(1_000);
+    seeded
+        .registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test("DROP TABLE runs");
+            Ok(())
+        })
+        .unwrap();
+    let name = InstanceName::new("money").unwrap();
+    let resolution = seeded.registry.resolved_limits(&name, None);
+    let note = resolution
+        .fail_closed
+        .expect("the failed read fails closed");
+    assert!(note.contains("the open Run could not be read"), "{note}");
+    assert_eq!(resolution.effective_action, BreachAction::Pause);
+}
+
+#[test]
+fn a_kept_marker_read_failure_fails_the_breach_action_closed_to_pause() {
+    // read_resolution_facts' third fault arm: an instance with NO Run
+    // anywhere reads its kept-on-pause marker by name; that read failing
+    // fails the BREACH ACTION closed (the marker is the FR-21 promise's
+    // carrier).
+    let state = tempfile::TempDir::new().unwrap();
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let name = InstanceName::new("keep").unwrap();
+    registry
+        .register_with_adapter(
+            "keep",
+            &crate::adapter::AdapterRef::Manifest(fake_manifest("keep")),
+        )
+        .unwrap();
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store()
+                .execute_batch_for_test("DROP TABLE breach_default_upgrade");
+            Ok(())
+        })
+        .unwrap();
+    let resolution = registry.resolved_limits(&name, None);
+    let note = resolution
+        .fail_closed
+        .expect("the failed read fails closed");
+    assert!(
+        note.contains("the kept-on-pause marker could not be read"),
+        "{note}"
+    );
+    assert_eq!(resolution.effective_action, BreachAction::Pause);
+}
+
+#[test]
+fn a_delete_whose_store_write_fails_surfaces_the_typed_store_error() {
+    // apply_policy_delete's writer-fault tail: the delete itself failing
+    // inside the job surfaces as the typed Store error (never a panic,
+    // never a silent success). Only the DELETE is refused — the `policies`
+    // table stays readable — so a swallowed delete error cannot hide behind
+    // the re-resolution's own Store error: the error names the refused
+    // write, and the row the delete was to remove is still there.
+    let seeded = seed(1_000);
+    change(
+        &seeded.registry,
+        "team",
+        "team=core",
+        PolicyLimits::default(),
+    );
+    seeded
+        .registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "CREATE TRIGGER no_delete BEFORE DELETE ON policies \
+                 BEGIN SELECT RAISE(ABORT, 'sabotaged delete'); END;",
+            );
+            Ok(())
+        })
+        .unwrap();
+    // The normal path: the caller's decoded prior record names the scope.
+    let existing = seeded.registry.policy("team").unwrap();
+    let refusal = seeded
+        .registry
+        .apply_policy_delete("team", existing, None, contexts())
+        .unwrap_err();
+    assert!(matches!(&refusal, RunError::Store(_)), "{refusal}");
+    assert!(
+        refusal.to_string().contains("sabotaged delete"),
+        "the error names the refused write: {refusal}"
+    );
+    assert!(
+        seeded.registry.policy("team").unwrap().is_some(),
+        "the refused delete left the Policy in place"
+    );
+}
+
+#[test]
+fn an_upgrade_pending_list_read_failure_keeps_the_marker_on_pause_until_the_next_open() {
+    // finish_breach_default_upgrade's pending-read fault arm, with the open
+    // note's claims made real: the list read failing pushes the open note
+    // and fires NO upgrade event, but LEAVES the marker rows untouched —
+    // the kept instance still resolves to Pause through its marker, and a
+    // fresh open (open() retries the upgrade) finishes the list and emits
+    // exactly one BreachDefaultUpgraded event.
+    let state = tempfile::TempDir::new().unwrap();
+    let mut registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "kept",
+            &crate::adapter::AdapterRef::Manifest(fake_manifest("kept")),
+        )
+        .unwrap();
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "INSERT INTO breach_default_upgrade (instance_id, listed_at) \
+                 SELECT id, 't' FROM agent_instances WHERE name = 'kept'",
+            );
+            Ok(())
+        })
+        .unwrap();
+    // Fail ONLY the pending-list read — the marker data itself survives
+    // (the table is renamed away, then back).
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "ALTER TABLE breach_default_upgrade RENAME TO breach_default_upgrade_aside",
+            );
+            Ok(())
+        })
+        .unwrap();
+    registry.finish_breach_default_upgrade();
+    let notes = registry.take_open_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("the kept-on-pause upgrade list could not be read")),
+        "{notes:?}"
+    );
+    assert!(!registry
+        .take_open_events()
+        .iter()
+        .any(|(_, event)| matches!(event, EngineEvent::BreachDefaultUpgraded(_))));
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "ALTER TABLE breach_default_upgrade_aside RENAME TO breach_default_upgrade",
+            );
+            Ok(())
+        })
+        .unwrap();
+    // The failed attempt left the marker intact: the kept read still sees
+    // it, and the instance still resolves to Pause through it (no fault
+    // note — this pause is the marker's doing, not a fail-closed read).
+    let name = InstanceName::new("kept").unwrap();
+    let (_, kept) = registry.resolved_limits_and_kept(&name, None, None);
+    assert!(kept, "the marker row survived the failed attempt");
+    let resolution = registry.resolved_limits(&name, None);
+    assert_eq!(resolution.effective_action, BreachAction::Pause);
+    assert!(
+        resolution.fail_closed.is_none(),
+        "{:?}",
+        resolution.fail_closed
+    );
+    // The next open retries the upgrade to completion: exactly one event.
+    drop(registry);
+    let mut reopened = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let events = reopened.take_open_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(_, event)| matches!(event, EngineEvent::BreachDefaultUpgraded(_)))
+            .count(),
+        1,
+        "{events:?}"
+    );
+}
+
+#[test]
+fn an_open_runs_read_failure_defers_the_initial_policy_sweep() {
+    // initial_policy_sweep's read-fault arm: the open Runs read failing is
+    // an open note (they re-resolve at their next change), never a failed
+    // open.
+    let mut seeded = seed(1_000);
+    seeded
+        .registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test("DROP TABLE runs");
+            Ok(())
+        })
+        .unwrap();
+    seeded.registry.initial_policy_sweep();
+    let notes = seeded.registry.take_open_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("the open Runs could not be resolved against the Policies")),
+        "{notes:?}"
+    );
+}
