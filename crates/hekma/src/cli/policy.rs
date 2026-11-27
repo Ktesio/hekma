@@ -689,4 +689,95 @@ mod tests {
         assert_eq!(empty.matched, 0);
         assert!(empty.record.is_none());
     }
+
+    #[test]
+    fn a_rate_for_on_create_is_refused_before_anything_is_opened() {
+        // The verb surface routes --rate-for to `change default` only; a
+        // WriteArgs carrying it into create is refused before any engine
+        // or host is opened, pointing at the default Policy's Rate table.
+        let err = create(args(
+            LimitFlags {
+                rate_input: Some("1.00".to_string()),
+                rate_output: Some("2.00".to_string()),
+                ..LimitFlags::default()
+            },
+            Vec::new(),
+            Some("gpt-demo".to_string()),
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--rate-for edits the default Policy's Rate table"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("change default"), "{err}");
+    }
+
+    #[test]
+    fn the_cached_rate_leg_prices_the_cached_column() {
+        let change = change_from(
+            &args(
+                LimitFlags {
+                    rate_input: Some("1.00".to_string()),
+                    rate_output: Some("2.00".to_string()),
+                    rate_cached: Some("0.25".to_string()),
+                    ..LimitFlags::default()
+                },
+                Vec::new(),
+                None,
+            ),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            change.set.rate,
+            Some(Rate {
+                input_micros_per_1m: 1_000_000,
+                output_micros_per_1m: 2_000_000,
+                cached_micros_per_1m: Some(250_000),
+            })
+        );
+    }
+
+    #[test]
+    fn a_cached_rate_on_its_own_is_refused_before_anything_is_opened() {
+        // `--rate-cached` has no `requires` of its own in the verb surface:
+        // this guard is the only check that a cached price never rides in
+        // without the input and output legs it is priced against — a
+        // cached-only change is refused, never silently accepted as "no
+        // Rate change".
+        let err = change_from(
+            &args(
+                LimitFlags {
+                    rate_cached: Some("0.25".to_string()),
+                    ..LimitFlags::default()
+                },
+                Vec::new(),
+                None,
+            ),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("both --rate-input"),
+            "a cached rate given on its own must be refused with the message naming both legs"
+        );
+    }
+
+    #[test]
+    fn the_dollars_cumulative_flag_parses_into_the_ceiling() {
+        let change = change_from(
+            &args(
+                LimitFlags {
+                    dollars_cumulative: Some("40".to_string()),
+                    ..LimitFlags::default()
+                },
+                Vec::new(),
+                None,
+            ),
+            true,
+        )
+        .unwrap();
+        assert_eq!(change.set.dollars_cumulative_micros, Some(40_000_000));
+    }
 }

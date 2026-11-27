@@ -232,3 +232,145 @@ fn a_policy_round_trip_through_the_service_host() {
     let run = hekma(&["policy", "show", "default"]);
     assert!(run.success, "the default survives every delete");
 }
+
+#[test]
+fn the_human_list_and_show_render_the_table_and_its_rates() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let hekma = |args: &[&str]| run_hekma_agent(args, &ctx.project_dir, state_dir);
+
+    let run = hekma(&[
+        "policy",
+        "create",
+        "nightly",
+        "--selector",
+        "team=research,env=prod",
+        "--tokens-per-run",
+        "2000000",
+        "--dollars-cumulative",
+        "40",
+    ]);
+    assert!(run.success, "stderr: {}", run.stderr);
+
+    // The human list prints one line per Policy, the default included —
+    // not only the --json document.
+    let run = hekma(&["policy", "list"]);
+    assert!(run.success, "stderr: {}", run.stderr);
+    assert!(
+        run.stdout.contains("default  (every Run)"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("nightly  team=research,env=prod"),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("tokens/run 2000000"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("est. $40.00 cumulative"),
+        "{}",
+        run.stdout
+    );
+
+    // The default's Rate table, cached column included, round-trips; the
+    // human show names each model's rate under the Policy line.
+    let run = hekma(&[
+        "policy",
+        "change",
+        "default",
+        "--rate-for",
+        "gpt-demo",
+        "--rate-input",
+        "2.00",
+        "--rate-output",
+        "8.00",
+        "--rate-cached",
+        "1.00",
+    ]);
+    assert!(run.success, "stderr: {}", run.stderr);
+    let run = hekma(&["policy", "show", "default", "--json"]);
+    assert!(run.success, "stderr: {}", run.stderr);
+    let document = json(&run.stdout);
+    assert_eq!(
+        document["policy"]["rates"]["gpt-demo"]["cached_micros_per_1m"],
+        1_000_000
+    );
+    let run = hekma(&["policy", "show", "default"]);
+    assert!(run.success, "stderr: {}", run.stderr);
+    assert!(
+        run.stdout
+            .contains("rate for gpt-demo: $2.00 in / $8.00 out per 1M tokens (estimated)"),
+        "{}",
+        run.stdout
+    );
+
+    // The named Policy's human show carries its limits, no rates section.
+    let run = hekma(&["policy", "show", "nightly"]);
+    assert!(run.success, "stderr: {}", run.stderr);
+    assert!(run.stdout.contains("tokens/run 2000000"), "{}", run.stdout);
+    assert!(!run.stdout.contains("rate for"), "{}", run.stdout);
+}
+
+#[test]
+fn change_and_delete_dry_runs_write_nothing_and_say_so() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let hekma = |args: &[&str]| run_hekma_agent(args, &ctx.project_dir, state_dir);
+
+    let run = hekma(&[
+        "policy",
+        "create",
+        "nightly",
+        "--selector",
+        "team=research",
+        "--tokens-per-run",
+        "2000000",
+    ]);
+    assert!(run.success, "stderr: {}", run.stderr);
+
+    // A change dry run resolves read-only and reports what it WOULD do.
+    let run = hekma(&[
+        "policy",
+        "change",
+        "nightly",
+        "--tokens-per-run",
+        "9000000",
+        "--breach-action",
+        "stop",
+        "--dry-run",
+    ]);
+    assert!(run.success, "stderr: {}", run.stderr);
+    assert!(
+        run.stdout.contains("would change Policy `nightly`"),
+        "{}",
+        run.stdout
+    );
+    let run = hekma(&["policy", "show", "nightly", "--json"]);
+    assert!(run.success, "stderr: {}", run.stderr);
+    let document = json(&run.stdout);
+    assert_eq!(document["policy"]["limits"]["tokens_per_run"], 2_000_000);
+    assert_eq!(
+        document["policy"]["limits"]["breach_action"],
+        serde_json::Value::Null
+    );
+
+    // A delete dry run re-resolves without deleting.
+    let run = hekma(&["policy", "delete", "nightly", "--dry-run"]);
+    assert!(run.success, "stderr: {}", run.stderr);
+    assert!(
+        run.stdout.contains("would delete Policy `nightly`"),
+        "{}",
+        run.stdout
+    );
+    let run = hekma(&["policy", "show", "nightly"]);
+    assert!(run.success, "the dry run deleted nothing");
+
+    // The real delete still works after both dry runs.
+    let run = hekma(&["policy", "delete", "nightly"]);
+    assert!(run.success, "stderr: {}", run.stderr);
+    let run = hekma(&["policy", "show", "nightly"]);
+    assert_eq!(run.code, Some(3), "deleted for real");
+}
