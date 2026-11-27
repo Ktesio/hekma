@@ -740,6 +740,31 @@ mod tests {
     }
 
     #[test]
+    fn a_cached_rate_on_its_own_is_refused_before_anything_is_opened() {
+        // `--rate-cached` has no `requires` of its own in the verb surface:
+        // this guard is the only check that a cached price never rides in
+        // without the input and output legs it is priced against — a
+        // cached-only change is refused, never silently accepted as "no
+        // Rate change".
+        let err = change_from(
+            &args(
+                LimitFlags {
+                    rate_cached: Some("0.25".to_string()),
+                    ..LimitFlags::default()
+                },
+                Vec::new(),
+                None,
+            ),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("both --rate-input"),
+            "a cached rate given on its own must be refused with the message naming both legs"
+        );
+    }
+
+    #[test]
     fn the_dollars_cumulative_flag_parses_into_the_ceiling() {
         let change = change_from(
             &args(
