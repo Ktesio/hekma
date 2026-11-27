@@ -12561,6 +12561,12 @@ fn a_block_breach_records_and_surfaces_the_missing_wire_listener() {
         ),
         "the missing-listener breadcrumb must be surfaced"
     );
+    // No enforcement was attempted: a `block` that fell through to the
+    // pause/stop path would surface its own enforcement diagnostic here.
+    assert!(
+        !text.contains("could not be honored"),
+        "a block breach must not attempt a pause or a stop"
+    );
     sup.stop(&registry, "blockarm", Some(Duration::from_secs(5)))
         .unwrap();
 }
@@ -12620,6 +12626,12 @@ fn a_dollar_cap_breach_pauses_with_the_cost_cap_cause() {
         cause.contains("\"kind\":\"budget-exceeded\"")
             && cause.contains("\"dimension\":\"dollars\""),
         "the pause edge must carry the DOLLARS budget-exceeded cause"
+    );
+    // The same micro-dollars the cap and the derived cost were stated in:
+    // the $0.05 cap and event 1's $0.06 cost (30 tokens at $2000/1M each way).
+    assert!(
+        cause.contains("\"dollar_limit\":50000") && cause.contains("\"dollar_observed\":60000"),
+        "the pause edge must carry the cap and the derived cost as micro-dollars"
     );
 }
 
@@ -12840,6 +12852,7 @@ fn a_breach_on_an_unparseable_instance_name_is_still_recorded_and_published() {
     let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let buffer = install_capture_sink(&mut sup);
+    let mut receiver = sup.events.subscribe();
 
     sup.publish_and_act(
         &registry,
@@ -12869,6 +12882,19 @@ fn a_breach_on_an_unparseable_instance_name_is_still_recorded_and_published() {
     assert!(
         text.contains("the breach is recorded but its action was not executed"),
         "the no-action outcome must be stated, never silent"
+    );
+    // Published: the breach still reaches the bus — once, under the name
+    // that failed to parse (there is no mirror entry: no name to file it under).
+    let mut published = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        if let crate::domain::EngineEvent::BudgetBreach(breach) = event {
+            published.push(breach.instance);
+        }
+    }
+    assert_eq!(
+        published,
+        vec!["Not A Valid Name!".to_string()],
+        "the breach on the unparseable name must be published exactly once"
     );
 }
 
