@@ -1601,8 +1601,7 @@ fn corrupt_tokens_rows_read_as_named_corrupt_rows() {
             Err(StoreError::CorruptRow { name, detail }) => {
                 assert_eq!(name, "tokens", "the refusal names its own table");
                 assert_eq!(
-                    detail,
-                    wording,
+                    detail, wording,
                     "the detail is the exact wording of what was refused"
                 );
             }
