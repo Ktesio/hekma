@@ -1607,6 +1607,12 @@ fn corrupt_tokens_rows_read_as_named_corrupt_rows() {
             }
             _ => panic!("expected a named CorruptRow refusal, saw a different outcome"),
         }
+        // The refusal hands the connection back free: no transaction is
+        // left open behind it.
+        store
+            .conn()
+            .execute_batch("BEGIN IMMEDIATE; COMMIT;")
+            .expect("the refusal leaves no open transaction");
         store
             .conn()
             .execute_batch("DELETE FROM tokens WHERE run_id = 'run_T'")
