@@ -4863,7 +4863,7 @@ fn a_selected_set_acts_per_run_with_the_child_refused_and_limits_scoped_to_the_r
     assert_eq!(results["results"][0]["outcome"], "closed");
     assert_eq!(results["results"][0]["run"]["status"], "ended");
 
-    // Labels over the set: one PATCH.
+    // Labels over the set: one PATCH, one result per Run.
     let token = select()["token"].as_str().unwrap().to_string();
     let (status, results) = json(
         "PATCH",
@@ -4872,6 +4872,7 @@ fn a_selected_set_acts_per_run_with_the_child_refused_and_limits_scoped_to_the_r
     );
     assert_eq!(status, 200, "{results}");
     assert_eq!(results["verb"], "label");
+    assert_eq!(results["matched"], 2, "one result per Run of the set");
     assert!(results["results"]
         .as_array()
         .unwrap()
@@ -4879,7 +4880,9 @@ fn a_selected_set_acts_per_run_with_the_child_refused_and_limits_scoped_to_the_r
         .all(|row| row["outcome"] == "labeled"));
 
     // The same label set again changes nothing: every outcome says
-    // `unchanged` (the labels already carry these values).
+    // `unchanged` (the labels already carry these values). The PATCH still
+    // answers one result per Run — a no-op Run is never dropped from the
+    // results, and an empty list would satisfy `all` for free.
     let token = select()["token"].as_str().unwrap().to_string();
     let (status, results) = json(
         "PATCH",
@@ -4887,6 +4890,14 @@ fn a_selected_set_acts_per_run_with_the_child_refused_and_limits_scoped_to_the_r
         serde_json::json!({"set_token": token, "set": {"tier": "gold"}}),
     );
     assert_eq!(status, 200, "{results}");
+    assert_eq!(
+        (
+            results["matched"].as_u64(),
+            results["results"].as_array().map(Vec::len)
+        ),
+        (Some(2), Some(2)),
+        "an unchanged set still answers one result per Run"
+    );
     assert!(
         results["results"]
             .as_array()
