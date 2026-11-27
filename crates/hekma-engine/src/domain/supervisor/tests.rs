@@ -12633,6 +12633,12 @@ fn a_dollar_cap_breach_pauses_with_the_cost_cap_cause() {
         cause.contains("\"dollar_limit\":50000") && cause.contains("\"dollar_observed\":60000"),
         "the pause edge must carry the cap and the derived cost as micro-dollars"
     );
+    // Labeled: the money is a derived figure, so the cause carries the
+    // `estimated` label.
+    assert!(
+        cause.contains("\"estimate_label\":\"estimated\""),
+        "the pause edge must carry the estimated label on its micro-dollars"
+    );
 }
 
 #[test]
@@ -12757,6 +12763,12 @@ fn a_staged_dollar_pause_through_the_dispatch_carries_the_cost_cause() {
             && cause.contains("\"dollar_observed\":60000"),
         "the pause edge must carry the DOLLARS cause with its labeled micros"
     );
+    // Labeled: the money is a derived figure, so the cause carries the
+    // `estimated` label.
+    assert!(
+        cause.contains("\"estimate_label\":\"estimated\""),
+        "the dispatched dollar pause must carry the estimated label on its micro-dollars"
+    );
 }
 
 #[test]
@@ -12843,10 +12855,11 @@ fn a_second_breach_for_the_same_agent_folds_into_its_open_action_entry() {
 }
 
 #[test]
-fn a_breach_on_an_unparseable_instance_name_is_still_recorded_and_published() {
-    // The unparseable-name arm: the breach is durable and publishable even
-    // when its instance name cannot parse — the diagnostic says exactly
-    // that, and no process action is attempted (there is no name to find a
+fn a_breach_on_an_unparseable_instance_name_is_published_and_its_unexecuted_action_named() {
+    // The unparseable-name arm: the breach is still publishable even when
+    // its instance name cannot parse — ONE diagnostic names the instance
+    // that failed to parse and states the action that was not executed —
+    // and no process action is attempted (there is no name to find a
     // process under).
     let state = tempfile::tempdir().unwrap();
     let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
@@ -12909,6 +12922,7 @@ fn a_breach_on_a_run_this_engine_does_not_supervise_is_mirrored_and_named_once()
     let name = InstanceName::new("foreigner").unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let buffer = install_capture_sink(&mut sup);
+    let mut receiver = sup.events.subscribe();
     let before = state_of(&registry, "foreigner");
 
     sup.publish_and_act(
@@ -12938,6 +12952,20 @@ fn a_breach_on_a_run_this_engine_does_not_supervise_is_mirrored_and_named_once()
     assert!(
         mirrored.contains("foreigner") && mirrored.contains("run-7"),
         "the foreign breach must be mirrored to the breach log"
+    );
+    // Published: the breach still reaches the bus — once, under the
+    // foreign agent's name (a dispatch that skipped Runs this engine does
+    // not supervise would leave this empty).
+    let mut published = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        if let crate::domain::EngineEvent::BudgetBreach(breach) = event {
+            published.push(breach.instance);
+        }
+    }
+    assert_eq!(
+        published,
+        vec!["foreigner".to_string()],
+        "the foreign breach must be published exactly once"
     );
     // Named once — ONE diagnostic for the pass, never one per breach — with
     // the responsibility split.
