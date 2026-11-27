@@ -848,10 +848,34 @@ mod tests {
             rendered.contains("(applies only where tighter)"),
             "{rendered}"
         );
+        // …and its line carries the CALLER's own limits, never the Run's
+        // (the Run here sets none).
+        let caller_line = rendered
+            .lines()
+            .find(|line| line.contains("set by the Caller"))
+            .expect("a set Caller layer prints its line");
+        assert!(
+            caller_line.contains("tokens per-run 7000000"),
+            "the Caller line carries the Caller's limit"
+        );
+        assert!(
+            !caller_line.contains("no Run-level limit"),
+            "the Caller line never shows the Run's own limits"
+        );
         // The read's notes ride along as note lines.
         assert!(
             rendered.contains("  note: the dollar cap has no price"),
             "{rendered}"
+        );
+        // No Caller layer: no Caller line at all — printing one would read
+        // as a limit the Caller never set.
+        let rendered = render_view(&RunLimitsView {
+            caller_limits: RunLimits::default(),
+            ..view.clone()
+        });
+        assert!(
+            !rendered.contains("set by the Caller"),
+            "an unset Caller layer prints no line"
         );
     }
 
