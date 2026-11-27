@@ -1600,12 +1600,13 @@ fn corrupt_tokens_rows_read_as_named_corrupt_rows() {
         match store.run_tokens(&RunId::from_wire("run_T")) {
             Err(StoreError::CorruptRow { name, detail }) => {
                 assert_eq!(name, "tokens", "the refusal names its own table");
-                assert!(
-                    detail.contains(wording),
-                    "the detail carries the exact wording of what was refused"
+                assert_eq!(
+                    detail,
+                    wording,
+                    "the detail is the exact wording of what was refused"
                 );
             }
-            _ => panic!("expected a named CorruptRow refusal, saw a different outcome"),
+            other => panic!("expected a named CorruptRow refusal, got {other:?}"),
         }
         // The refusal hands the connection back free: no transaction is
         // left open behind it.
