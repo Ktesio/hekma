@@ -1920,16 +1920,50 @@ fn l2_a_caller_may_not_trade_pause_or_stop_for_the_cooperative_block() {
 fn a_guarded_limit_write_names_a_ghost_run_not_found() {
     let seeded = seed();
     let ghost = RunId::mint();
-    // The guard presents a real Run's key; the TARGET does not exist, so
-    // the gate answers the target's own not-found before any key check.
+    // The guard presents an ACTIVE Run Key of a real Run; the TARGET does not
+    // exist, so the gate answers the target's own not-found before the key
+    // check — a key check that ran first would refuse with RunOutOfScope.
+    let key = crate::domain::credential::TokenHash::of("caller-key");
+    let keyed = seeded.run.clone();
+    seeded
+        .registry
+        .writer
+        .call(move |ctx| {
+            ctx.store().insert_token(&crate::ports::TokenRow {
+                hash: key,
+                token_id: key.token_id(),
+                class: crate::domain::credential::TokenClass::RunKey,
+                run_id: keyed,
+                launch_generation: None,
+                paired_hash: None,
+                issued_by_hash: None,
+                custody_eligible: true,
+                state: crate::domain::credential::TokenState::Active,
+                issued_at: "t".to_string(),
+                revoked_at: None,
+                revoke_cause: None,
+            })
+        })
+        .unwrap();
     let guard = || RunActor::Caller {
         run_id: seeded.run.clone(),
-        token_hash: crate::domain::credential::TokenHash::of("caller-key"),
+        token_hash: key,
     };
     let change = limits(RunLimits {
         token_per_run: Some(1_000),
         ..RunLimits::default()
     });
+    // The key is real: aimed at its own Run, the same guard clears the gate.
+    seeded
+        .registry
+        .plan_run_limits_guarded(
+            &seeded.run,
+            &change,
+            LimitActor::Operator,
+            None,
+            Some(&guard()),
+        )
+        .expect("the guard's key is an active Run Key of its Run");
     for refusal in [
         seeded
             .registry
