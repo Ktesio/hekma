@@ -782,4 +782,121 @@ mod tests {
             assert!(!source_text(&source).is_empty());
         }
     }
+
+    #[test]
+    fn the_show_renderer_marks_absent_cumulative_scopes_the_caller_layer_and_notes() {
+        use hekma_engine::{CostCap, LimitSources, RunStatus, ScentCheckMode, TokenBudget};
+        let view = RunLimitsView {
+            run: RunRecord {
+                run_id: hekma_engine::RunId::from_wire("run_A"),
+                control_depth: hekma_engine::ControlDepth::Supervised,
+                wire_path: false,
+                status: RunStatus::Active,
+                anomalies: Vec::new(),
+                parent_run_id: None,
+                instance: Some("money".to_string()),
+                process_owner: true,
+                end_cause: None,
+                created_at: "t".to_string(),
+                updated_at: "t".to_string(),
+                ended_at: None,
+            },
+            limits: RunLimits::default(),
+            caller_limits: RunLimits {
+                token_per_run: Some(7_000_000),
+                ..RunLimits::default()
+            },
+            resolution: PolicyResolution {
+                tokens: TokenBudget::none(),
+                dollars: CostCap::none(),
+                action: BreachAction::Pause,
+                effective_action: BreachAction::Pause,
+                scent_check: ScentCheckMode::Off,
+                rate: None,
+                sources: LimitSources {
+                    tokens_per_run: LimitSource::Unset,
+                    tokens_cumulative: LimitSource::Unset,
+                    dollars_per_run: LimitSource::Unset,
+                    dollars_cumulative: LimitSource::Unset,
+                    breach_action: LimitSource::Unset,
+                    scent_check: LimitSource::Unset,
+                    rate: LimitSource::Unset,
+                },
+                fallback: None,
+                unpriced: None,
+                fail_closed: None,
+            },
+            usage: hekma_engine::RunUsage::default(),
+            cumulative_usage: None,
+            budget: None,
+            latched: Vec::new(),
+            notes: vec!["the dollar cap has no price".to_string()],
+        };
+        let rendered = render_view(&view);
+        // No cumulative usage: both cumulative rows show an em dash as used.
+        assert!(
+            rendered.contains("  tokens cumulative  —  used —"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  dollars cumulative —  used —"),
+            "{rendered}"
+        );
+        // A set Caller layer names itself and where it applies.
+        assert!(rendered.contains("set by the Caller"), "{rendered}");
+        assert!(
+            rendered.contains("(applies only where tighter)"),
+            "{rendered}"
+        );
+        // …and its line carries the CALLER's own limits, never the Run's
+        // (the Run here sets none).
+        let caller_line = rendered
+            .lines()
+            .find(|line| line.contains("set by the Caller"))
+            .expect("a set Caller layer prints its line");
+        assert!(
+            caller_line.contains("tokens per-run 7000000"),
+            "the Caller line carries the Caller's limit"
+        );
+        assert!(
+            !caller_line.contains("no Run-level limit"),
+            "the Caller line never shows the Run's own limits"
+        );
+        // The read's notes ride along as note lines.
+        assert!(
+            rendered.contains("  note: the dollar cap has no price"),
+            "{rendered}"
+        );
+        // No Caller layer: no Caller line at all — printing one would read
+        // as a limit the Caller never set.
+        let rendered = render_view(&RunLimitsView {
+            caller_limits: RunLimits::default(),
+            ..view.clone()
+        });
+        assert!(
+            !rendered.contains("set by the Caller"),
+            "an unset Caller layer prints no line"
+        );
+    }
+
+    #[test]
+    fn a_dollars_per_run_flag_carries_its_micros_text_in_the_change_body() {
+        // A value whose micros text needs its zero padding: five cents is
+        // 50000 micros, and written unpadded that reads back as "0.50000"
+        // — half a dollar of cap the caller never asked for.
+        let change = change_from(&SetArgs {
+            dollars_per_run: Some("0.05".into()),
+            ..set_args()
+        })
+        .unwrap();
+        let body = change_body(&change);
+        assert_eq!(body["dollars_per_run"], "0.050000");
+        // A value that needs no padding carries through unchanged.
+        let change = change_from(&SetArgs {
+            dollars_per_run: Some("0.5".into()),
+            ..set_args()
+        })
+        .unwrap();
+        assert_eq!(change_body(&change)["dollars_per_run"], "0.500000");
+    }
 }
