@@ -72,7 +72,7 @@ webpki-roots = { workspace = true }
 # pulled on Unix; the cfg lives in Cargo.toml (the OS-cfg CI gate greps *.rs, not
 # manifests). Minimal features — nix is heavily feature-gated. MSRV 1.69.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["signal", "process"] }
+nix = { version = "0.32", features = ["signal", "process"] }
 
 # Windows ProcessBackend (AD-4): one Job Object per Agent Instance
 # (CreateJobObjectW / AssignProcessToJobObject / SetInformationJobObject
