@@ -80,11 +80,11 @@ An unknown `--clear` field is refused (exit 2 on the CLI, `400` on the API): a t
 
 ## Control Depth and fallback
 
-Each Run has a **Control Depth**, how far Hekma controls it. Where a Policy's Breach Action is beyond a Run's depth, such as `block` on an agent with no metering listener, or `pause` on a child Run inside an agent's process, the Run acts as `warn` for that ceiling and carries the `depth-fallback` Anomaly. The action takes effect if the Run's depth later allows it. Creating or changing a Policy reports how many matched Runs fall back.
+Each Run has a **Control Depth**, how far Hekma controls it. Where a Policy's Breach Action is beyond a Run's depth, such as `block` on an agent whose calls skip the [metering proxy](metering-proxy.md), or `pause` on a child Run inside an agent's process, the Run acts as `warn` for that ceiling and carries the `depth-fallback` Anomaly. The action takes effect if the Run's depth later allows it. Creating or changing a Policy reports how many matched Runs fall back.
 
 ## `block`, the wire fence
 
-`block` is never a default. On a breach, the agent's metering listener refuses further model calls with HTTP 402 and a typed, non-retryable error. The fence lifts when the Run ends, or when the ceiling is raised above the Run's usage — by a Policy change, `hekma budget set` or an agent configuration write — reason by reason. An agent that bypasses the listener bypasses the fence too.
+`block` is never a default. On a breach, the [metering proxy](metering-proxy.md) refuses further model calls of the Run, and of every Run beneath it, with HTTP 402 and a typed, non-retryable error. It works at every depth with a wire path, not only for supervised agents. The fence lifts when the Run ends, or when the ceiling is raised above the Run's usage — by a Policy change, `hekma budget set` or an agent configuration write — reason by reason. An agent that bypasses the proxy bypasses the fence too.
 
 ## Not yet
 

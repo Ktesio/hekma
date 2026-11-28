@@ -793,6 +793,7 @@ fn launch(w: &World, run: &RunId, fresh: bool) -> crate::domain::MintedToken {
         labels: Vec::new(),
         fresh,
         inputs: None,
+        upstream: None,
     };
     let publisher = std::sync::Arc::clone(w.registry.run_publisher());
     w.registry
@@ -887,6 +888,7 @@ fn each_launch_has_its_own_key_revoked_when_its_process_exits() {
         labels: Vec::new(),
         fresh: false,
         inputs: None,
+        upstream: None,
     };
     w.registry
         .writer

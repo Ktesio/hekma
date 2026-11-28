@@ -324,7 +324,8 @@ mod bench {
         UsageJob {
             row_rate: None,
             event: UsageEvent {
-                instance: instance.to_string(),
+                instance: Some(instance.to_string()),
+                call_id: None,
                 run_id: RunId::from_wire(run),
                 input_tokens: 10,
                 output_tokens: 5,
@@ -335,7 +336,7 @@ mod bench {
             },
             generation: 1,
             eval: EvalInput {
-                name: name(instance),
+                name: Some(name(instance)),
                 run_id: RunId::from_wire(run),
                 metering_source: "self-reported".to_string(),
                 token_budget: TokenBudget {
@@ -347,7 +348,6 @@ mod bench {
                 cost_cap: CostCap::default(),
                 cost_action: BreachAction::Pause,
                 supervised: true,
-                fence: None,
                 runs: None,
                 totals_fault: false,
             },

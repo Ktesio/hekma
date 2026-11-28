@@ -47,16 +47,20 @@ pub(crate) enum CredentialClass {
     Refresh,
     /// An announce credential (`hk_ann_`): no route yet takes one.
     Announce,
+    /// A per-binding proxy-access credential (`hk_pxy_`): nothing accepts
+    /// one in this release (the authenticated proxy beyond loopback does).
+    ProxyAccess,
 }
 
 impl CredentialClass {
     /// Every class (the matrix's rows).
     #[cfg(test)]
-    pub(crate) const ALL: [CredentialClass; 4] = [
+    pub(crate) const ALL: [CredentialClass; 5] = [
         CredentialClass::OperatorBearer,
         CredentialClass::RunKey,
         CredentialClass::Refresh,
         CredentialClass::Announce,
+        CredentialClass::ProxyAccess,
     ];
 
     /// The class of an engine-issued token.
@@ -65,6 +69,7 @@ impl CredentialClass {
             TokenClass::RunKey => CredentialClass::RunKey,
             TokenClass::Refresh => CredentialClass::Refresh,
             TokenClass::Announce => CredentialClass::Announce,
+            TokenClass::ProxyAccess => CredentialClass::ProxyAccess,
         }
     }
 }
@@ -139,6 +144,7 @@ impl CredentialClass {
             (C::Refresh, _) => false,
             (C::Announce, F::Heartbeat | F::OtlpIntake) => true,
             (C::Announce, _) => false,
+            (C::ProxyAccess, _) => false,
         }
     }
 }
@@ -636,6 +642,14 @@ mod tests {
             (C::Announce, F::Proxy, false),
             (C::Announce, F::Heartbeat, true),
             (C::Announce, F::OtlpIntake, true),
+            (C::ProxyAccess, F::Operator, false),
+            (C::ProxyAccess, F::RunOpen, false),
+            (C::ProxyAccess, F::RunClose, false),
+            (C::ProxyAccess, F::RunLimits, false),
+            (C::ProxyAccess, F::RunRefresh, false),
+            (C::ProxyAccess, F::Proxy, false),
+            (C::ProxyAccess, F::Heartbeat, false),
+            (C::ProxyAccess, F::OtlpIntake, false),
         ];
         assert_eq!(table.len(), C::ALL.len() * F::ALL.len());
         for (class, family, allowed) in table {
@@ -679,6 +693,7 @@ mod tests {
             TokenClass::RunKey,
             TokenClass::Refresh,
             TokenClass::Announce,
+            TokenClass::ProxyAccess,
         ] {
             for family in RouteFamily::ALL {
                 let allowed = gate(matched(class, false), true, family).is_ok();

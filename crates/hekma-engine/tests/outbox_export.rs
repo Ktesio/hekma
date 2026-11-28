@@ -302,7 +302,7 @@ fn the_engine_options_debug_names_the_mode_and_never_a_sink() {
     // support bundle can show how the engine was opened.
     let text = format!("{:?}", EngineOptions::default());
     assert!(text.contains("log_capture"), "{text}");
-    assert!(text.contains("metering_listen_port"), "{text}");
+    assert!(text.contains("metering_proxy"), "{text}");
 }
 
 #[test]

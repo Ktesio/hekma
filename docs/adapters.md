@@ -53,7 +53,7 @@ two-tier vocabulary): `self-reported` (the agent's usage accounting reaches
 the engine as `KTESIO_USAGE {json}` sentinel lines — under `acp`, on the
 agent's **stderr**, its stdout being the protocol stream) or
 `engine-observed` (the engine meters the agent's model traffic through a
-per-instance loopback proxy — no agent cooperation needed).
+host's shared loopback metering proxy — no agent cooperation needed).
 
 **Evidence classes** — how a claim in this gallery came to be believed:
 

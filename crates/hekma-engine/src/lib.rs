@@ -176,9 +176,18 @@ pub use domain::{
     CREDENTIAL_EVENT_SCHEMA_VERSION, MAX_CALLER_OPEN_CHILDREN, REFRESH_PREFIX, RUN_KEY_PREFIX,
     TOKEN_BODY_LEN, TOKEN_ID_LEN,
 };
+// Story 23-1: the shared Metering Proxy's endpoint bindings.
+pub use domain::{
+    Binding, BindingChange, BindingCredential, BindingCredentialClass, BindingError, BindingEvent,
+    BindingOutcome, BindingPatch, BindingRoute, BindingSpec, IssuedBindingCredential, RouteSpec,
+    BINDING_EVENT_SCHEMA_VERSION, MAX_BINDINGS, MAX_BINDING_ROUTES,
+};
+// Story 23-1: the shared Metering Proxy's options and address (the type of
+// `EngineOptions::metering_proxy` and `Engine::metering_proxy`).
 /// Story 22-1: the reserved credential config keys and the variable every
 /// supervised agent receives its Run Key in.
 pub use domain::{RUN_KEY_ENV, RUN_KEY_KEY, RUN_KEY_MARKER_PREFIX, RUN_REFRESH_KEY_KEY};
+pub use metering::proxy::{MeteringProxyOptions, ProxyInfo, ProxyStartError};
 // The shutdown drain's public surface (issue #328 item 3): the planner, the
 // per-instance outcome vocabulary, and (via `Engine::shutdown` / its
 // `blocking()` twin) the drain itself.

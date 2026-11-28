@@ -146,9 +146,10 @@ A host that starts agents detached owes its operators the same honesty: keep
 the enforcement window visible wherever the option is offered, and remember
 that a detached instance's usage ledger only advances while some engine holds
 it. `start_detached` is refused outright (`EngineError::DetachRefused`) for
-engine-observed instances, because their loopback metering listener lives
-inside the starting engine and would strand the agent's `base_url` on a dead
-port — start those without detaching.
+engine-observed instances, because the metering proxy their `base_url` points
+at lives inside the starting engine and would leave it on a dead port — start
+those without detaching. An embedder runs the proxy on an ephemeral port by
+default; see [The metering proxy](metering-proxy.md).
 
 ## The event bus
 

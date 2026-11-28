@@ -441,14 +441,16 @@ fn assert_subscriber_isolation(result: &FlowResult) {
 fn event_instance(event: &EngineEvent) -> &str {
     match event {
         EngineEvent::Transition(t) => &t.instance,
-        EngineEvent::BudgetBreach(b) => &b.instance,
-        EngineEvent::UsageUpdate(u) => &u.event.instance,
+        EngineEvent::BudgetBreach(b) => b.instance.as_deref().unwrap_or_default(),
+        EngineEvent::UsageUpdate(u) => u.event.instance.as_deref().unwrap_or_default(),
         EngineEvent::Run(r) => r.instance.as_deref().unwrap_or_default(),
         // Policy-family events are fleet-wide: they name no instance.
         EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => "",
         // Story 22-1: a credential event names its Run, not an instance —
         // checked by run id in the isolation assertion.
         EngineEvent::Credential(_) => "",
+        // Story 23-1: binding events are fleet-wide.
+        EngineEvent::Binding(_) => "",
     }
 }
 

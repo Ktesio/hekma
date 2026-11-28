@@ -72,7 +72,7 @@ The `acp` kind supervises an Agent Client Protocol v1 agent over its stdio; thes
 
 ## `start --detach` Refused ("cannot be started with --detach")
 
-A detached start of an `engine-observed` instance is refused before anything changes: the engine-observed channel's loopback forward listener lives inside the engine that starts it — for the CLI, the local Service Host — so a detached start would leave the agent pointing at a listener that dies with the host — its model calls would then hit a dead port. Start the instance without `--detach` (it still outlives the command: it runs under the host, which keeps the listener alive), or switch the adapter's metering source to `self-reported` if the instance must survive a host exit. This failure exits with code 5 and changes no state.
+A detached start of an `engine-observed` instance is refused before anything changes: the [metering proxy](metering-proxy.md) its `base_url` points at lives inside the engine that starts it — for the CLI, the local Service Host — so a detached start would leave the agent pointing at a proxy that dies with the host, and its model calls would then hit a dead port. Start the instance without `--detach` (it still outlives the command: it runs under the host, which keeps the proxy alive), or switch the adapter's metering source to `self-reported` if the instance must survive a host exit. This failure exits with code 5 and changes no state.
 
 ## "No local Service Host answered" / "could not start a local Service Host"
 

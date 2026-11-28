@@ -269,11 +269,15 @@ fn serve_helper_subprocess() {
     let engine = Engine::open_with_options(
         Some(state.clone()),
         EngineOptions {
-            metering_listen_port: port,
+            metering_proxy: hekma_engine::MeteringProxyOptions {
+                port,
+                sticky: true,
+                ..Default::default()
+            },
             ..EngineOptions::default()
         },
     )
-    .expect("engine1 open with fixed port");
+    .expect("engine1 open with the shared proxy on the fixed port");
     let facade = engine.blocking();
     facade
         .register_with_adapter("observed", &AdapterRef::Manifest(manifest))
@@ -310,11 +314,15 @@ fn a_fixed_metering_port_binds_and_injects_that_port() {
     let engine = Engine::open_with_options(
         Some(state.path().to_path_buf()),
         EngineOptions {
-            metering_listen_port: port,
+            metering_proxy: hekma_engine::MeteringProxyOptions {
+                port,
+                sticky: true,
+                ..Default::default()
+            },
             ..EngineOptions::default()
         },
     )
-    .expect("open with fixed port");
+    .expect("open with the shared proxy on a fixed port");
     let facade = engine.blocking();
     facade
         .register_with_adapter(
@@ -330,19 +338,24 @@ fn a_fixed_metering_port_binds_and_injects_that_port() {
         )
         .unwrap();
     facade.start("observed").unwrap();
-    // The INJECTED base_url names the FIXED port (the agent-observable seam).
+    // The proxy answers on the FIXED port, and the engine reports it.
+    assert_eq!(engine.metering_proxy().unwrap().port, port);
+    // The INJECTED base_url names the fixed port's origin and this Run's
+    // route (`<proxy url>/_hekma/runs/<run id>` — the agent-observable seam).
     let text = poll_dump_for(
         &dump,
-        &format!("env=OPENAI_BASE_URL=http://127.0.0.1:{port}"),
+        &format!("env=OPENAI_BASE_URL=http://127.0.0.1:{port}/_hekma/runs/"),
     );
     assert!(
-        text.contains(&format!("env=OPENAI_BASE_URL=http://127.0.0.1:{port}")),
-        "the injected base_url must carry the pinned port"
+        text.contains(&format!(
+            "env=OPENAI_BASE_URL=http://127.0.0.1:{port}/_hekma/runs/run_"
+        )),
+        "the injected base_url must carry the pinned port and the Run route: {text}"
     );
-    // The listener ANSWERS on that port (loopback, live accept loop).
+    // The proxy ANSWERS on that port (loopback, live accept loop).
     assert!(
         port_answer(port),
-        "the fixed-port listener must accept connects"
+        "the fixed-port proxy must accept connects"
     );
     facade
         .stop("observed", Some(Duration::from_secs(5)))
@@ -371,7 +384,11 @@ fn a_host_restart_rebinds_the_same_fixed_port() {
         let engine1 = Engine::open_with_options(
             Some(base.clone()),
             EngineOptions {
-                metering_listen_port: port,
+                metering_proxy: hekma_engine::MeteringProxyOptions {
+                    port,
+                    sticky: true,
+                    ..Default::default()
+                },
                 ..EngineOptions::default()
             },
         )
@@ -393,24 +410,28 @@ fn a_host_restart_rebinds_the_same_fixed_port() {
         facade.start("observed").unwrap();
         poll_dump_for(
             &dump,
-            &format!("env=OPENAI_BASE_URL=http://127.0.0.1:{port}"),
+            &format!("env=OPENAI_BASE_URL=http://127.0.0.1:{port}/_hekma/runs/"),
         );
         facade
             .stop("observed", Some(Duration::from_secs(5)))
             .unwrap();
-        // engine1 dropped here: its listener released the port.
+        // engine1 dropped here: its proxy released the port.
     }
     assert!(
         !port_answer(port),
-        "generation 1's listener must be gone before the restart"
+        "generation 1's proxy must be gone before the restart"
     );
-    // Generation 2 (the host restart): the SAME port re-binds and injects.
+    // Generation 2 (the host restart): the sticky port re-binds and injects.
     // (The dump is removed so gen 2's own write is what the poll sees.)
     std::fs::remove_file(&dump).ok();
     let engine2 = Engine::open_with_options(
         Some(base),
         EngineOptions {
-            metering_listen_port: port,
+            metering_proxy: hekma_engine::MeteringProxyOptions {
+                port,
+                sticky: true,
+                ..Default::default()
+            },
             ..EngineOptions::default()
         },
     )
@@ -419,11 +440,11 @@ fn a_host_restart_rebinds_the_same_fixed_port() {
     facade.start("observed").unwrap();
     poll_dump_for(
         &dump,
-        &format!("env=OPENAI_BASE_URL=http://127.0.0.1:{port}"),
+        &format!("env=OPENAI_BASE_URL=http://127.0.0.1:{port}/_hekma/runs/"),
     );
     assert!(
         port_answer(port),
-        "the restarted host's listener must answer the SAME port"
+        "the restarted host's proxy must answer the SAME port"
     );
     facade
         .stop("observed", Some(Duration::from_secs(5)))
@@ -484,34 +505,37 @@ fn an_adopted_observed_instance_is_rebound_live_on_the_fixed_port() {
         "between the engines, the fixed port is dead (the strand window)"
     );
     // Engine 2 (the restarting HOST): opens with the SAME fixed port + a
-    // sink — adoption must RE-BIND the listener live (the AI-46 closure).
+    // sink — the proxy re-binds the port, and the adopted agent's Run route
+    // (its base URL survived the crash) answers on it again.
     let shared = Arc::new(Mutex::new(Vec::new()));
     let engine2 = Engine::open_with_options(
         Some(state.path().to_path_buf()),
         EngineOptions {
-            metering_listen_port: port,
+            metering_proxy: hekma_engine::MeteringProxyOptions {
+                port,
+                sticky: true,
+                ..Default::default()
+            },
             diagnostics: Some(make_sink(&shared)),
             ..EngineOptions::default()
         },
     )
     .expect("engine2 open (the restarting host)");
+    assert_eq!(
+        engine2.metering_proxy().unwrap().port,
+        port,
+        "the restarted host's proxy binds the SAME port"
+    );
     let facade = engine2.blocking();
     let notes = sink_text(&shared);
     assert!(
-        notes.contains(&format!(
-            "re-bound the observed-metering listener on the fixed loopback port {port}"
-        )),
-        "the re-bind must be announced:\n{notes}"
+        !notes.contains("this engine runs no metering proxy"),
+        "a running proxy must not strand-warn:\n{notes}"
     );
-    assert!(
-        !notes.contains("stranded observed listener"),
-        "a live re-bind must NOT strand-warn:\n{notes}"
-    );
-    // The listener ANSWERS again — the adopted agent's traffic can flow.
-    assert!(
-        port_answer(port),
-        "the re-bound listener must accept connects"
-    );
+    // The proxy ANSWERS again — the adopted agent's traffic can flow (its
+    // base URL names the Run route on this port, which the snapshot still
+    // resolves).
+    assert!(port_answer(port), "the re-bound proxy must accept connects");
     // Cleanup: stop the adopted agent (the host's drain would).
     facade
         .stop("observed", Some(Duration::from_secs(5)))
@@ -520,37 +544,26 @@ fn an_adopted_observed_instance_is_rebound_live_on_the_fixed_port() {
 }
 
 #[test]
-fn an_ephemeral_open_adoption_keeps_the_strand_diagnostic() {
-    // The 11-3 posture is byte-unchanged when the restarting engine opens
-    // with NO fixed port (the pre-17-2 default): the adoption still warns
-    // the strand (no listener to re-bind), and no re-bind note appears.
+fn a_default_open_runs_the_proxy_on_an_os_picked_port() {
+    // Story 23-1: the default open (an embedder's shape) runs the shared
+    // proxy on an OS-picked port — the sticky per-state-dir port is the
+    // Service Host's posture, and an engine that never recorded one never
+    // pretends to (no recorded-port read, no strand text from the old
+    // per-instance listener world).
     if is_linux_ci() {
         return;
     }
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
-    let dump = state.path().join("ephemeral.dump");
-    write_observed_manifest(
-        manifest.path(),
-        "observedkind",
-        &[
-            "--linger-ms",
-            "600000",
-            "--dump",
-            &dump.display().to_string(),
-        ],
-    );
+    write_observed_manifest(manifest.path(), "observedkind", &["--linger-ms", "600000"]);
     let port = free_port();
     run_engine1_fixed_port(state.path(), manifest.path(), port);
     let pid = wait_for_agent_pid(&agent_log_path(state.path(), "observed"));
     // The NFR-1 crash-survival vehicle is Unix-only: on Windows the engine's
     // Job-Object kill-on-close takes the observed child the moment engine1's
-    // process exits (the documented no-orphan guarantee), so the live-orphan
-    // strand posture this test pins cannot exist there — the upstream 11-3
-    // proof (adoption.rs's ai46 strand test) is Windows-gated on the same
-    // survival harness. Pin the documented Windows outcome (no leaked child)
-    // and stop; the ephemeral-open posture is exercised where an orphan can
-    // survive. Runtime branch per the boundary gate's data-driven OS rule.
+    // process exits (the documented no-orphan guarantee), so pin the
+    // documented Windows outcome (no leaked child) and stop.
+    // Runtime branch per the boundary gate's data-driven OS rule.
     if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
         wait_until_gone(
             pid,
@@ -559,30 +572,39 @@ fn an_ephemeral_open_adoption_keeps_the_strand_diagnostic() {
         return;
     }
     let shared = Arc::new(Mutex::new(Vec::new()));
-    // The DEFAULT open (port 0) — the pre-17-2 shape, byte-identical. Held
-    // for the test's duration (the host-like shape: the engine stays open).
-    let _engine2 = Engine::open_with_options(
+    // The DEFAULT open: the proxy runs, ephemeral and unrecorded. Held for
+    // the test's duration (the host-like shape: the engine stays open).
+    let engine2 = Engine::open_with_options(
         Some(state.path().to_path_buf()),
         EngineOptions {
             diagnostics: Some(make_sink(&shared)),
             ..EngineOptions::default()
         },
     )
-    .expect("ephemeral open");
+    .expect("default open");
+    let info = engine2
+        .metering_proxy()
+        .expect("the default open runs the metering proxy");
+    assert!(
+        info.url.starts_with("http://127.0.0.1:"),
+        "the proxy binds loopback: {info:?}"
+    );
+    assert_ne!(info.port, 0, "the OS picked a real port");
+    assert!(
+        port_answer(info.port),
+        "the default proxy must accept connects"
+    );
     let notes = sink_text(&shared);
     assert!(
-        notes.contains("stranded observed listener"),
-        "the 11-3 strand note must stay under an ephemeral open:\n{notes}"
+        !notes.contains("stranded observed listener"),
+        "the old per-instance listener strand note is gone:\n{notes}"
     );
-    assert!(
-        !notes.contains("re-bound the observed-metering listener"),
-        "no re-bind happens on an ephemeral open:\n{notes}"
-    );
-    // Cleanup: kill the stranded orphan (a stop would work too, but the
-    // strand posture owes it nothing — the kill mirrors the operator's
-    // out-of-band cleanup of an unreachable agent).
+    // Cleanup: kill the orphaned agent (this engine adopted it under a
+    // proxy on another port; a stop would work too).
+    let facade = engine2.blocking();
+    let _ = facade.stop("observed", Some(Duration::from_secs(5)));
     kill_pid(pid);
-    wait_until_gone(pid, "the stranded orphan must be cleaned up");
+    wait_until_gone(pid, "the orphaned agent must be cleaned up");
 }
 
 #[test]
@@ -739,11 +761,28 @@ fn a_pinned_port_already_held_refuses_the_start_naming_the_port() {
     let engine = Engine::open_with_options(
         Some(state.path().to_path_buf()),
         EngineOptions {
-            metering_listen_port: held,
+            metering_proxy: hekma_engine::MeteringProxyOptions {
+                port: held,
+                sticky: true,
+                ..Default::default()
+            },
             ..EngineOptions::default()
         },
     )
     .unwrap();
+    // The engine OPENS (the Control API keeps serving) and says WHY the
+    // proxy is not running — never a silent port hop.
+    assert!(
+        engine.metering_proxy().is_none(),
+        "the port is held; no proxy"
+    );
+    let why = engine
+        .metering_proxy_error()
+        .expect("the bind failure is surfaced");
+    assert!(
+        why.contains(&held.to_string()),
+        "the surfaced reason must NAME the held port {held}: {why}"
+    );
     let facade = engine.blocking();
     facade
         .register_with_adapter(
@@ -763,8 +802,8 @@ fn a_pinned_port_already_held_refuses_the_start_naming_the_port() {
         EngineError::ObservedMetering { name, detail } => {
             assert_eq!(name, "collision");
             assert!(
-                detail.contains(&held.to_string()),
-                "the bind refusal must NAME the held port {held}: {detail}"
+                detail.contains("metering proxy is not running"),
+                "the start refusal names the proxy and the remediation: {detail}"
             );
         }
         other => panic!("the collision must be the typed ObservedMetering error, got: {other:?}"),

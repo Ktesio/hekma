@@ -1075,6 +1075,9 @@ pub fn generate() -> VectorsDocument {
             // Story 22-1 (still 1.4.0, unreleased; the 21-6 review's N7):
             // the resolver's Caller layer, appended after every case.
             .chain(caller_policy_cases())
+            // Story 23-1 (still 1.4.0, unreleased): `block` executes at
+            // every depth with a wire path; `pause`/`stop` there fall back.
+            .chain(wire_block_policy_cases())
             .collect(),
     }
 }
@@ -2318,6 +2321,60 @@ fn caller_policy_cases() -> Vec<Case> {
     ]
 }
 
+/// The wire-depth `policy` cases (story 23-1, still 1.4.0): the shared
+/// proxy fences every Run with a wire path, so a Policy's `block` executes
+/// at `wire` and `announced` depth, while `pause` and `stop` there still act
+/// as `warn` with the `depth-fallback` Anomaly. Appended after every case.
+fn wire_block_policy_cases() -> Vec<Case> {
+    use crate::domain::runs::ControlDepth;
+    let case = |id: &str, depth: ControlDepth, action: BreachAction| {
+        policy_case(
+            id,
+            crate::domain::runs::policy::ResolutionInput {
+                depth,
+                wire_path: true,
+                bound_labels: labels(&[("team", "core")]),
+                policies: vec![
+                    crate::domain::runs::PolicyRecord::default_policy(),
+                    crate::domain::runs::PolicyRecord {
+                        name: "p".to_string(),
+                        selector: Some("team=core".parse().unwrap()),
+                        limits: crate::domain::runs::PolicyLimits {
+                            tokens_per_run: Some(1_000),
+                            breach_action: Some(action),
+                            ..Default::default()
+                        },
+                        rates: Default::default(),
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+    };
+    vec![
+        case(
+            "policy-wire-block-executes-at-wire-depth",
+            ControlDepth::Wire,
+            BreachAction::Block,
+        ),
+        case(
+            "policy-wire-block-executes-at-announced-depth",
+            ControlDepth::Announced,
+            BreachAction::Block,
+        ),
+        case(
+            "policy-wire-pause-falls-back-at-wire-depth",
+            ControlDepth::Wire,
+            BreachAction::Pause,
+        ),
+        case(
+            "policy-wire-stop-falls-back-at-announced-depth",
+            ControlDepth::Announced,
+            BreachAction::Stop,
+        ),
+    ]
+}
+
 fn policy_case(id: &str, input: crate::domain::runs::policy::ResolutionInput) -> Case {
     Case::Policy(PolicyCase {
         id: id.to_string(),
@@ -3268,9 +3325,9 @@ mod tests {
         let document = generate();
         assert_eq!(
             document.cases.len(),
-            SHIPPED.len() + 14 + 10 + 6,
+            SHIPPED.len() + 14 + 10 + 6 + 4,
             "39 shipped + the 14 cases 21-3 appends + the 10 cases 21-6 appends + the 6 \
-             Caller-layer cases 22-1 appends"
+             Caller-layer cases 22-1 appends + the 4 wire-depth cases 23-1 appends"
         );
         for (index, id) in SHIPPED.iter().enumerate() {
             assert_eq!(
@@ -3327,11 +3384,12 @@ mod tests {
         assert!(document.cases[53..63]
             .iter()
             .all(|case| matches!(case, Case::Rearm(_))));
-        // Story 22-1 appends the 6 Caller-layer `policy` cases after them.
+        // Story 22-1 appends the 6 Caller-layer `policy` cases after them,
+        // and story 23-1 the 4 wire-depth `policy` cases after those.
         assert!(document.cases[63..]
             .iter()
             .all(|case| matches!(case, Case::Policy(_))));
-        assert_eq!(document.cases.len() - 53, 16);
+        assert_eq!(document.cases.len() - 53, 20);
     }
 
     /// The SHA-256 of the 1.3.0 artifact's 53 cases, pretty-printed as one
@@ -3502,11 +3560,27 @@ mod tests {
             )
             .expect("the Caller-layer cases exist");
         assert!(first_caller > first_rearm);
+        // Story 23-1 (still 1.4.0): the wire-depth `policy` cases close the
+        // artifact after the Caller-layer cases.
+        let first_wire = document
+            .cases
+            .iter()
+            .position(
+                |case| matches!(case, Case::Policy(case) if case.id.starts_with("policy-wire-")),
+            )
+            .expect("the wire-depth cases exist");
+        assert!(first_wire > first_caller);
         assert!(
-            document.cases[first_caller..].iter().all(
+            document.cases[first_caller..first_wire].iter().all(
                 |case| matches!(case, Case::Policy(case) if case.id.starts_with("policy-caller-"))
             ),
-            "the Caller-layer cases close the artifact"
+            "the Caller-layer cases follow the rearm cases"
+        );
+        assert!(
+            document.cases[first_wire..].iter().all(
+                |case| matches!(case, Case::Policy(case) if case.id.starts_with("policy-wire-"))
+            ),
+            "the wire-depth cases close the artifact"
         );
         assert!(
             document.cases[first_rearm..first_caller]
@@ -3741,5 +3815,29 @@ mod tests {
         let canonical = canonical_json(&generate());
         let back: VectorsDocument = serde_json::from_str(&canonical).unwrap();
         assert_eq!(back, generate());
+    }
+
+    #[test]
+    fn the_wire_depth_cases_execute_block_and_fall_back_for_process_actions() {
+        // Story 23-1: what the four appended cases must say, so a resolver
+        // change cannot silently re-author their expected outcomes.
+        for case in super::wire_block_policy_cases() {
+            let Case::Policy(case) = case else {
+                panic!("a wire-depth case is a policy case");
+            };
+            let expected = &case.expected;
+            if case.id.contains("-block-") {
+                assert_eq!(
+                    expected.effective_action,
+                    BreachAction::Block,
+                    "{}",
+                    case.id
+                );
+                assert!(expected.fallback.is_none(), "{}", case.id);
+            } else {
+                assert_eq!(expected.effective_action, BreachAction::Warn, "{}", case.id);
+                assert!(expected.fallback.is_some(), "{}", case.id);
+            }
+        }
     }
 }

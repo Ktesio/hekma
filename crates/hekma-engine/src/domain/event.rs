@@ -767,8 +767,11 @@ impl TransitionEvent {
 pub struct BudgetBreachEvent {
     /// The breach-event schema version ([`BUDGET_SCHEMA_VERSION`]).
     pub schema_version: u32,
-    /// The Agent Instance whose ledger crossed the ceiling.
-    pub instance: String,
+    /// The Agent Instance whose ledger crossed the ceiling. `None` for a
+    /// breach on a Run with no Agent Instance (a wire Run of the shared
+    /// Metering Proxy, story 23-1) — omitted on the wire then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
     /// The Run (spine AD-7) the breaching event was committed under.
     pub run_id: String,
     /// Which budget scope tripped (`per-run` / `cumulative`).
@@ -823,7 +826,7 @@ impl BudgetBreachEvent {
     ) -> Self {
         Self {
             schema_version: BUDGET_SCHEMA_VERSION,
-            instance: instance.into(),
+            instance: Some(instance.into()),
             run_id: run_id.into(),
             scope,
             dimension: BreachDimension::Tokens,
@@ -859,7 +862,7 @@ impl BudgetBreachEvent {
         let observed = u64::try_from(observed_micros.get()).unwrap_or(0);
         Self {
             schema_version: BUDGET_SCHEMA_VERSION,
-            instance: instance.into(),
+            instance: Some(instance.into()),
             run_id: run_id.into(),
             scope,
             dimension: BreachDimension::Dollars,
@@ -872,6 +875,13 @@ impl BudgetBreachEvent {
             metering_source: metering_source.into(),
             at: at.into(),
         }
+    }
+
+    /// The same breach on a Run with no Agent Instance (story 23-1): the
+    /// `instance` field is dropped.
+    pub fn without_instance(mut self) -> Self {
+        self.instance = None;
+        self
     }
 }
 

@@ -30,6 +30,7 @@ use super::lifecycle::LifecycleState;
 use super::usage::RunId;
 use crate::ports::StoreError;
 
+pub mod bindings;
 pub(crate) mod keys;
 pub(crate) mod labels;
 pub(crate) mod limits;
@@ -39,6 +40,7 @@ pub(crate) mod policy;
 pub mod selector;
 pub(crate) mod snapshot;
 pub mod verbs;
+pub(crate) mod wire;
 
 pub use labels::{validate_label_key, validate_label_value, LabelChange, LabelOutcome};
 pub use limits::{
@@ -348,6 +350,9 @@ pub enum LabelOrigin {
     Config,
     /// The Operator's label verb (`hekma label`, `PATCH /v0/runs/{id}/labels`).
     LabelVerb,
+    /// An Operator endpoint binding's labels (story 23-1): a binding's Run
+    /// and its split Runs carry them.
+    Binding,
 }
 
 impl LabelOrigin {
@@ -356,6 +361,7 @@ impl LabelOrigin {
         match self {
             LabelOrigin::Config => "config",
             LabelOrigin::LabelVerb => "label-verb",
+            LabelOrigin::Binding => "binding",
         }
     }
 
@@ -364,6 +370,7 @@ impl LabelOrigin {
         match raw {
             "config" => Some(LabelOrigin::Config),
             "label-verb" => Some(LabelOrigin::LabelVerb),
+            "binding" => Some(LabelOrigin::Binding),
             _ => None,
         }
     }
