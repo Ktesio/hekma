@@ -2,6 +2,7 @@ use super::*;
 use crate::domain::{RunLimits, RunStatus};
 use crate::ports::RunStore;
 use crate::store::run_store_sqlite::{migrate_v12, NoLegacy};
+use crate::store::tokens_sqlite::migrate_v17;
 use tempfile::TempDir;
 
 fn name(raw: &str) -> InstanceName {
@@ -1555,4 +1556,112 @@ fn a_v16_state_dir_migrates_to_v17_and_a_live_run_keeps_running_without_a_key() 
     drop(reopened);
     let again = SqliteStore::open(&db).unwrap();
     assert!(again.run_tokens(&run).unwrap().is_empty());
+}
+
+#[test]
+fn corrupt_tokens_rows_read_as_named_corrupt_rows() {
+    // The table's CHECKs refuse these rows at INSERT time; a row that is
+    // somehow already on disk (an older writer without the CHECKs, an
+    // external editor) must read as a NAMED CorruptRow naming its table
+    // and the exact wording of what it does not recognize — never a
+    // silent skip and never a raw backend error.
+    let (_tmp, store) = store();
+    store
+        .conn()
+        .execute_batch(
+            "INSERT INTO runs (run_id, control_depth, status, created_at, updated_at) \
+         VALUES ('run_T', 'announced', 'active', 't', 't')",
+        )
+        .unwrap();
+    for (hash, class, state, wording) in [
+        ("x'00'", "'run'", "'active'", "a token hash is not 32 bytes"),
+        (
+            "zeroblob(32)",
+            "'bogus'",
+            "'active'",
+            "unknown token class `bogus`",
+        ),
+        (
+            "zeroblob(32)",
+            "'run'",
+            "'zombie'",
+            "unknown token state `zombie`",
+        ),
+    ] {
+        store
+            .conn()
+            .execute_batch(&format!(
+                "PRAGMA ignore_check_constraints = ON; \
+                 INSERT INTO tokens (token_hash, token_id, class, run_id, state, issued_at) \
+                 VALUES ({hash}, 'id', {class}, 'run_T', {state}, 't'); \
+                 PRAGMA ignore_check_constraints = OFF;"
+            ))
+            .unwrap();
+        match store.run_tokens(&RunId::from_wire("run_T")) {
+            Err(StoreError::CorruptRow { name, detail }) => {
+                assert_eq!(name, "tokens", "the refusal names its own table");
+                assert_eq!(
+                    detail, wording,
+                    "the detail is the exact wording of what was refused"
+                );
+            }
+            other => panic!("expected a named CorruptRow refusal, got {other:?}"),
+        }
+        // The refusal hands the connection back free: no transaction is
+        // left open behind it.
+        store
+            .conn()
+            .execute_batch("BEGIN IMMEDIATE; COMMIT;")
+            .expect("the refusal leaves no open transaction");
+        store
+            .conn()
+            .execute_batch("DELETE FROM tokens WHERE run_id = 'run_T'")
+            .unwrap();
+    }
+    // With the garbage gone a well-formed row reads back through the same
+    // path, so the tampering left no trace.
+    store
+        .conn()
+        .execute_batch(
+            "INSERT INTO tokens (token_hash, token_id, class, run_id, state, issued_at) \
+             VALUES (zeroblob(32), 'ok', 'run', 'run_T', 'active', 't')",
+        )
+        .unwrap();
+    let rows = store.run_tokens(&RunId::from_wire("run_T")).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].token_id, "ok");
+}
+
+#[test]
+fn the_v17_step_aside_leaves_no_open_transaction() {
+    // The step's contract: when another process finished v17 while this one
+    // waited on BEGIN IMMEDIATE, the loser rolls back and steps aside — the
+    // connection must come back free, not holding a dangling transaction.
+    // The open path itself never calls the step at 17, so the arm is pinned
+    // by calling it directly on an already-migrated store.
+    let (_tmp, store) = store();
+    store
+        .conn()
+        .execute_batch(
+            "INSERT INTO runs (run_id, control_depth, status, created_at, updated_at) \
+         VALUES ('run_T', 'announced', 'active', 't', 't'); \
+         INSERT INTO tokens (token_hash, token_id, class, run_id, state, issued_at) \
+         VALUES (zeroblob(32), 'ok', 'run', 'run_T', 'active', 't');",
+        )
+        .unwrap();
+    migrate_v17(store.conn()).unwrap();
+    let version: i64 = store
+        .conn()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 17, "the step-aside stamps nothing new");
+    assert_eq!(
+        store.run_tokens(&RunId::from_wire("run_T")).unwrap().len(),
+        1,
+        "the existing rows survive the step-aside"
+    );
+    store
+        .conn()
+        .execute_batch("BEGIN IMMEDIATE; COMMIT;")
+        .unwrap();
 }
